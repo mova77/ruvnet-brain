@@ -134,7 +134,7 @@ New alerts:
 ${list}
 
 Rules:
-1. Read CLAUDE.md and CONTRIBUTING.md in this repo first; CONTRIBUTING.md is the only rulebook for branches, versions and releases. Ground any claim about rUv tools with the search_ruvnet tool.
+1. Read CLAUDE.md and CONTRIBUTING.md in this repo first; CONTRIBUTING.md is the only rulebook for branches, versions and releases. Ground any claim about rUv tools with the search_ruvnet tool (mcp__ruvnet-brain__search_ruvnet).
 2. You are in a dedicated clone on the internal disk, reset to origin/main. Never touch /Users/stuartkerr/Code/ruvnet-brain (the owner's checkout, on an external drive). Run npm ci before tests.
 3. For each alert: reproduce or read the evidence (job receipts in ~/.cache/ruvnet-brain/heartbeats, logs in ~/Library/Logs/launchd and ~/.claude/*.log, gh run view for CI, gh issue view for issues), find the root cause, and fix it properly (with a test that fails before the fix).
    - A problem on this Mac only (a job's config, a missing tool) is fixed on this Mac and verified by re-running the job.
@@ -172,6 +172,15 @@ export function responderEnv(base, cfg = {}) {
   return env;
 }
 
+function latestBrainPlugin() {
+  const base = path.join(os.homedir(), '.claude', 'plugins', 'cache', 'ruvnet-brain', 'ruvnet-brain');
+  try {
+    const v = fs.readdirSync(base).filter((d) => /^\d+\.\d+\.\d+$/.test(d))
+      .sort((a, b) => a.split('.').map(Number).reduce((r, n, i) => r || n - b.split('.').map(Number)[i], 0)).at(-1);
+    return v ? path.join(base, v) : null;
+  } catch { return null; }
+}
+
 function launchResponder(prompt, cfg) {
   // Its own clone on the INTERNAL disk, never the owner's checkout: ~/Code is an external drive that macOS keeps
   // Homebrew's git/gh/node out of when launchd starts them (measured 2026-10-25), and a separate clone can never
@@ -193,9 +202,17 @@ function launchResponder(prompt, cfg) {
   // subscription login, never a metered key. Same least-privilege shape as issue-fix: an explicit tool list,
   // no --dangerously-skip-permissions. Wrapped by job-heartbeat.sh: a receipt, a 3 h limit, one page on failure.
   const env = responderEnv(process.env, cfg);
-  const tools = 'Bash Read Edit Write Glob Grep Agent mcp__plugin_ruvnet-brain_ruvnet-brain__search_ruvnet';
+  // Measured 2026-10-25: started by launchd, a full-profile `claude -p` stalls while loading the owner's own
+  // customizations; with user settings, plugins and skills left out it answers in ~10 s. So the run loads only
+  // project settings plus the Brain's search server from the newest installed plugin.
+  const pluginRoot = latestBrainPlugin();
+  const mcpFile = path.join(RESPONDER_DIR(), 'mcp.json');
+  writeJson(mcpFile, { mcpServers: pluginRoot ? { 'ruvnet-brain': { command: path.join(os.homedir(), '.local', 'share', 'ruvnet-brain', 'job-bin', 'node'),
+    args: [path.join(pluginRoot, 'mcp', 'server.mjs')], env: { CLAUDE_PLUGIN_ROOT: pluginRoot } } } : {} });
+  const tools = 'Bash Read Edit Write Glob Grep Agent mcp__ruvnet-brain__search_ruvnet';
   const child = spawn('/bin/sh', [path.join(ROOT, 'scripts', 'job-heartbeat.sh'), 'com.ruvnet.ntfy-responder', '--',
-    claude, '-p', prompt, '--model', cfg.model || 'opus', '--permission-mode', 'acceptEdits', '--allowedTools', tools, '--output-format', 'text'],
+    claude, '-p', prompt, '--model', cfg.model || 'opus', '--permission-mode', 'acceptEdits', '--allowedTools', tools,
+    '--setting-sources', 'project', '--strict-mcp-config', '--mcp-config', mcpFile, '--disable-slash-commands', '--output-format', 'text'],
   { cwd: worktree, detached: true, stdio: ['ignore', log, log], env });
   child.unref();
   return child.pid;
