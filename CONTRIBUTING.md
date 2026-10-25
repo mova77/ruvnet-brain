@@ -354,7 +354,11 @@ artifact only together with its classification there, or `--doctor` will report 
   `kb.archive/<stamp>/<copy>/`, verifies each byte-for-byte, writes `<copy>.json` beside it, and only then
   releases the copy; a link, unsafe path or unreadable metadata still keeps it. `kb.archive/` is never removed
   automatically, counts toward the footprint budget, and the updater's `reclaimBackups` treats a copy whose
-  every byte survives in live or in an archive as accounted for. Links are never followed; trees of an in-progress storage transaction, a foreign refresh lock, an
+  every byte survives in live or in an archive as accounted for. The one exception is operational files (top-level `update.log`, `forge-update.log`,
+  `forge-guard-injection.log`, and ruflo's `.claude-flow/` scratch, each at most 2 MiB, 16 MiB per copy):
+  they do not keep a copy, they are copied to `kb-copy-rescued/<copy>/` in the brain home and verified
+  before the copy goes (kept for the newest five released copies), and a failed rescue keeps the copy.
+  Links are never followed; trees of an in-progress storage transaction, a foreign refresh lock, an
   install that is activating (`.kb.install-activation.lock` with a live pid), and live leases are kept; plugin generations go only through `prunePluginGenerations` (lease-aware).
 - **Enforced automatically**: after install/forced reinstall (the installer releases its own preserved
   generation once the new one validates), before and after every `--update` (incl. the SessionStart
