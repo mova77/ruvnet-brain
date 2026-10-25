@@ -88,6 +88,7 @@ import { probeFreshCodexDeclarations } from '../scripts/codex-fresh-host-proof.m
 import { repairSecurityGuidance } from '../scripts/security-guidance-codex-compat.mjs';
 import { installNativeLaunchers, installRoutingRuntime, runtimeSnapshot } from '../scripts/model-routing-launchers.mjs';
 import { installTerminalLaunchers } from '../scripts/model-terminal-launchers.mjs';
+import { addGrokAgentsLine, grokPaths, grokStatus, grokStatusLine, GROK_AGENTS_LINE } from '../scripts/grok-host.mjs';
 import { readConsoleReceipts, replaceStaleConsoles } from '../scripts/console-instances.mjs';
 import { moveBrain, MoveRefused } from '../scripts/move-brain.mjs';
 import { brainLocation } from '../plugin/scripts/brain-location.mjs';
@@ -173,6 +174,7 @@ const FLAG_WITH_STACK = argv.includes('--with-stack'); // add missing Ruflo/RuVe
 const FLAG_NO_STACK = argv.includes('--no-stack'); // skip the toolkit offer entirely
 const FLAG_ENHANCE_CLAUDE_MD = argv.includes('--enhance-claude-md'); // add the CLAUDE.md section without prompting
 const FLAG_NO_ENHANCE = argv.includes('--no-enhance'); // skip the CLAUDE.md offer entirely
+const FLAG_GROK_AGENTS_MD = argv.includes('--grok-agents-md'); // opt in: add the search-first line to ~/.grok/AGENTS.md (#301)
 const FLAG_STATUSLINE = argv.includes('--statusline'); // opt in to the status-bar version segment, non-interactively
 const FLAG_NO_STATUSLINE = argv.includes('--no-statusline'); // decline the status-bar offer without prompting
 // --version <tag> forces a specific Release tag (e.g. --version v0.5.0-dev); --pin <tag> is the same.
@@ -2547,6 +2549,37 @@ export function retireManagedHookRegistrations({ home = os.homedir(), codexDir =
   return { removed, changedFiles, conflicts };
 }
 
+/** Grok's state for --doctor and the install summary (#301): reported, never wired automatically. */
+function currentGrokStatus() {
+  return grokStatus({ pluginInstalled: Boolean(pluginCommandsDir()), hookCount: shippedHookHandlerCounts().grok });
+}
+function grokCheckLines(check) {
+  const status = currentGrokStatus();
+  const line = grokStatusLine(status);
+  if (!line) return [];
+  // Advisory only when the Brain cannot reach Grok at all; the AGENTS.md line is the user's choice.
+  return [check('grok', 'Grok', !status.pluginInstalled, line, 'npx ruvnet-brain', { advisory: true })];
+}
+
+/** Opt-in, never automatic: offer the search-first line when Grok is here and the line is not. */
+async function offerGrokAgentsMd() {
+  const status = currentGrokStatus();
+  if (!status.present || status.groundingLine || !status.pluginInstalled) return;
+  step('Optional — a search-first line for Grok', 'Grok drops prompt-time context, so this line is what makes it ground itself');
+  info(`Adds ${c.bold('one line')} (between ruvnet-brain markers) to the bottom of ${c.bold(status.agentsFile)}:`);
+  info(c.dim(`  ${GROK_AGENTS_LINE}`));
+  info('Backed up first; --uninstall removes it.');
+  const yes = FLAG_GROK_AGENTS_MD || (await ask('Add it?', false, { blanketYes: false }));
+  if (!yes) { info(`Skipped — add it any time with  ${c.bold('npx ruvnet-brain --grok-agents-md')}`); return; }
+  reportGrokAgentsLine(addGrokAgentsLine());
+}
+function reportGrokAgentsLine(result) {
+  if (result === 'added') ok(`added the search-first line to ${grokPaths().agents}`);
+  else if (result === 'present') ok('~/.grok/AGENTS.md already has a search_ruvnet line — left unchanged');
+  else if (result === 'no-grok') info('Grok CLI not detected (~/.grok/bin/grok) — nothing changed');
+  else warn('could not update ~/.grok/AGENTS.md — your file is untouched');
+}
+
 /**
  * How many lifecycle handlers each SHIPPED host manifest registers, counted from the manifests
  * themselves so help and progress text can never again claim "zero" while they carry handlers
@@ -3502,6 +3535,7 @@ async function doctorRun({ json }) {
       nightlyCode.state === 'current' ? 'registered update modules match the installed set' : `${nightlyCode.state}: registered ${String(nightlyCode.registered || '?').slice(0, 12)}, installed ${String(nightlyCode.current || '?').slice(0, 12)}`,
       nightlyCode.fix || 'npx ruvnet-brain@latest --update', { advisory: true })] : []),
     check('host-convergence', 'Hosts sync', !hostConvergence.healthy, hostConvergence.state, 'npx ruvnet-brain --update'),
+    ...grokCheckLines(check),
     ...(rufloOperational ? [rufloCheckLine(rufloOperational)] : []),
     ...(agentdbLine ? [agentdbLine] : []),
     turnLine,
@@ -4856,6 +4890,12 @@ export function machineFootprint() {
       items.push({ label: 'CLAUDE.md block (6 lines, between markers)', path: cmdPath, undo: 'npx ruvnet-brain --uninstall' });
     }
   } catch { /* unreadable */ }
+  try {
+    const grokAgents = grokPaths().agents;
+    if (fs.existsSync(grokAgents) && fs.readFileSync(grokAgents, 'utf8').includes(CLAUDE_MD_START)) {
+      items.push({ label: 'Grok AGENTS.md search-first line (between markers)', path: grokAgents, undo: 'npx ruvnet-brain --uninstall' });
+    }
+  } catch { /* unreadable */ }
   add('Usage-counts preference', telemetryConsentPath(), 'delete this file');
 
   // EVERYTHING ELSE THIS INSTALLER WRITES. The first version of this listed the KB bundle and
@@ -4960,8 +5000,7 @@ function showWhatsNew() {
  * Backed up and written atomically, same as when it was added — taking something away is at least
  * as sensitive as putting it there.
  */
-function removeClaudeMdBlock() {
-  const p = path.join(os.homedir(), '.claude', 'CLAUDE.md');
+function removeClaudeMdBlock(p = path.join(os.homedir(), '.claude', 'CLAUDE.md')) {
   let src = '';
   try { src = fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : ''; } catch { return 'unreadable'; }
   // PAIR THE MARKERS PROPERLY. The first version took the FIRST start and the FIRST end, unpaired.
@@ -5040,6 +5079,7 @@ function uninstallAll() {
 
   const claudeMd = removeClaudeMdBlock();
   if (claudeMd === 'removed') ok('removed our block from ~/.claude/CLAUDE.md (your content untouched, backup saved)');
+  if (removeClaudeMdBlock(grokPaths().agents) === 'removed') ok('removed our line from ~/.grok/AGENTS.md (your content untouched, backup saved)');
 
   // GAP FIX: this used to be permanently "manual" — machineFootprint() treated ANY settings.json edit
   // as something only the user could safely touch. That blanket rule was right for edits we cannot
@@ -6287,6 +6327,8 @@ function success({ cacheDir, isCustom, plugin, codexHost, codexPlugin, env, nigh
       `    • the Codex host ${hostReady && pluginReady ? c.green('wired at user scope') : c.yellow('needs attention')} — search_ruvnet + native Brain skills`,
     );
   }
+  const grokLine = grokStatusLine(currentGrokStatus());
+  if (grokLine) console.log(`    • ${grokLine}`);
   if (env) {
     const t = (okv) => (okv ? c.green('✓ present') : c.yellow('not added (optional)'));
     console.log(`    • rUv build toolkit — Ruflo: ${t(env.ruflo)} · RuVector: ${t(env.ruvector)}  ${c.dim('answers work without them')}`);
@@ -6392,6 +6434,8 @@ Usage:
                               block only — your own CLAUDE.md content is preserved and backed up)
   npx ruvnet-brain --enable-spend-guard   Install the hourly runaway-agent spend alarm (alert-only)
   npx ruvnet-brain --disable-spend-guard  Remove it (safe to run any time)
+  npx ruvnet-brain --grok-agents-md       Grok CLI only, opt-in: add one search-first line to ~/.grok/AGENTS.md
+                              (only if no search_ruvnet line is there; backed up; --uninstall removes it)
   npx ruvnet-brain --enhance-claude-md    Add the 6-line RuvNet-Brain block to ~/.claude/CLAUDE.md
                               (appended at the bottom between markers; your file is backed up first)
                               (a default install RECOMMENDS nightly and asks, defaulting to yes)
@@ -6515,6 +6559,7 @@ the installer reports that boot-level declarations changed.
   if (FLAG_ENABLE_SPEND_GUARD) { enableSpendGuard(); return; }
   if (FLAG_DISABLE_SPEND_GUARD) { disableSpendGuard(); return; }
   if (FLAG_UNINSTALL) { uninstallAll(); return; }
+  if (FLAG_GROK_AGENTS_MD) { reportGrokAgentsLine(addGrokAgentsLine()); return; }
   if (FLAG_WHAT_CHANGED) { printBanner('what RuvNet Brain put on this machine'); printFootprint(); return; }
   if (FLAG_WHATS_NEW) { showWhatsNew(); return; }
 
@@ -6737,6 +6782,7 @@ the installer reports that boot-level declarations changed.
   const env = detectEnvironment();
   try { await offerStack(env); } catch (e) { warn(`(toolkit check skipped: ${e && e.message})`); }
   try { await offerClaudeMd(); } catch { /* non-fatal — never let an offer break the install */ }
+  try { await offerGrokAgentsMd(); } catch { /* non-fatal — never let an offer break the install */ }
   // Stuart's requirement: a default install must end by clearly recommending nightly auto-updates
   // and asking, DEFAULTING TO YES (TTY + macOS + not already on). Non-fatal like every other offer.
   let nightly = 'skipped';
