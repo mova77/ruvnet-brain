@@ -1432,7 +1432,7 @@ function codexInstalledPluginRoot({ codexHome = codexHomeDir(), status } = {}) {
 function wirePlugin({ expectedVersion = PACKAGE_VERSION, requireManaged = false } = {}) {
   step(
     'Wiring the Claude Code plugin',
-    'this registers search_ruvnet, native skills, and slash commands without automatic lifecycle hooks',
+    `this registers search_ruvnet, native skills, slash commands, and the allowlisted lifecycle hooks (${shippedHookHandlerCounts().claude ?? 'unknown number of'} handlers)`,
   );
   const marketplaceSource = process.env.RUVNET_CLAUDE_MARKETPLACE_SOURCE || 'stuinfla/ruvnet-brain';
   const manualMarketplace = `claude plugin marketplace add ${marketplaceSource}`;
@@ -2547,6 +2547,30 @@ export function retireManagedHookRegistrations({ home = os.homedir(), codexDir =
   return { removed, changedFiles, conflicts };
 }
 
+/**
+ * How many lifecycle handlers each SHIPPED host manifest registers, counted from the manifests
+ * themselves so help and progress text can never again claim "zero" while they carry handlers
+ * (#400). A missing or unreadable manifest is null ("unknown"), never 0.
+ */
+export function shippedHookHandlerCounts(root = REPO_ROOT) {
+  const count = (relative) => {
+    try {
+      const doc = JSON.parse(fs.readFileSync(path.join(root, relative), 'utf8'));
+      return Object.values(doc?.hooks || {}).flat().reduce((n, group) => n + (Array.isArray(group?.hooks) ? group.hooks.length : 0), 0);
+    } catch { return null; }
+  };
+  return {
+    claude: count('plugin/hooks/hooks.json'),
+    codex: count('plugin/hooks/codex-hooks.json'),
+    grok: count('plugin/hooks/grok-hooks.json'),
+  };
+}
+
+function hookCountPhrase({ claude, codex } = shippedHookHandlerCounts()) {
+  const n = (v) => (Number.isInteger(v) ? String(v) : 'an unknown number of');
+  return `${n(claude)} Claude Code, ${n(codex)} Codex handlers`;
+}
+
 export function automaticHookRetirementStatus(root = REPO_ROOT, { scope = 'source' } = {}) {
   if (!['source', 'installed'].includes(scope)) throw new Error('invalid hook retirement scope');
   const files = [
@@ -3397,8 +3421,9 @@ async function doctorRun({ json }) {
   const turnLine = { id: 'turn-recording', label: 'Turn recording', state: turnStatus.state, detail: turnStatus.line, fix: null };
 
   // ── THE MECHANICAL VERDICT ────────────────────────────────────────────────────────────────────
-  // `--hooks` is retained as a compatibility alias for a read-only zero-registration proof. It must
-  // never execute dormant hook bodies.
+  // `--hooks` is a read-only proof that every registration in the shipped manifests is on the
+  // continuity allowlist (#400: it is not, and never was, a zero-registration proof). It must never
+  // execute hook bodies.
   let hookResult = null;
   if (FLAG_HOOKS) {
     const retirement = automaticHookRetirementStatus(REPO_ROOT, { scope: 'installed' });
@@ -6325,7 +6350,7 @@ function success({ cacheDir, isCustom, plugin, codexHost, codexPlugin, env, nigh
   console.log(`\n  ${c.bold('If it earns it:')} a GitHub star helps other people find the brain —`);
   console.log(`    ${c.bold('https://github.com/stuinfla/ruvnet-brain')}   ${c.dim('· feedback in one command: npx ruvnet-brain --feedback')}`);
 
-  console.log(`\n  ${c.dim('The plugin is disable-able and installs no automatic lifecycle handlers.')}`);
+  console.log(`\n  ${c.dim(`The plugin is disable-able. It registers lifecycle hooks (${hookCountPhrase()}), only the allowlisted set in continuity-hook-policy.mjs; Codex runs its set once trusted in /hooks.`)}`);
   console.log('');
 }
 
@@ -6348,8 +6373,9 @@ Usage:
                               EXITS NON-ZERO when the install is genuinely broken, so it can gate a
                               script:  npx ruvnet-brain --doctor && ./deploy.sh
   npx ruvnet-brain --doctor --hooks
-                              Backward-compatible, read-only proof that both shipped Brain hook
-                              manifests contain zero automatic registrations. Executes no hook body.
+                              Read-only proof that the shipped hook manifests register only the
+                              allowlisted continuity handlers (${hookCountPhrase()}).
+                              Executes no hook body.
   npx ruvnet-brain --demo     Guided walkthrough — 2 real questions, real cited answers
   npx ruvnet-brain --feedback Tell us how it went — prefills a GitHub Discussion with your brain
                               version, platform, and a 3-line health summary (you see exactly
