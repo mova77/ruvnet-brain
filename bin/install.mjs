@@ -83,8 +83,9 @@ import {
   CONSOLE_RUNTIME_SURFACE, CONSOLE_RUNTIME_IDENTITY_FILE, consoleRuntimeDigest,
 } from '../scripts/console-runtime-identity.mjs';
 import { shellDiff as pluginShellDiff } from '../plugin/scripts/host-shell-boundary.mjs';
-import { codexTrustChanges, CODEX_TRUST_ACTION } from '../scripts/codex-hook-trust.mjs';
+import { codexPluginContentChanged, codexTrustChanges, codexUsesContentTrust, CODEX_TRUST_ACTION } from '../scripts/codex-hook-trust.mjs';
 import { probeFreshCodexDeclarations } from '../scripts/codex-fresh-host-proof.mjs';
+import { refreshSharedCodexAppServer } from '../scripts/codex-hook-trust-reconcile.mjs';
 import { repairSecurityGuidance } from '../scripts/security-guidance-codex-compat.mjs';
 import { installNativeLaunchers, installRoutingRuntime, runtimeSnapshot } from '../scripts/model-routing-launchers.mjs';
 import { installTerminalLaunchers } from '../scripts/model-terminal-launchers.mjs';
@@ -1973,9 +1974,20 @@ const CODEX_MARKETPLACE_SOURCE = 'stuinfla/ruvnet-brain';
  * [{ key, status: 'modified'|'untrusted' }]. No installed root = a fresh install = every hook untrusted.
  * An unreadable file is treated as absent (fail toward telling the user to review, never toward silence).
  */
-export function codexHooksNeedingReview(installedRoot, candidateRoot) {
+export function codexHooksNeedingReview(installedRoot, candidateRoot, { contentTrust = false } = {}) {
   const read = (root) => { try { return root ? JSON.parse(fs.readFileSync(path.join(root, 'hooks', 'codex-hooks.json'), 'utf8')) : {}; } catch { return {}; } };
-  return codexTrustChanges(read(installedRoot), read(candidateRoot));
+  // Codex 0.164+ (or a version we could not read) also holds back every hook whose plugin bytes changed (#492).
+  const contentChanged = contentTrust !== false && codexPluginContentChanged(installedRoot, candidateRoot);
+  return codexTrustChanges(read(installedRoot), read(candidateRoot), undefined, { contentChanged });
+}
+
+/** codex --version → whether it approves plugin hooks by content too (true/false), or null when unknown. */
+export function codexHostContentTrust({ codexBin = process.env.CODEX_BIN || 'codex', codexHome = codexHomeDir(), run = runHostCli } = {}) {
+  try {
+    const r = run(codexBin, ['--version'], { stdio: 'pipe', shell: false, encoding: 'utf8', timeout: 10_000,
+      env: { ...process.env, CODEX_HOME: codexHome } });
+    return r?.status === 0 ? codexUsesContentTrust(r.stdout) : null;
+  } catch { return null; }
 }
 
 function codexMarketplaceTarget() {
@@ -2131,6 +2143,8 @@ export function wireCodexPlugin({
   announce = true,
   runJson = runCodexJson,
   aliasHome,
+  // true/false/null (unknown): does this Codex pin plugin contents in hook approval (0.164+)? Probed for a real host.
+  contentTrust,
 } = {}) {
   if (!fs.existsSync(codexDir)) return { host: false, action: 'no-host' };
   const options = { codexBin, codexHome, cwd, repair: true };
@@ -2169,11 +2183,6 @@ export function wireCodexPlugin({
       path.join(REPO_ROOT, 'plugin'),
     )
     : { known: true, changed: false, paths: [], restartRequired: false, reason: 'new host installation' };
-  // Which Brain hooks will Codex hold back after this update until the user re-reviews them? Codex keys
-  // trust to a hash of each hook's definition (scripts/codex-hook-trust.mjs), and codex-hooks.json is not
-  // a boot-surface path, so the shell boundary above cannot see it. Computed from the two files, offline.
-  const hooksNeedingReview = codexHooksNeedingReview(before.installed
-    ? codexInstalledPluginRoot({ codexHome, status: before }) : null, path.join(REPO_ROOT, 'plugin'));
   if (before.installed && before.enabled && versionSatisfies(before.version, expectedVersion)) {
     const hookTrust = runJson === runCodexJson ? repairReleasedCodexHookTrust(before, options) : null;
     if (announce) {
@@ -2187,6 +2196,13 @@ export function wireCodexPlugin({
     };
   }
 
+  // Which Brain hooks will Codex hold back after this update until the user re-reviews them? Codex keys
+  // trust to a hash of each hook's definition (scripts/codex-hook-trust.mjs), and codex-hooks.json is not
+  // a boot-surface path, so the shell boundary above cannot see it. Computed offline, before the install
+  // replaces the installed folder; on Codex 0.164+ a change to any plugin byte holds back every hook too (#492).
+  const hooksNeedingReview = codexHooksNeedingReview(before.installed
+    ? codexInstalledPluginRoot({ codexHome, status: before }) : null, path.join(REPO_ROOT, 'plugin'),
+    { contentTrust: contentTrust ?? (runJson === runCodexJson ? codexHostContentTrust({ codexBin, codexHome }) : false) });
   if (runJson === runCodexJson && !localMarketplace) {
     try { localMarketplace = prepareCodexMarketplace(); }
     catch (error) {
@@ -2236,7 +2252,9 @@ export function wireCodexPlugin({
     }
     if (hooksNeedingReview.length && !trustVerified) {
       warn(`Codex will NOT run ${hooksNeedingReview.length} Brain hook${hooksNeedingReview.length === 1 ? '' : 's'} until you review`
-        + ` ${hooksNeedingReview.length === 1 ? 'it' : 'them'} (${hooksNeedingReview.map((h) => `${h.key.split(':').slice(-3).join(':')} ${h.status}`).join(', ')}).`);
+        + ` ${hooksNeedingReview.length === 1 ? 'it' : 'them'} (${hooksNeedingReview.map((h) => `${h.key.split(':').slice(-3).join(':')} ${h.status}`).join(', ')}).`
+        + (hooksNeedingReview.some((h) => h.reason === 'plugin-content')
+          ? ' This update changed the plugin\'s files, and Codex 0.164+ approves those bytes as well as each hook\'s definition.' : ''));
       info(`  ${CODEX_TRUST_ACTION}`);
     }
   }
@@ -2258,6 +2276,18 @@ export function wireCodexPlugin({
       restartScope: 'unproven',
     } : {}),
   };
+}
+
+/**
+ * After the Brain changed Codex's view of its plugin (new bytes, or hook trust written from another process), tell an
+ * already-running shared Codex app-server to reload, so its open sessions stop reporting the previous hooks (#492).
+ * Never starts, stops or restarts a server, and never grants an approval (scripts/codex-hook-trust-reconcile.mjs).
+ */
+export async function refreshCodexSharedHost(codexPlugin, { codexHome = codexHomeDir(), refresh = refreshSharedCodexAppServer } = {}) {
+  const pluginChanged = ['installed', 'updated'].includes(codexPlugin?.action);
+  const trustChanged = codexPlugin?.hookTrust?.changed === true || codexPlugin?.hookTrust?.changed === 'unknown';
+  if (!pluginChanged && !trustChanged) return { state: 'not-needed', changed: false };
+  return refresh({ codexHome });
 }
 
 export function codexSessionSafety(status) {
@@ -6686,6 +6716,9 @@ the installer reports that boot-level declarations changed.
     codexHost = wireCodexHost();
     if (codexHost.host) {
       codexPlugin = wireCodexPlugin();
+      const hostRefresh = await refreshCodexSharedHost(codexPlugin);
+      if (hostRefresh.state === 'refreshed') info('  Running Codex app-server reloaded: its open sessions now see the installed Brain plugin (no approval granted, nothing restarted).');
+      else if (hostRefresh.state === 'failed') warn(`Running Codex app-server not reloaded (${hostRefresh.reason}); its open sessions may report the previous Brain hooks until Codex restarts.`);
       if (codexPlugin.available) printCodexLifecycle(await codexLifecycleStatus());
     }
   } catch (e) {
