@@ -68,7 +68,7 @@ describe('fold', () => {
     open = mod.fold(open, [msg('2', '✅ Recovered: com.x')], { resolver: never });
     open = mod.fold(open.filter((a) => !a.closedAt), [msg('3', '🔴 SCHEDULED JOB FAILED: com.x')], { resolver: never });
     expect(open.filter((a) => !a.closedAt)).toHaveLength(1);
-    expect(open.find((a) => !a.closedAt).id).toBe('3');
+    expect(open.find((a) => !a.closedAt)).toMatchObject({ id: '3' });
   });
   it('is idempotent: folding the same messages twice changes nothing', () => {
     const now = Date.parse('2026-10-25T12:00:00Z');
@@ -88,7 +88,7 @@ describe('issue alerts close on the cause, not just on close', () => {
     expect(mod.resolvedNow(alert, { gh })).toBeFalsy();
   });
   it('closes when the owner has replied in person, or the issue is closed', () => {
-    expect(mod.resolvedNow(alert, { gh: () => issue({ comments: [{ author: { login: 'stuinfla' }, body: 'Fixed in 4.7.20, thanks!' }] }) })).toMatch(/owner replied/);
+    expect(mod.resolvedNow(alert, { gh: () => issue({ comments: [{ author: { login: 'stuinfla' }, body: 'Fixed in the next release, thanks!' }] }) })).toMatch(/owner replied/);
     expect(mod.resolvedNow(alert, { gh: () => issue({ state: 'CLOSED' }) })).toMatch(/closed/);
     expect(mod.resolvedNow({ ...alert, kind: 'pr' }, { gh: () => issue({ state: 'MERGED' }) })).toMatch(/closed|merged/i);
   });
@@ -272,7 +272,7 @@ describe('responder bounds', () => {
     const parts = env.PATH.split(':');
     expect(parts[0]).toMatch(/job-bin$/);
     expect(parts.indexOf('/usr/bin')).toBeLessThan(parts.indexOf('/opt/homebrew/bin'));
-    expect(env.JOB_MAX_SECONDS).toBe('10800');
+    expect(Number(env.JOB_MAX_SECONDS)).toBe(3 * 60 * 60); // the 3 h default limit
   });
 });
 
