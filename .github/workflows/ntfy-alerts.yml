@@ -64,9 +64,18 @@ jobs:
           WR_NAME: ${{ github.event.workflow_run.name }}
           WR_BRANCH: ${{ github.event.workflow_run.head_branch }}
           WR_URL: ${{ github.event.workflow_run.html_url }}
+          WR_EVENT: ${{ github.event.workflow_run.event }}
         run: |
           [ -z "$TOPIC" ] && exit 0
           EVENT="${{ github.event_name }}"
+          # PAGE ONLY WHAT NEEDS THE OWNER (2026-10-25: 10,747 notifications on this topic). Not paged:
+          #  - issues/PRs opened by the owner's own account or a bot (Dream Cycle, release PRs, dependabot):
+          #    nobody is waiting on them;
+          #  - a run that was cancelled, skipped, or is waiting for approval: superseded or not a failure;
+          #  - a red run on a working branch (dream/*, fix/*, PR checks): the work in progress reports there.
+          # Paged: a person's new issue or PR, and a red run on main or a scheduled job.
+          AUTHOR="${ISSUE_USER:-$PR_USER}"
+          case "$AUTHOR" in stuinfla|dependabot\[bot\]|github-actions\[bot\]) [ "$EVENT" != "workflow_run" ] && exit 0 ;; esac
           case "$EVENT" in
             issues)
               TITLE="🐛 New issue #${ISSUE_NUM}"
@@ -81,7 +90,8 @@ jobs:
               BODY="${SENDER} starred ruvnet-brain"
               PRIO="default"; TAGS="star" ;;
             workflow_run)
-              [ "$WR_CONC" = "success" ] && exit 0
+              case "$WR_CONC" in success|cancelled|skipped|neutral|action_required|stale) exit 0 ;; esac
+              [ "$WR_BRANCH" != "main" ] && [ "$WR_EVENT" != "schedule" ] && exit 0
               TITLE="🔴 CI ${WR_CONC}: ${WR_NAME}"
               BODY="branch ${WR_BRANCH} — ${WR_URL}"
               PRIO="urgent"; TAGS="rotating_light" ;;

@@ -127,19 +127,34 @@ finish() {
   # Derive ok / failed / killed from the CHILD'S OWN wait status, never from anything the child said
   # about itself. POSIX: a process terminated by signal N is reported by `wait`/`$?` as 128+N — the
   # same convention this wrapper's own TERM/INT traps below use when THEY are what killed the child.
+  [ -n "${TIMER:-}" ] && kill "$TIMER" 2>/dev/null
+  timed_out=0; [ -f "$HB.timeout-$RUN_ID" ] && { timed_out=1; rm -f "$HB.timeout-$RUN_ID"; }
   if [ "$code" -eq 0 ]; then
     state="ok"; extra=""
   elif [ "$code" -gt 128 ]; then
     sig=$((code - 128))
     state="killed"; extra=",\"signal\":$sig"
+    [ "$timed_out" -eq 1 ] && extra="$extra,\"timed_out_after_sec\":$MAX_SECONDS"
   else
     state="failed"; extra=""
   fi
-  write_receipt "{\"label\":\"$LABEL\",\"started_at\":\"$STARTED\",\"ended_at\":\"$ended\",\"state\":\"$state\",\"exit_code\":$code,\"duration_sec\":$dur,\"run_id\":\"$RUN_ID\"$extra}"
-  # Gong on failure, immediately — not at the next watchdog sweep. A failing nightly should reach the
-  # phone while it is still tonight's problem.
+  # PAGE ON THE TRANSITION, NOT ON EVERY RUN (owner, 2026-10-25: 10,747 notifications on one topic). A job that
+  # starts failing pages once, urgently, while it is still tonight's problem; while it KEEPS failing it stays
+  # quiet (failing_since carries the first failure; the nightly watchdog's digest still lists it); the run
+  # that passes again sends one low-priority "recovered" note. The previous run's state comes from PREV_HB.
+  prev_state="$(printf '%s' "$PREV_HB" | sed -n 's/.*"state":"\([^"]*\)".*/\1/p' | head -1)"
+  prev_since="$(printf '%s' "$PREV_HB" | sed -n 's/.*"failing_since":"\([^"]*\)".*/\1/p' | head -1)"
+  was_failing=0; case "$prev_state" in failed|killed) was_failing=1 ;; esac
+  since=""
   if [ "$code" -ne 0 ]; then
-    notify "🔴 SCHEDULED JOB FAILED: $LABEL" "exit $code after ${dur}s — see the job's log. Receipt: $HB" "urgent"
+    if [ "$was_failing" -eq 1 ] && [ -n "$prev_since" ]; then since="$prev_since"; else since="$STARTED"; fi
+    extra="$extra,\"failing_since\":\"$since\""
+  fi
+  write_receipt "{\"label\":\"$LABEL\",\"started_at\":\"$STARTED\",\"ended_at\":\"$ended\",\"state\":\"$state\",\"exit_code\":$code,\"duration_sec\":$dur,\"run_id\":\"$RUN_ID\"$extra}"
+  if [ "$code" -ne 0 ] && [ "$was_failing" -eq 0 ]; then
+    notify "🔴 SCHEDULED JOB FAILED: $LABEL" "exit $code after ${dur}s — see the job's log. Receipt: $HB. Further failures stay quiet until it recovers." "urgent"
+  elif [ "$code" -eq 0 ] && [ "$was_failing" -eq 1 ]; then
+    notify "✅ Recovered: $LABEL" "passed again after failing since ${prev_since:-an earlier run}" "low"
   fi
   exit "$code"
 }
@@ -160,4 +175,19 @@ trap 'FORCED_CODE=130; kill -TERM "$CHILD" 2>/dev/null; exit 130' INT
 # ("started and never finished"). Trap for catchable deaths, watchdog for uncatchable ones.
 "$@" &
 CHILD=$!
+# RUN-TIME LIMIT (2026-10-25: five jobs finished their work and then never exited, each holding its own
+# next run off for 7-9 hours). After JOB_MAX_SECONDS (default 2 h; a plist may set less) the job is
+# stopped: TERM, then KILL 10 s later. It is recorded as killed and pages once like any other failure.
+MAX_SECONDS="${JOB_MAX_SECONDS:-7200}"
+case "$MAX_SECONDS" in ''|*[!0-9]*) MAX_SECONDS=7200 ;; esac
+(
+  sleep "$MAX_SECONDS" & SLEEPER=$!
+  trap 'kill "$SLEEPER" 2>/dev/null; exit 0' TERM
+  wait "$SLEEPER"
+  : > "$HB.timeout-$RUN_ID"
+  # The job's own children go too, or one of them keeps the job's log pipe (and its work) alive.
+  pkill -TERM -P "$CHILD" 2>/dev/null; kill -TERM "$CHILD" 2>/dev/null; sleep 10
+  pkill -KILL -P "$CHILD" 2>/dev/null; kill -KILL "$CHILD" 2>/dev/null
+) &
+TIMER=$!
 wait "$CHILD"

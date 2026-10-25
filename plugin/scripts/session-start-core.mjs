@@ -31,7 +31,7 @@ import { turnRecordingStatus } from './turn-outcome-capture.mjs';
 import {
   read, json, exists, mkdir, write, runNode,
 } from './session-start-fsutil.mjs';
-import { maintainerIssueEntitlement, surfaceIssuePointer } from './session-start-issue-alert.mjs';
+import { maintainerIssueEntitlement, surfaceIssuePointer, surfaceNtfyAlerts } from './session-start-issue-alert.mjs';
 import { surfaceSignals } from './session-start-signals.mjs';
 import { failureLine, FAILURE_LINE_PREFIX } from './hook-failures.mjs';
 import { brainState, health, knowledgeCurrency, mcpReadiness, KNOWLEDGE_LINE_PREFIX } from './session-start-health.mjs';
@@ -305,6 +305,7 @@ export async function runSessionStart({
 
     tracer.stage('issue-pointer', () => {
       surfaceIssuePointer({ stateDir, emit, now, env, home, platform, cwd });
+      surfaceNtfyAlerts({ stateDir, emit, now, env, home, platform, cwd });
     });
     tracer.stage('signal-surface', () => {
       surfaceSignals({ env, cwd, stateDir, hookDir, emit, now });

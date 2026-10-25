@@ -79,7 +79,7 @@
     },
     {
       "label": "com.ruvnet.issue-watch",
-      "what": "Hourly GitHub-issues SLA watcher (stuinfla/ruvnet-brain) — pages ntfy when an open issue sits >4h with no comment from the repo owner",
+      "what": "Hourly GitHub-issues SLA watcher (stuinfla/ruvnet-brain): pages once when a person's issue arrives and once if it passes 4h unanswered; one 9 a.m. ET summary of anything still waiting (owner/bot issues never page)",
       "schedule": "hourly",
       "maxAgeHours": 3,
       "required": true
@@ -102,6 +102,13 @@
       "schedule": "WatchPaths on ~/.npm/_npx (event-driven, no cadence)",
       "maxAgeHours": 2160,
       "what": "records every npx-cache mutation to the witness log (pure observer). Event-driven: weeks of silence are NORMAL when nothing touches _npx — maxAgeHours is a 90-day tripwire against the job being unloaded, not a freshness SLA. Registered per F2 2026-07-18: it was loaded+wrapped but absent here, i.e. unwatched by the registry's own definition."
+    },
+    {
+      "label": "com.ruvnet.ntfy-inbox",
+      "what": "Every 15 min: reads the owner's ntfy topic into ~/.cache/ruvnet-brain/ntfy-inbox.jsonl and keeps the open-alert list SessionStart shows (scripts/ntfy-inbox.mjs)",
+      "schedule": "every 15 minutes",
+      "maxAgeHours": 2,
+      "required": true
     }
   ],
   "_retired": [

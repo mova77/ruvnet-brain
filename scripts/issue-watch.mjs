@@ -46,6 +46,21 @@ export const OWNER_LOGIN = 'stuinfla';
 // moved here.)
 export const BOT_MARKER = '🤖 Automated';
 const SLA_HOURS = 4;
+// WHO IS WAITING (owner, 2026-10-25: "10,747 notifications"). An issue opened by the owner's own account or a bot is
+// work the owner's automation filed (Dream Cycle, dependabot), not a person waiting for an answer: it never pages
+// and gets no acknowledgment. Only a person's issue pages.
+const AUTOMATION_AUTHORS = new Set([OWNER_LOGIN, 'dependabot', 'dependabot[bot]', 'github-actions', 'github-actions[bot]', 'app/dependabot']);
+export const isPersonIssue = (issue) => !AUTOMATION_AUTHORS.has(String(issue?.author?.login || '').toLowerCase())
+  && !issue?.author?.is_bot && !String(issue?.author?.login || '').endsWith('[bot]');
+// ONE morning summary instead of a page per issue per 4 hours: the first run at or after 9 a.m. Eastern sends it,
+// only if a person's issue is still waiting, and at most once per Eastern calendar day.
+const DIGEST_HOUR_ET = 9;
+const etParts = (ms) => Object.fromEntries(new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', year: 'numeric',
+  month: '2-digit', day: '2-digit', hour: '2-digit', hour12: false }).formatToParts(new Date(ms)).map((p) => [p.type, p.value]));
+export function digestDue(lastDay, now) {
+  const p = etParts(now); const day = `${p.year}-${p.month}-${p.day}`;
+  return { due: Number(p.hour) % 24 >= DIGEST_HOUR_ET && lastDay !== day, day };
+}
 const STATE_PATH = process.env.ISSUE_WATCH_STATE
   || path.join(os.homedir(), '.claude', 'ruvnet-brain', 'issue-watch-state.json');
 // A compact, always-current snapshot the SessionStart hook surfaces (2026-07-17). ntfy alerts are
@@ -78,7 +93,9 @@ function ghJson(args) {
 /** Resolve the ntfy topic the same way the rest of the repo does: env, then the machine-wide
  * cache file, then the repo .env — see scripts/notify.sh / scripts/job-heartbeat.sh / scripts/nightly-watchdog.mjs. */
 function resolveTopic() {
-  if (process.env.NTFY_TOPIC) return process.env.NTFY_TOPIC;
+  // Set-but-EMPTY is an explicit opt-out (job-heartbeat.sh's convention): tests use it, and it must never fall
+  // through to the repo's real .env topic (2026-10-25: a unit test read the owner's topic that way).
+  if (process.env.NTFY_TOPIC !== undefined) return process.env.NTFY_TOPIC || null;
   try {
     const t = fs.readFileSync(path.join(os.homedir(), '.cache', 'ruvnet-brain', 'ntfy-topic'), 'utf8').trim();
     if (t) return t;
@@ -133,7 +150,7 @@ export function judgeIssue(issue, comments, now) {
 
 export async function run({ dryRun = false, now = Date.now(), repo = REPO } = {}) {
   const issues = ghJson(['issue', 'list', '--repo', repo, '--state', 'open', '--json',
-    'number,title,createdAt,comments,updatedAt']);
+    'number,title,createdAt,comments,updatedAt,author']);
 
   const state = loadState();
   const results = [];
@@ -144,17 +161,21 @@ export async function run({ dryRun = false, now = Date.now(), repo = REPO } = {}
     const { ageHours, ownerComment, breach } = judgeIssue(issue, detail.comments || [], now);
     const url = `https://github.com/${repo}/issues/${issue.number}`;
     const key = String(issue.number);
-    const last = state[key]?.lastAlertAt ? Date.parse(state[key].lastAlertAt) : null;
-    const dueForAlert = breach && (!last || (now - last) / 3_600_000 >= SLA_HOURS);
+    // A person's issue pages ONCE when it first passes the SLA, never again (it used to repeat every 4 h, forever,
+    // which with ~14 old issues and an hourly run was most of the 10,747 notifications). The morning digest below
+    // carries whatever is still waiting. An existing lastAlertAt means that one page already went out.
+    const person = isPersonIssue(issue);
+    const dueForAlert = person && breach && !state[key]?.lastAlertAt;
     // First sighting → page once, immediately (rule 2 in the header). Delivery-derived like
     // lastAlertAt: state is only written when the push actually went out, so a failed push
     // retries next run instead of burying the sighting.
     const firstSighting = !state[key];
-    // Acknowledgment delivery is not page delivery. Retry each missing channel independently.
-    const needsNewPage = !state[key]?.newAlertAt;
-    const needsAck = !state[key]?.ackAt;
+    // Acknowledgment delivery is not page delivery. Retry each missing channel independently. Neither applies to an
+    // issue the owner's automation opened.
+    const needsNewPage = person && !state[key]?.newAlertAt;
+    const needsAck = person && !state[key]?.ackAt;
 
-    results.push({ number: issue.number, title: issue.title, ageHours, ownerComment, breach, dueForAlert, firstSighting, url });
+    results.push({ number: issue.number, title: issue.title, ageHours, ownerComment, breach, dueForAlert, firstSighting, url, person });
 
     if (needsNewPage || needsAck) {
       if (dryRun) {
@@ -212,6 +233,22 @@ export async function run({ dryRun = false, now = Date.now(), repo = REPO } = {}
         else state[key] = { ...(state[key] || {}), lastAttemptAt: new Date(now).toISOString(), sent: false, title: issue.title, url };
         alertsSent.push({ number: issue.number, sent, kind: 'sla-breach', reason: topic ? null : 'no ntfy topic configured' });
       }
+    }
+  }
+
+  // The morning digest: one notification naming every person's issue still unanswered, oldest first.
+  const waiting = results.filter((r) => r.person && r.breach).sort((a, b) => b.ageHours - a.ageHours);
+  const digest = digestDue(state._digest?.day, now);
+  if (waiting.length && digest.due) {
+    const title = `Waiting on a reply: ${waiting.length} contributor issue${waiting.length === 1 ? '' : 's'}`;
+    const body = waiting.slice(0, 8).map((r) => `#${r.number} (${fmtAge(r.ageHours)}) ${r.title.slice(0, 70)}`).join('\n')
+      + (waiting.length > 8 ? `\n…and ${waiting.length - 8} more` : '') + `\nhttps://github.com/${repo}/issues`;
+    if (dryRun) alertsSent.push({ kind: 'digest', sent: false, reason: 'dry-run', count: waiting.length });
+    else {
+      const topic = resolveTopic();
+      const sent = topic ? await pushNtfy(topic, { title, body, priority: 'default', tags: 'clipboard' }) : false;
+      if (sent) state._digest = { day: digest.day, sentAt: new Date(now).toISOString(), count: waiting.length };
+      alertsSent.push({ kind: 'digest', sent, count: waiting.length, reason: topic ? null : 'no ntfy topic configured' });
     }
   }
 
@@ -353,8 +390,10 @@ async function main() {
       if (r.dueForAlert) {
         const alert = output.alertsSent.find((a) => a.number === r.number && a.kind === 'sla-breach');
         console.log(`   ${dryRun ? '[DRY-RUN] would push ntfy alert' : alert?.sent ? 'ntfy alert pushed' : `ntfy alert NOT sent (${alert?.reason})`}`);
+      } else if (r.breach && !r.person) {
+        console.log('   opened by the owner\'s own automation — never paged');
       } else if (r.breach) {
-        console.log(`   already alerted within the last ${SLA_HOURS}h — not repeating`);
+        console.log('   already paged once — listed in the morning summary until answered');
       }
       console.log('');
     }

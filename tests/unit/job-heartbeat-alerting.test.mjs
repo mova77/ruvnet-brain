@@ -105,6 +105,50 @@ describe('job-heartbeat.sh — a failing job must actually page, not just record
     expect(curlCalls().length).toBe(0); // success must never page
   });
 
+  it('a job that KEEPS failing pages once, stays quiet while it fails, and sends one low "recovered" note (2026-10-25)', () => {
+    const { run, curlCalls, receipt } = makeHarness({ withTopic: true });
+    run('com.test.flaky', 1);
+    const since = receipt('com.test.flaky').failing_since;
+    expect(since).toBeTruthy();
+    run('com.test.flaky', 1); run('com.test.flaky', 2);
+    expect(curlCalls().length).toBe(1); // one page for the whole failing streak, not one per run
+    expect(receipt('com.test.flaky').failing_since).toBe(since); // the streak keeps its first failure time
+    run('com.test.flaky', 0);
+    const calls = curlCalls();
+    expect(calls.length).toBe(2);
+    expect(calls[1]).toContain('Recovered: com.test.flaky');
+    expect(calls[1]).toContain('Priority: low');
+    run('com.test.flaky', 0);
+    expect(curlCalls().length).toBe(2); // staying green is silent
+    run('com.test.flaky', 3);
+    expect(curlCalls().length).toBe(3); // a NEW streak pages again
+  });
+
+  it('a job that never exits is stopped at JOB_MAX_SECONDS and recorded as timed out (2026-10-25)', () => {
+    const { curlCalls, receipt } = makeHarness({ withTopic: true });
+    const hang = path.join(workDir, 'hang.sh');
+    fs.writeFileSync(hang, '#!/bin/sh\nsleep 60\n'); fs.chmodSync(hang, 0o755);
+    const t0 = Date.now();
+    spawnSync('/bin/sh', [WRAPPER, 'com.test.hang', '--', hang], {
+      encoding: 'utf8',
+      env: { PATH: `${path.join(workDir, 'bin')}:/usr/bin:/bin`, HOME: path.join(workDir, 'home'), JOB_HEARTBEAT_DIR: path.join(workDir, 'heartbeats'), JOB_MAX_SECONDS: '1' },
+    });
+    expect(Date.now() - t0).toBeLessThan(20_000); // stopped near the limit, not after the job's 60 s
+    const r = receipt('com.test.hang');
+    expect(r.state).toBe('killed');
+    expect(r.timed_out_after_sec).toBe(1);
+    expect(curlCalls().length).toBe(1);
+    expect(fs.readdirSync(path.join(workDir, 'heartbeats')).some((f) => f.includes('.timeout-'))).toBe(false);
+  }, 30_000);
+
+  it('a quick job leaves no timer behind and is not marked timed out', () => {
+    const { run, receipt } = makeHarness({ withTopic: false });
+    const t0 = Date.now();
+    run('com.test.quick', 0);
+    expect(Date.now() - t0).toBeLessThan(5_000);
+    expect(receipt('com.test.quick').timed_out_after_sec).toBeUndefined();
+  });
+
   it('REGRESSION GUARD: with NO topic configured (the pre-fix state on this machine), a failing '
     + 'job still records the failure but CANNOT page — proving the missing topic file, not a code '
     + 'bug, was the entire reason three jobs failed silently', () => {

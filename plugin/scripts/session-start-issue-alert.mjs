@@ -75,3 +75,25 @@ export function surfaceIssuePointer({ stateDir, emit, now, env, home, platform, 
     emit(`[RuvNet Brain — OPEN ISSUES: ${open.length} on ${status.repo}${breachNote}, checked ${ageHours.toFixed(1)}h ago — full detail: node scripts/issue-watch.mjs]`);
   } catch { /* advisory only — a broken cache read must never affect the session */ }
 }
+
+/**
+ * The owner's ntfy alerts that still need action (scripts/ntfy-inbox.mjs keeps the list; owner, 2026-10-25: "I don't
+ * want to be in the middle of this equation where I'm having to tell you what's broken"). Same maintainer gate as the
+ * issue pointer; one line, naming the count and the three newest, with the instruction to handle them first.
+ */
+export function surfaceNtfyAlerts({ stateDir, emit, env, home, platform, cwd, now = Date.now() }) {
+  try {
+    const file = path.join(stateDir, 'ntfy-open-alerts.json');
+    let size = 0;
+    try { size = fs.statSync(file).size; } catch { return; }
+    if (size > MAX_STATUS_BYTES) return;
+    if (!maintainerIssueEntitlement(env, home, 'stuinfla/ruvnet-brain', platform) || !isMaintainerRepo(cwd)) return;
+    const open = (json(file, []) || []).filter((a) => a && !a.closedAt);
+    if (!open.length) return;
+    const newest = open.sort((a, b) => Date.parse(b.lastAt) - Date.parse(a.lastAt)).slice(0, 3)
+      .map((a) => String(a.title || a.key).replace(/[\u0000-\u001f]/g, ' ').slice(0, 70));
+    const polled = json(path.join(stateDir, 'ntfy-inbox-state.json'), {})?.polledAt;
+    const age = polled ? `, read ${((now - Date.parse(polled)) / 3_600_000).toFixed(1)}h ago` : '';
+    emit(`[RuvNet Brain — NTFY: ${open.length} alert(s) need action${age}: ${newest.join(' | ')}. Handle these before other work: node scripts/ntfy-inbox.mjs --open; close each with --ack <id> --note "<what was done>"]`);
+  } catch { /* advisory only */ }
+}

@@ -74,7 +74,9 @@ describe('watcher channel delivery is independent across consecutive runs', () =
     const first = { firstSeenAt: new Date(NOW - 600000).toISOString(), newAlertAt: new Date(NOW - 600000).toISOString(), ackAt: new Date(NOW - 600000).toISOString(), untouched: 1 };
     fs.writeFileSync(file, JSON.stringify({ 38: first })); comments = [{ author: { login: 'stuinfla' }, body: '🤖 Automated acknowledgment' }];
     const output = await run({ now: NOW + 5 * 3600000 });
-    expect(output.results[0].breach).toBe(true); expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(output.results[0].breach).toBe(true);
+    // The one SLA page (a 1 p.m. ET run may also carry the once-a-day summary, counted separately since 2026-10-25).
+    expect(fetcher.mock.calls.filter(([, init]) => /^SLA breach/.test(init?.headers?.Title || ''))).toHaveLength(1);
     expect(ackCalls()).toHaveLength(0); expect(read()).toMatchObject(first); expect(read().lastAlertAt).toBeTruthy();
   });
 });
