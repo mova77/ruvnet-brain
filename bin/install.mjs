@@ -6301,8 +6301,8 @@ function success({ cacheDir, isCustom, plugin, codexHost, codexPlugin, env, nigh
   console.log(`\n  ${c.bold('Where it runs:')} ${c.bold(`everywhere you use ${hostLabel}`)} — CLI and supported editor/desktop surfaces.`);
   console.log(`    It's ${c.bold('user-level (global)')}: open ANY repo or folder and it's already there. Nothing per project,`);
   console.log(`    nothing to copy in, nothing to git-ignore. ${c.dim('(Runs locally — it is not active in the claude.ai web app.)')}`);
-  console.log(`\n  ${c.bold('How it runs:')} ${c.bold('explicitly')} — use search_ruvnet, a Brain skill, or a proof command when you want`);
-  console.log(`    source-grounded RuvNet context. Brain code does not run on host lifecycle events.`);
+  console.log(`\n  ${c.bold('How it runs:')} search_ruvnet, Brain skills and proof commands when you ask, plus the allowlisted`);
+  console.log(`    lifecycle hooks (${hookCountPhrase()}): grounding reminders, a write gate, and continuity snapshots.`);
   console.log(`\n  ${c.bold('Keep it fresh:')} re-run ${c.bold('npx ruvnet-brain')} any time — the brain itself always pulls the latest`);
   console.log(`  Release regardless (that part isn't cached). For the bleeding-edge installer too, use ${c.bold('npx github:stuinfla/ruvnet-brain')}.`);
 
@@ -6319,12 +6319,12 @@ function success({ cacheDir, isCustom, plugin, codexHost, codexPlugin, env, nigh
   console.log(`\n  ${c.bold('How you\'ll know it\'s working:')}`);
   console.log(`    ${c.green('✓')} ${c.bold('search_ruvnet')} returns cited source paths when invoked.`);
   console.log(`    ${c.green('✓')} Brain skills and slash commands remain available.`);
-  console.log(`    ${c.green('✓')} ${c.bold('No Brain hook message or tool-call refusal appears by itself.')}`);
+  console.log(`    ${c.green('✓')} Writing rUv-product code the Brain has not looked up is refused until search_ruvnet grounds it.`);
 
   // ── honest expectations ──
   console.log(`\n  ${c.bold('What to expect (honestly):')}`);
-  console.log(`    • Grounding is available on demand; it is no longer injected into every turn.`);
-  console.log(`    • Host work proceeds normally unless you explicitly invoke a Brain command or skill.`);
+  console.log(`    • Grounding reminders are added only to prompts that touch the rUv stack.`);
+  console.log(`    • Other work proceeds normally; the write gate is the only hook that refuses by default.`);
   console.log(`    • Not sure it's on?  Run  ${c.bold('npx ruvnet-brain --doctor')}  any time for a health check.
     • Want to see it answer, live, right now?  ${c.bold('npx ruvnet-brain --demo')}  — 2 real questions, real cited answers.`);
 

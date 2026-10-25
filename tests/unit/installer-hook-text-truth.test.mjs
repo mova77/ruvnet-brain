@@ -22,6 +22,9 @@ const ZERO_CLAIMS = [
   /zero automatic registrations/i,
   /installs no automatic lifecycle handlers/i,
   /without automatic lifecycle hooks/i,
+  /does not run on host lifecycle events/i,
+  /No Brain hook message or tool-call refusal/i,
+  /no longer injected into every turn/i,
 ];
 
 describe('#400 installer hook text matches the shipped manifests', () => {
