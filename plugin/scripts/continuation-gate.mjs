@@ -53,7 +53,7 @@ import { deferralAtStop } from './deferral-evidence.mjs';
 import { readSettledTranscript } from './turn-outcome-capture.mjs';
 import { continuationProjectIdentity, authorizedContinuationObjective, authorizedPromiseItems, assistantCommitmentOwned, setAssistantCommitmentState } from './continuation-objective.mjs';
 import {
-  auditCompletionClaims, readClaudeTurn, extractCommitments, claimClosesPromise,
+  auditCompletionClaims, readClaudeTurn, extractCommitments, promiseClosingClaim,
   PROMISE_KIND, PROMISE_CAP_OPEN,
 } from './completion-claim-evidence.mjs';
 
@@ -401,7 +401,7 @@ function promiseBookkeeping() {
     if (completion.verdict === 'PASS') {
       for (const item of led.items) {
         if (!assistantCommitmentOwned(item, hookInput.session_id, projectIdentity)) continue;
-        const claim = completion.claims.find((c) => claimClosesPromise(c.text, item.text));
+        const claim = promiseClosingClaim(completion, hookInput.last_assistant_message, item.text);
         if (!claim) continue;
         const verifiedCompletion = completion.verdict === 'PASS' && Boolean(claim);
         Object.assign(item, { done: verifiedCompletion, state: verifiedCompletion ? 'completed' : item.state, doneAt: at, completionEvidence: { claim: claim.text,

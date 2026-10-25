@@ -227,6 +227,10 @@ const PROMISE_REJECT = /\?|:\*\*|\b(?:if|unless|once|when|whenever|as\s+soon\s+a
 const TRIVIAL_PROMISE = /^(?:not|never|be|say|mention|note|admit|point|flag|stop|stay|leave|keep|summari[sz]e|explain|answer|respond|reply|report|remember|give|tell|send|paste|bring|hand|show|walk|notify|post|update\s+you|come\s+back|get\s+back|handle|only|stand|work)\b/i;
 const OWNER_DEPENDENT_OFFER = /\b(?:say\s+the\s+word|(?:just|simply)\s+(?:ask|say)|ask\s+me|let\s+me\s+know|give\s+me\s+the\s+(?:word|go|nod|ok)|on\s+your\s+(?:word|go|ok|say)|up\s+to\s+you)\b/i;
 const STANDING_APPROVAL = /^(?:ask|confirm|check\s+with\s+you|clear\s+(?:it|this|that)\s+with\s+you|run\s+.+\s+by\s+you)\b.*\b(?:before|first)\b/i;
+// "hide it the same way", "check for it then": a verb whose only object is a pronoun has no referent
+// once the turn's context is gone (#369), so no later session could ever close it honestly.
+const PRONOUN_OBJECT = /\b(?:it|this|that|them|these|those)\b/i;
+const PRONOUN_ONLY = /^\S+(?:\s+(?:it|this|that|them|these|those|the|same|way|then|again|too|also|now|later|for|to|on|in|into|at|about|with|up|out|back|down|over|off|as|well|a|an|there|here|first|next))*$/i;
 
 export const normalizePromise = (value) => String(value || '').toLowerCase().replace(/[`*_"“”'’]/g, '')
   .replace(/[^a-z0-9./:+-]+/g, ' ').trim().slice(0, 160);
@@ -248,6 +252,7 @@ export function extractCommitments(message) {
       if (PROMISE_REJECT.test(whole) || OWNER_DEPENDENT_OFFER.test(whole)
         || STANDING_APPROVAL.test(action.trim()) || TRIVIAL_PROMISE.test(action.trim())) continue;
       const text = action.replace(/\s+/g, ' ').trim().replace(/[,;:]$/, '');
+      if (PRONOUN_OBJECT.test(text) && PRONOUN_ONLY.test(text)) continue;
       const key = normalizePromise(text);
       if (key.length < 6 || seen.has(key)) continue;
       seen.add(key);
@@ -268,4 +273,24 @@ export function claimClosesPromise(claimText, promiseText) {
   const have = new Set(tokens(claimText));
   const hit = want.filter((t) => have.has(t)).length;
   return hit >= 2 && hit / want.length >= 0.4;
+}
+
+const unquoted = (value) => String(value).replace(/"([^"\n]{0,300})"|“([^”\n]{0,300})”/g, (_, a, b) => a ?? b);
+
+/**
+ * The claim that closes `promiseText`, or null. Only a PASS verdict can close a promise. strippedProse()
+ * removes double-quoted text, so `"push the branch itself" is done` extracts only `is done`; that claim
+ * may still close the promise through its raw sentence (quotes kept), which becomes the evidence. The
+ * sentence must be a recognised claim outside its quotes, so quoting alone never makes a claim (#369).
+ */
+export function promiseClosingClaim(completion, answer, promiseText) {
+  if (completion?.verdict !== 'PASS') return null;
+  const direct = completion.claims.find((c) => claimClosesPromise(c.text, promiseText));
+  if (direct) return direct;
+  for (const raw of String(answer || '').split(/(?<=[.!?])\s+|\n+/)) {
+    const own = sentences(raw);
+    const claim = completion.claims.find((c) => own.includes(c.text));
+    if (claim && claimClosesPromise(unquoted(raw), promiseText)) return { ...claim, text: raw.trim() };
+  }
+  return null;
 }
