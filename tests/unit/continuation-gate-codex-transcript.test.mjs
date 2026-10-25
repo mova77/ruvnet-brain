@@ -1,0 +1,81 @@
+// #423: the Stop gate reads a Codex rollout through the shared nativeTurnLines reader, so an observed,
+// scoped check on Codex is judged like the same check on Claude — and missing, failed, stale,
+// overlapping or unsupported evidence still cannot establish one. Driven through the REAL gate.
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { readClaudeTurn, auditCompletionClaims } from '../../plugin/scripts/completion-claim-evidence.mjs';
+
+const ROOT = path.resolve(import.meta.dirname, '../..');
+const GATE = path.join(ROOT, 'plugin/scripts/continuation-gate.mjs');
+let dir; let home;
+beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-codex-')); home = path.join(dir, 'home'); fs.mkdirSync(path.join(home, 'caps'), { recursive: true }); });
+afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+function repo() {
+  const d = path.join(dir, 'repo'); fs.mkdirSync(d, { recursive: true });
+  for (const args of [['init', '-q'], ['remote', 'add', 'origin', 'https://github.com/example/a.git']]) spawnSync('git', args, { cwd: d });
+  return fs.realpathSync(d);
+}
+function fire(cwd, message, transcriptPath, host = 'codex') {
+  const r = spawnSync(process.execPath, [GATE], { cwd, encoding: 'utf8',
+    input: JSON.stringify({ hook_event_name: 'Stop', cwd, session_id: 'cx1', stop_hook_active: false, last_assistant_message: message,
+      ...(transcriptPath ? { transcript_path: transcriptPath } : {}) }),
+    env: { ...process.env, HOME: home, USERPROFILE: home, RUVNET_HOOK_HOST: host, RUVNET_WORK_LEDGER: path.join(home, 'ledger.json'),
+      RUVNET_OPEN_ISSUES_FILE: path.join(home, 'none.json'), RUVNET_CI_STATUS_FILE: path.join(home, 'none.json'),
+      RUVNET_CAPABILITY_ROOTS: path.join(home, 'caps'), RUVNET_CAPABILITY_LIVE_EVIDENCE: path.join(home, 'live.jsonl'),
+      RUVNET_EVIDENCE_FILE: path.join(home, 'ev.jsonl'), RUVNET_CONTINUATION_COOLDOWN_MS: '1' } });
+  expect(r.status).toBe(0);
+  return r.stdout;
+}
+
+const ev = (payload) => JSON.stringify({ type: 'event_msg', payload });
+const ri = (payload) => JSON.stringify({ type: 'response_item', payload });
+const user = ri({ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'please fix the updater' }] });
+const patch = (start, end) => ev({ type: 'item_completed', started_at_ms: start, completed_at_ms: end,
+  item: { type: 'FileChange', id: `fc-${start}`, status: 'completed', stdout: 'Success. Updated the following files' } });
+const run = (start, end, { command = 'npx vitest run tests/unit/updater.test.mjs', exit = 0, out = 'Tests  5 passed (5)' } = {}) => ev({ type: 'item_completed',
+  started_at_ms: start, completed_at_ms: end, item: { type: 'CommandExecution', id: `ce-${start}`, command: ['/bin/zsh', '-lc', command],
+    status: exit === 0 ? 'completed' : 'failed', exit_code: exit, aggregated_output: out } });
+const rollout = (...lines) => { const f = path.join(dir, `rollout-${Math.random().toString(16).slice(2)}.jsonl`); fs.writeFileSync(f, `${lines.join('\n')}\n`); return f; };
+
+const SCOPED = 'Targeted unit tests are passing.\nVerified: npx vitest run tests/unit/updater.test.mjs — 5 passed.\nNot verified: the complete consumer path.';
+const UNPARSED = 'transcript is unavailable or not parsed';
+
+describe('Codex completion audit reads the native rollout (#423)', () => {
+  it('accepts a scoped claim backed by a native exit-0 check after the last change', () => {
+    const t = rollout(user, patch(100, 110), run(200, 300));
+    expect(fire(repo(), SCOPED, t)).toBe('');
+    expect(auditCompletionClaims(SCOPED, { turn: readClaudeTurn(t, { host: 'codex' }), host: 'codex' }).verdict).toBe('OBSERVED_CHECK');
+  });
+  it('the same scoped claim is still corrected when the evidence does not qualify', () => {
+    const r = repo();
+    expect(fire(r, SCOPED, rollout(user, patch(100, 110), run(200, 300, { exit: 1, out: 'FAIL 1' })))).toContain('no end-to-end check ran this turn after the last change');
+    expect(fire(r, SCOPED, rollout(user, run(50, 90), patch(100, 110)))).toContain('no end-to-end check ran this turn after the last change');
+    // Completion order hides overlap: the check started before the patch finished, so it proves nothing.
+    expect(fire(r, SCOPED, rollout(user, patch(100, 250), run(200, 300)))).toContain('no end-to-end check');
+    // An unsupported native tool after the check is a change boundary.
+    expect(fire(r, SCOPED, rollout(user, patch(100, 110), run(200, 300),
+      ri({ type: 'function_call', name: 'spawn_agent', call_id: 'sa', arguments: '{}' })))).toContain('no end-to-end check');
+    // No current-turn boundary, or no transcript at all, stays UNKNOWN.
+    expect(fire(r, SCOPED, rollout(patch(100, 110), run(200, 300)))).toContain(UNPARSED);
+    expect(fire(r, SCOPED)).toContain(UNPARSED);
+  });
+  it('legacy exec_command records need an explicit exit 0', () => {
+    const call = ri({ type: 'function_call', name: 'exec_command', call_id: 'c1', arguments: JSON.stringify({ cmd: 'npx vitest run tests/unit/updater.test.mjs' }) });
+    const output = (text) => ri({ type: 'function_call_output', call_id: 'c1', output: text });
+    const r = repo();
+    expect(fire(r, SCOPED, rollout(user, patch(100, 110), call, output('Process exited with code 0\nOutput:\nTests  5 passed (5)')))).toBe('');
+    expect(fire(r, SCOPED, rollout(user, patch(100, 110), call, output('Tests  5 passed (5)')))).toContain('no end-to-end check');
+  });
+  it('Claude transcripts are judged exactly as before', () => {
+    const rec = (type, content) => JSON.stringify({ type, message: { role: type, content } });
+    const t = rollout(rec('user', 'go'), rec('assistant', [{ type: 'tool_use', id: 'e', name: 'Edit', input: { file_path: '/r/a.mjs' } }]),
+      rec('user', [{ type: 'tool_result', tool_use_id: 'e', content: 'ok' }]),
+      rec('assistant', [{ type: 'tool_use', id: 'b', name: 'Bash', input: { command: 'npx vitest run tests/unit/updater.test.mjs' } }]),
+      rec('user', [{ type: 'tool_result', tool_use_id: 'b', content: 'Tests  5 passed (5)' }]));
+    expect(fire(repo(), SCOPED, t, 'claude')).toBe('');
+  });
+});

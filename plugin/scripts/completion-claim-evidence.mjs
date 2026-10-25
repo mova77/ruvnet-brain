@@ -16,13 +16,14 @@
  *   (3) the answer discloses what is NOT verified.
  *   Anything else is one correction request. No claim recognised → no verdict about the prose.
  *
- * HOSTS. Claude Code transcripts (`transcript_path`, JSONL) are parsed. Codex's Stop payload also
- * carries `transcript_path`, but its rollout format is NOT parsed anywhere in this repository
- * (turn-outcome-capture.mjs declines it), so on Codex the
- * transcript half is UNKNOWN and only the answer-side half (2)+(3) is enforced — disclosed in the
- * correction text, never silently treated as proven.
+ * HOSTS. Claude Code transcripts (`transcript_path`, JSONL) are parsed. A Codex rollout is read through
+ * the shared native-turn-transcript normalizer (#423) and held to a stricter evidence rule: a command
+ * counts as a check only with an explicit exit 0 (normalizeToolOutcome `pass`), an unknown native tool
+ * is a change boundary, and a rollout without a current-turn boundary yields no evidence (UNKNOWN).
  */
 import { readSettledTranscript } from './turn-outcome-capture.mjs';
+import { nativeTurnLines } from './native-turn-transcript.mjs';
+import { normalizeToolOutcome } from './continuity-events.mjs';
 
 const MAX_SENTENCE = 400;
 export const PROMISE_KIND = 'assistant-commitment';
@@ -135,8 +136,12 @@ export function currentTurnRecords(lines) {
   return { boundaryFound: start >= 0, prompt: start >= 0 ? textOf(recs[start].message?.content) : '', recs: recs.slice(start + 1) };
 }
 
-/** Ordered events for the current turn of a Claude JSONL transcript. */
-export function claudeTurnEvents(lines) {
+// Codex tools that neither change state nor run a check; every other unrecognised tool is a change.
+const CODEX_NEUTRAL = /^(?:update_plan|view_image|sleep|list_agents|request_user_input(?:_async)?)$/;
+
+/** Ordered events for the current turn of a Claude JSONL (or normalized Codex) transcript. */
+export function claudeTurnEvents(lines, { host = 'claude' } = {}) {
+  const codex = host === 'codex';
   const { boundaryFound, recs: turnRecs } = currentTurnRecords(lines);
   const results = new Map();
   for (const o of turnRecs) {
@@ -145,7 +150,8 @@ export function claudeTurnEvents(lines) {
     for (const r of c) {
       if (r?.type === 'tool_result' && r.tool_use_id) {
         results.set(r.tool_use_id, { error: r.is_error === true || o.toolUseResult?.interrupted === true,
-          present: textOf(r.content).trim().length > 0 || String(o.toolUseResult?.stdout || '').trim().length > 0 });
+          present: textOf(r.content).trim().length > 0 || String(o.toolUseResult?.stdout || '').trim().length > 0,
+          ...(codex ? { passed: normalizeToolOutcome(r).outcome === 'pass', nativeOk: r.is_error === false && r.status === 'completed' } : {}) });
       }
     }
   }
@@ -156,8 +162,10 @@ export function claudeTurnEvents(lines) {
     for (const u of c) {
       if (u?.type !== 'tool_use') continue;
       const input = u.input || {};
-      const result = results.get(u.id) || { present: false, error: false };
-      if (['Edit', 'Write', 'MultiEdit', 'NotebookEdit'].includes(u.name)) {
+      const found = results.get(u.id) || { present: false, error: false };
+      // Codex: a check needs an explicit exit 0 (commands) or a completed native status (MCP).
+      const { passed, nativeOk, ...result } = codex ? { ...found, error: found.error || !(u.name === 'Bash' ? found.passed : found.nativeOk) } : found;
+      if (['Edit', 'Write', 'MultiEdit', 'NotebookEdit'].includes(u.name) || (codex && u.name === 'apply_patch')) {
         events.push({ kind: 'change', what: `${u.name} ${input.file_path || input.notebook_path || ''}`.trim() });
       } else if (u.name === 'Bash') {
         for (const seg of segments(input.command)) {
@@ -169,6 +177,8 @@ export function claudeTurnEvents(lines) {
       } else if (String(u.name || '').startsWith('mcp__')) {
         events.push(MCP_MUTATING.test(u.name) ? { kind: 'change', what: u.name }
           : { kind: 'check', what: u.name, name: u.name.split('__').pop(), ...result });
+      } else if (codex && !CODEX_NEUTRAL.test(String(u.name || ''))) {
+        events.push({ kind: 'change', what: `codex ${String(u.name || 'tool').slice(0, 60)}` });
       }
     }
   }
@@ -185,9 +195,12 @@ export function postChangeVerification(turn) {
     staleChecks: events.slice(0, Math.max(0, lastChange)).filter((e) => e.kind === 'check').length };
 }
 
-export function readClaudeTurn(transcriptPath, { read = readSettledTranscript } = {}) {
+export function readClaudeTurn(transcriptPath, { read = readSettledTranscript, host = 'claude' } = {}) {
   if (typeof transcriptPath !== 'string' || !/\.jsonl$/i.test(transcriptPath)) return null;
-  try { return claudeTurnEvents(read(transcriptPath, { maxMs: 0 })); } catch { return null; }
+  try {
+    const turn = claudeTurnEvents(nativeTurnLines(read(transcriptPath, { maxMs: 0 }), host), { host });
+    return host === 'codex' && !turn.boundaryFound ? null : turn;
+  } catch { return null; }
 }
 
 /**

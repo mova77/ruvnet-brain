@@ -366,15 +366,15 @@ const HOST = process.env.RUVNET_HOOK_HOST === 'codex' ? 'codex' : 'claude';
  * COMPLETION CLAIMS (ADR-074 class `completion`, owner 2026-09-30: "You can never ever tell me
  * something is done and implemented without having tested it end to end"). Audited ONCE per Stop:
  * the verdict both requests a correction (below, under every loop guard) and is the only evidence
- * that may close a captured promise. Claude transcripts are parsed; Codex's rollout format is not
- * parsed anywhere in this repo, so on Codex only the answer-side half is enforced and the transcript
- * half is reported UNKNOWN (completion-claim-evidence.mjs header). Fails open: a throw is NONE.
+ * that may close a captured promise. Claude transcripts and Codex rollouts (through the shared
+ * nativeTurnLines reader, #423) are parsed; a Codex rollout that cannot be read or has no current-turn
+ * boundary stays UNKNOWN (completion-claim-evidence.mjs header). Fails open: a throw is NONE.
  */
 const completion = (() => {
   const message = String(hookInput.last_assistant_message || '');
   if (!message || !hookInput.session_id) return { verdict: 'NONE', claims: [] };
   try {
-    const turn = HOST === 'claude' ? readClaudeTurn(hookInput.transcript_path) : null;
+    const turn = readClaudeTurn(hookInput.transcript_path, { host: HOST });
     // Claude always sends a JSONL transcript; one we cannot read is OUR failure, and a Stop hook
     // fails open on its own machinery (ADR-074 failure semantics) — never a correction request.
     // Missing native evidence stays UNKNOWN; it cannot silently validate a completion claim.
