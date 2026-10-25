@@ -55,8 +55,10 @@ function fire(cwd, message, { transcriptPath, stopHookActive = false, host = 'cl
     encoding: 'utf8',
   });
   expect(r.status).toBe(0);
+  lastStderr = r.stderr;
   return r.stdout;
 }
+let lastStderr = '';
 const ledger = () => { try { return JSON.parse(fs.readFileSync(path.join(home, 'ledger.json'), 'utf8')); } catch { return { items: [] }; } };
 
 beforeEach(() => {
@@ -83,9 +85,22 @@ describe('completion claims (Piece A)', () => {
     expect(out).toContain('no end-to-end check ran this turn after the last change');
   });
 
-  it('allows a claim with a post-edit check that the answer names and a NOT-verified disclosure', () => {
+  it('#425: a scope-only UNKNOWN (post-edit check named, gaps disclosed) is reported, not blocked, and stays UNKNOWN', () => {
     const repo = gitRepo('a');
-    expect(fire(repo, GOOD, { transcriptPath: transcript(edit(), bash('npx vitest run tests/unit/updater.test.mjs')) })).toContain('whole-task completion is UNKNOWN');
+    const t = transcript(edit(), bash('npx vitest run tests/unit/updater.test.mjs'));
+    expect(fire(repo, GOOD, { transcriptPath: t })).toBe('');
+    const advisory = JSON.parse(lastStderr.trim().split('\n').find((l) => l.includes('completion-scope-advisory')));
+    expect(advisory).toMatchObject({ kind: 'completion-scope-advisory', authority: false, verdict: 'UNKNOWN' });
+    expect(advisory.text).toContain('completion stays UNKNOWN');
+    const turn = claudeTurnEvents(readSettledTranscript(t, { maxMs: 0 }));
+    expect(auditCompletionClaims(GOOD, { turn }).verdict).toBe('UNKNOWN');
+    // The reporter's scoped task statement: same named-check/disclosure lines, same non-blocking result.
+    const scoped = 'The five listed recovery tasks are complete at their documented local scope.\nVerified: `npx vitest run tests/unit/updater.test.mjs` — 5 passed.\nNot verified: the browser path.';
+    expect(auditCompletionClaims(scoped, { turn }).verdict).toBe('UNKNOWN');
+    expect(fire(repo, scoped, { transcriptPath: t })).toBe('');
+    // Every other UNKNOWN/FAIL still blocks: no check after the change, or no disclosure.
+    expect(fire(repo, scoped, { transcriptPath: transcript(edit()) })).toContain('beyond the available verified scope');
+    expect(fire(repo, 'The five listed recovery tasks are complete.', { transcriptPath: t })).toContain('does not disclose what is NOT verified');
   });
 
   it('blocks when the check ran but the answer neither names it nor discloses gaps', () => {

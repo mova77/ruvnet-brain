@@ -438,7 +438,10 @@ a file, command, `search_ruvnet` hit or raw page, read after any small-model Web
 same subject (`node scripts/grounding-turn-replay.mjs` measures it on real transcripts; ADR-0030 gates #2/#3
 are shadow-logged only). The Stop continuation body also asks for ONE
 correction when a final answer claims work is done without a check run after the last change this
-turn, a named check, and a NOT-verified disclosure, and it records first-person promises ("I'll do X
+turn, a named check, and a NOT-verified disclosure. When all three are present and only the task
+scope cannot be qualified (the audit recognizes check-scoped sentences only), the verdict stays
+UNKNOWN, closes nothing, and is reported as a `completion-scope-advisory` rather than a correction
+(#425). It also records first-person promises ("I'll do X
 next") in the project's work ledger until a later evidenced completion claim closes them (Claude
 only; `npm run completion-claim:replay` measures both on real transcripts). It also asks ONCE when a
 Claude turn created an ADR in an adopted project and no successful `decision-record.mjs --record` ran

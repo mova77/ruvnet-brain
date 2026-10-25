@@ -102,9 +102,8 @@ describe('registered Stop assistant commitment ownership', () => {
   it('a different session cannot close another session promise even with PASS evidence', () => {
     const f = fixture(); f.stop('session-A', promise); checkedTranscript(f.transcript);
     const original = f.read().items[0];
-    const correction = JSON.parse(f.stop('session-B', verified).stdout);
-    expect(correction.decision).toBe('block');
-    expect(correction.reason).not.toContain('you said you would');
+    // #425: a scope-only UNKNOWN is not a correction, and session-B owns no promise to nudge.
+    expect(f.stop('session-B', verified).stdout).toBe('');
     expect(f.read().items[0]).toEqual(original);
     f.stop('session-A', verified);
     expect(f.read().items[0]).toEqual(original);

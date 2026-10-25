@@ -715,7 +715,19 @@ if (observations.length && STOP_NUDGES_FULL) console.error(JSON.stringify({ kind
   authority: false, items: observations.map(({ text, at }) => ({ text, at })) }));
 // ONE correction per turn: a single item however many claims the answer made; the stop_hook_active
 // exit and the cooldown lock below bound it to one request per stop episode.
-const completionWork = ['FAIL', 'UNKNOWN'].includes(completion.verdict) ? [{
+// #425 (owner decision): an UNKNOWN whose ONLY problem is task scope — a check observed after the last
+// change, named in the answer, with what is NOT verified disclosed — is not a correction. The audit
+// recognizes check-scoped sentences only; it has no representation for a scoped task outcome, so
+// re-running checks or rewording cannot satisfy it. The verdict stays UNKNOWN (never PASS: it closes
+// no promise and grants no completion authority); under `full` the limitation is reported, not enforced.
+const scopeOnlyUnknown = completion.verdict === 'UNKNOWN' && completion.namesCheck === true
+  && completion.disclosesGaps === true && (completion.verification?.checks?.length || 0) > 0;
+if (scopeOnlyUnknown && STOP_NUDGES_FULL) console.error(JSON.stringify({ kind: 'completion-scope-advisory',
+  authority: false, verdict: 'UNKNOWN', text: `"${completion.claims[0].text.slice(0, 160)}": a check ran after the last change`
+    + ' and the answer names it and discloses what is not verified. This gate cannot judge whether that task outcome'
+    + ' is complete (it only qualifies check-scoped statements), so completion stays UNKNOWN. Not blocking: more checks'
+    + ' or rewording cannot change this verdict.' }));
+const completionWork = ['FAIL', 'UNKNOWN'].includes(completion.verdict) && !scopeOnlyUnknown ? [{
   text: `You claimed "${completion.claims[0].text.slice(0, 160)}" is done; ${completion.problems.join('; ')}. Run the real consumer path, or restate it as UNVERIFIED.`,
   at: new Date(nowMs).toISOString(), derived: true, kind: 'completion-claim-integrity',
 }] : [];
