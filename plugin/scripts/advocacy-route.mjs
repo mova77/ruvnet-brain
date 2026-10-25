@@ -341,9 +341,9 @@ export function buildCandidate({ prompt, match, availability }) {
     ? `It is already installed here.`
     : `Install state unknown from here — say so rather than claiming it is available.`;
   const copy = [
-    `[RuvNet Brain — capability advocacy] If it genuinely fits, tell the user in ONE sentence: `
-      + `"Consider ${cap.id} — ${cap.benefit}. Say 'use ${cap.id}' to proceed, or ignore this." ${avail}`,
-    `If they accept, the safe first step is \`${cap.nextAction}\` (undo: ${cap.undo}); confirm it with `
+    `[RuvNet Brain — capability advocacy] If it genuinely fits, state it in ONE sentence: `
+      + `"${cap.id} fits here — ${cap.benefit}; 'use ${cap.id}' adopts it." ${avail}`,
+    `If the user later says to use it, the safe first step is \`${cap.nextAction}\` (undo: ${cap.undo}); confirm it with `
       + `search_ruvnet before you build. Say it once, do not expand it, then carry on with the actual work.`,
   ].join('\n');
   return {
