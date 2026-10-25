@@ -59,11 +59,12 @@ export const RELEASE_REQUIREMENTS = Object.freeze({
     },
     {
       "id": "canonical-learning-capture",
-      "reason": "Fixed metadata capture, canonical scope, consent, exact readback and loud refusal retain privacy; learning is handed straight to ruflo memory store with no local queue",
+      "reason": "Fixed metadata capture, canonical scope, consent, exact readback and loud refusal retain privacy; learning is handed straight to ruflo memory store with no local queue; the SessionEnd checkpoint plans for Claude Code's real 1.5 s budget and detaches instead of being cancelled",
       "files": [
         "tests/unit/learn-capture-project-root.test.mjs",
         "tests/unit/learn-capture-redaction.test.mjs",
-        "tests/unit/learner-scope-agreement.test.mjs"
+        "tests/unit/learner-scope-agreement.test.mjs",
+        "tests/unit/claude-session-end-budget.test.mjs"
       ]
     },
     {

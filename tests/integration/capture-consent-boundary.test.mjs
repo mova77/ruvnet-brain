@@ -47,9 +47,24 @@ it.each(['Stop', 'PreCompact', 'SessionEnd'])('native %s launcher leaves opted-o
 
 it.each(['PreCompact', 'SessionEnd'])('%s with consent on stores one checkpoint through ruflo and reads it back', async (event) => {
   const f = fixture();
-  const result = await runLifecycleBoundary(event, { session_id: 'consent', hook_event_name: event, cwd: f.origin }, { env: f.env });
+  // Claude Code's default SessionEnd budget (1.5 s) detaches the checkpoint (claude-session-end-budget.test.mjs);
+  // a user who raised it with CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS gets the inline store and readback.
+  const env = event === 'SessionEnd' ? { ...f.env, CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS: '10000' } : f.env;
+  const result = await runLifecycleBoundary(event, { session_id: 'consent', hook_event_name: event, cwd: f.origin }, { env });
   expect(result.checkpoint.stored).toBe(true);
   expect(result.checkpoint.verified).toBe(true);
   const stores = f.cli.calls().filter((c) => c.argv[1] === 'store' && /^project-state-auto-\d+-[0-9a-f]{8}$/.test(c.key || ''));
   expect(stores.length).toBe(1);
 });
+
+// Issue #420 item 2: under Claude Code's default 1.5 s SessionEnd budget the checkpoint is not started inline
+// (Claude Code cancelled it on /exit); it is handed to the detached child, which stores and reads it back.
+it('SessionEnd under the default Claude Code budget detaches the checkpoint, and the child stores it', async () => {
+  const f = fixture();
+  const result = await runLifecycleBoundary('SessionEnd', { session_id: 'consent', hook_event_name: 'SessionEnd', cwd: f.origin }, { env: f.env });
+  expect(result.checkpoint).toMatchObject({ stored: false, detached: true });
+  const checkpointStores = () => f.cli.calls().filter((c) => c.argv[1] === 'store' && /^project-state-auto-\d+-[0-9a-f]{8}$/.test(c.key || ''));
+  const deadline = Date.now() + 15_000;
+  while (!checkpointStores().length && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
+  expect(checkpointStores().length).toBe(1);
+}, 20_000);
