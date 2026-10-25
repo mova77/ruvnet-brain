@@ -111,9 +111,13 @@ finish() {
   [ -n "${TIMER:-}" ] && kill "$TIMER" 2>/dev/null
   timed_out=0
   if [ -f "$HB.timeout-$RUN_ID" ]; then
-    # Finish the KILL phase on the recorded tree: the child may have exited on TERM while descendants linger.
-    timed_out=1; sleep 1; kill -KILL $(cat "$HB.timeout-$RUN_ID") 2>/dev/null; rm -f "$HB.timeout-$RUN_ID"
+    # Finish the KILL phase on the job's own process group: the child may have exited on TERM while processes it
+    # started (even ones started during TERM handling) linger.
+    timed_out=1; sleep 1; kill -KILL -"$CHILD" 2>/dev/null; rm -f "$HB.timeout-$RUN_ID"
   fi
+  # An overrun is a failure however the job chose to exit on TERM, including 0 and 75 (the skip code), so this
+  # comes before the skip branch (GPT-6.1 review round 2).
+  [ "$timed_out" -eq 1 ] && [ "$code" -le 128 ] && code=143
   ended="$(ts)"
   dur=$(( $(date +%s) - START_EPOCH ))
   # Exit 75 = SKIP (lock held by a live run). Restore the pre-fire receipt so the live run's evidence
@@ -137,8 +141,6 @@ finish() {
   # Derive ok / failed / killed from the CHILD'S OWN wait status, never from anything the child said
   # about itself. POSIX: a process terminated by signal N is reported by `wait`/`$?` as 128+N — the
   # same convention this wrapper's own TERM/INT traps below use when THEY are what killed the child.
-  # A job that was stopped for running too long is "killed" however it chose to exit on TERM.
-  [ "$timed_out" -eq 1 ] && [ "$code" -le 128 ] && code=143
   if [ "$code" -eq 0 ]; then
     state="ok"; extra=""
   elif [ "$code" -gt 128 ]; then
@@ -156,7 +158,9 @@ finish() {
   prev_since="$(printf '%s' "$PREV_HB" | sed -n 's/.*"failing_since":"\([^"]*\)".*/\1/p' | head -1)"
   was_failing=0; case "$prev_state" in failed|killed) was_failing=1 ;; esac
   # A failing streak counts as already paged only if that page was delivered ("paged":false = retry it).
-  prev_unpaged=0; case "$PREV_HB" in *'"paged":false'*) prev_unpaged=1 ;; esac
+  # Only a page PROVEN delivered ("paged":true) keeps the streak quiet; a receipt from before this field existed
+  # counts as unknown and is paged once more (review round 2).
+  prev_unpaged=1; case "$PREV_HB" in *'"paged":true'*) prev_unpaged=0 ;; esac
   since=""
   if [ "$code" -ne 0 ]; then
     if [ "$was_failing" -eq 1 ] && [ -n "$prev_since" ]; then since="$prev_since"; else since="$STARTED"; fi
@@ -179,8 +183,8 @@ trap finish EXIT
 # The exit codes (143 = 128+15 TERM, 130 = 128+2 INT) intentionally reuse the same 128+signal
 # convention `wait` uses for a directly-signalled child, so finish() classifies BOTH as "killed"
 # with the right signal number, whether the signal reached the child directly or via this wrapper.
-trap 'FORCED_CODE=143; [ -n "${TIMER:-}" ] && kill "$TIMER" 2>/dev/null; kill -TERM "$CHILD" 2>/dev/null; exit 143' TERM
-trap 'FORCED_CODE=130; [ -n "${TIMER:-}" ] && kill "$TIMER" 2>/dev/null; kill -TERM "$CHILD" 2>/dev/null; exit 130' INT
+trap 'FORCED_CODE=143; [ -n "${TIMER:-}" ] && kill "$TIMER" 2>/dev/null; kill -TERM -"$CHILD" 2>/dev/null || kill -TERM "$CHILD" 2>/dev/null; exit 143' TERM
+trap 'FORCED_CODE=130; [ -n "${TIMER:-}" ] && kill "$TIMER" 2>/dev/null; kill -TERM -"$CHILD" 2>/dev/null || kill -TERM "$CHILD" 2>/dev/null; exit 130' INT
 
 # Run the job in the BACKGROUND and `wait` for it — do NOT run it in the foreground.
 # Break-test finding (2026-07-13): a POSIX shell blocked on a FOREGROUND child does not run its trap
@@ -189,30 +193,30 @@ trap 'FORCED_CODE=130; [ -n "${TIMER:-}" ] && kill "$TIMER" 2>/dev/null; kill -T
 # The one death nothing can catch is SIGKILL (-9) / power loss, by definition: no handler runs. That
 # case is caught one level up — nightly-watchdog.mjs reports a receipt stuck in "running" as FAILING
 # ("started and never finished"). Trap for catchable deaths, watchdog for uncatchable ones.
+# The job gets its own process group (job control on just for this launch) so a timeout or a signal to this
+# wrapper reaches everything the job started.
+set -m
 "$@" &
 CHILD=$!
+set +m
 # RUN-TIME LIMIT (2026-10-25: five jobs finished their work and then never exited, each holding its own
 # next run off for 7-9 hours). After JOB_MAX_SECONDS (default 2 h; a plist may set less) the job is
 # stopped: TERM, then KILL 10 s later. It is recorded as killed and pages once like any other failure.
-descendants() { # every live descendant PID of $1 (portable: ps + awk)
-  for k in $(ps -A -o pid= -o ppid= 2>/dev/null | awk -v p="$1" '$2==p {print $1}'); do printf '%s ' "$k"; descendants "$k"; done
-}
 MAX_SECONDS="${JOB_MAX_SECONDS:-7200}"
 WRAPPER_PID=$$
 case "$MAX_SECONDS" in ''|*[!0-9]*) MAX_SECONDS=7200 ;; esac
 (
-  sleep "$MAX_SECONDS" & SLEEPER=$!
-  trap 'kill "$SLEEPER" 2>/dev/null; exit 0' TERM
-  wait "$SLEEPER"
+  # Short sleeps, not one long one: killing this shell then leaves at most a 2 s sleep behind, never a 2 h one
+  # holding the job's output open (review round 2).
+  n=0; while [ "$n" -lt "$MAX_SECONDS" ]; do sleep 2; n=$((n + 2)); done
   # Only ever signal OUR child: still alive and still parented by this wrapper. If the wrapper died (the child
   # is reparented) or the PID was reused, do nothing.
   [ "$(ps -o ppid= -p "$CHILD" 2>/dev/null | tr -d ' ')" = "$WRAPPER_PID" ] || exit 0
-  # The whole descendant tree goes, or a grandchild keeps the job's log pipe (and its work) alive. The tree
-  # is recorded in the marker so finish() can complete the KILL phase even if the child exits on TERM.
-  tree="$(descendants "$CHILD") $CHILD"
-  printf '%s\n' $tree > "$HB.timeout-$RUN_ID"
-  kill -TERM $tree 2>/dev/null; sleep 10
-  kill -KILL $tree $(descendants "$CHILD") 2>/dev/null
+  : > "$HB.timeout-$RUN_ID"
+  # The job runs in its own process group (set -m above), so the whole group goes: every descendant, including
+  # ones started after this point.
+  kill -TERM -"$CHILD" 2>/dev/null || kill -TERM "$CHILD" 2>/dev/null; sleep 10
+  kill -KILL -"$CHILD" 2>/dev/null
 ) &
 TIMER=$!
 wait "$CHILD"

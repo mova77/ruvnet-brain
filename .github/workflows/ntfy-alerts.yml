@@ -56,9 +56,11 @@ jobs:
           ISSUE_NUM: ${{ github.event.issue.number }}
           ISSUE_TITLE: ${{ github.event.issue.title }}
           ISSUE_USER: ${{ github.event.issue.user.login }}
+          ISSUE_USER_TYPE: ${{ github.event.issue.user.type }}
           PR_NUM: ${{ github.event.pull_request.number }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_USER: ${{ github.event.pull_request.user.login }}
+          PR_USER_TYPE: ${{ github.event.pull_request.user.type }}
           SENDER: ${{ github.event.sender.login }}
           WR_CONC: ${{ github.event.workflow_run.conclusion }}
           WR_NAME: ${{ github.event.workflow_run.name }}
@@ -77,7 +79,11 @@ jobs:
           # possibly cut by the unattended responder) or a scheduled job.
           AUTHOR="${ISSUE_USER:-$PR_USER}"
           # Every bot account (login ends in [bot] or is an app/ login), not just two named ones.
-          case "$AUTHOR" in stuinfla|*\[bot\]|app/*) [ "$EVENT" != "workflow_run" ] && exit 0 ;; esac
+          # GitHub's own account type is authoritative for bots; the login patterns are a fallback.
+          if [ "$EVENT" != "workflow_run" ]; then
+            [ "${ISSUE_USER_TYPE:-$PR_USER_TYPE}" = "Bot" ] && exit 0
+            case "$AUTHOR" in stuinfla|*\[bot\]|app/*) exit 0 ;; esac
+          fi
           case "$EVENT" in
             issues)
               TITLE="🐛 New issue #${ISSUE_NUM}"
@@ -98,4 +104,7 @@ jobs:
               BODY="branch ${WR_BRANCH} — ${WR_URL}"
               PRIO="urgent"; TAGS="rotating_light" ;;
           esac
-          curl -sS -H "Title: $TITLE" -H "Priority: $PRIO" -H "Tags: $TAGS" -d "$BODY" "https://ntfy.sh/$TOPIC" || true
+          # This workflow is the only sender of arrival pages, so a failed delivery is retried and then fails the run
+          # visibly (red in Actions) instead of vanishing (review round 2).
+          curl -sS --fail --retry 3 --retry-all-errors --retry-delay 5 -m 20 \
+            -H "Title: $TITLE" -H "Priority: $PRIO" -H "Tags: $TAGS" -d "$BODY" "https://ntfy.sh/$TOPIC" >/dev/null

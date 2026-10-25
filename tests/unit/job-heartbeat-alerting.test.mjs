@@ -190,6 +190,31 @@ describe('job-heartbeat.sh — a failing job must actually page, not just record
     expect(hb('com.test.tree').state).toBe('killed');
   }, 40_000);
 
+  it('a child started during TERM handling is stopped too (the job has its own process group)', () => {
+    makeHarness({ withTopic: false });
+    const marker = path.join(workDir, 'late.pid');
+    runWith('com.test.late', `trap 'sh -c "trap \\"\\" TERM; echo \\$\\$ > ${marker}; sleep 120" & exit 0' TERM\nsleep 60 & wait`, { JOB_MAX_SECONDS: '1' });
+    const lpid = Number(fs.readFileSync(marker, 'utf8'));
+    let alive = true; try { process.kill(lpid, 0); } catch { alive = false; }
+    expect(alive).toBe(false);
+  }, 40_000);
+
+  it('an overrunning job that exits 75 (the skip code) on TERM is still recorded as killed', () => {
+    makeHarness({ withTopic: false });
+    runWith('com.test.skipexit', "trap 'exit 75' TERM\nsleep 60 & wait", { JOB_MAX_SECONDS: '1' });
+    expect(hb('com.test.skipexit').state).toBe('killed');
+  }, 30_000);
+
+  it('a failed receipt from before delivery tracking existed is paged once more, not muted', () => {
+    const { run, curlCalls } = makeHarness({ withTopic: true });
+    const hbDir = path.join(workDir, 'heartbeats');
+    fs.writeFileSync(path.join(hbDir, 'com.test.legacy.json'), JSON.stringify({ label: 'com.test.legacy', state: 'failed', exit_code: 1, run_id: 'old', failing_since: '2026-10-01T00:00:00Z' }));
+    run('com.test.legacy', 1);
+    expect(curlCalls()).toHaveLength(1);
+    run('com.test.legacy', 1);
+    expect(curlCalls()).toHaveLength(1);
+  });
+
   it('the run-time timer never outlives the wrapper', () => {
     makeHarness({ withTopic: false });
     runWith('com.test.short', 'exit 0', { JOB_MAX_SECONDS: '7321' });

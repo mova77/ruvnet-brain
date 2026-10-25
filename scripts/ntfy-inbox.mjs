@@ -31,6 +31,7 @@ const INBOX = () => path.join(STATE_DIR(), 'ntfy-inbox.jsonl');
 export const OPEN_FILE = () => path.join(STATE_DIR(), 'ntfy-open-alerts.json');
 const STATE_FILE = () => path.join(STATE_DIR(), 'ntfy-inbox-state.json');
 const MAX_INBOX_BYTES = 4 * 1024 * 1024;
+export const MAX_OPEN_ALERTS = 200;
 const MAX_SEEN = 1000;
 const MAX_ATTEMPTS = 2;
 
@@ -105,7 +106,7 @@ export function fold(open, messages, { now = Date.now(), resolver = resolvedNow 
     const at = new Date((msg.time || now / 1000) * 1000).toISOString();
     if (c.resolves) {
       const a = byKey.get(c.key);
-      if (a && !a.closedAt && Date.parse(at) >= Date.parse(a.firstAt) && resolver(a)) { a.closedAt = at; a.closedBy = 'recovered notice (confirmed)'; a.closedByMsg = msg.id; }
+      if (a && !a.closedAt && Date.parse(at) >= Date.parse(a.lastAt) && resolver(a)) { a.closedAt = at; a.closedBy = 'recovered notice (confirmed)'; a.closedByMsg = msg.id; }
       continue;
     }
     if (!c.actionable) continue;
@@ -123,8 +124,14 @@ export function fold(open, messages, { now = Date.now(), resolver = resolvedNow 
     const why = resolver(a);
     if (why) { a.closedAt = new Date(now).toISOString(); a.closedBy = typeof why === 'string' ? why : 'cause cleared'; }
   }
-  // Closed alerts are kept 7 days for the record, then dropped.
-  return [...byKey.values()].filter((a) => !a.closedAt || now - Date.parse(a.closedAt) < 7 * 86_400_000);
+  // Closed alerts are kept 7 days for the record, then dropped. The open list is capped (newest kept, real alerts
+  // before unrecognised ones) so it always stays small enough for SessionStart to read (review round 2).
+  const kept = [...byKey.values()].filter((a) => !a.closedAt || now - Date.parse(a.closedAt) < 7 * 86_400_000);
+  const openOnes = kept.filter((a) => !a.closedAt)
+    .sort((x, y) => (x.kind === 'other') - (y.kind === 'other') || Date.parse(y.lastAt) - Date.parse(x.lastAt));
+  const over = new Set(openOnes.slice(MAX_OPEN_ALERTS).map((a) => a.key));
+  for (const a of kept) if (over.has(a.key)) { a.closedAt = new Date(now).toISOString(); a.closedBy = `dropped: more than ${MAX_OPEN_ALERTS} open alerts`; }
+  return kept.filter((a) => !a.closedAt || !over.has(a.key)).slice(-(MAX_OPEN_ALERTS * 3));
 }
 
 // ── LOCK: one writer of the inbox state at a time ──────────────────────────────────────────────────────────────
@@ -167,17 +174,17 @@ export function releaseLock(lock) {
   if (readJson(path.join(lock.dir, 'owner.json'), null)?.token === lock.token) fs.rmSync(lock.dir, { recursive: true, force: true });
 }
 
-export async function poll({ fetcher = globalThis.fetch, now = Date.now(), resolver, launcher, known, lockWait = 60_000 } = {}) {
+export async function poll({ fetcher = globalThis.fetch, now = Date.now(), resolver, launcher, known, lockWait = 60_000, available } = {}) {
   const topic = resolveTopic();
   if (!topic) throw new Error('no ntfy topic configured');
   const deadline = Date.now() + lockWait;
   let lock;
   while (!(lock = tryLock()) && Date.now() < deadline) await sleep(500);
   if (!lock) return { skipped: true, received: 0, open: [], responder: { started: false, why: 'another poll or ack holds the inbox lock' } };
-  try { return await pollLocked(topic, { fetcher, now, resolver, launcher, known }); } finally { releaseLock(lock); }
+  try { return await pollLocked(topic, { fetcher, now, resolver, launcher, known, available }); } finally { releaseLock(lock); }
 }
 
-async function pollLocked(topic, { fetcher, now, resolver, launcher, known }) {
+async function pollLocked(topic, { fetcher, now, resolver, launcher, known, available }) {
   const state = readJson(STATE_FILE(), {});
   const seen = new Set(Array.isArray(state.seen) ? state.seen : []);
   const since = state.lastId || '12h';
@@ -205,7 +212,7 @@ async function pollLocked(topic, { fetcher, now, resolver, launcher, known }) {
 
   let responded;
   try {
-    responded = dispatch(open, { now, launcher, known });
+    responded = dispatch(open, { now, launcher, known, available });
     delete state.responderError;
   } catch (error) {
     responded = { started: false, why: `responder launch failed: ${error.message}` };
@@ -216,7 +223,7 @@ async function pollLocked(topic, { fetcher, now, resolver, launcher, known }) {
 }
 
 /** Pick what to hand the responder: open, validated, not blocked, under the attempt limit. Mutates `open`. */
-function dispatch(open, { now, launcher, known = knownTargets() }) {
+function dispatch(open, { now, launcher, known = knownTargets(), available }) {
   const st = readJson(RESPONDER_STATE(), { runs: [] });
   const running = Boolean(st.pid && aliveGroup(st.pid));
   for (const a of open) if (a.attempts === undefined) a.attempts = a.dispatchedAt ? 1 : 0; // the old one-shot field
@@ -226,7 +233,7 @@ function dispatch(open, { now, launcher, known = knownTargets() }) {
   const rank = { issue: 0, pr: 1, ci: 2, job: 3 };
   const eligible = open.filter((a) => !a.closedAt && !a.blocked && a.attempts < MAX_ATTEMPTS && responderTask(a, known))
     .sort((a, b) => (rank[a.kind] ?? 9) - (rank[b.kind] ?? 9) || Date.parse(a.firstAt) - Date.parse(b.firstAt)).slice(0, 3);
-  const responded = maybeRespond(eligible, { now, known, ...(launcher ? { launcher } : {}) });
+  const responded = maybeRespond(eligible, { now, known, ...(launcher ? { launcher } : {}), ...(available !== undefined ? { available } : {}) });
   if (responded.started) for (const a of eligible) { a.attempts += 1; a.lastAttemptAt = new Date(now).toISOString(); a.lastRunPid = responded.pid; }
   return responded;
 }
@@ -297,7 +304,14 @@ Rules:
 6. Finish with a short plain-English summary of what you found and did.`;
 }
 
-export function maybeRespond(newAlerts, { now = Date.now(), launcher = launchResponder, known = knownTargets() } = {}) {
+// The unattended responder is OFF in code for this release, whatever the config says. Two independent reviews
+// (Opus 5.5 and GPT-6.1, 2026-10-25) found that flags cannot bound a headless run that reads public issue text:
+// it needs an OS-enforced sandbox, a repo-scoped token and a verified subscription login first. The machinery and
+// its tests stay so that work can resume; the poll never launches anything until this is switched on deliberately.
+export const RESPONDER_AVAILABLE = false;
+
+export function maybeRespond(newAlerts, { now = Date.now(), launcher = launchResponder, known = knownTargets(), available = RESPONDER_AVAILABLE } = {}) {
+  if (!available) return { started: false, why: 'unattended responder not available in this release (needs an OS sandbox)' };
   const cfg = readJson(RESPONDER_CONFIG(), null);
   if (!cfg?.enabled || !newAlerts.length) return { started: false, why: cfg?.enabled ? 'nothing new' : 'responder off' };
   const alerts = newAlerts.filter((a) => responderTask(a, known));
