@@ -352,10 +352,11 @@ export const RELEASE_REQUIREMENTS = Object.freeze({
     },
     {
       "id": "installed-routing-and-hook-trust",
-      "reason": "Actual installer update converges managed routing while preserving private overrides; POSIX archive and native metadata subprocess probes bind authorized hook trust to verified released bytes and preserve concurrent or disabled owner state",
+      "reason": "Actual installer update converges managed routing while preserving private overrides; POSIX archive and native metadata subprocess probes bind authorized hook trust to verified released bytes and preserve concurrent or disabled owner state; a running shared Codex app-server is reloaded after a plugin or trust change without granting approval (#492)",
       "files": [
         "tests/unit/model-router-update-convergence.test.mjs",
-        "tests/unit/codex-hook-trust-reconcile.test.mjs"
+        "tests/unit/codex-hook-trust-reconcile.test.mjs",
+        "tests/unit/codex-shared-host-refresh.test.mjs"
       ]
     },
     {
