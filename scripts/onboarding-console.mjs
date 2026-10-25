@@ -2613,12 +2613,8 @@ function apply(ids) {
     } : {});
     if (res.ok && learningBefore) {
       const after = observeLearning();
-      // `ruflo memory distill run` owns the patterns; progress here is a known, readable learner afterwards.
-      const progressed = learningBefore.statusKnown && after.statusKnown;
-      if (!progressed) {
-        res.ok = false;
-        res.log += `\nNo measured learning progress: queue ${after.queueDir}; learner ${after.learnerCwd}. Reload to inspect the remaining evidence.`;
-      }
+      res.ok = learningProgressed(learningBefore, after);
+      if (!res.ok) res.log += `\nNo measured learning progress: ${learningProgressDetail(learningBefore, after)}. Reload to inspect the remaining evidence.`;
     }
     phaseMs.childRemedyMs += elapsedMs(remedyStartedAt);
     results.push({ id, ...res, undoToken });
@@ -2626,6 +2622,21 @@ function apply(ids) {
   // This receipt contains only aggregate durations, never the applied ids, paths, command output,
   // or undo tokens. It makes an end-user-visible delay diagnosable without exposing their machine.
   return { results, timings: { ...phaseMs, totalMs: elapsedMs(startedAt) } };
+}
+
+/**
+ * #377: Apply on "Your learner has gone quiet" counts as progress only when `ruflo memory distill
+ * status` shows the learner's last distillation moved FORWARD. A readable store alone is not progress.
+ */
+export function learningProgressed(before, after) {
+  const was = Date.parse(before?.lastDistillAt || '');
+  const now = Date.parse(after?.lastDistillAt || '');
+  return !!(before?.statusKnown && after?.statusKnown && after.distillKnown === true
+    && Number.isFinite(now) && (!Number.isFinite(was) || now > was));
+}
+export function learningProgressDetail(before, after) {
+  return `learner ${after?.learningDb || before?.learningDb || 'unresolved'}; last distillation `
+    + `${before?.lastDistillAt || 'not recorded'} → ${after?.distillKnown === true ? (after.lastDistillAt || 'not recorded') : 'unknown'}`;
 }
 
 function autoEligibleIds(recommendations = []) {
