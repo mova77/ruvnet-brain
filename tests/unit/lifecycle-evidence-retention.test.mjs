@@ -274,4 +274,66 @@ describe('lifecycle evidence retention', () => {
     expect(result.withinBudget).toBe(true);
     expect(fs.existsSync(old)).toBe(false);
   });
+
+  describe('abandoned atomic-write temporaries (#434)', () => {
+    const now = () => '2026-10-20T12:00:00Z';
+    const temp = ({ brainHome }, runId, { content = '', ageMs = 2 * 60 * 60 * 1000, suffix = '2756628-1574d1f1' } = {}) => {
+      const file = path.join(brainHome, 'refresh-runs', `${runId}.json.tmp-${suffix}`);
+      fs.writeFileSync(file, content, { mode: 0o600 });
+      const at = (Date.parse(now()) - ageMs) / 1000;
+      fs.utimesSync(file, at, at);
+      return file;
+    };
+
+    it('reclaims the reported pair of empty stale temps beside their canonical receipt, reported, not silent', () => {
+      const f = fixture();
+      const runId = '1791258423435-ea78236a066a7f72';
+      refresh(f, runId, { at: '2026-10-19T03:00:00Z', status: 'ABANDONED' });
+      const a = temp(f, runId);
+      const b = temp(f, runId, { suffix: '2756628-4401e88f' });
+      const assessed = assessLifecycleEvidence({ ...f, now });
+      expect(assessed.unsafe).toEqual([]);
+      expect(assessed.withinBudget).toBe(true);
+      expect(assessed.abandonedTemporaries.map(({ path: p }) => p)).toEqual([a, b]);
+      const result = pruneLifecycleEvidence({ ...f, now });
+      expect(result.unsafe).toEqual([]);
+      expect(result.withinBudget).toBe(true);
+      expect(result.reclaimedTemporaries).toEqual([a, b].map((p) => expect.objectContaining({ path: p, runId, writerPid: 2756628,
+        bytes: 0, canonicalReceipt: true, sha256: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855' })));
+      expect(fs.readdirSync(path.join(f.brainHome, 'refresh-runs'))).toEqual([`${runId}.json`]);
+      expect(result.removed).toEqual({ refresh: [], transactions: [] });
+    });
+
+    it('leaves a young (in-flight) temp alone without blocking retention', () => {
+      const f = fixture();
+      refresh(f, 'live', { at: '2026-10-20T11:59:00Z', status: 'RUNNING' });
+      const young = temp(f, 'live', { content: '{"partial"', ageMs: 1000 });
+      const result = pruneLifecycleEvidence({ ...f, now });
+      expect(result.unsafe).toEqual([]);
+      expect(result.withinBudget).toBe(true);
+      expect(result.reclaimedTemporaries).toEqual([]);
+      expect(fs.readFileSync(young, 'utf8')).toBe('{"partial"');
+    });
+
+    it('preserves a stale temp with content but no canonical receipt (ambiguous) and still reports it unsafe', () => {
+      const f = fixture();
+      const orphan = temp(f, 'orphan', { content: '{"runId":"orphan"}' });
+      const result = pruneLifecycleEvidence({ ...f, now });
+      expect(result.unsafe).toEqual([{ path: orphan, reason: expect.stringMatching(/no canonical receipt; preserved/) }]);
+      expect(result.reclaimedTemporaries).toEqual([]);
+      expect(fs.readFileSync(orphan, 'utf8')).toBe('{"runId":"orphan"}');
+    });
+
+    it('refuses a stale temp that is a symlink or hard link', () => {
+      const f = fixture();
+      refresh(f, 'linked', { at: '2026-10-19T03:00:00Z' });
+      const target = path.join(f.brainHome, 'outside.txt');
+      fs.writeFileSync(target, '');
+      fs.linkSync(target, path.join(f.brainHome, 'refresh-runs', 'linked.json.tmp-1-aaaaaaaa'));
+      const result = pruneLifecycleEvidence({ ...f, now });
+      expect(result.unsafe.map(({ reason }) => reason)).toEqual(['atomic-write temporary is not an exclusive regular file']);
+      expect(fs.existsSync(target)).toBe(true);
+    });
+  });
 });
+

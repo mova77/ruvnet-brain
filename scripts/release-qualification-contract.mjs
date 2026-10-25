@@ -231,9 +231,10 @@ export const RELEASE_REQUIREMENTS = Object.freeze({
     },
     {
       "id": "lossless-lifecycle-retention",
-      "reason": "Evidence compaction preserves tokens, private state and atomic transaction recovery",
+      "reason": "Evidence compaction preserves tokens, private state and atomic transaction recovery; an abandoned atomic receipt temporary is reclaimed or preserved, never a permanent blocker",
       "files": [
         "tests/unit/lifecycle-evidence-retention.test.mjs",
+        "tests/unit/refresh-run.test.mjs",
         "tests/unit/update-storage-transaction.test.mjs"
       ]
     },

@@ -260,8 +260,14 @@ function atomicJson(file, value) {
   const temporary = `${file}.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const fd = fs.openSync(temporary, 'wx', 0o600);
-  try { fs.writeFileSync(fd, `${JSON.stringify(value, null, 2)}\n`); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-  fs.renameSync(temporary, file);
+  try {
+    try { fs.writeFileSync(fd, `${JSON.stringify(value, null, 2)}\n`); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    fs.renameSync(temporary, file);
+  } catch (error) {
+    // #434: a failed write/rename must not leave a temp behind to block lifecycle retention.
+    try { fs.rmSync(temporary, { force: true }); } catch { /* the original error is the one to report */ }
+    throw error;
+  }
 }
 
 export function openRefreshReceipt({ brainHome, lock, action, desiredVersion = null,
