@@ -312,6 +312,13 @@ describe('issue #79 — Console runtime update transaction', () => {
       wireCodexPlugin: () => ({ host: true, action: 'verification-failed', error: 'Codex verification failed' }),
       reason: /^Codex plugin verification-failed: Codex verification failed$/,
     },
+    {
+      label: 'Codex throw',
+      wireClaude: () => ({ host: false, wired: false }),
+      wireCodexHost: () => ({ host: true, action: 'unchanged' }),
+      wireCodexPlugin: () => { throw new Error('codex-unavailable'); },
+      reason: /^Codex plugin failed: codex-unavailable$/,
+    },
   ])('$label selected-host failure rolls Console runtime B back to byte-identical A', (hostFailure) => {
     const cache = temporary('brain-console-cache-');
     const brainHome = temporary('brain-console-home-');
