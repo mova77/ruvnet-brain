@@ -1,4 +1,4 @@
-Updated: 2026-10-24 15:00:00 EDT | Version 1.4.0
+Updated: 2026-10-25 19:02:43 EDT | Version 1.5.0
 Created: 2026-07-07 09:22:01 EDT
 
 # Contributing to RuvNet Brain — the one rulebook
@@ -242,6 +242,24 @@ not the public default. Run-local CLI overrides do not silently rewrite the save
 ```bash
 ruvnet-brain-update --check --channel latest --scope ruvnet
 ruvnet-brain-update --apply --channel alpha --scope all
+```
+
+**Keeping a package at the version you chose (#319).** There is no separate notify-only mode; three
+existing controls cover it:
+
+- `preservePackages` (npm package names) in the same config file. Manual applies and the 03:30 schedule
+  never install over a listed package: the coordinator still looks up the newer tag and records the step
+  as `local-modification-preserved` (listed under `coverage.preservedLocalModification` in
+  `nightly-suite-update.json`). Unlisted packages, host plugins and the signed knowledge corpus still
+  update as configured. A corpus update runs the installed `ruvnet-brain` package's own installer
+  (`<npm root -g>/ruvnet-brain/bin/install.mjs --update`), not `npx …@latest`, and its corpus checks still apply.
+- `ruvnet-brain-update --check` changes nothing and reports each package as `current`,
+  `update-available` or preserved: that is the notify-only run, on demand.
+- `ruvnet-brain --update-source installed` makes the remaining legacy (unconfigured) automatic paths use
+  the installed package instead of unattended npx (`docs/AUTOMATIC-UPDATE-SOURCE.md`).
+
+```json
+{ "schemaVersion": 1, "channel": "latest", "scope": "ruvnet", "preservePackages": ["ruflo", "ruvnet-brain"] }
 ```
 
 The coordinator discovers existing npm prefix/root and command ownership, then updates in
