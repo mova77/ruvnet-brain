@@ -195,7 +195,7 @@ function launchResponder(prompt, cfg) {
   const env = responderEnv(process.env, cfg);
   const tools = 'Bash Read Edit Write Glob Grep Agent mcp__plugin_ruvnet-brain_ruvnet-brain__search_ruvnet';
   const child = spawn('/bin/sh', [path.join(ROOT, 'scripts', 'job-heartbeat.sh'), 'com.ruvnet.ntfy-responder', '--',
-    claude, '-p', prompt, '--model', cfg.model || 'claude-opus-5-5', '--permission-mode', 'acceptEdits', '--allowedTools', tools, '--output-format', 'text'],
+    claude, '-p', prompt, '--model', cfg.model || 'opus', '--permission-mode', 'acceptEdits', '--allowedTools', tools, '--output-format', 'text'],
   { cwd: worktree, detached: true, stdio: ['ignore', log, log], env });
   child.unref();
   return child.pid;
