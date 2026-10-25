@@ -108,7 +108,9 @@ export const knowledgeFacts = ({ env = process.env, home, now = Date.now() } = {
   const auto = autoUpdatePaths(brainHome);
   const provenWithin = (h) => Boolean((history.lastSuccess && hours(history.lastSuccess.at) <= h)
     || (check?.currencyVerdict === 'CURRENT' && Number.isFinite(checkMs) && hours(checkMs) <= h));
-  return { brainHome, kbDir, source, builtMs, history, hours, provenWithin, auto,
+  // brain-confirmation.mjs SIGNATURE_RECORD (not imported: that module imports this one).
+  const installedAtMs = Date.parse(json(path.join(brainHome, 'knowledge-signature.json'))?.verifiedAt || '');
+  return { brainHome, kbDir, source, builtMs, history, hours, provenWithin, auto, installedAtMs,
     attempt: json(auto.attemptFile), corpusCheck: json(auto.checkFile),
     lockMs: Date.parse(json(auto.lockFile)?.at || '') || mtimeMs(auto.lockFile) };
 };
@@ -146,11 +148,34 @@ export const autoUpdateOptOut = ({ env = process.env, home, facts }) => {
  * installed tree carries no generation stamp) and that tag is not what SOURCE.json now names. A check
  * recorded before the update landed therefore stops reading as pending the moment B is installed.
  */
+const SEMVER_TAG = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/;
+/** Semver order of two release tags (>0 a newer, <0 older, 0 same); null when either is not semver. */
+export const compareReleaseTags = (a, b) => {
+  const A = SEMVER_TAG.exec(String(a ?? '')), B = SEMVER_TAG.exec(String(b ?? ''));
+  if (!A || !B) return null;
+  for (let i = 1; i <= 3; i++) if (Number(A[i]) !== Number(B[i])) return Number(A[i]) > Number(B[i]) ? 1 : -1;
+  if ((A[4] || '') === (B[4] || '')) return 0;
+  if (!A[4]) return 1;
+  if (!B[4]) return -1;
+  return A[4] > B[4] ? 1 : -1;
+};
+
 export const newerCorpusPending = (facts) => {
   const c = facts.corpusCheck;
   if (!c?.candidateTag || !['UPDATE_AVAILABLE', 'UNKNOWN'].includes(c.verdict)) return null;
   const installed = [facts.source?.corpusReleaseTag, facts.source?.releaseTag].filter(Boolean);
   if (installed.includes(c.candidateTag)) return null;
+  // #401: a different tag is not a newer one. When both are semver release tags, order decides: a
+  // retained check naming v4.5.7 must never call an installed v4.5.9 out of date, and a v4.5.10
+  // candidate still reads as pending however recently something was installed.
+  const order = compareReleaseTags(c.candidateTag, facts.source?.releaseTag);
+  if (order !== null) { if (order <= 0) return null; }
+  else {
+    // Opaque (non-orderable) identities: a check recorded before the installed bytes were
+    // signature-verified is stale evidence the install superseded, not proof of a newer corpus.
+    const checkedMs = Date.parse(c.checkedAt || c.launchedAt || '');
+    if (Number.isFinite(facts.installedAtMs) && Number.isFinite(checkedMs) && checkedMs < facts.installedAtMs) return null;
+  }
   return { tag: c.candidateTag, installed: installed[0] || null, checkedAt: c.checkedAt || c.launchedAt || null, outcome: c.outcome };
 };
 const shortTag = (tag) => (tag && tag.length > 28 ? `${tag.slice(0, 26)}…` : tag || 'unknown');
