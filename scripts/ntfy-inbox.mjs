@@ -50,20 +50,29 @@ export function classify(msg) {
   let m;
   // job-heartbeat.sh pages "SCHEDULED JOB FAILED: X" / "Recovered: X"; nightly-watchdog.mjs pages "🔴 <STATE>: X" /
   // "✅ X is healthy again". Same cause, same key, so either recovery closes either failure.
-  if ((m = /SCHEDULED JOB FAILED: (\S+)/.exec(title)) || (m = /^\W*(?:FAILING|NEVER-RAN|STALE): (\S+)/.exec(title))) return { kind: 'job', key: `job:${m[1]}`, label: m[1], actionable: true };
+  if ((m = /SCHEDULED JOB FAILED: (\S+)/.exec(title)) || (m = /^\W*(?:FAILING|NEVER-RAN|STALE|MISSING|STALLED): (\S+)/.exec(title))) return { kind: 'job', key: `job:${m[1]}`, label: m[1], actionable: true };
   if ((m = /Recovered: (\S+)/.exec(title)) || (m = /^\W*(\S+) is healthy again/.exec(title))) return { kind: 'job-recovered', key: `job:${m[1]}`, label: m[1], actionable: false, resolves: true };
-  if ((m = /CI \w+: (.+)$/.exec(title))) return { kind: 'ci', key: `ci:${m[1].trim()}`, workflow: m[1].trim(), actionable: true };
+  if ((m = /CI \w+: (.+)$/.exec(title))) {
+    const b = /branch ([\w./-]{1,100})/.exec(body);
+    return { kind: 'ci', key: `ci:${m[1].trim()}`, workflow: m[1].trim(), ...(b ? { branch: b[1] } : {}), actionable: true };
+  }
   if ((m = /(?:New issue|SLA breach: issue) #(\d+)/.exec(title))) return { kind: 'issue', key: `issue:${m[1]}`, number: Number(m[1]), actionable: true };
   if ((m = /New PR #(\d+)/.exec(title))) return { kind: 'pr', key: `pr:${m[1]}`, number: Number(m[1]), actionable: true };
   if (/^Waiting on a reply/.test(title)) return { kind: 'digest', key: 'digest:issues', actionable: false };
   if (/New star/.test(title)) return { kind: 'info', key: `info:${msg.id}`, actionable: false };
+  // Anything else: a success or low-priority notice (✅, priority 3 or lower) is information, not work. Only an
+  // unrecognised high-priority message is kept as an `other` alert, and it expires after 3 days (never dispatched).
+  if (/^\s*✅/.test(title) || /white_check_mark/.test(String(msg.tags || '')) || Number(msg.priority || 3) <= 3) return { kind: 'info', key: `info:${msg.id}`, actionable: false };
   return { kind: 'other', key: `other:${title.slice(0, 60) || body.slice(0, 60)}`, actionable: true };
 }
 
 /** Is this alert's cause gone? Returns the reason (truthy) or false. Checked live; an unreadable fact keeps it open. */
 export function resolvedNow(alert, { gh = ghJson, heartbeat = readHeartbeat } = {}) {
   try {
-    if (alert.kind === 'job') return heartbeat(alert.label)?.state === 'ok' ? 'job passed again' : false;
+    if (alert.kind === 'job') {
+      const hb = heartbeat(alert.label);
+      return hb?.state === 'ok' && Date.parse(hb.ended_at || 0) > Date.parse(alert.lastAt) ? 'job passed again' : false;
+    }
     if (alert.kind === 'issue' || alert.kind === 'pr') {
       const item = gh([alert.kind === 'pr' ? 'pr' : 'issue', 'view', String(alert.number), '--repo', REPO, '--json', 'state,author,comments']);
       if (!item) return false;
@@ -74,9 +83,10 @@ export function resolvedNow(alert, { gh = ghJson, heartbeat = readHeartbeat } = 
       return judgeIssue({ createdAt: new Date().toISOString() }, item.comments || [], Date.now()).ownerComment ? 'owner replied' : false;
     }
     if (alert.kind === 'ci') {
-      const runs = gh(['run', 'list', '--repo', REPO, '--workflow', alert.workflow, '--branch', 'main', '--limit', '1', '--json', 'conclusion,status,createdAt']);
+      const branch = /^[\w./-]{1,100}$/.test(alert.branch || '') ? alert.branch : 'main';
+      const runs = gh(['run', 'list', '--repo', REPO, '--workflow', alert.workflow, '--branch', branch, '--limit', '1', '--json', 'conclusion,status,createdAt']);
       const run = runs?.[0];
-      return run && run.status === 'completed' && run.conclusion === 'success' && Date.parse(run.createdAt) > Date.parse(alert.lastAt) ? 'workflow green on main' : false;
+      return run && run.status === 'completed' && run.conclusion === 'success' && Date.parse(run.createdAt) > Date.parse(alert.lastAt) ? `workflow green on ${branch}` : false;
     }
   } catch { return false; }
   return false;
@@ -95,7 +105,7 @@ export function fold(open, messages, { now = Date.now(), resolver = resolvedNow 
     const at = new Date((msg.time || now / 1000) * 1000).toISOString();
     if (c.resolves) {
       const a = byKey.get(c.key);
-      if (a && !a.closedAt && Date.parse(at) >= Date.parse(a.firstAt)) { a.closedAt = at; a.closedBy = 'recovered notice'; a.closedByMsg = msg.id; }
+      if (a && !a.closedAt && Date.parse(at) >= Date.parse(a.firstAt) && resolver(a)) { a.closedAt = at; a.closedBy = 'recovered notice (confirmed)'; a.closedByMsg = msg.id; }
       continue;
     }
     if (!c.actionable) continue;
@@ -109,6 +119,7 @@ export function fold(open, messages, { now = Date.now(), resolver = resolvedNow 
   }
   for (const a of byKey.values()) {
     if (a.closedAt) continue;
+    if (a.kind === 'other' && now - Date.parse(a.lastAt) > 3 * 86_400_000) { a.closedAt = new Date(now).toISOString(); a.closedBy = 'expired (unrecognised message, 3 days)'; continue; }
     const why = resolver(a);
     if (why) { a.closedAt = new Date(now).toISOString(); a.closedBy = typeof why === 'string' ? why : 'cause cleared'; }
   }
@@ -207,7 +218,7 @@ async function pollLocked(topic, { fetcher, now, resolver, launcher, known }) {
 /** Pick what to hand the responder: open, validated, not blocked, under the attempt limit. Mutates `open`. */
 function dispatch(open, { now, launcher, known = knownTargets() }) {
   const st = readJson(RESPONDER_STATE(), { runs: [] });
-  const running = Boolean(st.pid && alive(st.pid));
+  const running = Boolean(st.pid && aliveGroup(st.pid));
   for (const a of open) if (a.attempts === undefined) a.attempts = a.dispatchedAt ? 1 : 0; // the old one-shot field
   // The last run has ended and these are still open after the attempt limit: a person has to look.
   if (!running) for (const a of open) if (!a.closedAt && !a.blocked && a.attempts >= MAX_ATTEMPTS) { a.blocked = true; a.blockedAt = new Date(now).toISOString(); }
@@ -260,7 +271,7 @@ export function responderTask(alert, known = knownTargets()) {
 
 const TASK_LINE = {
   job: (t) => `- Scheduled job ${t.label} is failing, stale, or never ran (config/scheduled-jobs.json). alert id: ${t.id}`,
-  ci: (t) => `- GitHub Actions workflow "${t.workflow}" failed on main or on its schedule. alert id: ${t.id}`,
+  ci: (t) => `- GitHub Actions workflow "${t.workflow}" failed${/^[\w./-]{1,100}$/.test(t.branch || '') ? ` on branch ${t.branch}` : ''}. alert id: ${t.id}`,
   issue: (t) => `- GitHub issue #${t.number} on ${REPO} is waiting for an answer. alert id: ${t.id}`,
   pr: (t) => `- GitHub pull request #${t.number} on ${REPO} is waiting for review. alert id: ${t.id}`,
 };
@@ -293,7 +304,11 @@ export function maybeRespond(newAlerts, { now = Date.now(), launcher = launchRes
   if (!alerts.length) return { started: false, why: 'nothing dispatchable' };
   const st = readJson(RESPONDER_STATE(), { runs: [] });
   st.runs = Array.isArray(st.runs) ? st.runs : [];
-  if (st.pid && alive(st.pid)) return { started: false, why: `responder ${st.pid} still running` };
+  if (st.pid && aliveGroup(st.pid)) return { started: false, why: `responder ${st.pid} still running` };
+  // The real boundary is the GitHub credential, not the tool list (Opus review 2026-10-25): the run gets ONLY a
+  // fine-grained token scoped to this repo, never the owner's gh login or SSH agent. No token, no run.
+  const token = readScopedToken(cfg);
+  if (!token) return { started: false, why: 'responder needs a repo-scoped GitHub token (githubTokenFile in ntfy-responder.json, mode 0600)' };
   const today = etDay(now);
   const runsToday = st.runs.filter((r) => etDay(Date.parse(r.startedAt)) === today).length;
   if (runsToday >= (cfg.maxRunsPerDay || 4)) return { started: false, why: 'daily cap reached' };
@@ -306,7 +321,18 @@ export function maybeRespond(newAlerts, { now = Date.now(), launcher = launchRes
 // BILLING SAFETY (issue-fix.mjs, the $1,600 lesson), as an ALLOWLIST: copying process.env and deleting known keys
 // would let any provider selector or credential we did not think of (ANTHROPIC_BASE_URL, CLAUDE_CODE_USE_BEDROCK /
 // _VERTEX / _FOUNDRY, AWS_*, …) move the run off the owner's subscription. Only these pass through.
-const ENV_ALLOW = ['HOME', 'USER', 'LOGNAME', 'SHELL', 'TMPDIR', 'LANG', 'LC_ALL', 'TERM', 'SSH_AUTH_SOCK'];
+const ENV_ALLOW = ['HOME', 'USER', 'LOGNAME', 'SHELL', 'TMPDIR', 'LANG', 'LC_ALL', 'TERM'];
+const aliveGroup = (pid) => { try { process.kill(-pid, 0); return true; } catch (e) { return e.code === 'EPERM' || alive(pid); } };
+/** The repo-scoped token from cfg.githubTokenFile: an owner-only regular file, else null. */
+export function readScopedToken(cfg = {}) {
+  try {
+    const file = String(cfg.githubTokenFile || '');
+    const st = fs.lstatSync(file);
+    if (!st.isFile() || (st.mode & 0o077) !== 0) return null;
+    const t = fs.readFileSync(file, 'utf8').trim();
+    return /^github_pat_[A-Za-z0-9_]{20,}$/.test(t) ? t : null;
+  } catch { return null; }
+}
 /** The responder's environment: subscription login only, approved programs first, a 3 h limit. */
 export function responderEnv(base, cfg = {}) {
   const env = {};
@@ -316,6 +342,8 @@ export function responderEnv(base, cfg = {}) {
   // blocked; Apple's /usr/bin tools and the approved node in job-bin allowed). Approved programs come first.
   env.PATH = [path.join(os.homedir(), '.local', 'share', 'ruvnet-brain', 'job-bin'), '/usr/bin', '/bin', '/usr/sbin', '/sbin',
     path.join(os.homedir(), '.npm-global', 'bin'), '/opt/homebrew/bin'].join(':');
+  const token = readScopedToken(cfg);
+  if (token) { env.GH_TOKEN = token; env.GITHUB_TOKEN = token; }
   env.RUVNET_RESPONDER = '1';
   env.JOB_MAX_SECONDS = String(cfg.maxSeconds || 10_800);
   return env;
@@ -397,8 +425,15 @@ function launchResponder(prompt, cfg) {
   writeJson(mcpFile, { mcpServers: pluginRoot ? { 'ruvnet-brain': { command: path.join(os.homedir(), '.local', 'share', 'ruvnet-brain', 'job-bin', 'node'),
     args: [path.join(pluginRoot, 'mcp', 'server.mjs')], env: { CLAUDE_PLUGIN_ROOT: pluginRoot } } } : {} });
   const tools = 'Bash Read Edit Write Glob Grep Agent mcp__ruvnet-brain__search_ruvnet';
+  // Speed bumps on top of the scoped token (which is the real limit): account, secret, settings and
+  // force-push commands, and writes outside the run's own workspace.
+  const denied = ['Bash(gh ssh-key:*)', 'Bash(gh secret:*)', 'Bash(gh variable:*)', 'Bash(gh repo:*)', 'Bash(gh auth:*)',
+    'Bash(gh release delete:*)', 'Bash(gh pr merge:*)', 'Bash(git push --force:*)', 'Bash(git push -f:*)', 'Bash(git push --delete:*)',
+    'Bash(security:*)', 'Bash(launchctl:*)', 'Bash(npm publish:*)', 'Bash(sudo:*)',
+    'Edit(~/.config/**)', 'Write(~/.config/**)', 'Edit(~/.claude/**)', 'Write(~/.claude/**)', 'Write(~/Library/**)', 'Edit(~/Library/**)',
+    'Write(~/.cache/ruvnet-brain/**)', 'Edit(~/.cache/ruvnet-brain/**)', 'Write(/Users/stuartkerr/Code/**)', 'Edit(/Users/stuartkerr/Code/**)'];
   const child = spawn('/bin/sh', [path.join(ROOT, 'scripts', 'job-heartbeat.sh'), 'com.ruvnet.ntfy-responder', '--',
-    claude, '-p', prompt, '--model', cfg.model || 'opus', '--permission-mode', 'acceptEdits', '--allowedTools', tools,
+    claude, '-p', prompt, '--model', cfg.model || 'opus', '--permission-mode', 'acceptEdits', '--allowedTools', tools, '--disallowedTools', ...denied,
     '--setting-sources', 'project', '--strict-mcp-config', '--mcp-config', mcpFile, '--disable-slash-commands', '--output-format', 'text'],
   { cwd: worktree, detached: true, stdio: ['ignore', log, log], env });
   // A spawn that fails has no pid (thrown below, recorded as state.responderError); this keeps its async 'error'

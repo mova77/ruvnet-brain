@@ -18,8 +18,16 @@ beforeEach(async () => {
   mod = await import('../../scripts/ntfy-inbox.mjs');
 });
 afterEach(() => { vi.unstubAllEnvs(); fs.rmSync(dir, { recursive: true, force: true }); });
-const msg = (id, title, t = 1_792_900_000, message = '') => ({ id, event: 'message', time: t, title, message });
-const cfg = (value) => { fs.mkdirSync(path.join(dir, '.config', 'ruvnet-brain'), { recursive: true }); fs.writeFileSync(path.join(dir, '.config', 'ruvnet-brain', 'ntfy-responder.json'), JSON.stringify(value)); };
+// Real alert senders page at high priority (4-5); info and recoveries go out at 3 or lower.
+const msg = (id, title, t = 1_792_900_000, message = '', priority = 5) => ({ id, event: 'message', time: t, title, message, priority });
+// A live check that agrees the job recovered (a recovery notice alone no longer closes an alert).
+const jobLive = (a) => (a.kind === 'job' ? 'job passed again' : false);
+const TOKEN = 'github_pat_FIXTUREfixture0123456789abcdef';
+const cfg = (value) => {
+  const d = path.join(dir, '.config', 'ruvnet-brain'); fs.mkdirSync(d, { recursive: true });
+  const tokenFile = path.join(d, 'responder-token'); fs.writeFileSync(tokenFile, TOKEN, { mode: 0o600 });
+  fs.writeFileSync(path.join(d, 'ntfy-responder.json'), JSON.stringify({ githubTokenFile: tokenFile, ...value }));
+};
 const fetcherOf = (...batches) => { let i = 0; return async () => { const b = batches[Math.min(i++, batches.length - 1)]; return { ok: true, status: 200, text: async () => b.map((m) => JSON.stringify(m)).join('\n') }; }; };
 const readOpen = () => JSON.parse(fs.readFileSync(path.join(dir, 'ntfy-open-alerts.json'), 'utf8'));
 const readState = () => JSON.parse(fs.readFileSync(path.join(dir, 'ntfy-inbox-state.json'), 'utf8'));
@@ -38,15 +46,54 @@ describe('classify', () => {
     expect(mod.classify(msg('g', '⭐ New star')).actionable).toBe(false);
   });
   it("maps the nightly watchdog's titles to job alerts and job recovery (scripts/nightly-watchdog.mjs push())", () => {
-    for (const state of ['FAILING', 'NEVER-RAN', 'STALE']) {
+    for (const state of ['FAILING', 'NEVER-RAN', 'STALE', 'MISSING', 'STALLED']) {
       expect(mod.classify(msg('w', `🔴 ${state}: com.ruvnet.issue-watch`))).toMatchObject({ kind: 'job', key: 'job:com.ruvnet.issue-watch', label: 'com.ruvnet.issue-watch', actionable: true });
     }
     expect(mod.classify(msg('h', '✅ com.ruvnet.issue-watch is healthy again'))).toMatchObject({ resolves: true, key: 'job:com.ruvnet.issue-watch' });
     // A watchdog failure and the heartbeat's own failure page are the same cause: one alert, closed by either recovery.
     let open = mod.fold([], [msg('1', '🔴 FAILING: com.x'), msg('2', '🔴 SCHEDULED JOB FAILED: com.x', 1_792_900_001)], { resolver: never });
     expect(open).toHaveLength(1);
-    open = mod.fold(open, [msg('3', '✅ com.x is healthy again', 1_792_900_002)], { resolver: never });
-    expect(open[0].closedBy).toBe('recovered notice');
+    open = mod.fold(open, [msg('3', '✅ com.x is healthy again', 1_792_900_002)], { resolver: jobLive });
+    expect(open[0].closedBy).toBe('recovered notice (confirmed)');
+  });
+});
+
+describe('round-2 review fixes', () => {
+  it('a forged recovery notice cannot close a real alert (the live check must agree)', () => {
+    let open = mod.fold([], [msg('1', '🔴 SCHEDULED JOB FAILED: com.x')], { resolver: never });
+    open = mod.fold(open, [msg('2', '✅ Recovered: com.x', 1_792_900_005)], { resolver: never });
+    expect(open[0].closedAt).toBeUndefined();
+  });
+  it('a STALE page stays open while the last pass is older than the page', () => {
+    const lastAt = new Date(1_792_900_000 * 1000).toISOString();
+    const old = { state: 'ok', ended_at: new Date(1_792_800_000 * 1000).toISOString() };
+    const fresh = { state: 'ok', ended_at: new Date(1_792_910_000 * 1000).toISOString() };
+    expect(mod.resolvedNow({ kind: 'job', label: 'com.x', lastAt }, { heartbeat: () => old })).toBe(false);
+    expect(mod.resolvedNow({ kind: 'job', label: 'com.x', lastAt }, { heartbeat: () => fresh })).toBe('job passed again');
+  });
+  it('a CI alert resolves against the branch it failed on, not always main', () => {
+    const a = mod.classify(msg('c', '🔴 CI failure: release-candidate-preflight', 1_792_900_000, 'branch release/4.7.20 — https://x'));
+    expect(a.branch).toBe('release/4.7.20');
+    const calls = [];
+    mod.resolvedNow({ ...a, lastAt: new Date(0).toISOString() }, { gh: (args) => { calls.push(args); return [{ status: 'completed', conclusion: 'success', createdAt: new Date().toISOString() }]; } });
+    expect(calls[0][calls[0].indexOf('--branch') + 1]).toBe('release/4.7.20');
+  });
+  it('successes and low-priority notices are information, never open alerts; unknown alerts expire', () => {
+    expect(mod.classify(msg('i1', '✅ RuvNet Brain recovered')).actionable).toBe(false);
+    expect(mod.classify(msg('i2', 'self-update applied', 1_792_900_000, '', 3)).actionable).toBe(false);
+    const now = Date.parse('2026-10-25T12:00:00Z');
+    const open = mod.fold([], [msg('o1', 'something odd', (now - 4 * 86_400_000) / 1000)], { resolver: never, now });
+    expect(open[0].closedBy).toMatch(/expired/);
+  });
+  it('the responder will not start without a repo-scoped token file (owner-only)', () => {
+    const d = path.join(dir, '.config', 'ruvnet-brain'); fs.mkdirSync(d, { recursive: true });
+    const f = path.join(d, 'tok'); fs.writeFileSync(f, TOKEN, { mode: 0o644 });
+    expect(mod.readScopedToken({ githubTokenFile: f })).toBeNull(); // readable by others
+    fs.chmodSync(f, 0o600);
+    expect(mod.readScopedToken({ githubTokenFile: f })).toBe(TOKEN);
+    fs.writeFileSync(f, 'gho_classicOAuthLogin'); fs.chmodSync(f, 0o600);
+    expect(mod.readScopedToken({ githubTokenFile: f })).toBeNull(); // only fine-grained PATs
+    expect(mod.responderEnv({ HOME: '/h' }, { githubTokenFile: path.join(d, 'missing') }).GH_TOKEN).toBeUndefined();
   });
 });
 
@@ -58,14 +105,14 @@ describe('fold', () => {
   });
   it('a "recovered" notice closes its job alert; a cleared cause closes on its own', () => {
     let open = mod.fold([], [msg('1', '🔴 SCHEDULED JOB FAILED: com.x'), msg('2', '🔴 CI failure: integration-linux')], { resolver: never });
-    open = mod.fold(open, [msg('3', '✅ Recovered: com.x')], { resolver: never });
-    expect(open.find((a) => a.key === 'job:com.x').closedBy).toBe('recovered notice');
+    open = mod.fold(open, [msg('3', '✅ Recovered: com.x')], { resolver: jobLive });
+    expect(open.find((a) => a.key === 'job:com.x').closedBy).toBe('recovered notice (confirmed)');
     open = mod.fold(open, [], { resolver: (a) => a.kind === 'ci' });
     expect(open.find((a) => a.kind === 'ci').closedBy).toBe('cause cleared');
   });
   it('a new failure after a closed alert opens a fresh one', () => {
     let open = mod.fold([], [msg('1', '🔴 SCHEDULED JOB FAILED: com.x')], { resolver: never });
-    open = mod.fold(open, [msg('2', '✅ Recovered: com.x')], { resolver: never });
+    open = mod.fold(open, [msg('2', '✅ Recovered: com.x')], { resolver: jobLive });
     open = mod.fold(open.filter((a) => !a.closedAt), [msg('3', '🔴 SCHEDULED JOB FAILED: com.x')], { resolver: never });
     expect(open.filter((a) => !a.closedAt)).toHaveLength(1);
     expect(open.find((a) => !a.closedAt)).toMatchObject({ id: '3' });
@@ -268,7 +315,8 @@ describe('responder bounds', () => {
     const env = mod.responderEnv({ ANTHROPIC_API_KEY: 'k1', CLAUDE_API_KEY: 'k2', ANTHROPIC_AUTH_TOKEN: 'k3', ANTHROPIC_BASE_URL: 'https://x', ANTHROPIC_MODEL: 'm',
       CLAUDE_CODE_USE_BEDROCK: '1', CLAUDE_CODE_USE_VERTEX: '1', CLAUDE_CODE_USE_FOUNDRY: '1', AWS_PROFILE: 'p', AWS_ACCESS_KEY_ID: 'a', OPENAI_API_KEY: 'o', GH_TOKEN: 'g',
       KEEP: 'x', HOME: '/h', USER: 'u', LANG: 'en_US.UTF-8', SSH_AUTH_SOCK: '/s', TERM: 'xterm', PATH: '/opt/homebrew/bin' });
-    expect(Object.keys(env).sort()).toEqual(['HOME', 'JOB_MAX_SECONDS', 'LANG', 'PATH', 'RUVNET_RESPONDER', 'SSH_AUTH_SOCK', 'TERM', 'USER']);
+    // The SSH agent never passes: the run pushes over https with its scoped token only (review round 2).
+    expect(Object.keys(env).sort()).toEqual(['HOME', 'JOB_MAX_SECONDS', 'LANG', 'PATH', 'RUVNET_RESPONDER', 'TERM', 'USER']);
     const parts = env.PATH.split(':');
     expect(parts[0]).toMatch(/job-bin$/);
     expect(parts.indexOf('/usr/bin')).toBeLessThan(parts.indexOf('/opt/homebrew/bin'));
