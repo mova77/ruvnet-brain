@@ -10,7 +10,7 @@
 // receipts and logs, and paging NOBODY, is exactly "too much loaded, and failures go unnoticed."
 //
 // Fix: ~/.cache/ruvnet-brain/ntfy-topic now holds the same topic already configured in .env
-// (NTFY_TOPIC=ruvnet-brain-stuart-e37a0e58) and confirmed live via a real ntfy.sh delivery during
+// (the NTFY_TOPIC value — a secret, never written in this public repo) and confirmed live via a real ntfy.sh delivery during
 // this fix (message id ivcb7EloTrlG, 2026-09-27T12:38:14Z).
 //
 // This test proves the WIRING, not the network: it stubs `curl` on PATH and points $HOME at a temp
@@ -147,6 +147,66 @@ describe('job-heartbeat.sh — a failing job must actually page, not just record
     run('com.test.quick', 0);
     expect(Date.now() - t0).toBeLessThan(5_000);
     expect(receipt('com.test.quick').timed_out_after_sec).toBeUndefined();
+  });
+
+  const runWith = (label, body, extraEnv = {}) => {
+    const f = path.join(workDir, `${label}.sh`);
+    fs.writeFileSync(f, `#!/bin/sh\n${body}\n`); fs.chmodSync(f, 0o755);
+    return spawnSync('/bin/sh', [WRAPPER, label, '--', f, 'line one\nline "two"'], {
+      encoding: 'utf8',
+      env: { PATH: `${path.join(workDir, 'bin')}:/usr/bin:/bin`, HOME: path.join(workDir, 'home'), JOB_HEARTBEAT_DIR: path.join(workDir, 'heartbeats'), NTFY_TOPIC: '', ...extraEnv },
+    });
+  };
+  const hb = (label) => JSON.parse(fs.readFileSync(path.join(workDir, 'heartbeats', `${label}.json`), 'utf8'));
+
+  it('a job that exits 0 when stopped for overrunning is still recorded as killed (review 2026-10-25)', () => {
+    makeHarness({ withTopic: false });
+    runWith('com.test.polite', "trap 'exit 0' TERM\nsleep 60 & wait", { JOB_MAX_SECONDS: '1' });
+    expect(hb('com.test.polite').state).toBe('killed');
+    expect(hb('com.test.polite').timed_out_after_sec).toBe(1);
+  }, 30_000);
+
+  it('a page that did not deliver is retried on the next failing run, then the streak goes quiet', () => {
+    const { run, receipt } = makeHarness({ withTopic: true });
+    const curl = path.join(workDir, 'bin', 'curl');
+    const log = path.join(workDir, 'curl-calls.log');
+    fs.writeFileSync(curl, `#!/bin/sh\necho "$@" >> "${log}"\nexit 22\n`); // ntfy down: HTTP error
+    run('com.test.undelivered', 1);
+    expect(receipt('com.test.undelivered').paged).toBe(false);
+    fs.writeFileSync(curl, `#!/bin/sh\necho "$@" >> "${log}"\nexit 0\n`);
+    run('com.test.undelivered', 1);
+    expect(receipt('com.test.undelivered').paged).toBe(true);
+    run('com.test.undelivered', 1);
+    expect(fs.readFileSync(log, 'utf8').trim().split('\n')).toHaveLength(2); // retried once, then quiet
+  });
+
+  it('an overrun stops the whole tree, including a grandchild that ignores TERM', () => {
+    makeHarness({ withTopic: false });
+    const marker = path.join(workDir, 'grandchild.pid');
+    runWith('com.test.tree', `sh -c 'trap "" TERM; echo $$ > ${marker}; sleep 120' &\nwait`, { JOB_MAX_SECONDS: '1' });
+    const gpid = Number(fs.readFileSync(marker, 'utf8'));
+    let alive = true; try { process.kill(gpid, 0); } catch { alive = false; }
+    expect(alive).toBe(false);
+    expect(hb('com.test.tree').state).toBe('killed');
+  }, 40_000);
+
+  it('the run-time timer never outlives the wrapper', () => {
+    makeHarness({ withTopic: false });
+    runWith('com.test.short', 'exit 0', { JOB_MAX_SECONDS: '7321' });
+    const left = spawnSync('/usr/bin/pgrep', ['-f', 'sleep 7321'], { encoding: 'utf8' }).stdout.trim();
+    expect(left).toBe('');
+  });
+
+  it('the running receipt stays valid JSON when the command has quotes and newlines', () => {
+    makeHarness({ withTopic: false });
+    const label = 'com.test.json';
+    const f = path.join(workDir, 'peek.sh');
+    // While running, copy the receipt aside so the test can parse the "running" record itself.
+    fs.writeFileSync(f, `#!/bin/sh\ncp "${path.join(workDir, 'heartbeats', label + '.json')}" "${path.join(workDir, 'running.json')}"\n`); fs.chmodSync(f, 0o755);
+    spawnSync('/bin/sh', [WRAPPER, label, '--', f, 'a\n"b"\\c'], { encoding: 'utf8', env: { PATH: '/usr/bin:/bin', HOME: path.join(workDir, 'home'), JOB_HEARTBEAT_DIR: path.join(workDir, 'heartbeats'), NTFY_TOPIC: '' } });
+    const running = JSON.parse(fs.readFileSync(path.join(workDir, 'running.json'), 'utf8'));
+    expect(running.state).toBe('running');
+    expect(running.command).not.toMatch(/"b"/);
   });
 
   it('REGRESSION GUARD: with NO topic configured (the pre-fix state on this machine), a failing '

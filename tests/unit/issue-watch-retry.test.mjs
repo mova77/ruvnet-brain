@@ -24,51 +24,33 @@ afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); fs.rmSync(dir, { re
 const read = () => JSON.parse(fs.readFileSync(file, 'utf8'))['38'];
 const ackCalls = () => vi.mocked(spawnSync).mock.calls.filter(c => c[1][1] === 'comment');
 describe('watcher channel delivery is independent across consecutive runs', () => {
-  it('retries a failed page after successful acknowledgment without duplicating the comment', async () => {
-    fetcher.mockResolvedValueOnce({ ok: false });
+  // Since 2026-10-25 the arrival page belongs to .github/workflows/ntfy-alerts.yml (it fired twice before); the
+  // watcher still posts the one public acknowledgment, retried independently until delivered.
+  it('the watcher sends no arrival page and acknowledges once', async () => {
     await run({ now: NOW }); const first = read();
+    expect(fetcher).not.toHaveBeenCalled();
     expect(first.ackAt).toBeTruthy(); expect(first.newAlertAt).toBeUndefined();
-    fs.writeFileSync(file, JSON.stringify({ 38: { ...first, preserved: 'owner-field' } }));
-    await run({ now: NOW + 60000 }); const next = read();
-    expect(fetcher).toHaveBeenCalledTimes(2); expect(ackCalls()).toHaveLength(1);
-    expect(next.newAlertAt).toBe(new Date(NOW + 60000).toISOString());
-    expect(next.ackAt).toBe(first.ackAt); expect(next.firstSeenAt).toBe(first.firstSeenAt);
-    expect(next.preserved).toBe('owner-field');
-    expect(ackCalls()[0][1].at(-1)).not.toMatch(/has been paged/);
+    await run({ now: NOW + 60000 }); expect(read()).toEqual(first);
+    expect(ackCalls()).toHaveLength(1);
   });
-  it('acknowledgment never asserts page delivery when the notification request fails', async () => {
-    fetcher.mockRejectedValueOnce(new Error('fixture network unavailable'));
+  it('the acknowledgment never claims anyone was paged', async () => {
     await run({ now: NOW });
     const body = ackCalls()[0][1].at(-1);
     expect(body).toMatch(/^🤖 Automated acknowledgment/);
     expect(body).not.toMatch(/has been paged/);
-    expect(read().newAlertAt).toBeUndefined();
   });
-  it('retries a failed acknowledgment without repeating a delivered page', async () => {
-    ackStatus = 1; await run({ now: NOW }); const first = read();
-    expect(first.newAlertAt).toBeTruthy(); expect(first.ackAt).toBeUndefined();
-    ackStatus = 0; const nextRun = await run({ now: NOW + 60000 });
-    expect(fetcher).toHaveBeenCalledTimes(1); expect(ackCalls()).toHaveLength(2);
-    expect(read().newAlertAt).toBe(first.newAlertAt); expect(read().ackAt).toBeTruthy();
-    expect(nextRun.alertsSent[0]).toMatchObject({ sent: true, acked: true, pageAttempted: false });
-  });
-  it('fresh sighting sends both once and fully delivered state never duplicates either', async () => {
-    await run({ now: NOW }); const first = read();
-    expect(first.ackAt).toBeTruthy(); expect(first.newAlertAt).toBeTruthy();
-    await run({ now: NOW + 60000 }); expect(read()).toEqual(first);
-    expect(fetcher).toHaveBeenCalledTimes(1); expect(ackCalls()).toHaveLength(1);
-  });
-  it('missing notification configuration retains pending page independently of acknowledgment', async () => {
-    vi.stubEnv('NTFY_TOPIC', ''); await run({ now: NOW });
-    expect(read().newAlertAt).toBeUndefined(); expect(read().ackAt).toBeTruthy();
+  it('a failed acknowledgment is retried next run, keeping fields it already has', async () => {
+    ackStatus = 1; await run({ now: NOW });
+    expect(read()?.ackAt).toBeUndefined();
+    fs.writeFileSync(file, JSON.stringify({ 38: { ...read(), preserved: 'owner-field' } }));
+    ackStatus = 0; await run({ now: NOW + 60000 });
+    expect(ackCalls()).toHaveLength(2); expect(read().ackAt).toBeTruthy(); expect(read().preserved).toBe('owner-field');
     expect(fetcher).not.toHaveBeenCalled();
-    vi.stubEnv('NTFY_TOPIC', 'owned-fixture'); await run({ now: NOW + 60000 });
-    expect(fetcher).toHaveBeenCalledTimes(1); expect(ackCalls()).toHaveLength(1);
   });
-  it('dry-run never delivers or writes state and does not consume either obligation', async () => {
+  it('dry-run never delivers or writes state and does not consume the acknowledgment', async () => {
     await run({ now: NOW, dryRun: true });
     expect(fs.existsSync(file)).toBe(false); expect(fetcher).not.toHaveBeenCalled(); expect(ackCalls()).toHaveLength(0);
-    await run({ now: NOW }); expect(read().newAlertAt).toBeTruthy(); expect(read().ackAt).toBeTruthy();
+    await run({ now: NOW }); expect(read().ackAt).toBeTruthy();
   });
   it('SLA escalation still excludes bot acknowledgment and preserves delivery fields', async () => {
     const first = { firstSeenAt: new Date(NOW - 600000).toISOString(), newAlertAt: new Date(NOW - 600000).toISOString(), ackAt: new Date(NOW - 600000).toISOString(), untouched: 1 };

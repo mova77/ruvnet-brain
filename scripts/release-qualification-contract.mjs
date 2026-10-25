@@ -26,6 +26,15 @@ export const RELEASE_REQUIREMENTS = Object.freeze({
       "files": ["tests/unit/forge-currency-selected-root.test.mjs", "tests/unit/brain-score-producer.test.mjs", "tests/unit/brain-grade-groundtruth-timestamp.test.mjs", "tests/unit/record-lesson.test.mjs", "tests/unit/lesson-presentation-budget.test.mjs", "tests/unit/metrics-truth.test.mjs", "tests/unit/issue-watch-retry.test.mjs"]
     },
     {
+      "id": "owner-alerting-volume-and-trust",
+      "reason": "Alerts page on change, not repeat; an undelivered page is retried; overrunning jobs and their whole process tree stop; people's issues page once at SLA with one daily summary; the ntfy inbox never turns message text into instructions",
+      "files": ["tests/unit/issue-watch-paging.test.mjs", "tests/unit/ntfy-inbox.test.mjs"],
+      "platformFiles": {
+        "linux": ["tests/unit/job-heartbeat-alerting.test.mjs"],
+        "macos": ["tests/unit/job-heartbeat-alerting.test.mjs"]
+      }
+    },
+    {
       "id": "automatic-update-source-and-transport",
       "reason": "Captured owner policy never falls back on read failures; installed-only automation avoids npx; transient GET and body failures retry without weakening trust; POSIX executable aliases retain interpreter identity",
       "files": ["tests/unit/automatic-update.test.mjs", "tests/unit/download-retry.test.mjs"],

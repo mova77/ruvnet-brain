@@ -73,9 +73,11 @@ jobs:
           #    nobody is waiting on them;
           #  - a run that was cancelled, skipped, or is waiting for approval: superseded or not a failure;
           #  - a red run on a working branch (dream/*, fix/*, PR checks): the work in progress reports there.
-          # Paged: a person's new issue or PR, and a red run on main or a scheduled job.
+          # Paged: a person's new issue or PR, and a red run on main, a release/* branch (a release in flight,
+          # possibly cut by the unattended responder) or a scheduled job.
           AUTHOR="${ISSUE_USER:-$PR_USER}"
-          case "$AUTHOR" in stuinfla|dependabot\[bot\]|github-actions\[bot\]) [ "$EVENT" != "workflow_run" ] && exit 0 ;; esac
+          # Every bot account (login ends in [bot] or is an app/ login), not just two named ones.
+          case "$AUTHOR" in stuinfla|*\[bot\]|app/*) [ "$EVENT" != "workflow_run" ] && exit 0 ;; esac
           case "$EVENT" in
             issues)
               TITLE="🐛 New issue #${ISSUE_NUM}"
@@ -91,7 +93,7 @@ jobs:
               PRIO="default"; TAGS="star" ;;
             workflow_run)
               case "$WR_CONC" in success|cancelled|skipped|neutral|action_required|stale) exit 0 ;; esac
-              [ "$WR_BRANCH" != "main" ] && [ "$WR_EVENT" != "schedule" ] && exit 0
+              case "$WR_BRANCH" in main|release/*) ;; *) [ "$WR_EVENT" != "schedule" ] && exit 0 ;; esac
               TITLE="🔴 CI ${WR_CONC}: ${WR_NAME}"
               BODY="branch ${WR_BRANCH} — ${WR_URL}"
               PRIO="urgent"; TAGS="rotating_light" ;;

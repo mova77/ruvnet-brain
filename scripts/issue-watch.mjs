@@ -172,7 +172,9 @@ export async function run({ dryRun = false, now = Date.now(), repo = REPO } = {}
     const firstSighting = !state[key];
     // Acknowledgment delivery is not page delivery. Retry each missing channel independently. Neither applies to an
     // issue the owner's automation opened.
-    const needsNewPage = person && !state[key]?.newAlertAt;
+    // Arrival is paged once, instantly, by .github/workflows/ntfy-alerts.yml (the `issues: opened` event). Paging it
+    // here too sent every new issue twice (review 2026-10-25), so this watcher owns only the SLA page and the digest.
+    const needsNewPage = false;
     const needsAck = person && !state[key]?.ackAt;
 
     results.push({ number: issue.number, title: issue.title, ageHours, ownerComment, breach, dueForAlert, firstSighting, url, person });

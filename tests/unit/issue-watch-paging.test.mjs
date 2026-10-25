@@ -38,12 +38,12 @@ describe('issue watcher paging frequency', () => {
   it('a full day of hourly runs: a few clear pages, not dozens', async () => {
     for (let h = 0; h < 24; h += 1) await run({ now: START + h * HOUR });
     const titles = pages();
-    // #301: one "new issue" page and one SLA page, then silence. Owner/bot issues: nothing at all.
-    expect(titles.filter((t) => /#301/.test(t))).toHaveLength(2);
+    // #301: one SLA page, then silence (arrival is paged by the GitHub workflow). Owner/bot issues: nothing.
+    expect(titles.filter((t) => /#301/.test(t))).toHaveLength(1);
     expect(titles.some((t) => /#494|#478/.test(t))).toBe(false);
     // One morning summary (9 a.m. ET = 13:00 UTC), naming the person still waiting.
     expect(titles.filter((t) => /^Waiting on a reply/.test(t))).toHaveLength(1);
-    expect(titles.length).toBe(3);
+    expect(titles.length).toBe(2);
     // The bot never posts an acknowledgment on the owner's own issues.
     const commented = vi.mocked(spawnSync).mock.calls.filter((c) => c[1][1] === 'comment').map((c) => c[1][2]);
     expect(commented).toEqual(['301']);

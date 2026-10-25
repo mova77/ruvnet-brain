@@ -115,6 +115,7 @@ export async function runSessionStart({
       || s.startsWith(KNOWLEDGE_LINE_PREFIX)
       || s.startsWith(FOOTPRINT_LINE_PREFIX)
       || s.startsWith('[RuvNet Brain — OPEN ISSUES')
+      || s.startsWith('[RuvNet Brain — NTFY:')
       || s.startsWith('[RuvNet Brain — TURN CAPTURE]')
       || /\bopen issue\(s\)/i.test(s)
       || /^\[RuvNet Brain — external signal/i.test(s)

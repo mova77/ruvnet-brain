@@ -81,7 +81,7 @@ PREV_HB=""
 
 # Start receipt. If the job vanishes without ever writing an end receipt, THIS is the evidence that
 # it started and never finished — a state the watchdog reports as FAILING, not as silence.
-write_receipt "{\"label\":\"$LABEL\",\"started_at\":\"$STARTED\",\"state\":\"running\",\"pid\":$$,\"run_id\":\"$RUN_ID\",\"command\":\"$(echo "$@" | sed 's/"/\\"/g')\"}"
+write_receipt "{\"label\":\"$LABEL\",\"started_at\":\"$STARTED\",\"state\":\"running\",\"pid\":$$,\"run_id\":\"$RUN_ID\",\"command\":\"$(printf '%s %s' "$1" "${2:-}" | tr -d '"\\\n\r' | cut -c1-200)\"}"
 
 notify() { # notify <title> <body> <priority>
   # NTFY_TOPIC set-but-EMPTY is an explicit opt-out (2026-07-18): unit tests wrap this script around
@@ -92,8 +92,10 @@ notify() { # notify <title> <body> <priority>
   if [ "${NTFY_TOPIC+set}" = "set" ] && [ -z "$NTFY_TOPIC" ]; then return 0; fi
   topic="${NTFY_TOPIC:-}"
   [ -z "$topic" ] && [ -f "$HOME/.cache/ruvnet-brain/ntfy-topic" ] && topic="$(cat "$HOME/.cache/ruvnet-brain/ntfy-topic")"
-  [ -z "$topic" ] && return 0
-  curl -sS -m 10 -H "Title: $1" -H "Priority: $3" -H "Tags: rotating_light" -d "$2" "https://ntfy.sh/$topic" >/dev/null 2>&1 || true
+  [ -z "$topic" ] && return 1
+  # --fail: an HTTP error is a failed delivery. The caller records whether the page landed, so a page that
+  # never arrived is retried on the next run instead of muting the whole failing streak (review 2026-10-25).
+  curl -sS --fail -m 10 -H "Title: $1" -H "Priority: $3" -H "Tags: ${4:-rotating_light}" -d "$2" "https://ntfy.sh/$topic" >/dev/null 2>&1
 }
 
 # The run_id currently on disk for this label, or empty if the receipt is missing/unreadable/has
@@ -104,6 +106,14 @@ current_run_id() {
 
 finish() {
   code=${FORCED_CODE:-$?}
+  # Stop the run-time timer FIRST, on every exit path (skip, stale writer, normal), so it can never outlive
+  # this wrapper (Opus review 2026-10-25).
+  [ -n "${TIMER:-}" ] && kill "$TIMER" 2>/dev/null
+  timed_out=0
+  if [ -f "$HB.timeout-$RUN_ID" ]; then
+    # Finish the KILL phase on the recorded tree: the child may have exited on TERM while descendants linger.
+    timed_out=1; sleep 1; kill -KILL $(cat "$HB.timeout-$RUN_ID") 2>/dev/null; rm -f "$HB.timeout-$RUN_ID"
+  fi
   ended="$(ts)"
   dur=$(( $(date +%s) - START_EPOCH ))
   # Exit 75 = SKIP (lock held by a live run). Restore the pre-fire receipt so the live run's evidence
@@ -127,8 +137,8 @@ finish() {
   # Derive ok / failed / killed from the CHILD'S OWN wait status, never from anything the child said
   # about itself. POSIX: a process terminated by signal N is reported by `wait`/`$?` as 128+N — the
   # same convention this wrapper's own TERM/INT traps below use when THEY are what killed the child.
-  [ -n "${TIMER:-}" ] && kill "$TIMER" 2>/dev/null
-  timed_out=0; [ -f "$HB.timeout-$RUN_ID" ] && { timed_out=1; rm -f "$HB.timeout-$RUN_ID"; }
+  # A job that was stopped for running too long is "killed" however it chose to exit on TERM.
+  [ "$timed_out" -eq 1 ] && [ "$code" -le 128 ] && code=143
   if [ "$code" -eq 0 ]; then
     state="ok"; extra=""
   elif [ "$code" -gt 128 ]; then
@@ -145,17 +155,23 @@ finish() {
   prev_state="$(printf '%s' "$PREV_HB" | sed -n 's/.*"state":"\([^"]*\)".*/\1/p' | head -1)"
   prev_since="$(printf '%s' "$PREV_HB" | sed -n 's/.*"failing_since":"\([^"]*\)".*/\1/p' | head -1)"
   was_failing=0; case "$prev_state" in failed|killed) was_failing=1 ;; esac
+  # A failing streak counts as already paged only if that page was delivered ("paged":false = retry it).
+  prev_unpaged=0; case "$PREV_HB" in *'"paged":false'*) prev_unpaged=1 ;; esac
   since=""
   if [ "$code" -ne 0 ]; then
     if [ "$was_failing" -eq 1 ] && [ -n "$prev_since" ]; then since="$prev_since"; else since="$STARTED"; fi
     extra="$extra,\"failing_since\":\"$since\""
   fi
-  write_receipt "{\"label\":\"$LABEL\",\"started_at\":\"$STARTED\",\"ended_at\":\"$ended\",\"state\":\"$state\",\"exit_code\":$code,\"duration_sec\":$dur,\"run_id\":\"$RUN_ID\"$extra}"
-  if [ "$code" -ne 0 ] && [ "$was_failing" -eq 0 ]; then
-    notify "🔴 SCHEDULED JOB FAILED: $LABEL" "exit $code after ${dur}s — see the job's log. Receipt: $HB. Further failures stay quiet until it recovers." "urgent"
-  elif [ "$code" -eq 0 ] && [ "$was_failing" -eq 1 ]; then
-    notify "✅ Recovered: $LABEL" "passed again after failing since ${prev_since:-an earlier run}" "low"
+  if [ "$code" -ne 0 ] && { [ "$was_failing" -eq 0 ] || [ "$prev_unpaged" -eq 1 ]; }; then
+    reason="exit $code after ${dur}s"; [ "$timed_out" -eq 1 ] && reason="stopped after running past its ${MAX_SECONDS}s limit"
+    if notify "🔴 SCHEDULED JOB FAILED: $LABEL" "$reason — see the job's log. Receipt: $HB. Further failures stay quiet until it recovers." "urgent"; then
+      extra="$extra,\"paged\":true"; else extra="$extra,\"paged\":false"; fi
+  elif [ "$code" -ne 0 ]; then
+    extra="$extra,\"paged\":true"
+  elif [ "$was_failing" -eq 1 ]; then
+    notify "✅ Recovered: $LABEL" "passed again after failing since ${prev_since:-an earlier run}" "low" "white_check_mark" || true
   fi
+  write_receipt "{\"label\":\"$LABEL\",\"started_at\":\"$STARTED\",\"ended_at\":\"$ended\",\"state\":\"$state\",\"exit_code\":$code,\"duration_sec\":$dur,\"run_id\":\"$RUN_ID\"$extra}"
   exit "$code"
 }
 trap finish EXIT
@@ -163,8 +179,8 @@ trap finish EXIT
 # The exit codes (143 = 128+15 TERM, 130 = 128+2 INT) intentionally reuse the same 128+signal
 # convention `wait` uses for a directly-signalled child, so finish() classifies BOTH as "killed"
 # with the right signal number, whether the signal reached the child directly or via this wrapper.
-trap 'FORCED_CODE=143; kill -TERM "$CHILD" 2>/dev/null; exit 143' TERM
-trap 'FORCED_CODE=130; kill -TERM "$CHILD" 2>/dev/null; exit 130' INT
+trap 'FORCED_CODE=143; [ -n "${TIMER:-}" ] && kill "$TIMER" 2>/dev/null; kill -TERM "$CHILD" 2>/dev/null; exit 143' TERM
+trap 'FORCED_CODE=130; [ -n "${TIMER:-}" ] && kill "$TIMER" 2>/dev/null; kill -TERM "$CHILD" 2>/dev/null; exit 130' INT
 
 # Run the job in the BACKGROUND and `wait` for it — do NOT run it in the foreground.
 # Break-test finding (2026-07-13): a POSIX shell blocked on a FOREGROUND child does not run its trap
@@ -178,16 +194,25 @@ CHILD=$!
 # RUN-TIME LIMIT (2026-10-25: five jobs finished their work and then never exited, each holding its own
 # next run off for 7-9 hours). After JOB_MAX_SECONDS (default 2 h; a plist may set less) the job is
 # stopped: TERM, then KILL 10 s later. It is recorded as killed and pages once like any other failure.
+descendants() { # every live descendant PID of $1 (portable: ps + awk)
+  for k in $(ps -A -o pid= -o ppid= 2>/dev/null | awk -v p="$1" '$2==p {print $1}'); do printf '%s ' "$k"; descendants "$k"; done
+}
 MAX_SECONDS="${JOB_MAX_SECONDS:-7200}"
+WRAPPER_PID=$$
 case "$MAX_SECONDS" in ''|*[!0-9]*) MAX_SECONDS=7200 ;; esac
 (
   sleep "$MAX_SECONDS" & SLEEPER=$!
   trap 'kill "$SLEEPER" 2>/dev/null; exit 0' TERM
   wait "$SLEEPER"
-  : > "$HB.timeout-$RUN_ID"
-  # The job's own children go too, or one of them keeps the job's log pipe (and its work) alive.
-  pkill -TERM -P "$CHILD" 2>/dev/null; kill -TERM "$CHILD" 2>/dev/null; sleep 10
-  pkill -KILL -P "$CHILD" 2>/dev/null; kill -KILL "$CHILD" 2>/dev/null
+  # Only ever signal OUR child: still alive and still parented by this wrapper. If the wrapper died (the child
+  # is reparented) or the PID was reused, do nothing.
+  [ "$(ps -o ppid= -p "$CHILD" 2>/dev/null | tr -d ' ')" = "$WRAPPER_PID" ] || exit 0
+  # The whole descendant tree goes, or a grandchild keeps the job's log pipe (and its work) alive. The tree
+  # is recorded in the marker so finish() can complete the KILL phase even if the child exits on TERM.
+  tree="$(descendants "$CHILD") $CHILD"
+  printf '%s\n' $tree > "$HB.timeout-$RUN_ID"
+  kill -TERM $tree 2>/dev/null; sleep 10
+  kill -KILL $tree $(descendants "$CHILD") 2>/dev/null
 ) &
 TIMER=$!
 wait "$CHILD"

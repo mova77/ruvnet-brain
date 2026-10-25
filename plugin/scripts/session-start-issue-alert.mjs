@@ -90,10 +90,13 @@ export function surfaceNtfyAlerts({ stateDir, emit, env, home, platform, cwd, no
     if (!maintainerIssueEntitlement(env, home, 'stuinfla/ruvnet-brain', platform) || !isMaintainerRepo(cwd)) return;
     const open = (json(file, []) || []).filter((a) => a && !a.closedAt);
     if (!open.length) return;
-    const newest = open.sort((a, b) => Date.parse(b.lastAt) - Date.parse(a.lastAt)).slice(0, 3)
-      .map((a) => String(a.title || a.key).replace(/[\u0000-\u001f]/g, ' ').slice(0, 70));
+    // Counts by kind only, never message text: anyone who learns the topic can post to it, so a title here would be
+    // a way to put words into the session (review 2026-10-25). The owner's tool prints the details.
+    const kinds = {};
+    for (const a of open) { const k = ['job', 'ci', 'issue', 'pr'].includes(a.kind) ? a.kind : 'other'; kinds[k] = (kinds[k] || 0) + 1; }
+    const summary = Object.entries(kinds).map(([k, n]) => `${n} ${k}`).join(', ');
     const polled = json(path.join(stateDir, 'ntfy-inbox-state.json'), {})?.polledAt;
     const age = polled ? `, read ${((now - Date.parse(polled)) / 3_600_000).toFixed(1)}h ago` : '';
-    emit(`[RuvNet Brain — NTFY: ${open.length} alert(s) need action${age}: ${newest.join(' | ')}. Handle these before other work: node scripts/ntfy-inbox.mjs --open; close each with --ack <id> --note "<what was done>"]`);
+    emit(`[RuvNet Brain — NTFY: ${open.length} open alert(s) (${summary})${age}. Details: node scripts/ntfy-inbox.mjs --open]`);
   } catch { /* advisory only */ }
 }
