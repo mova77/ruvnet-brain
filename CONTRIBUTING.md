@@ -329,8 +329,14 @@ artifact only together with its classification there, or `--doctor` will report 
 
 - **Removal is proof-gated.** A KB copy is deleted only when `plugin/scripts/kb-copy-proof.mjs` shows nothing
   in it is unique: every private-store file (fence of live AND copy, plus `updateManaged:false`) byte-identical
-  in live; every other file a public release file or installer-written. Anything else keeps the copy and is
-  named. Links are never followed; trees of an in-progress storage transaction, a foreign refresh lock, an
+  in live; every other file a public release file or installer-written. A file byte-identical at the same path
+  in a copy that stays (one kept earlier in the same sweep, or a `kb.archive/` tree) is accounted for too, so
+  duplicate preserved copies release down to one (#335). Anything else keeps the copy and is
+  named. `npx ruvnet-brain --clean --archive` (explicit, never automatic) copies exactly those named files into
+  `kb.archive/<stamp>/<copy>/`, verifies each byte-for-byte, writes `<copy>.json` beside it, and only then
+  releases the copy; a link, unsafe path or unreadable metadata still keeps it. `kb.archive/` is never removed
+  automatically, counts toward the footprint budget, and the updater's `reclaimBackups` treats a copy whose
+  every byte survives in live or in an archive as accounted for. Links are never followed; trees of an in-progress storage transaction, a foreign refresh lock, an
   install that is activating (`.kb.install-activation.lock` with a live pid), and live leases are kept; plugin generations go only through `prunePluginGenerations` (lease-aware).
 - **Enforced automatically**: after install/forced reinstall (the installer releases its own preserved
   generation once the new one validates), before and after every `--update` (incl. the SessionStart

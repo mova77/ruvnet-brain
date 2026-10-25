@@ -14,7 +14,10 @@
 //     listed with these exact bytes in the copy's own ARCHIVE-MANIFEST.json, or a public store family (named by either COVERAGE.json
 //     or the live SOURCE.json) that a newer release replaced or retired;
 //   * installer-written or reinstallable (node_modules/, the updater/validator files the installer places);
-//   * a symbolic link identical in the live brain (links are compared, never followed).
+//   * a symbolic link identical in the live brain (links are compared, never followed);
+//   * (#335) a regular file byte-identical at the same path in a KEPT sibling: another copy the caller has
+//     already decided to retain, or a `kb.archive/<stamp>/<copy>/` tree. The caller passes only copies that
+//     stay on disk, so duplicate preserved copies release down to one and no unique byte is lost.
 // Anything else — a user's own file, an unfenced store, a link the live brain lacks — KEEPS the copy, and
 // is named. Paths are checked for symlink ancestors within both KB roots before any exemption; host
 // aliases above those roots (such as macOS /tmp) are not traversed as part of this check. Invalid metadata,
@@ -143,7 +146,7 @@ function metadataFailure(root) {
  * @returns {{disposable: boolean, unique: {file: string, why: string}[], reason: string}} — a kept copy
  * always names the files that keep it.
  */
-export function kbCopyProof({ copyDir, liveDir }) {
+export function kbCopyProof({ copyDir, liveDir, keptSiblings = [] }) {
   const copy = lstat(copyDir);
   if (!copy || copy.isSymbolicLink() || !copy.isDirectory()) return { disposable: false, unique: [], reason: 'not a real directory (a link is never entered)' };
   const live = lstat(liveDir);
@@ -172,6 +175,18 @@ export function kbCopyProof({ copyDir, liveDir }) {
   // it lists with these exact bytes is a public, re-downloadable release file.
   const shipped = new Map((readJson(path.join(copyDir, 'ARCHIVE-MANIFEST.json'))?.files || [])
     .filter((f) => typeof f?.path === 'string').map((f) => [path.normalize(f.path), f]));
+  // #335: retained siblings that may account for a file. Only real directories, never the copy or live itself.
+  const siblings = (Array.isArray(keptSiblings) ? keptSiblings : []).filter((dir) => {
+    const st = lstat(dir);
+    return st && st.isDirectory() && !st.isSymbolicLink() && path.resolve(dir) !== path.resolve(copyDir)
+      && path.resolve(dir) !== path.resolve(liveDir);
+  });
+  let bySibling = 0;
+  const inKeptSibling = (relative) => {
+    const hit = siblings.some((dir) => safeAncestors(dir, relative) && sameBytes(path.join(copyDir, relative), path.join(dir, relative)));
+    if (hit) bySibling += 1;
+    return hit;
+  };
   const unique = [];
   let files;
   try { files = walk(copyDir); } catch (error) { return { disposable: false, unique, reason: `unreadable copy: ${error.message}` }; }
@@ -183,7 +198,7 @@ export function kbCopyProof({ copyDir, liveDir }) {
       continue;
     }
     if (isPrivate) {
-      if (!sameBytes(path.join(copyDir, relative), inLive)) {
+      if (!sameBytes(path.join(copyDir, relative), inLive) && !inKeptSibling(relative)) {
         unique.push({ file: relative, why: lstat(inLive) ? 'private file differs from the live brain' : 'private file absent from the live brain' });
       }
       continue;
@@ -202,9 +217,12 @@ export function kbCopyProof({ copyDir, liveDir }) {
     if (listed && listed.bytes === size && listed.sha256 === sha256File(path.join(copyDir, relative))) continue;
     if (sameBytes(path.join(copyDir, relative), inLive)) continue; // existence alone proves no ownership or redundancy
     if (publicNames.has(storeStem(relative))) continue; // a public store family a newer release replaced or retired
+    if (inKeptSibling(relative)) continue; // #335: these exact bytes stay in a retained sibling copy or the archive
     unique.push({ file: relative, why: 'not in the live brain, not in this copy\'s release manifest, not a public store' });
   }
   return unique.length
     ? { disposable: false, unique, reason: `holds ${unique.length} file(s) the live brain does not: ${unique.slice(0, 4).map((u) => u.file).join(', ')}${unique.length > 4 ? ', …' : ''}` }
-    : { disposable: true, unique, reason: 'every private file is byte-identical in the live brain; public bytes are re-downloadable' };
+    : { disposable: true, unique, reason: bySibling
+      ? `${bySibling} file(s) the live brain lacks are byte-identical in a kept copy or kb.archive; the rest is in the live brain or re-downloadable`
+      : 'every private file is byte-identical in the live brain; public bytes are re-downloadable' };
 }

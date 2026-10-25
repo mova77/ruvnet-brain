@@ -829,7 +829,7 @@ describe('SessionStart footprint line', () => {
   });
   // Review S7: a copy kept because it holds private files the live brain lacks cannot be fixed by --clean.
   // Say the honest reason, never re-hash it every 6h, and never dispatch a sweep that can only keep it again.
-  it('a private-unique copy: proven once, cached, honest fix (not --clean), no background sweep, shown once', () => {
+  it('a private-unique copy: proven once, cached, honest fix (--clean --archive, never bare --clean), no background sweep, shown once', () => {
     const m = machine(); live(m);
     const kept = kbTree(path.join(m.brainHome, 'kb.bak-2026-09-02T00-00-00-000Z'), { publicStores: { alpha: 'a0' }, privateStores: { secret: 'OLDER-secret' } });
     const calls = [];
@@ -842,11 +842,14 @@ describe('SessionStart footprint line', () => {
     const it_ = item(fp, kept);
     expect(it_).toMatchObject({ action: 'report', class: 'must-not-exist' });
     expect(it_.fix).toMatch(/holds private data the live brain lacks.*secret\.big\.rvf/);
-    expect(it_.fix).not.toMatch(/--clean/);
+    // #335: bare --clean can only keep it again; the fix names the explicit archive path that releases it.
+    const bareClean = /--clean(?! --archive)/;
+    expect(it_.fix).toMatch(/^npx ruvnet-brain --clean --archive/);
+    expect(it_.fix).not.toMatch(bareClean);
     const r = confirm({ footprint: fp, env: m.env, home: m.home, now: Date.now(), readiness: [] });
-    expect(r.lines.find((l) => l.id === 'knowledge').fix).not.toMatch(/--clean/);
-    expect(r.lines.find((l) => l.id === 'cruft').fix).not.toMatch(/--clean/);
-    expect(footprintAlarm(r)).not.toMatch(/--clean/);
+    expect(r.lines.find((l) => l.id === 'knowledge').fix).not.toMatch(bareClean);
+    expect(r.lines.find((l) => l.id === 'cruft').fix).not.toMatch(bareClean);
+    expect(footprintAlarm(r)).not.toMatch(bareClean);
     expect(footprintAlarm(r)).toMatch(/private data the live brain lacks/);
     // SessionStart: no background sweep for it, and the line is shown once, not every session.
     const lines = []; const dispatched = [];
@@ -898,7 +901,7 @@ async function mutant(replacements) {
 
 describe('BREAK IT: every guard is proven by a mutant that goes red', () => {
   it('private byte-identity guard removed -> a private-unique copy is deleted', async () => {
-    const mod = await mutant([['kb-copy-proof.mjs', 'if (!sameBytes(path.join(copyDir, relative), inLive)) {', 'if (false) {']]);
+    const mod = await mutant([['kb-copy-proof.mjs', 'if (!sameBytes(path.join(copyDir, relative), inLive) && !inKeptSibling(relative)) {', 'if (false) {']]);
     const m = machine(); live(m);
     const copy = kbTree(path.join(m.brainHome, 'kb.bak-2026-09-01T00-00-00-000Z'), { publicStores: { alpha: 'a0' }, privateStores: { secret: 'OLD' } });
     mod.sweepFootprint(opts(m, { apply: true }));

@@ -26,7 +26,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isKbTree, kbCopyProof } from './kb-copy-proof.mjs';
 import { brainLocation } from './brain-location.mjs';
 import { RUFLO_CWD_ARTIFACTS } from './ruflo-bin.mjs';
-import { assessMoveLeftovers, cachedKept, cmpVersion, isVolumeMetadata, keptCopyFix, physical, pidAlive, readProofCache, rememberKept, removeWithin, rotate,
+import { archiveRoots, archiveUniqueFiles, assessMoveLeftovers, cachedKept, cmpVersion, isVolumeMetadata, keptCopyFix, physical, pidAlive, readProofCache, rememberKept, removeWithin, rotate,
   treeBytes, truncateToTail } from './footprint-io.mjs';
 
 export { cmpVersion, physical, treeBytes } from './footprint-io.mjs';
@@ -185,6 +185,10 @@ export function inventoryFootprint({ env = process.env, home = os.homedir(), now
     }
   };
   const classifySibling = (name, full, st) => {
+    if (name === `${base}.archive` && st.isDirectory() && !st.isSymbolicLink()) { // #335: written only by --clean --archive
+      return void add({ id: 'kb-archive', path: full, class: 'may-exist', kind: 'kb-archive', action: 'keep', bytes: bytes(full),
+        reason: 'files unique to released KB copies, archived on request (--clean --archive); never removed automatically' });
+    }
     {
       const prefix = kbCopyPrefixes(base).find((p) => name.startsWith(p));
       if (prefix === `${base}.bak-` && !BRAIN_BACKUP_STAMP.test(name.slice(prefix.length))) {
@@ -390,7 +394,7 @@ function summarize({ roots, items, policy, kbCopyDirs, lockHeld }) {
   const owned = items.filter((i) => i.class !== 'unowned');
   const kbBytes = sum(items.filter((i) => i.kind === 'live-kb'));
   const modelBytes = sum(items.filter((i) => i.kind === 'models'));
-  const budgetBytes = kbBytes + modelBytes + policy.fixedAllowanceBytes;
+  const budgetBytes = kbBytes + modelBytes + sum(items.filter((i) => i.kind === 'kb-archive')) + policy.fixedAllowanceBytes;
   const breakdown = {};
   for (const i of owned) {
     const group = i.kind === 'live-kb' ? 'knowledge base' : i.kind === 'models' ? 'models' : /plugin|spine/.test(i.kind) ? 'plugins'
@@ -419,13 +423,30 @@ function summarize({ roots, items, policy, kbCopyDirs, lockHeld }) {
  * every refusal is returned with its reason. `collectPluginGenerations` is the caller's lease-aware
  * collector (bin/install.mjs prunePluginGenerations); `pruneEvidence` is kb's pruneLifecycleEvidence.
  */
-export function sweepFootprint({ apply = false, collectPluginGenerations = null, pruneEvidence = null,
+export function sweepFootprint({ apply = false, archive = false, collectPluginGenerations = null, pruneEvidence = null,
   proveCopy = kbCopyProof, beforeRemove = null, ...options } = {}) {
   const before = inventoryFootprint(options);
   const { roots } = before;
   const owned = [...new Set([roots.kbParent, roots.brainHome, ...roots.brainHomeParents, roots.npxRoot].map(physical))];
-  const prove = (copyDir) => {
-    const proof = proveCopy({ copyDir, liveDir: roots.kbDir });
+  // #335: copies that STAY on disk this sweep may account for a later copy's files (kept siblings). Only
+  // final decisions are added: archive trees, copies a cached proof keeps (outside --archive, which re-proves
+  // them), and each copy this sweep keeps. A copy is never a reference for one evaluated before it.
+  const archiveDir = path.join(roots.kbParent, `${path.basename(roots.kbDir)}.archive`);
+  const stampDir = path.join(archiveDir, new Date(options.now ?? Date.now()).toISOString().replace(/[:.]/g, '-'));
+  const archiving = apply && archive;
+  const reArchive = (item) => archiving && ['kb-copy', 'quarantine'].includes(item.kind) && item.keptUnique && !item.blocked;
+  const refs = [...archiveRoots(archiveDir), ...before.items.filter((i) => i.kind === 'kb-copy' && i.keptUnique && !reArchive(i)).map((i) => i.path)];
+  const prove = (copyDir, label = path.basename(copyDir)) => {
+    let proof = proveCopy({ copyDir, liveDir: roots.kbDir, keptSiblings: [...refs] });
+    if (!proof.disposable && archiving && proof.unique?.length) {
+      const archived = archiveUniqueFiles({ copyDir, unique: proof.unique, stampDir, label, now: options.now ?? Date.now() });
+      if (archived.ok) {
+        refs.push(archived.root);
+        const again = proveCopy({ copyDir, liveDir: roots.kbDir, keptSiblings: [...refs] });
+        proof = again.disposable ? { ...again, reason: `archived ${archived.files.length} unique file(s) to ${archived.root}; ${again.reason}` } : again;
+      } else proof = { ...proof, reason: `${proof.reason}; not archived: ${archived.reason}` };
+    }
+    if (!proof.disposable) refs.push(copyDir);
     if (apply && !proof.disposable && isKbTree(roots.kbDir)) rememberKept(roots.brainHome, copyDir, roots.kbDir, proof); // a dry run writes nothing
     return proof;
   };
@@ -436,7 +457,7 @@ export function sweepFootprint({ apply = false, collectPluginGenerations = null,
   }
   const record = (item, freed, note) => removed.push({ path: item.path, kind: item.kind, bytes: freed ?? item.bytes, reason: note || item.reason });
   for (const item of before.items) {
-    if (!['remove', 'remove-if-proven', 'rotate', 'truncate'].includes(item.action)) {
+    if (!['remove', 'remove-if-proven', 'rotate', 'truncate'].includes(item.action) && !reArchive(item)) {
       if (item.class === 'must-not-exist' || item.class === 'unowned') kept.push({ path: item.path, kind: item.kind, reason: item.blocked || item.reason, fix: item.fix || null });
       continue;
     }
@@ -456,7 +477,7 @@ export function sweepFootprint({ apply = false, collectPluginGenerations = null,
       const quarantineReal = physical(item.path);
       for (const child of names(item.path)) {
         const childPath = path.join(item.path, child);
-        const proof = isKbTree(childPath) ? prove(childPath)
+        const proof = isKbTree(childPath) ? prove(childPath, `${path.basename(item.path)}__${child}`)
           : { disposable: false, unique: [], reason: 'not a KB copy; not ours to judge' };
         if (!proof.disposable) { uniqueLeft = true; kept.push({ path: childPath, kind: 'quarantined-copy', reason: `KEPT: ${proof.reason}`, unique: proof.unique }); continue; }
         record({ path: childPath, kind: 'quarantined-copy', bytes: treeBytes(childPath) }, apply ? removeWithin(childPath, quarantineReal, owned) : undefined, proof.reason);

@@ -166,6 +166,7 @@ const FLAG_MOVE_BRAIN = argv.includes('--move-brain');
 const MOVE_BRAIN_TO = (() => { const i = argv.indexOf('--move-brain'); const v = i === -1 ? null : argv[i + 1]; return v && !v.startsWith('-') ? v : null; })();
 const FLAG_CLEAN = argv.includes('--clean'); // enforce the footprint guarantee now (ADR-0098), then confirm
 const FLAG_JSON = argv.includes('--json'); // with --doctor / --clean: machine-readable confirmation only
+const FLAG_ARCHIVE = argv.includes('--archive'); // with --clean only (#335): archive files unique to old KB copies, then release them
 // ── onboarding-experience flags (all optional; every offer is safe to decline) ──
 const FLAG_YES = argv.includes('--yes') || argv.includes('-y'); // accept every optional offer non-interactively
 const FLAG_PLAN = argv.includes('--plan') || argv.includes('--dry-run'); // show the interactive checklist, then exit — install NOTHING
@@ -4318,7 +4319,7 @@ async function runUpdate() {
   });
   if (outcome.verdict === 'refused-retained-copies') {
     warn('nothing was changed: full copies of earlier brain generations already sit beside this one (listed above).');
-    info('Check that you no longer need them, remove them, then re-run  npx ruvnet-brain --update');
+    info('Run  npx ruvnet-brain --clean --archive  (keeps only the files they alone hold, in kb.archive/), then re-run  npx ruvnet-brain --update');
   }
   if (outcome.fallback && FLAG_HOST_SYNC_ONLY) {
     // Host synchronization has a narrower contract than a full update: it must converge the
@@ -4748,10 +4749,10 @@ function footprintEvidence() {
 
 /** Enforce the footprint now: remove what must not exist (proof-gated), rotate over-cap logs, collect
  * lease-free plugin generations. Narrates every removal and every refusal; never throws. */
-export function enforceFootprint({ holdingRefreshLock = false, pruneEvidence = false, quiet = false } = {}) {
+export function enforceFootprint({ holdingRefreshLock = false, pruneEvidence = false, quiet = false, archive = false } = {}) {
   let result;
   try {
-    result = sweepFootprint({ apply: true, holdingRefreshLock, now: footprintNow(), evidence: footprintEvidence(),
+    result = sweepFootprint({ apply: true, archive, holdingRefreshLock, now: footprintNow(), evidence: footprintEvidence(),
       collectPluginGenerations: ({ registryPath, apply }) => prunePluginGenerations({ registryPath, apply }),
       pruneEvidence: pruneEvidence ? (args) => pruneLifecycleEvidence(args) : null });
   } catch (error) {
@@ -6345,6 +6346,9 @@ Usage:
                               footprint within budget, no cruft. --doctor --json prints only that, as JSON.
   npx ruvnet-brain --clean    Remove everything that must not exist (old KB copies — never one holding
                               private files the live brain lacks — old installers, over-cap logs), then confirm.
+  npx ruvnet-brain --clean --archive
+                              Same, and for a kept copy: copy only the files it alone holds into
+                              kb.archive/<stamp>/ (verified byte-for-byte), then release that copy.
                               EXITS NON-ZERO when the install is genuinely broken, so it can gate a
                               script:  npx ruvnet-brain --doctor && ./deploy.sh
   npx ruvnet-brain --doctor --hooks
@@ -6461,7 +6465,7 @@ the installer reports that boot-level declarations changed.
   // remains and nothing that must not exist is left (a private-unique copy kept for safety is a 1).
   if (FLAG_CLEAN) {
     if (!FLAG_JSON) printBanner('clean');
-    const swept = enforceFootprint({ pruneEvidence: true, quiet: FLAG_JSON });
+    const swept = enforceFootprint({ pruneEvidence: true, quiet: FLAG_JSON, archive: FLAG_ARCHIVE });
     const result = await printConfirmation({ footprint: swept?.after || null, json: FLAG_JSON });
     process.exitCode = swept && result.footprint.kbCopies === 1 && result.footprint.cruft.length === 0 ? 0 : 1;
     return;
