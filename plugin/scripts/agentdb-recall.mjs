@@ -115,7 +115,9 @@ function clean(value, limit) {
   return out;
 }
 
-const NOISE_KEY = /^(?:verify[-_]|probe[-_]|test[-_]|rnb-quality-probe|session[-_]|turn[-_]|project-progress[-_]|cevt[-_])/i;
+const MISSING_KNOWLEDGE = /\b(?:cannot\s+(?:be\s+determined|determine)|can(?:'|’)?t\s+(?:be\s+)?determined?|do\s+not\s+know|don(?:'|’)?t\s+know|cannot\s+answer|no\s+(?:verified\s+|supplied\s+|historical\s+)?(?:record|memory|evidence)\s+(?:is\s+)?(?:available|found))\b/i;
+const MISSING_KNOWLEDGE_QUERY = /\b(?:fail(?:ed|ing|ures?)?|missing|unavailable|unknown)\b/i;
+const NOISE_KEY =/^(?:verify[-_]|probe[-_]|test[-_]|rnb-quality-probe|session[-_]|turn[-_]|project-progress[-_]|cevt[-_])/i;
 const SIGNAL_NAMESPACES = new Set(['lessons', 'patterns', 'pattern']);
 /** Turn knowledge is the actual redacted outcome, never its session/transcript wrapper. */
 function turnOutcomeClauses(value, prompt) {
@@ -393,9 +395,10 @@ export async function recall({ prompt, projectDir = process.cwd(), env = process
       ...await searchOnce({ ruflo: bin, store: jobStore, deadline: searchDeadline, env, scratch: scratchFor, args, signal }) })));
     let status = results.every((r) => r.state === 'ok') ? 'ok'
       : results.some((r) => r.state === 'timed out') ? 'timed out' : 'unavailable';
-    // Overfetch a bounded six exact values so rejected turn metadata cannot hide
-    // the next useful outcome; at most three verified excerpts are delivered.
-    const candidates = pickRows(results, 6);
+    // Overfetch a bounded twelve exact values (the one search already returns twelve; the exact reads are
+    // one batched reader, so this adds no Ruflo startup) so rejected turn metadata and repeated "cannot
+    // determine" answers cannot hide the next useful outcome (#429); at most three excerpts are delivered.
+    const candidates = pickRows(results, 12);
     // Ruflo previews are ~60 characters. Read the actual selected values within
     // the same deadline so the block contains useful evidence rather than titles.
     const exactResults = await exactReads({ candidates, bin, deadline, env, scratch: scratchFor, signal });
@@ -417,6 +420,12 @@ export async function recall({ prompt, projectDir = process.cwd(), env = process
       }
       return { pick: null, state: r.state === 'ok' ? 'unavailable' : r.state };
     }));
+    // A turn that admitted it could not answer is evidence of a failed recall, not the missing fact (#429).
+    // It stays available, after concrete outcomes; a query about failures keeps the ranked order.
+    if (!MISSING_KNOWLEDGE_QUERY.test(prompt)) {
+      const rank = ({ pick }) => Number(pick?.namespace === 'turns' && MISSING_KNOWLEDGE.test(pick.preview));
+      retrieved.sort((a, b) => rank(a) - rank(b));
+    }
     const seenClauses = new Set();
     const picks = retrieved.flatMap(({ pick }) => {
       if (!pick) return [];
