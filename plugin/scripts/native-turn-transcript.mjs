@@ -1,7 +1,7 @@
 /** Bounded, mechanical Codex JSONL normalization. No model inference or user-text persistence. */
 const LIMIT = 2 * 1024 * 1024;
 const text = content => typeof content === 'string' ? content : Array.isArray(content)
-  ? content.filter(part => ['text', 'input_text', 'output_text'].includes(part?.type)).map(part => part.text || '').join('\n') : '';
+  ? content.filter(part => ['text', 'Text', 'input_text', 'output_text'].includes(part?.type)).map(part => part.text || '').join('\n') : '';
 const message = (role, content) => ({ message: { role, content } });
 const parse = value => { try { return JSON.parse(value); } catch { return null; } };
 
@@ -16,17 +16,33 @@ export function nativeTurnLines(lines, host) {
   }
   records.reverse();
   const out = []; const sessions = new Map(); const calls = new Map();
+  // Codex writes the same answer up to three times (response_item, item_completed AgentMessage,
+  // task_complete.last_agent_message); any one of them may be the only copy that survived.
+  let said = new Set();
+  const say = (role, value) => {
+    if (role === 'user') said = new Set();
+    else if (said.has(value.trim())) return;
+    else said.add(value.trim());
+    out.push(message(role, value));
+  };
   for (const record of records) {
     const p = record.payload;
     if (record.type === 'event_msg' && p?.type === 'user_message') {
-      out.push(message('user', p.message || '')); continue;
+      say('user', p.message || ''); continue;
     }
     if (record.type === 'event_msg' && p?.type === 'agent_message' && typeof p.message === 'string') {
-      out.push(message('assistant', p.message)); continue;
+      say('assistant', p.message); continue;
+    }
+    // Native turn end (rollout and `codex exec`): the closing answer, recorded once per turn.
+    if (record.type === 'event_msg' && p?.type === 'task_complete' && typeof p.last_agent_message === 'string') {
+      say('assistant', p.last_agent_message); continue;
+    }
+    if (record.type === 'event_msg' && p?.type === 'item_completed' && p.item?.type === 'AgentMessage') {
+      say('assistant', text(p.item.content)); continue;
     }
     if (record.type !== 'response_item' || !p) continue;
     if (p.type === 'message' && ['user', 'assistant'].includes(p.role)) {
-      out.push(message(p.role, text(p.content))); continue;
+      say(p.role, text(p.content)); continue;
     }
     if (['function_call', 'custom_tool_call'].includes(p.type) && typeof p.call_id === 'string') {
       const args = typeof p.arguments === 'string' ? parse(p.arguments) : p.arguments;
