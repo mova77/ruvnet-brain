@@ -141,8 +141,8 @@ export const RELEASE_REQUIREMENTS = Object.freeze({
         "tests/unit/console-runtime-transaction.test.mjs"
       ],
       "platformFiles": {
-        "linux": ["tests/unit/codex-wrapper-upgrade-ownership-links.test.mjs"],
-        "macos": ["tests/unit/codex-wrapper-upgrade-ownership-links.test.mjs"]
+        "linux": ["tests/unit/codex-wrapper-upgrade-ownership-links.test.mjs", "tests/unit/forge-update-signal.test.mjs"],
+        "macos": ["tests/unit/codex-wrapper-upgrade-ownership-links.test.mjs", "tests/unit/forge-update-signal.test.mjs"]
       }
     },
     {

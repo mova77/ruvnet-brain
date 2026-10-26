@@ -648,35 +648,6 @@ describe('forge-update --apply: retention is advisory; a signal settles the run'
     expect(served.hits.zip).toBe(0);
   });
 
-  // POSIX only: Windows has no SIGTERM delivery to a handler (process.kill terminates outright), so there is nothing to settle.
-  it.skipIf(process.platform === 'win32')('SIGTERM during the bundle download records "interrupted", exits 143, and releases the lock and the temp stage', async () => {
-    const current = sourceJson({ releaseTag: 'v4.0.7', brainVersion: '4.0.7', builtUtc: '2026-07-31T04:39:28.414Z', stores: [STORE_A] });
-    layDown(kbDir, current);
-    publish(sourceJson({ releaseTag: 'v4.0.8', brainVersion: '4.0.8', builtUtc: '2026-08-02T12:00:00.000Z', stores: [STORE_A] }), 'v4.0.8');
-    served.stallZip = true;
-    const resultFile = path.join(root, 'signal-result.json');
-    const lockDir = path.join(root, '.kb.refresh-run.lock');
-    const stagesBefore = new Set(fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith('forge-update-release-')));
-    const home = path.join(root, 'home'); fs.mkdirSync(home, { recursive: true });
-    const child = spawn(process.execPath, [path.join(kbDir, 'forge-update.mjs'), '--apply', '--result-file', resultFile],
-      { cwd: kbDir, env: { ...process.env, HOME: home, RUVNET_SETTINGS_FILE: path.join(home, 'nope.json') } });
-    let out = ''; child.stdout.on('data', (d) => { out += d; }); child.stderr.on('data', (d) => { out += d; });
-    const closed = new Promise((resolve) => child.on('close', (code, signal) => resolve({ code, signal })));
-    const deadline = Date.now() + 30_000;
-    while (served.hits.zip === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
-    expect(served.hits.zip, out).toBe(1);
-    expect(fs.existsSync(lockDir), 'the update holds its lock while downloading').toBe(true);
-    const ownStages = fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith('forge-update-release-') && !stagesBefore.has(n));
-    child.kill('SIGTERM');
-    const { code, signal } = await closed;
-    expect({ code, signal }, out).toEqual({ code: 143, signal: null });
-    expect(out).toMatch(/interrupted by SIGTERM/);
-    expect(JSON.parse(fs.readFileSync(resultFile, 'utf8'))).toMatchObject({ terminalVerdict: 'interrupted', exitCode: 143 });
-    expect(fs.existsSync(lockDir), 'lock released').toBe(false);
-    expect(ownStages, 'the bundle streams into the temp stage while downloading').toHaveLength(1);
-    expect(fs.existsSync(path.join(os.tmpdir(), ownStages[0])), 'temp stage removed').toBe(false);
-    expect(JSON.parse(fs.readFileSync(path.join(kbDir, 'SOURCE.json'), 'utf8')).releaseTag).toBe('v4.0.7');
-  }, 60_000);
 });
 
 describe('forge-update --check (issue #108 bug 2)', () => {
