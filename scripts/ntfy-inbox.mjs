@@ -135,7 +135,7 @@ export function fold(open, messages, { now = Date.now(), resolver = resolvedNow,
     if (a.closedAt) continue;
     if (a.kind === 'other' && now - Date.parse(a.lastAt) > 3 * 86_400_000) { a.closedAt = new Date(now).toISOString(); a.closedBy = 'expired (unrecognised message, 3 days)'; continue; }
     // Live checks stop at the budget; the rest are checked on the next poll (a poll never outlives its lock).
-    if (clock() > resolveUntil) break;
+    if (clock() > resolveUntil) continue; // skip only the live check; expiry above still runs for every alert
     const why = resolver(a);
     if (why) { a.closedAt = new Date(now).toISOString(); a.closedBy = typeof why === 'string' ? why : 'cause cleared'; }
   }

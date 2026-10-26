@@ -108,5 +108,5 @@ jobs:
           # visibly (red in Actions) instead of vanishing (review round 2).
           # --retry (not --retry-all-errors): only transient failures are retried, which keeps the rare duplicate page
           # (a POST accepted but its reply lost) to a timeout case; a lost page is worse than a duplicate.
-          curl -sS --fail --retry 3 --retry-delay 5 -m 20 \
+          curl -sS --fail --retry 3 --retry-connrefused --retry-delay 5 -m 20 \
             -H "Title: $TITLE" -H "Priority: $PRIO" -H "Tags: $TAGS" --data-raw "$BODY" "https://ntfy.sh/$TOPIC" >/dev/null

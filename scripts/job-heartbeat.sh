@@ -230,6 +230,7 @@ CHILD=$!
 MAX_SECONDS="${JOB_MAX_SECONDS:-7200}"
 WRAPPER_PID=$$
 case "$MAX_SECONDS" in ''|*[!0-9]*) MAX_SECONDS=7200 ;; esac
+[ "$MAX_SECONDS" -lt 2 ] && MAX_SECONDS=2
 (
   # Short sleeps, not one long one: killing this shell then leaves at most a 2 s sleep behind, never a 2 h one
   # holding the job's output open (review round 2).
@@ -239,10 +240,11 @@ case "$MAX_SECONDS" in ''|*[!0-9]*) MAX_SECONDS=7200 ;; esac
   [ "$(ps -o ppid= -p "$CHILD" 2>/dev/null | tr -d ' ')" = "$WRAPPER_PID" ] || exit 0
   : > "$HB.timeout-$RUN_ID"
   kill -USR1 "$WRAPPER_PID" 2>/dev/null
-) &
+) </dev/null >/dev/null 2>&1 &
 TIMER=$!
 # `wait` returns early when USR1 arrives; stop the job, then wait again for its real exit status.
 while :; do
+  if [ "$OVERRUN" = 1 ]; then OVERRUN=0; stop_job; fi
   wait "$CHILD"; RC=$?
   if [ "$OVERRUN" = 1 ]; then OVERRUN=0; stop_job; continue; fi
   break

@@ -136,7 +136,7 @@ describe('job-heartbeat.sh — a failing job must actually page, not just record
     expect(Date.now() - t0).toBeLessThan(20_000); // stopped near the limit, not after the job's 60 s
     const r = receipt('com.test.hang');
     expect(r.state).toBe('killed');
-    expect(r.timed_out_after_sec).toBe(1);
+    expect(r.timed_out_after_sec).toBe(2) // the limit is never below 2 s;
     expect(curlCalls().length).toBe(1);
     expect(fs.readdirSync(path.join(workDir, 'heartbeats')).some((f) => f.includes('.timeout-'))).toBe(false);
   }, 30_000);
@@ -164,7 +164,7 @@ describe('job-heartbeat.sh — a failing job must actually page, not just record
     makeHarness({ withTopic: false });
     runWith('com.test.polite', "trap 'exit 0' TERM\nsleep 60 & wait", { JOB_MAX_SECONDS: '1' });
     expect(hb('com.test.polite').state).toBe('killed');
-    expect(hb('com.test.polite').timed_out_after_sec).toBe(1);
+    expect(hb('com.test.polite').timed_out_after_sec).toBe(2) // the limit is never below 2 s;
   }, 30_000);
 
   it('a page that did not deliver is retried on the next failing run, then the streak goes quiet', () => {
