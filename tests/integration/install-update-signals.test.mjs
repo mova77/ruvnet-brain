@@ -30,7 +30,9 @@ describe.skipIf(process.platform === 'win32')('install.mjs --update under SIGTER
     const home = path.join(root, 'home');
     const brainHome = path.join(root, 'brain');
     const kb = path.join(brainHome, 'kb');
+    const tmpdir = path.join(root, 'tmp'); // the installer's own temp dirs land here, so leaks are countable
     fs.mkdirSync(home);
+    fs.mkdirSync(tmpdir);
     fs.mkdirSync(kb, { recursive: true });
 
     const pending = [];
@@ -44,7 +46,7 @@ describe.skipIf(process.platform === 'win32')('install.mjs --update under SIGTER
 
     const child = spawn(process.execPath, [path.join(ROOT, 'bin', 'install.mjs'), '--update', '--no-nightly-prompt'], {
       cwd: root, detached: true, stdio: ['ignore', 'pipe', 'pipe'],
-      env: { PATH: process.env.PATH, HOME: home, TMPDIR: process.env.TMPDIR || os.tmpdir(), RUVNET_BRAIN_TEST: '1',
+      env: { PATH: process.env.PATH, HOME: home, TMPDIR: tmpdir, RUVNET_BRAIN_TEST: '1',
         RUVNET_BRAIN_HOME: brainHome, RUVNET_BRAIN_KB: kb, RUVNET_BRAIN_NO_UPDATE_FALLBACK: '1' },
     });
     let output = '';
@@ -55,6 +57,8 @@ describe.skipIf(process.platform === 'win32')('install.mjs --update under SIGTER
       const winner = await Promise.race([asked, exited.then(() => 'exited'),
         new Promise((resolve) => setTimeout(() => resolve('timeout'), 90_000))]);
       expect(winner, output).toBe('/manifest.json'); // the real updater is now blocked mid-run
+      // The installer made its result dir before starting the updater; it must not outlive the interrupted run.
+      expect(fs.readdirSync(tmpdir).filter((name) => name.startsWith('ruvnet-update-result-'))).toHaveLength(1);
       const lockPath = path.join(brainHome, '.kb.refresh-run.lock');
       expect(fs.existsSync(lockPath)).toBe(true);
 
@@ -66,6 +70,8 @@ describe.skipIf(process.platform === 'win32')('install.mjs --update under SIGTER
       expect({ code, signal }, output).toEqual({ code: 143, signal: null }); // before: { code: null, signal: 'SIGTERM' }
       expect(settleMs).toBeLessThan(2000);
       expect(fs.existsSync(lockPath)).toBe(false); // before: the lock stayed
+      // Fable review #6: settleIfSignalled exited before the result dir was removed, leaking one per interrupted run.
+      expect(fs.readdirSync(tmpdir).filter((name) => name.startsWith('ruvnet-update-result-'))).toEqual([]);
       const runs = fs.readdirSync(path.join(brainHome, 'refresh-runs')).filter((name) => name.endsWith('.json'));
       expect(runs).toHaveLength(1);
       const receipt = JSON.parse(fs.readFileSync(path.join(brainHome, 'refresh-runs', runs[0]), 'utf8'));

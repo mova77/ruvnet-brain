@@ -292,7 +292,8 @@ function download(url, dest) {
   let lastShown = -1;
   return downloadFileWithRetry(url, dest, {
     headers: { 'User-Agent': 'ruvnet-brain-installer', Accept: 'application/octet-stream' },
-    onRetry: ({ attempt, error }) => warn(`download interrupted (${error.message}); retry ${attempt + 1}/3 from a fresh stage`),
+    // The retry continues the staged bytes (HTTP Range) when the server proves the same asset; otherwise it restarts.
+    onRetry: ({ attempt, error }) => warn(`download interrupted (${error.message}); retry ${attempt + 1}/3, resuming where it stopped when the server allows`),
     onProgress: ({ received, total }) => {
       const mb = Math.floor(received / 1e6);
       const pct = total ? Math.floor(received / total * 100) : mb;
@@ -3954,8 +3955,11 @@ export function classifyUpdaterExit(status, { fallbackAllowed = true, result = n
   // Exit 2 is "manifest unreachable, nothing touched". The fallback exists for a DEAD manifest URL (an old
   // bundle polling a path that 404s); a rate limit, a 5xx or no network is transient, and a full fresh
   // reinstall over it re-downloads the brain and preserves another full copy each time. Retry later instead.
-  if (status === 2 && /returned HTTP (?:403|408|429|5\d\d)\b|network failure/.test(String(result?.reason || ''))) {
-    return { verdict: 'transient-network', fallback: false, exitCode: 2 };
+  // Exit 3 is the same transport failure one request later: the bundle downloaded, then its 64-byte .sig hit a
+  // 5xx or a timeout. Nothing was touched, and a fallback would re-download the whole ~745 MB bundle. A 404 on
+  // the .sig (a release published without one) is not transient and keeps the fallback.
+  if ((status === 2 || status === 3) && /returned HTTP (?:403|408|429|5\d\d)\b|network failure/.test(String(result?.reason || ''))) {
+    return { verdict: 'transient-network', fallback: false, exitCode: status };
   }
   // Neither of these is a broken updater, so a fresh reinstall cannot fix them; it only re-downloads ~745 MB
   // into the same wall, every night (4.7.21, audit C: a `.prune-*` left by a killed run made retention
@@ -4563,13 +4567,14 @@ async function runUpdate() {
   const r = spawnSync(process.execPath, updaterArgs, {
     cwd: kbDir, stdio: 'inherit', env: refreshEnv,
   });
-  settleIfSignalled(r);
   updateStatus = r.error ? 1 : (r.status === null ? 1 : r.status);
   const updaterExit = updateStatus;
   let updaterResult = null;
   try { if (updaterResultFile && fs.existsSync(updaterResultFile)) updaterResult = JSON.parse(fs.readFileSync(updaterResultFile, 'utf8')); }
   catch { updaterResult = null; }
+  // Before settleIfSignalled, which exits: an interrupted run used to leak one ruvnet-update-result-* temp dir.
   if (updaterResultDir) fs.rmSync(updaterResultDir, { recursive: true, force: true });
+  settleIfSignalled(r);
   // FALLBACK (2026-07-17), scoped 2026-07-18 to exists-but-FAILED only. An OLDER bundle whose
   // canonicalManifestUrl points at the dead main/kb/.last-built.json path and 404s (the exact break a
   // real user, Jan Lafko, hit). NEVER leave the user stranded at a 404: re-run THIS installer as a
@@ -4835,10 +4840,13 @@ export async function finishUpdate({ kbDir, brainHome, refreshReceipt, outcome, 
       budgetBytes: after?.budgetBytes ?? null, removed: footprint?.removed.length ?? 0, freedBytes: footprint?.freedBytes ?? 0,
     });
   } catch { /* the advisory never blocks settlement */ }
-  const exitCode = cleanupPending ? 12 : updateStatus;
+  // A genuine failure (a required host convergence) outranks cleanup-pending: 12 tells the coordinator and
+  // host-update the knowledge applied and only redundant cleanup is owed, so it must not mask an exit 1.
+  const failed = updateStatus !== 0;
+  const exitCode = failed ? updateStatus : (cleanupPending ? 12 : 0);
   settle(exitCode, {
-    phase: cleanupPending ? 'cleanup' : (updateStatus === 0 ? 'complete' : 'failed'),
-    terminalVerdict: cleanupPending ? 'cleanup-pending' : (outcome?.verdict === 'noop' ? 'noop' : 'applied'),
+    phase: failed ? 'failed' : (cleanupPending ? 'cleanup' : 'complete'),
+    terminalVerdict: failed ? 'failed' : cleanupPending ? 'cleanup-pending' : (outcome?.verdict === 'noop' ? 'noop' : 'applied'),
     storageDelta: updaterResult?.storageDelta || null, lifecycleRetention: retention });
   return { exitCode, footprint, hostConvergence: host };
 }

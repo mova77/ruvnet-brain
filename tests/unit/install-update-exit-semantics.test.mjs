@@ -64,6 +64,21 @@ describe('classifyUpdaterExit: no reinstall for what a reinstall cannot fix', ()
       .toEqual({ verdict: 'refused-incompatible', fallback: false, exitCode: 5 }); // before: fallback:true
   });
 
+  // Opus review #3 (4.7.21): forge-update exit 3 = "the signature could not be fetched". After a 745 MB bundle
+  // downloaded, a 5xx or timeout on its 64-byte .sig fell to the fresh-reinstall fallback (another ~745 MB).
+  it('exit 3 from a transient .sig fetch failure is transient-network, never a reinstall; a missing .sig (404) keeps the fallback', () => {
+    const net = { terminalVerdict: 'failed', exitCode: 3,
+      reason: 'network failure downloading signature https://x/bundle.zip.sig: socket hang up — nothing changed locally.' };
+    expect(install.classifyUpdaterExit(3, { result: net, requireResult: true }))
+      .toEqual({ verdict: 'transient-network', fallback: false, exitCode: 3 }); // before: { verdict:'failed', fallback:true }
+    const busy = { terminalVerdict: 'failed', exitCode: 3, reason: 'signature download returned HTTP 503 for https://x/bundle.zip.sig — nothing changed.' };
+    expect(install.classifyUpdaterExit(3, { result: busy, requireResult: true }))
+      .toEqual({ verdict: 'transient-network', fallback: false, exitCode: 3 });
+    const missing = { terminalVerdict: 'failed', exitCode: 3, reason: 'signature download returned HTTP 404 for https://x/bundle.zip.sig — nothing changed.' };
+    expect(install.classifyUpdaterExit(3, { result: missing, requireResult: true }))
+      .toEqual({ verdict: 'failed', fallback: true, exitCode: 3 });
+  });
+
   it('an ordinary updater failure keeps its documented fallback; the other verdicts are unchanged', () => {
     expect(install.classifyUpdaterExit(1, { result: { terminalVerdict: 'failed', reason: 'boom' } }))
       .toEqual({ verdict: 'failed', fallback: true, exitCode: 1 });
@@ -161,6 +176,29 @@ describe('finishUpdate: the host and retention outcomes after the knowledge phas
   it('cleanup pending still exits 12 (applied, with redundant rollback cleanup owed)', async () => {
     const run = knowledgePassedRun();
     const { result } = await finish(run, { cleanupPending: true });
+    expect(result.exitCode).toBe(12);
+    expect(run.settled.receipt).toMatchObject({ status: 'FAILED', terminalVerdict: 'cleanup-pending' });
+  });
+
+  // Codex r3 #2 (4.7.21): cleanup pending AND a required host convergence that failed returned 12, which the
+  // coordinator and host-update accept as "knowledge applied", so the genuine host failure was masked.
+  it('cleanup pending beside a failed host convergence exits 1 with terminal verdict failed, not 12', async () => {
+    const run = knowledgePassedRun();
+    const { result, reconcile } = await finish(run, { cleanupPending: true, converge: async () => ({ ok: false, results: {},
+      convergence: { healthy: false, state: 'host-pending', action: 're-run host synchronization' }, error: 'Codex plugin failed' }) });
+    expect(result.exitCode).toBe(1); // before: 12
+    expect(run.settled.code).toBe(1);
+    expect(run.settled.receipt).toMatchObject({ status: 'FAILED', terminalVerdict: 'failed', // before: cleanup-pending
+      detail: { phase: 'failed', terminalVerdict: 'failed' } });
+    expect(phase(run.settled.receipt, 'host-convergence')).toMatchObject({ status: 'FAIL', required: true });
+    expect(phase(run.settled.receipt, 'cleanup')).toMatchObject({ status: 'FAIL', required: true }); // still recorded
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    expect(fs.existsSync(run.lock.path)).toBe(false);
+  });
+
+  it('cleanup pending beside a restart-only host gap still exits 12 (the restart is an advisory)', async () => {
+    const run = knowledgePassedRun();
+    const { result } = await finish(run, { cleanupPending: true, converge: async () => restartOnly });
     expect(result.exitCode).toBe(12);
     expect(run.settled.receipt).toMatchObject({ status: 'FAILED', terminalVerdict: 'cleanup-pending' });
   });

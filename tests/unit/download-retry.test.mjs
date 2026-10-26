@@ -191,6 +191,64 @@ describe('large-body transport: idle timeout, Range resume, size-scaled deadline
     expect(fs.readFileSync(file).equals(BODY)).toBe(true);
   });
 
+  // Fable review #1 (4.7.21): an asset replaced at the same URL between attempts was stitched onto the old prefix,
+  // which only the signature caught (exit 4, then a full reinstall). Two servers: one that honours If-Range (RFC 9110
+  // 13.1.5: a stale validator gets the whole new body as 200), one that ignores it but labels the 206 with its ETag.
+  const OLD = Buffer.alloc(BODY.length, 'a'); const NEW = Buffer.alloc(BODY.length, 'b');
+  const replacedMidDownload = ({ honoursIfRange }) => {
+    const seen = []; let current = OLD; let calls = 0;
+    const handler = (request, response) => {
+      calls += 1; seen.push({ range: request.headers.range, ifRange: request.headers['if-range'] });
+      const etag = current === OLD ? '"v1"' : '"v2"';
+      const match = /^bytes=(\d+)-$/.exec(request.headers.range || '');
+      const stale = request.headers['if-range'] && request.headers['if-range'] !== etag;
+      if (!match || (honoursIfRange && stale)) {
+        response.writeHead(200, { 'content-length': current.length, etag });
+        if (calls === 1) { response.write(current.subarray(0, 1000)); current = NEW; setTimeout(() => response.destroy(), 50); return; }
+        response.end(current); return;
+      }
+      const start = Number(match[1]);
+      response.writeHead(206, { 'content-length': current.length - start, etag, 'content-range': `bytes ${start}-${current.length - 1}/${current.length}` });
+      response.end(current.subarray(start));
+    };
+    return { seen, handler };
+  };
+
+  it.each([true, false])('an asset replaced between attempts restarts from zero, never stitched (server honours If-Range: %s)', async (honoursIfRange) => {
+    const { seen, handler } = replacedMidDownload({ honoursIfRange });
+    viaHttp(await serve(handler));
+    const file = target();
+    await downloadFileWithRetry('https://release.invalid/bundle', file, options);
+    const bytes = fs.readFileSync(file);
+    expect(bytes.length).toBe(BODY.length);
+    expect(bytes.equals(NEW)).toBe(true); // before: 1000 bytes of 'a' then 2000 of 'b'
+    expect(bytes.subarray(0, 1000).includes('a'.charCodeAt(0))).toBe(false);
+    expect(seen).toHaveLength(honoursIfRange ? 2 : 3); // the ignoring server's 206 is discarded, then one fresh 200
+    expect(seen[1]).toEqual({ range: 'bytes=1000-', ifRange: '"v1"' }); // the resume names what the stage holds
+  });
+
+  // Fable review #2 (4.7.21): a resumed 206 whose Content-Range total is '*' disabled the final size check, so a short
+  // body that ended cleanly was accepted. The size from the response that started the stage is the bound.
+  it("a resumed 206 with an unknown total ('*') is still held to the stage's original size", async () => {
+    let calls = 0;
+    const url = await serve((request, response) => {
+      calls += 1;
+      const match = /^bytes=(\d+)-$/.exec(request.headers.range || '');
+      if (!match) { response.writeHead(200, { 'content-length': BODY.length }); response.write(BODY.subarray(0, 1000)); setTimeout(() => response.destroy(), 50); return; }
+      const start = Number(match[1]);
+      // Second request: a clean but SHORT continuation (500 of the 2000 remaining bytes); third: the rest.
+      const end = calls === 2 ? start + 500 : BODY.length;
+      response.writeHead(206, { 'content-range': `bytes ${start}-${end - 1}/*` });
+      response.end(BODY.subarray(start, end));
+    });
+    viaHttp(url);
+    const file = target();
+    await downloadFileWithRetry('https://release.invalid/bundle', file, options);
+    expect(calls).toBe(3); // before: 2, and a 1500-byte file was accepted as the bundle
+    expect(fs.statSync(file).size).toBe(BODY.length);
+    expect(fs.readFileSync(file).equals(BODY)).toBe(true);
+  });
+
   it('a server that stops sending for 2x the idle window is aborted as ETIMEDOUT and retried', async () => {
     let calls = 0; const retries = [];
     const url = await serve((_request, response) => {

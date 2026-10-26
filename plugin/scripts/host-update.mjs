@@ -148,8 +148,11 @@ if (knowledgeAt >= 0) {
       const tail = `${run.stderr || ''}\n${run.stdout || ''}`.replace(/\u001b\[[0-9;]*m/g, '')
         .split('\n').map((line) => line.trim()).filter(Boolean);
       const code = run.error ? null : run.status;
-      record({ outcome: code === 0 ? 'succeeded' : 'failed', code,
-        reason: code === 0 ? '' : String(run.error?.message || tail.find((l) => /✗|error|fail/i.test(l)) || tail.at(-1) || 'no output').slice(0, 200) });
+      // Exit 12 is the installer's "knowledge applied, redundant rollback cleanup still pending"; the coordinator
+      // (developer-update.mjs) accepts it as success too. Recording it FAILED spoke a false failure line.
+      const succeeded = code === 0 || code === 12;
+      record({ outcome: succeeded ? 'succeeded' : 'failed', code,
+        reason: succeeded ? '' : String(run.error?.message || tail.find((l) => /✗|error|fail/i.test(l)) || tail.at(-1) || 'no output').slice(0, 200) });
     }
   } catch (error) {
     record({ outcome: 'failed', code: null, reason: error.message.slice(0, 200) });

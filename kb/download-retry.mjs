@@ -99,6 +99,7 @@ function stagedBytes(file) {
 // A resumed body is appended ONLY when the server proves it is the continuation of the bytes already
 // staged: HTTP 206 with a Content-Range that starts exactly at the staged size. Anything else (a 200 for
 // the whole body, a mirror that ignores Range, a different start) restarts the stage from zero.
+// Returns the declared total, 0 for an unknown total ('*'), or null when the response is not a continuation.
 function resumedTotal(response, offset) {
   if (response.statusCode !== 206) return null;
   const match = /^bytes (\d+)-(\d+)\/(\d+|\*)$/.exec(String(response.headers['content-range'] || '').trim());
@@ -106,21 +107,42 @@ function resumedTotal(response, offset) {
   return match[3] === '*' ? 0 : Number(match[3]);
 }
 
+// What the staged bytes are a prefix of, taken from the response that started the stage: its validator
+// (a strong ETag, else Last-Modified) for If-Range, and its full size. An asset replaced at the same URL
+// between attempts must restart from zero, never be stitched onto the old prefix (which only the signature
+// check would catch, as exit 4 and a full reinstall).
+function bodyIdentity(response, total) {
+  const etag = response.headers.etag || null;
+  const strong = etag && !/^W\//.test(etag) ? etag : null;
+  return { etag, validator: strong || response.headers['last-modified'] || null, total: total || 0 };
+}
+
 export async function downloadFileWithRetry(url, destination, { headers = {}, onProgress = () => {}, ...options } = {}) {
   // One stage for the whole call: a retry continues it (Range) instead of discarding every byte received.
   const staged = `${destination}.part-${process.pid}-${randomUUID()}`;
+  let identity = null;
   try {
     await retryDownload(async ({ signal, progress, expectBytes }) => {
       let offset = stagedBytes(staged);
-      let response = await get(url, { signal, headers: offset ? { ...headers, Range: `bytes=${offset}-` } : headers });
+      const resume = { ...headers, Range: `bytes=${offset}-`, ...(identity?.validator ? { 'If-Range': identity.validator } : {}) };
+      let response = await get(url, { signal, headers: offset ? resume : headers });
       let total = offset ? resumedTotal(response, offset) : null;
+      if (total !== null) {
+        // '*' (unknown total) keeps the size the stage was started with, so the final size check still runs.
+        if (total === 0) total = identity?.total || 0;
+        const etag = response.headers.etag || null;
+        if ((identity?.etag && etag && etag !== identity.etag) || (identity?.total && total !== identity.total)) {
+          total = null; // a continuation of a DIFFERENT body: the asset changed under the stage
+        }
+      }
       if (total === null) {
         if (offset) { // the server did not continue the stage: restart from byte zero
           offset = 0;
-          // A 200 already carries the whole body; only a 206 for other bytes or a 416 needs a fresh request.
+          // A 200 already carries the whole body; a 206 for other bytes (or another body) or a 416 needs a fresh request.
           if (response.statusCode !== 200) { response.destroy(); response = await get(url, { signal, headers }); }
         }
         total = Number(response.headers['content-length'] || 0);
+        identity = bodyIdentity(response, total);
       }
       if (total) expectBytes(total);
       let received = offset;

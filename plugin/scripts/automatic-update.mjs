@@ -101,7 +101,12 @@ export function automaticInvocation(args, { source, home = os.homedir(), nodePat
       // Hooks and timers get knowledge only, never the whole suite (brew, cargo, every npm install) under a session TTL
       // that kills it mid-install (AuditC #10). The full suite runs only from the scheduled runner, which calls the
       // coordinator directly, not through here.
-      return { executable: nodePath, args: [coordinator.entry, '--apply', '--knowledge-only'], source: 'developer-suite', coordinator };
+      // The registered snapshot moves only when an --update reconciles it, so it can predate --knowledge-only
+      // (4.7.20 and older refuse it: "unsupported developer update argument", exit 1). Pass the flag only to a
+      // coordinator whose source parses it, as runUpdate does for the updater's --result-file.
+      const knowledgeOnly = fs.readFileSync(coordinator.entry, 'utf8').includes("'--knowledge-only'");
+      return { executable: nodePath, args: [coordinator.entry, '--apply', ...(knowledgeOnly ? ['--knowledge-only'] : [])],
+        source: 'developer-suite', coordinator };
     }
   }
   source ??= updateSource({ home });

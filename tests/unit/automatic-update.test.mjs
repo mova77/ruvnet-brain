@@ -2,7 +2,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { automaticInvocation, automaticPath, installedUpdater, ownerSettingsPath, updateSource } from '../../plugin/scripts/automatic-update.mjs';
+import crypto from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { automaticInvocation, automaticPath, installedUpdater, ownerSettingsPath, saveUpdateSource, updateSource } from '../../plugin/scripts/automatic-update.mjs';
+import { installNightlyRunner } from '../../plugin/scripts/nightly-scheduler.mjs';
 
 const roots = [];
 function scratch() { const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rnb-automatic-')); roots.push(root); return root; }
@@ -81,3 +85,79 @@ describe('owner automatic update authority', () => {
   });
 });
 
+
+// Opus review #1 (4.7.21): the SessionStart self-heal passed --knowledge-only to the REGISTERED coordinator snapshot,
+// which moves only when an --update reconciles it (never on runner-changed). A 4.7.20 snapshot refuses the flag
+// ("unsupported developer update argument", exit 1), so every knowledge self-heal on those machines recorded FAILED.
+describe('coordinated self-heal against an older registered coordinator', () => {
+  const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+  const current = fs.readFileSync(path.join(ROOT, 'plugin/scripts/developer-update.mjs'), 'utf8');
+  // The real 4.7.20 coordinator when the tag is in this clone (CI checks out full history); the derived copy always runs.
+  const tagged = spawnSync('git', ['show', 'v4.7.20:plugin/scripts/developer-update.mjs'], { cwd: ROOT, encoding: 'utf8' });
+  const derived = current.replace(/\n\s*if \(args\[i\] === '--knowledge-only'\) knowledgeOnly = true;\n\s*else /, '\n    ');
+  const register = (source) => {
+    // Real path: 4.7.20's main guard compares argv[1] with import.meta.url literally (macOS /var -> /private/var).
+    const home = fs.realpathSync(scratch()); const brainHome = path.join(home, '.cache/ruvnet-brain');
+    const record = installNightlyRunner({ brainHome, source: path.join(ROOT, 'bin/nightly-refresh.mjs'), nodePath: process.execPath });
+    const entry = record.updateModules['developer-update.mjs'].path;
+    if (source !== undefined) {
+      fs.writeFileSync(entry, source);
+      const registration = JSON.parse(fs.readFileSync(record.recordPath, 'utf8'));
+      registration.updateModules['developer-update.mjs'].sha256 = crypto.createHash('sha256').update(source).digest('hex');
+      fs.writeFileSync(record.recordPath, JSON.stringify(registration));
+    }
+    return { home, entry };
+  };
+
+  it('the derived old coordinator really lacks the flag, and the current one really has it', () => {
+    expect(derived).not.toBe(current);
+    expect(derived.includes("'--knowledge-only'")).toBe(false);
+    expect(current.includes("'--knowledge-only'")).toBe(true);
+  });
+
+  it.each([['4.7.20 (git tag)', 'tagged'], ['derived pre-flag copy', 'derived']])('%s: the self-heal asks it for --apply only', (_label, kind) => {
+    if (kind === 'tagged' && tagged.status !== 0) { expect(tagged.stderr).toMatch(/v4\.7\.20|unknown revision|not a git repository/); return; }
+    const old = kind === 'tagged' ? tagged.stdout : derived;
+    const { home, entry } = register(old);
+    const invocation = automaticInvocation(['--update', '--no-nightly-prompt'], { home });
+    expect(invocation.source).toBe('developer-suite');
+    expect(invocation.args).toEqual([entry, '--apply']); // before: [entry, '--apply', '--knowledge-only']
+    // The premise, executed: the registered old coordinator refuses the flag before doing anything.
+    const refused = spawnSync(process.execPath, [entry, '--knowledge-only'], { encoding: 'utf8', timeout: 30_000,
+      env: { HOME: home, USERPROFILE: home, RUVNET_BRAIN_HOME: path.join(home, '.cache/ruvnet-brain'), PATH: path.dirname(process.execPath) } });
+    expect(refused.status).toBe(1);
+    expect(refused.stderr).toMatch(/unsupported developer update argument: --knowledge-only/);
+  });
+
+  it('a current coordinator still gets --knowledge-only', () => {
+    const { home, entry } = register(undefined);
+    expect(automaticInvocation(['--update'], { home }).args).toEqual([entry, '--apply', '--knowledge-only']);
+  });
+});
+
+// Fable review #3 (4.7.21): the knowledge self-heal recorded installer exit 12 (knowledge applied, redundant rollback
+// cleanup pending) as FAILED, while the coordinator accepts 0/12, so the next session spoke a false failure.
+describe.skipIf(process.platform === 'win32')('host-update --knowledge outcome for installer exits', () => {
+  const HOST_UPDATE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../plugin/scripts/host-update.mjs');
+  const knowledgeRun = (exitCode) => {
+    const home = scratch();
+    const root = path.join(home, '.npm-global', 'lib', 'node_modules', 'ruvnet-brain');
+    fs.mkdirSync(path.join(root, 'bin'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: 'ruvnet-brain', version: '9.0.0', bin: { 'ruvnet-brain': 'bin/install.mjs' } }));
+    fs.writeFileSync(path.join(root, 'bin', 'install.mjs'), `console.log('stub installer'); process.exit(${exitCode});\n`);
+    saveUpdateSource('installed', { home }); // offline-independent: the installed source needs no registry probe
+    const attempt = path.join(home, 'auto-update.json'); const lock = path.join(home, 'auto-update.lock');
+    fs.writeFileSync(lock, '{}');
+    const r = spawnSync(process.execPath, [HOST_UPDATE, '--knowledge', attempt, lock], { encoding: 'utf8', timeout: 60_000,
+      env: { HOME: home, USERPROFILE: home, RUVNET_BRAIN_HOME: path.join(home, '.cache/ruvnet-brain'), PATH: path.dirname(process.execPath) } });
+    expect(r.status, r.stderr).toBe(0);
+    expect(fs.existsSync(lock)).toBe(false);
+    return JSON.parse(fs.readFileSync(attempt, 'utf8'));
+  };
+  it.each([[0, 'succeeded'], [12, 'succeeded'], [1, 'failed'], [2, 'failed']])('installer exit %i is recorded %s', (code, outcome) => {
+    const record = knowledgeRun(code);
+    expect(record).toMatchObject({ outcome, code }); // exit 12 before: 'failed'
+    if (outcome === 'succeeded') expect(record.reason).toBe('');
+    else expect(record.reason).toBe('stub installer');
+  });
+});
