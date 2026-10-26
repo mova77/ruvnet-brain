@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { afterEach, expect, it } from 'vitest';
-import { adoptedProject, cleanup, fakeRuflo } from '../helpers/continuity-fixture.mjs';
+import { adoptedProject, cleanup, fakeRuflo, waitForDetached } from '../helpers/continuity-fixture.mjs';
 import { runLifecycleBoundary } from '../../plugin/scripts/session-snapshot-hook.mjs';
 
 function fixture() {
@@ -48,8 +48,12 @@ it.each(['Stop', 'PreCompact', 'SessionEnd'])('native %s launcher leaves opted-o
 it.each(['PreCompact', 'SessionEnd'])('%s with consent on stores one checkpoint through ruflo and reads it back', async (event) => {
   const f = fixture();
   const result = await runLifecycleBoundary(event, { session_id: 'consent', hook_event_name: event, cwd: f.origin }, { env: f.env });
+  // These boundaries also start the detached turn-distill worker, which writes its receipt and ledger rows into
+  // the temp brain home after this returns; cleanup must not race it (ENOTEMPTY, preflight run 40255856163).
+  // Waited for first, so a failing assertion below cannot leave it running into cleanup either.
+  await waitForDetached([result.turn?.launch?.pid, result.checkpoint?.pid]);
   expect(result.checkpoint.stored).toBe(true);
   expect(result.checkpoint.verified).toBe(true);
   const stores = f.cli.calls().filter((c) => c.argv[1] === 'store' && /^project-state-auto-\d+-[0-9a-f]{8}$/.test(c.key || ''));
   expect(stores.length).toBe(1);
-});
+}, 40_000);
