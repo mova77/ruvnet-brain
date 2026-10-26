@@ -66,6 +66,7 @@
     "learning:replay:check": "node scripts/learning-replay.mjs --check-portfolio",
     "learning:replay:mutants:check": "node scripts/learning-replay.mjs --check-mutants",
     "learning:replay:dry": "node scripts/learning-replay.mjs --dry-run",
+    "learning:replay:wire": "node scripts/learning-replay.mjs --check-wire",
     "wired:check": "node scripts/wired-check.mjs --check",
     "doc:currency": "node scripts/doc-currency.mjs --check",
     "status:check": "node scripts/status-honesty.mjs",

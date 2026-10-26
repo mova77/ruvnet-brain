@@ -43,6 +43,7 @@ const usage = () => `Usage:
   node scripts/learning-replay.mjs --check-portfolio
   node scripts/learning-replay.mjs --measure-portfolio --host codex --model MODEL
   node scripts/learning-replay.mjs --check-mutants
+  node scripts/learning-replay.mjs --check-wire      (token-free; needs the global ruflo)
   node scripts/learning-replay.mjs --dry-run
   node scripts/learning-replay.mjs --mutant <${Object.keys(MUTANTS).join('|')}>
 
@@ -57,29 +58,85 @@ function parse(argv) {
   return { has, arg };
 }
 
-function wireProbe(dirs, spec, stateDir) {
-  const result = spawnSync(process.execPath, [
-    path.join(ROOT, 'plugin', 'scripts', 'hook-shim.mjs'),
-    'unprompted-speech', 'UserPromptSubmit',
-  ], {
+// Fire project B's prompt hook exactly as each host registers it: Claude through hook-shim.mjs
+// (plugin/hooks/hooks.json), Codex through the Brain home's stable codex-hook.mjs wrapper. The user's
+// nudge setting and the runtime's test seams are pinned to the DEFAULT install, so an ambient
+// RUVNET_STOP_NUDGES=full on the measuring machine can never hide a regression that every user has.
+export function wireOutput(dirs, spec, stateDir, host = 'claude-code') {
+  const argv = host === 'codex'
+    ? [path.join(dirs.brainHome, 'codex-hook.mjs'), 'unprompted-speech', 'UserPromptSubmit']
+    : [path.join(ROOT, 'plugin', 'scripts', 'hook-shim.mjs'), 'unprompted-speech', 'UserPromptSubmit'];
+  const env = {
+    ...process.env,
+    RUVNET_BRAIN_HOME: dirs.brainHome,
+    RUVNET_BRAIN_STATE_DIR: stateDir,
+    RUVNET_CONFIG_ROOT: path.join(dirs.base, 'config'),
+    RUVNET_LESSON_STORE: dirs.lessons,
+    RUVNET_LESSON_GATE_STATE: dirs.gateState,
+    CLAUDE_PLUGIN_ROOT: path.join(ROOT, 'plugin'),
+    RUVNET_STOP_NUDGES: '',
+  };
+  for (const seam of ['RUVNET_UNPROMPTED_CHANNELS', 'RUVNET_UNPROMPTED_PRODUCERS', 'RUVNET_REPLAY_SEQUENCE_FILE']) delete env[seam];
+  const result = spawnSync(process.execPath, argv, {
     input: JSON.stringify({
+      hook_event_name: 'UserPromptSubmit',
       prompt: spec.prompt,
-      session_id: `dry-${Date.now()}`,
+      session_id: `wire-${Date.now()}`,
       cwd: dirs.projectB,
     }),
     encoding: 'utf8',
     cwd: dirs.projectB,
-    env: {
-      ...process.env,
-      RUVNET_BRAIN_HOME: dirs.brainHome,
-      RUVNET_BRAIN_STATE_DIR: stateDir,
-      RUVNET_CONFIG_ROOT: path.join(dirs.base, 'config'),
-      RUVNET_LESSON_STORE: dirs.lessons,
-      RUVNET_LESSON_GATE_STATE: dirs.gateState,
-      CLAUDE_PLUGIN_ROOT: path.join(ROOT, 'plugin'),
-    },
+    timeout: 60_000,
+    env,
   });
-  return (result.stdout || '').length;
+  return result.stdout || '';
+}
+
+const wireProbe = (dirs, spec, stateDir) => wireOutput(dirs, spec, stateDir).length;
+
+// THE TOKEN-FREE HALF OF D4, measured on every schedule. No model is called, so this does NOT prove a
+// model changed its behaviour (that is --check-portfolio, priced in tokens). It proves the brain's half
+// of the loop on the current code with the real global ruflo: a lesson recorded independently in two
+// projects is promoted, survives a refresh, and reaches project B's prompt on BOTH hosts — while the
+// brain-off control never receives it and deleting the lesson removes it (the causal mutant).
+export function checkWire({ fire = wireOutput, premise = verifyRufloFlag, hosts = ['claude-code', 'codex'] } = {}) {
+  const ruflo = premise();
+  if (!ruflo.ok) return { status: VERDICT.UNKNOWN, why: `ruflo premise not verified: ${ruflo.why}` };
+  const checked = [];
+  for (const trap of [TRAP.MEMORY_SEARCH, TRAP.POST_TASK]) {
+    const spec = trapSpec(trap);
+    const probe = spec.lesson.slice(0, 60);
+    const base = allocateRunBase();
+    const dirs = buildFixtures(base);
+    try {
+      const record = recordInProjectA(dirs, { trap });
+      if (!record.sources.every((source) => source.recorded)) {
+        return { status: VERDICT.UNKNOWN, why: `${trap}: ruflo could not record the lesson in project A`, checked };
+      }
+      if (!record.ok || !record.promoted) return { status: VERDICT.FAIL, why: `${trap}: lesson was not promoted across two projects`, checked };
+      const refresh = nightlyRefresh(dirs);
+      if (!refresh.lessonSurvived) return { status: VERDICT.FAIL, why: `${trap}: lesson did not survive refresh`, checked };
+      for (const host of hosts) {
+        if (fire(dirs, spec, dirs.stateOff, host).includes(probe)) {
+          return { status: VERDICT.INCONCLUSIVE, why: `${trap}/${host}: the brain-off control also received the lesson`, checked };
+        }
+        if (!fire(dirs, spec, dirs.stateOn, host).includes(probe)) {
+          return { status: VERDICT.FAIL, why: `${trap}/${host}: the promoted lesson did not reach project B's prompt`, checked };
+        }
+      }
+      saveLessons([], dirs.lessons);
+      for (const host of hosts) {
+        if (fire(dirs, spec, dirs.stateOn, host).includes(probe)) {
+          return { status: VERDICT.FAIL, why: `${trap}/${host}: delete-lesson mutant still delivered it — delivery is not caused by the lesson`, checked };
+        }
+      }
+      checked.push(trap);
+    } finally {
+      cleanupFixtureDaemons(dirs);
+      removeFixture(base);
+    }
+  }
+  return { status: VERDICT.PASS, why: `both lessons reached project B on ${hosts.join(' and ')}; control and delete-lesson mutant stayed silent`, checked };
 }
 
 function printed(label, result) {
@@ -127,6 +184,7 @@ export async function main(argv = process.argv.slice(2)) {
   }
   if (has('--check-portfolio')) return printed(`${INVARIANT}-PORTFOLIO`, checkPortfolio());
   if (has('--check-mutants')) return printed(`${INVARIANT}-MUTANTS`, checkMutantArtifacts());
+  if (has('--check-wire')) return printed(`${INVARIANT}-WIRE`, checkWire());
   if (has('--measure-portfolio')) return measurePortfolio({ host, model });
 
   const source = checkSourceIdentity();
