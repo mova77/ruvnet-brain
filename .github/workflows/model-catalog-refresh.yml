@@ -31,8 +31,16 @@ jobs:
         with:
           node-version: '20'
 
+      # Exit 1 only when the router's core evidence (inventory, evaluations) failed; a broken third-party advisory
+      # page alone is `partial`: exit 0 with a ::warning annotation and a line in the job summary.
       - name: Collect weekly independent model and effort evidence
-        run: node scripts/model-currency.mjs --refresh --router-dir "$RUNNER_TEMP/model-currency"
+        run: |
+          set -o pipefail
+          node scripts/model-currency.mjs --refresh --router-dir "$RUNNER_TEMP/model-currency" | tee "$RUNNER_TEMP/model-currency.out"
+
+      - name: Summarize the model-currency verdict
+        if: always()
+        run: node scripts/model-currency.mjs --summarize "$RUNNER_TEMP/model-currency.out" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Preserve source evidence and incomplete-refresh diagnostics
         if: always()

@@ -10,6 +10,9 @@ it('refreshes and verifies the catalog on main and reports it without any write 
   expect(workflow).not.toMatch(/: write\b/);
   expect(workflow).toContain('name: model-catalog-refresh\n          path: ${{ runner.temp }}/catalog-refresh/');
   expect(workflow).toContain('>> "$GITHUB_STEP_SUMMARY"');
+  expect(workflow).toContain('--refresh --router-dir "$RUNNER_TEMP/model-currency" | tee "$RUNNER_TEMP/model-currency.out"');
+  expect(workflow).toMatch(/set -o pipefail\n {10}node scripts\/model-currency.mjs --refresh/);
+  expect(workflow).toContain('node scripts/model-currency.mjs --summarize "$RUNNER_TEMP/model-currency.out" >> "$GITHUB_STEP_SUMMARY"');
   expect(workflow).not.toMatch(/^  (integration|canonical-qa):/m);
   expect(workflow).not.toContain('HEAD:main');
 });

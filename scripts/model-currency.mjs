@@ -243,12 +243,17 @@ if (isDirectInvocation(import.meta.url)) {
   const dirIndex = process.argv.indexOf('--router-dir');
   const routerDir = dirIndex >= 0 ? process.argv[dirIndex + 1] : DEFAULT_ROUTER_DIR;
   if (!routerDir || !path.isAbsolute(routerDir)) throw new Error('--router-dir must be absolute');
-  if (process.argv.includes('--refresh')) {
+  if (process.argv.includes('--summarize')) {
+    // Markdown for the CI job summary from a captured `--refresh` stdout; a missing or unreadable capture says so.
+    let outcome;
+    try { outcome = JSON.parse(fs.readFileSync(process.argv[process.argv.indexOf('--summarize') + 1], 'utf8').split('\n')[0]).outcome; }
+    catch { outcome = null; }
+    process.stdout.write(outcome ? outcomeSummary(outcome) : '### model-currency refresh: no result (the refresh step crashed before reporting)\n');
+  } else if (process.argv.includes('--refresh')) {
     refreshModelCurrency({ routerDir, claimToken: process.argv.includes('--claim-token') ? process.argv[process.argv.indexOf('--claim-token') + 1] : null }).then((result) => {
       const outcome = refreshOutcome(result);
       console.log(JSON.stringify({ ...result, outcome }));
       if (outcome.status === 'partial') console.log(`::warning title=model-currency partial::${outcome.warnings.join('; ').replace(/[\r\n]+/g, ' ')}`);
-      if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, outcomeSummary(outcome));
       process.exitCode = outcome.exitCode;
     }).catch((error) => { console.error(error.message); process.exitCode = 1; });
   } else console.log(JSON.stringify(process.argv.includes('--catch-up') ? maybeLaunchCurrencyRefresh({ routerDir }) : readCurrencyStatus({ routerDir })));

@@ -87,12 +87,15 @@ globalThis.fetch = async (url) => {
   if (url.includes('/agents/coding-agents')) return { ok: true, text: async () => '<html>agents moved</html>' };
   return { ok: true, text: async () => b.aaHtml };
 };\n`);
+    const cli = path.join(ROOT, 'scripts', 'model-currency.mjs');
     const run = (extraEnv) => {
-      const routerDir = tempDir(); const summary = path.join(work, `summary-${dirs.length}.md`);
-      const result = spawnSync(process.execPath, ['--import', pathToFileURL(preload).href, path.join(ROOT, 'scripts', 'model-currency.mjs'),
-        '--refresh', '--router-dir', routerDir], { cwd: ROOT, encoding: 'utf8', timeout: 60_000,
-        env: { ...process.env, GITHUB_STEP_SUMMARY: summary, ...extraEnv } });
-      return { ...result, summary: fs.existsSync(summary) ? fs.readFileSync(summary, 'utf8') : '' };
+      const routerDir = tempDir(); const captured = path.join(work, `refresh-${dirs.length}.out`);
+      const result = spawnSync(process.execPath, ['--import', pathToFileURL(preload).href, cli, '--refresh', '--router-dir', routerDir],
+        { cwd: ROOT, encoding: 'utf8', timeout: 60_000, env: { ...process.env, ...extraEnv } });
+      fs.writeFileSync(captured, result.stdout);
+      // The workflow's summary step: `--summarize <captured stdout> >> $GITHUB_STEP_SUMMARY`.
+      const summary = spawnSync(process.execPath, [cli, '--summarize', captured], { cwd: ROOT, encoding: 'utf8', timeout: 30_000 });
+      return { ...result, summary: summary.stdout };
     };
     const partial = run({});
     expect(partial.status, partial.stderr).toBe(0);
@@ -103,6 +106,9 @@ globalThis.fetch = async (url) => {
     expect(down.status).toBe(1);
     expect(JSON.parse(down.stdout.split('\n')[0]).outcome.status).toBe('failed');
     expect(down.summary).toContain('error: inventory: HTTP 500');
+    const missing = spawnSync(process.execPath, [cli, '--summarize', path.join(work, 'absent.out')], { cwd: ROOT, encoding: 'utf8' });
+    expect(missing.status).toBe(0);
+    expect(missing.stdout).toContain('no result');
   });
 
   it('refreshModelCurrency on the live page records fresh agent evidence and a complete attempt', async () => {
