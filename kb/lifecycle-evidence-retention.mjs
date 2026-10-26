@@ -252,9 +252,11 @@ function quarantineAndRemove(entry, root, removeEntry, afterQuarantine) {
     throw new Error(`refusing unsafe lifecycle evidence removal: ${entry}`);
   }
   const quarantine = path.join(root, `.prune-${name.replace(/\.json$/, '')}-${crypto.randomBytes(8).toString('hex')}`);
-  fs.renameSync(resolved, quarantine);
+  // Vanished since the snapshot (another sweep, the writer itself): already gone, not a failed prune.
+  try { fs.renameSync(resolved, quarantine); } catch (error) { if (error?.code === 'ENOENT') return false; throw error; }
   afterQuarantine?.({ entry: resolved, quarantine });
   removeEntry(quarantine);
+  return true;
 }
 
 // Keep every JSON token (including numeric precision and escaped string spelling).
@@ -308,10 +310,12 @@ export function pruneLifecycleEvidence(options = {}) {
   // silent). The file identity is rechecked immediately before it is quarantined.
   const reclaimedTemporaries = [];
   for (const row of snapshot(options).temporaries.filter((entry) => entry.disposition === 'abandoned')) {
-    const current = fs.lstatSync(row.path);
+    let current;
+    // A temp that vanished between the snapshot and this re-check is already gone; it must not throw the whole prune.
+    try { current = fs.lstatSync(row.path); } catch (error) { if (error?.code === 'ENOENT') continue; throw error; }
     if (!current.isFile() || current.isSymbolicLink() || current.nlink !== 1 || current.dev !== row.identity.dev
       || current.ino !== row.identity.ino || current.size !== row.identity.size || current.mtimeMs !== row.identity.mtimeMs) continue;
-    quarantineAndRemove(row.path, path.dirname(row.path), removeEntry, options.afterQuarantine);
+    if (!quarantineAndRemove(row.path, path.dirname(row.path), removeEntry, options.afterQuarantine)) continue;
     reclaimedTemporaries.push({ path: row.path, runId: row.runId, writerPid: row.writerPid, bytes: row.bytes,
       sha256: row.sha256, canonicalReceipt: row.canonicalReceipt });
   }
@@ -335,7 +339,7 @@ export function pruneLifecycleEvidence(options = {}) {
         : [...refreshCandidates, ...transactionCandidates].sort((a, b) => a.timestamp - b.timestamp)[0];
     if (!candidate) break;
     const root = candidate.kind === 'refresh' ? state.roots.refresh : state.roots.transactions;
-    quarantineAndRemove(candidate.path, root, removeEntry, options.afterQuarantine);
+    if (!quarantineAndRemove(candidate.path, root, removeEntry, options.afterQuarantine)) continue; // gone: re-snapshot
     removed[candidate.kind === 'refresh' ? 'refresh' : 'transactions'].push(candidate.path);
   }
   const final = assessLifecycleEvidence({ ...options, policy });
