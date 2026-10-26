@@ -3967,6 +3967,11 @@ export function classifyUpdaterExit(status, { fallbackAllowed = true, result = n
     return { verdict: 'recovery-required', fallback: false, exitCode: status || 1 };
   }
   if (status === 5) return { verdict: 'refused-incompatible', fallback: false, exitCode: 5 };
+  // The updater was stopped by a signal (its own TTL, a logout, Ctrl-C) and settled itself as `interrupted`.
+  // Nothing is broken, so a fresh reinstall would only re-download ~745 MB into the same interruption.
+  if (result?.terminalVerdict === 'interrupted' || status === 143 || status === 130) {
+    return { verdict: 'interrupted', fallback: false, exitCode: status || 143 };
+  }
   return { verdict: 'failed', fallback: fallbackAllowed, exitCode: status || 1 };
 }
 

@@ -45,6 +45,12 @@ afterAll(() => {
 });
 
 describe('classifyUpdaterExit: no reinstall for what a reinstall cannot fix', () => {
+  it('a signal-interrupted updater is reported as interrupted, never a fresh-reinstall fallback', () => {
+    expect(install.classifyUpdaterExit(143, { result: { terminalVerdict: 'interrupted' }, requireResult: true }))
+      .toEqual({ verdict: 'interrupted', fallback: false, exitCode: 143 });
+    expect(install.classifyUpdaterExit(130, {})).toEqual({ verdict: 'interrupted', fallback: false, exitCode: 130 });
+  });
+
   it('recovery-required (e.g. lifecycle retention) is returned as is, never a fresh-reinstall fallback', () => {
     const result = { terminalVerdict: 'recovery-required', exitCode: 1,
       reason: 'lifecycle evidence retention failed: refresh-runs/.DS_Store is not a receipt' };
