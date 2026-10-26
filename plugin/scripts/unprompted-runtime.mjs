@@ -128,6 +128,11 @@ const MAX_BUFFER = 1 << 20;
 
 const VALID_CHANNELS = new Set(['advocacy', 'promotion', 'lesson', 'alarm']);
 const VALID_EFFECTS = new Set(['advisory', 'block']);
+// The shim's quiet default (RUVNET_STOP_NUDGES unset) narrows this run to lesson + alarm: lesson
+// producers still run and deliver, advocacy/promotion producers are never spawned. Unset → every channel.
+const ALLOWED_CHANNELS = process.env.RUVNET_UNPROMPTED_CHANNELS
+  ? new Set(process.env.RUVNET_UNPROMPTED_CHANNELS.split(',').map((c) => c.trim()).filter((c) => VALID_CHANNELS.has(c)))
+  : VALID_CHANNELS;
 
 /** Exit 0 with byte-empty stdout — the fail-safe and the "nothing to say" path. */
 function silent() { process.exit(0); }
@@ -243,7 +248,7 @@ if (!event) silent();
   if (typeof promptText === 'string' && isHarnessGenerated(promptText)) silent();
 }
 
-const producers = resolveProducers(EVENT);
+const producers = resolveProducers(EVENT).filter((p) => p.channels.some((c) => ALLOWED_CHANNELS.has(c)));
 if (!producers.length) silent();   // unknown event, or nothing wired for it — never speak on a guess
 
 // ── Spawn producers as CAPTURED children, collect candidate lines ──────────────────────────────────
@@ -300,6 +305,7 @@ for (const { s, channels } of rawLines) {
   try { c = JSON.parse(s); } catch { continue; }              // not JSON → drop (a rogue's raw line)
   if (!c || typeof c !== 'object' || Array.isArray(c)) continue;
   if (!VALID_CHANNELS.has(c.channel)) continue;               // unknown/absent channel → drop
+  if (!ALLOWED_CHANNELS.has(c.channel)) continue;             // narrowed by the shim's quiet default → drop
   if (!channels.includes(c.channel)) continue;                // ANTI-SPOOF (GPT-5.6-Sol): this producer is
                                                               // not authorised for this channel → drop
   if (!VALID_EFFECTS.has(c.effect)) continue;                 // unknown/absent effect → drop

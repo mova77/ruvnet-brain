@@ -48,6 +48,29 @@ describe('quiet by default', () => {
       if (id === 'capacity-aware-parallel-work') expect(run('full').stdout).toContain('Capacity-aware parallel-work advisory');
     }
   });
+  it('quiet unprompted-speech still delivers a recorded lesson, and only the lesson', () => {
+    // A recorded correction is not an advisory nudge: from 4.7.8 to 4.7.20 quiet mode exited this hook
+    // whole and no learned lesson reached any prompt. Fake producers through the runtime's test seam.
+    const SHIM = path.resolve('plugin/scripts/hook-shim.mjs');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'quiet-lesson-'));
+    dirs.push(dir);
+    const spawned = path.join(dir, 'advocacy-spawned');
+    const emit = (channel, copy, marker = '') => ({ argv: [process.execPath, '-e',
+      `${marker ? `require('fs').writeFileSync(${JSON.stringify(marker)}, '1');` : ''}`
+      + `process.stdout.write(JSON.stringify({channel:'${channel}',effect:'advisory',copy:'${copy}'})+'\\n')`],
+    feedStdin: false, channels: [channel] });
+    const producers = JSON.stringify([emit('lesson', 'LESSON-COPY-7'), emit('advocacy', 'ADVOCACY-COPY-7', spawned)]);
+    const run = (nudges) => spawnSync(process.execPath, [SHIM, 'unprompted-speech', 'UserPromptSubmit'], { cwd: dir, encoding: 'utf8',
+      input: JSON.stringify({ hook_event_name: 'UserPromptSubmit', session_id: 's1', cwd: dir, prompt: 'recall the caching note' }),
+      env: { ...process.env, HOME: dir, RUVNET_STOP_NUDGES: nudges, RUVNET_UNPROMPTED_PRODUCERS: producers } });
+    const quiet = run('');
+    expect(quiet.status).toBe(0);
+    expect(quiet.stdout).toContain('LESSON-COPY-7');
+    expect(quiet.stdout).not.toContain('ADVOCACY-COPY-7');
+    expect(fs.existsSync(spawned)).toBe(false);     // the advocacy producer was never even spawned
+    expect(run('full').stdout).toContain('LESSON-COPY-7');
+    expect(fs.existsSync(spawned)).toBe(true);      // and full mode still runs it
+  });
   it('an observed SLA-breach issue is not printed on an ordinary stop', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'quiet-obs-'));
     dirs.push(dir);
