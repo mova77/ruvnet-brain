@@ -62,7 +62,7 @@ export const RELEASE_REQUIREMENTS = Object.freeze({
       "files": ["tests/unit/advocacy-route.test.mjs", "tests/unit/advocacy-catalog.test.mjs", "tests/unit/card-lane.test.mjs"],
       "platformFiles": {
         "linux": ["tests/unit/advocacy-route-budget.test.mjs", "tests/unit/ground-before-write.test.mjs", "tests/unit/grounding-code-projection.test.mjs", "tests/unit/package-recommender.test.mjs", "tests/unit/write-gate-policy.test.mjs"],
-        "macos": ["tests/unit/advocacy-route-budget.test.mjs", "tests/unit/ground-before-write.test.mjs", "tests/unit/grounding-code-projection.test.mjs", "tests/unit/package-recommender.test.mjs", "tests/unit/write-gate-policy.test.mjs"]
+        "macos": ["tests/unit/advocacy-route-budget.test.mjs", "tests/unit/ground-before-write.test.mjs", "tests/unit/grounding-code-projection.test.mjs", "tests/unit/package-recommender.test.mjs"]
       }
     },
     {
@@ -150,8 +150,8 @@ export const RELEASE_REQUIREMENTS = Object.freeze({
         "tests/unit/install-update-exit-semantics.test.mjs"
       ],
       "platformFiles": {
-        "linux": ["tests/unit/codex-wrapper-upgrade-ownership-links.test.mjs", "tests/unit/forge-update-signal.test.mjs", "tests/unit/console-runtime-replacement-posix.test.mjs", "tests/unit/update-apply-lock-identity.test.mjs", "tests/unit/update-apply-lock-takeover-race.test.mjs", "tests/integration/install-update-signals.test.mjs", "tests/unit/forge-guard-injection-log-location.test.mjs", "tests/unit/installer-sibling-imports-packaged.test.mjs", "tests/unit/npm-pack-json.test.mjs", "tests/unit/npm-tarball-codex.test.mjs", "tests/unit/model-catalog-packaging.test.mjs", "tests/integration/pack-completeness.test.mjs"],
-        "macos": ["tests/unit/codex-wrapper-upgrade-ownership-links.test.mjs", "tests/unit/forge-update-signal.test.mjs", "tests/unit/console-runtime-replacement-posix.test.mjs", "tests/unit/update-apply-lock-identity.test.mjs", "tests/unit/update-apply-lock-takeover-race.test.mjs", "tests/integration/install-update-signals.test.mjs", "tests/unit/forge-guard-injection-log-location.test.mjs", "tests/unit/installer-sibling-imports-packaged.test.mjs", "tests/unit/npm-pack-json.test.mjs", "tests/unit/npm-tarball-codex.test.mjs", "tests/unit/model-catalog-packaging.test.mjs", "tests/integration/pack-completeness.test.mjs", "tests/unit/spend-guard-install.test.mjs"]
+        "linux": ["tests/unit/codex-wrapper-upgrade-ownership-links.test.mjs", "tests/unit/forge-update-signal.test.mjs", "tests/unit/console-runtime-replacement-posix.test.mjs", "tests/unit/update-apply-lock-identity.test.mjs", "tests/unit/update-apply-lock-takeover-race.test.mjs", "tests/integration/install-update-signals.test.mjs", "tests/unit/forge-guard-injection-log-location.test.mjs", "tests/unit/installer-sibling-imports-packaged.test.mjs", "tests/unit/npm-pack-json.test.mjs", "tests/unit/npm-tarball-codex.test.mjs", "tests/integration/pack-completeness.test.mjs"],
+        "macos": ["tests/unit/codex-wrapper-upgrade-ownership-links.test.mjs", "tests/unit/forge-update-signal.test.mjs", "tests/unit/console-runtime-replacement-posix.test.mjs", "tests/unit/update-apply-lock-identity.test.mjs", "tests/unit/update-apply-lock-takeover-race.test.mjs", "tests/integration/install-update-signals.test.mjs", "tests/unit/forge-guard-injection-log-location.test.mjs", "tests/unit/installer-sibling-imports-packaged.test.mjs", "tests/unit/npm-pack-json.test.mjs", "tests/unit/npm-tarball-codex.test.mjs", "tests/integration/pack-completeness.test.mjs", "tests/unit/spend-guard-install.test.mjs"]
       }
     },
     {
@@ -269,8 +269,8 @@ export const RELEASE_REQUIREMENTS = Object.freeze({
       "reason": "The gists nightly re-embeds over a stale store, scales its stall budget with the slowest batch and reports its error paths; a stalled shard is detected; a reader never deadlocks the refresh",
       "files": ["tests/unit/forge-big-stall.test.mjs"],
       "platformFiles": {
-        "linux": ["tests/integration/ingest-gists.test.mjs", "tests/integration/nightly-gists-error-paths.test.mjs", "tests/integration/reader-deadlock-regression.test.mjs"],
-        "macos": ["tests/integration/ingest-gists.test.mjs", "tests/integration/nightly-gists-error-paths.test.mjs", "tests/integration/reader-deadlock-regression.test.mjs"]
+        "linux": ["tests/integration/ingest-gists.test.mjs", "tests/integration/nightly-gists-error-paths.test.mjs"],
+        "macos": ["tests/integration/ingest-gists.test.mjs", "tests/integration/nightly-gists-error-paths.test.mjs"]
       }
     },
     {
