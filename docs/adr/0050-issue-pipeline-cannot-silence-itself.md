@@ -9,7 +9,7 @@ updated: 2026-10-25
 # tests/unit/fix-workstream-guidance.test.mjs. Do not let a currency stamp move it.
 updated_pinned: true
 impl: wired
-reviewed_digest: 30b953c3e054
+reviewed_digest: 0479f7f2da2d
 version: 1.0.4
 authors: [Stuart Kerr, Claude Code]
 tags: [issues, automation, alerting, sla, security, circuit-breaker]
@@ -220,6 +220,7 @@ The four parallel agents working tonight support this distinction. They show tha
   regressions (8 of 12 assertions fail on the pre-fix code, proven by stash-mutation).
 
 ## Currency log
+| 2026-10-25 | Review `0479f7f2da2d` (4.7.21): decision unchanged; the pipeline still cannot silence itself. `scripts/issue-watch.mjs`, `scripts/issue-fix.mjs` and `plugin/scripts/session-start-core.mjs` changed only by the entry-point sweep (each file's own main-module check replaced by `isDirectInvocation` from `plugin/scripts/entrypoint.mjs`). `plugin/skills/ruvnet-brain/SKILL.md` rewords the optional-recommendation line as a statement, never a question or approval dialog (#489); acknowledgment, escalation, paging and the fixer's stop conditions are untouched. | Reviewed diffs 320b778b..63ca7c0d for `scripts/issue-watch.mjs`, `scripts/issue-fix.mjs`, `plugin/scripts/session-start-core.mjs` and `plugin/skills/ruvnet-brain/SKILL.md`. |
 | 2026-10-25 | Review `30b953c3e054` (4.7.20): decision unchanged; the pipeline still cannot silence itself. `scripts/issue-watch.mjs` now pages a person's issue once at the 4 h SLA (never the owner's or a bot's), adds one 9 a.m. ET summary, and leaves the arrival page to `.github/workflows/ntfy-alerts.yml` (which retries delivery and fails visibly); the acknowledgment comment and SLA tracking are unchanged. `plugin/scripts/session-start-core.mjs` admits one new counts-only NTFY status line. | Reviewed `scripts/issue-watch.mjs` and `plugin/scripts/session-start-core.mjs` diffs 5b1f5c59..HEAD; tests issue-watch-paging, issue-watch-retry, session-start-core-parity. Owner-reported cause: 10,747 notifications on one topic (2026-10-25). |
 | 2026-10-05 | Reviewed current source and recorded remaining limitations; no verification or implementation-status promotion. | reviewed_digest 217aeebc7672; inspected `scripts/issue-watch.mjs` and all expanded governs against source 5d9ea4df. Independent review preserved incident dates, Proposed/expired states and historical evidence; notification and oldest-runtime limits are explicit. |
 | 2026-09-27 | Currency review: decision unchanged. Motion: session-start-core's corpus-currency verdict consolidation and a silent-exit-0 guard closure; a release-proof SKILL.md diagnostics alignment. The issue-pipeline's own self-silencing guard is untouched. | Reviewed `scripts/issue-watch.mjs`, `scripts/issue-fix.mjs`, `plugin/scripts/session-start-core.mjs`, `plugin/skills/ruvnet-brain/SKILL.md`, `plugin/skills/release-proof/SKILL.md` against the commits listed above; reviewed_digest 51940a548841. |
