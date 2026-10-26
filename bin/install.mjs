@@ -557,7 +557,7 @@ function placeFileAtomic(target, bytes) {
 // one. The signed npm package carries the updater and the sibling modules it imports; the `--update`
 // preflight places them (same trust as the validator) so a stale updater upgrades itself before it runs.
 const UPDATER_FILES = ['forge-update.mjs', 'zip-extract.mjs', 'brain-profile.mjs', 'refresh-run.mjs',
-  'update-storage-transaction.mjs', 'lifecycle-evidence-retention.mjs', 'corpus-release-identity.mjs', 'download-retry.mjs'];
+  'update-storage-transaction.mjs', 'lifecycle-evidence-retention.mjs', 'corpus-release-identity.mjs', 'download-retry.mjs', 'forge-guard-injection.mjs'];
 export function placeUpdater(kbDir, { sourceDir = path.join(REPO_ROOT, 'kb') } = {}) {
   const placed = {};
   for (const name of UPDATER_FILES) {
