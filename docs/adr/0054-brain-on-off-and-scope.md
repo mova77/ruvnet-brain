@@ -5,7 +5,7 @@ status: Accepted
 date: 2026-07-26
 updated: 2026-10-25
 updated_source: derived-from-git
-reviewed_digest: 324748827666
+reviewed_digest: d8c2d50bf07b
 version: 1.1.7
 impl: verification-expired
 verified: 2026-07-31
@@ -226,6 +226,7 @@ overlays and preserves the prior generation as unclassified data instead of dele
 source review does not renew the expired verification or prove the native-host acceptance criteria.
 
 ## Currency log
+| 2026-10-25 | Review `d8c2d50bf07b` (4.7.21): on/off and per-part scope handling unchanged; one retention sentence now has an exception the owner should ratify. `kb/forge-update.mjs` (#335, review A): after an explicit `npx ruvnet-brain --clean --archive`, `reclaimBackups` releases a backup whose every regular-file byte survives at the same path in live or in a `kb.archive/` tree, before and regardless of the store-inventory checks. So the sentence that the rollback reclaimer still keeps any backup containing an unknown private/local RVF no longer holds literally once such an archive exists; the private bytes stay in `kb.archive/`, which is never removed automatically, so nothing private is lost. `kb/forge-ask-all.mjs` `corpusAgeFor` reads the recorded `builtUtc` before file mtime (Dream #359). `scripts/onboarding-console.mjs`: plugin-aware session-hook probe and quiet-learner progress check. `bin/install.mjs`: #492, #301, #335, #420 item 4, #400 (the summary now states that the allowlisted lifecycle hooks run). `plugin/scripts/session-start-core.mjs`: entry-point sweep only. | Reviewed diffs 320b778b..63ca7c0d for `kb/forge-update.mjs`, `kb/forge-ask-all.mjs`, `scripts/onboarding-console.mjs`, `bin/install.mjs` and `plugin/scripts/session-start-core.mjs`; CONTRIBUTING.md 1.5.1 documents the archive rule. |
 | 2026-10-25 | Review `324748827666` (4.7.20): decision unchanged. `plugin/scripts/session-start-core.mjs` only adds `[RuvNet Brain — NTFY:` to the status allow-list for a maintainer-only, counts-only alert line; on/off and scope handling are untouched. | Reviewed the `plugin/scripts/session-start-core.mjs` diff 5b1f5c59..HEAD (one line). |
 | 2026-10-24 | Review `ebcaf007ff14` (4.7.18): decision unchanged. `bin/install.mjs` moved | The 4.7.18 changes to it are Codex snapshot retry/repair during wiring, a recorded reason on every failed host sync, and an early refusal for a stale source checkout running `--update`. The on/off switch and scope handling are untouched. Source: `bin/install.mjs`. |
 | 2026-10-01 | Currency review (4.5, keyword lane off by default): decision unchanged. `kb/keyword-lane.mjs` gains `keywordLaneEnabled()`, and `kb/forge-ask-all.mjs` adds keyword candidates only when RUVNET_BRAIN_KEYWORD_LANE=1. Brain on/off and per-part scope handling are untouched. reviewed_digest 75556bed3285. | Reviewed `kb/forge-ask-all.mjs` and `kb/keyword-lane.mjs` against `evals/runs/2026-10-01-retrieval-4.5/e2-mitigation/cost-sim.jsonl`. |

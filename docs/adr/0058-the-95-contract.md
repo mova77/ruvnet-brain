@@ -7,7 +7,7 @@ updated: 2026-10-25
 updated_source: derived-from-git
 version: 1.1.7
 impl: wired
-reviewed_digest: 89144c2de786
+reviewed_digest: fcda0e66fec6
 authors: [Stuart Kerr, Claude Fable 5, GPT-5.6-Sol (codex)]
 tags: [qa, gen2-qe, grading, external-signals, ci-watch, release-gate, mutation]
 supersedes: []
@@ -90,6 +90,7 @@ UNKNOWN, and no new behavioral learning result is claimed.
 
 ## Currency log
 
+| 2026-10-25 | Review `fcda0e66fec6` (4.7.21): decision unchanged. Of 16 moved governed files, 15 changed only by the entry-point sweep (`kb/forge-big.mjs`, `scripts/qe/card-lane-gate.mjs`, `scripts/release-proof.mjs`, `plugin/scripts/session-start-core.mjs` and the rest now call `isDirectInvocation`, which compares real paths on both sides; the copies that used `path.resolve` now run through a symlink instead of exiting 0 having done nothing, which strengthens these gates). `bin/install.mjs`: Codex hook trust and app-server reload (#492), Grok reporting (#301), `--clean --archive` (#335), per-project install report (#420 item 4), real hook counts (#400). No observable, mutant or watch-plane rule moved. | Reviewed diffs 320b778b..63ca7c0d for every moved governed path, including `bin/install.mjs`, `kb/forge-big.mjs` and `scripts/qe/card-lane-gate.mjs`. |
 | 2026-10-25 | Review `89144c2de786` (4.7.20): decision unchanged. `plugin/scripts/session-start-core.mjs` gains one allow-listed status prefix for the owner's alert count; no install, hook or release behaviour this contract scores moved. | Reviewed the `plugin/scripts/session-start-core.mjs` diff 5b1f5c59..HEAD. |
 | 2026-10-24 | Review `d88b18444b4e` (4.7.18): decision unchanged. `bin/install.mjs` and `scripts/nightly-wrapper.sh` moved | No contract threshold, lane or gate changed. `bin/install.mjs`: Codex plugin commands wait once and retry when Codex cannot load a marketplace snapshot, and only the install/update path refreshes a third-party snapshot; a failed host sync always records its reason; `--update` from a source checkout older than the installed runtime stops before downloading. `scripts/nightly-wrapper.sh`: its two ruflo calls set `CLAUDE_FLOW_AUTO_UPDATE=false`. Source: `bin/install.mjs`, `scripts/nightly-wrapper.sh`. |
 | 2026-10-03 | Architecture-aligned qualification replaces the contradictory whole-suite promotion job. New capture/recall/continuity/retention/learning boundaries join explicit reviewed inventories; duplicate Linux discovery/uninstall invocations removed. Zero-skip, exact-source, sealed artifact and native public verification remain required. Historical diagnostics are not a second release authority. | `scripts/release-qualification-contract.mjs`; `.github/workflows/canonical-qa.yml`; `.github/workflows/integration-linux.yml`; `CONTRIBUTING.md`. |

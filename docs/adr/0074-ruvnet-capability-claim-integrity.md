@@ -3,9 +3,9 @@ id: ADR-074
 title: RuvNet capability claims require live evidence
 status: Accepted
 date: 2026-08-22
-updated: 2026-10-15
+updated: 2026-10-25
 updated_source: derived-from-git
-reviewed_digest: 9ad8b3485e0d
+reviewed_digest: 38329ebc9caa
 version: 1.1.2
 authors: [Stuart Kerr, Codex]
 tags: [architecture, truthfulness, capabilities, hosts, evidence, receipts]
@@ -144,6 +144,7 @@ tests establish request-envelope behavior, not native-host continuation or a sig
 result. Cross-platform, public-byte, false-positive, and aggregate obligations remain unproven.
 
 ## Currency log
+| 2026-10-25 | Review `38329ebc9caa` (4.7.21): decision unchanged, but the section 2 completion row's example that an unparsed Codex transcript is UNKNOWN is now out of date. `plugin/scripts/completion-claim-evidence.mjs` reads Codex rollouts through `nativeTurnLines` (#423) under a stricter rule: a command counts as a check only with an explicit exit 0, an MCP call only with a completed non-error status, an unrecognised Codex tool is a change, and a rollout with no current-turn boundary stays UNKNOWN; pronoun-only promises are no longer captured (#369). `plugin/scripts/continuation-gate.mjs`: an UNKNOWN whose only gap is task scope (a check after the last change, named, with what is NOT verified disclosed) is reported as `completion-scope-advisory` instead of a correction and still closes nothing (#425, owner decision); the work ledger is written atomically (Dream #474) and its folder is created before the cooldown lock (#404). `plugin/mcp/managed-cli-interface.mjs` resolves ruflo through `resolveRuflo`, so RUFLO_BIN is honoured (#449). `scripts/completion-claim-replay.mjs`: entry-point sweep only. | Reviewed diffs 320b778b..63ca7c0d for `plugin/scripts/completion-claim-evidence.mjs`, `plugin/scripts/continuation-gate.mjs`, `plugin/mcp/managed-cli-interface.mjs`, `scripts/completion-claim-replay.mjs`, `tests/unit/continuation-gate-completion-claims.test.mjs` and `tests/unit/managed-cli-interface.test.mjs`. |
 | 2026-10-15 | Review `9ad8b3485e0d`: decision unchanged. `plugin/scripts/continuation-gate.mjs` moved in 4.7.9 | The observed-work advisory line (open SLA-breach issues, red CI, open PRs, security alerts) is printed only under `RUVNET_STOP_NUDGES=full`; what the gate may force is unchanged. No claim-audit rule, receipt or verdict changed. Source: `plugin/scripts/continuation-gate.mjs`, `tests/unit/continuation-gate-quiet-default.test.mjs`. |
 | 2026-10-15 | Review `1515cbfab58a`: decision unchanged. `plugin/scripts/continuation-gate.mjs` moved in 4.7.7 | An assistant promise whose completion verdict cannot be PASS was forced at every Stop forever; it is now forced at most three times, counted beside the ledger, then retained as deferred and never marked completed, and the gate is quiet by default unless `RUVNET_STOP_NUDGES=full` (only an explicit user objective or a capability claim contradicted by typed evidence still speaks). No claim-audit rule, evidence receipt or verdict changed; a completion claim is still never marked verified by prose. Source: `plugin/scripts/continuation-gate.mjs`, `tests/unit/continuation-gate-quiet-default.test.mjs`. |
 | 2026-09-30 | `extractClaims` exported with an optional `tools` vocabulary (default scope unchanged, so this Stop body's audit is identical) and `currentTurnRecords` factored out of `claudeTurnEvents`, both reused by `grounding-turn-evidence.mjs` for ADR-0030 decision point #1; that gate skips sentences this ADR's RUVNET_TOOL class already audits. | `plugin/scripts/capability-claim-evidence.mjs`, `plugin/scripts/completion-claim-evidence.mjs`; `tests/unit/grounding-turn-assertion.test.mjs`, `tests/unit/continuation-gate-completion-claims.test.mjs`, `tests/unit/capability-claim-evidence.test.mjs` green. |
