@@ -1058,20 +1058,31 @@ function dirSize(dir) {
 // bytes sit at the same relative path in one of them is accounted for even when live lacks or changed it.
 function assertRedundantBackup(backup, live, archives = []) {
   const quiet = (file) => { try { return fs.lstatSync(file); } catch { return null; } };
-  const archived = (relative, prior, size) => archives.some((root) => {
+  // A reference (live or archive) counts only as a regular file reached through real directories, no link at
+  // the root or any ancestor, whose real path is outside the backup being judged: a link into the backup would
+  // compare the backup with itself and approve deleting its only copy (cross-vendor review A).
+  const realBackup = (() => { try { return fs.realpathSync(backup); } catch { return path.resolve(backup); } })();
+  const insideBackup = (file) => {
+    let real; try { real = fs.realpathSync(file); } catch { return true; }
+    return real === realBackup || real.startsWith(`${realBackup}${path.sep}`);
+  };
+  const reference = (root, relative) => {
     let dir = root;
-    for (const part of relative.split(path.sep).slice(0, -1)) {
-      dir = path.join(dir, part);
+    for (const part of ['', ...relative.split(path.sep).slice(0, -1)]) {
+      dir = part ? path.join(dir, part) : dir;
       const st = quiet(dir);
-      if (!st || !st.isDirectory() || st.isSymbolicLink()) return false;
+      if (!st || !st.isDirectory() || st.isSymbolicLink()) return null;
     }
-    const st = quiet(path.join(root, relative));
-    return Boolean(st && st.isFile() && !st.isSymbolicLink() && st.size === size && sha256File(path.join(root, relative)) === sha256File(prior));
+    const file = path.join(root, relative); const st = quiet(file);
+    return st && st.isFile() && !st.isSymbolicLink() && !insideBackup(file) ? { file, st } : null;
+  };
+  const archived = (relative, prior, size) => archives.some((root) => {
+    const ref = reference(root, relative);
+    return Boolean(ref && ref.st.size === size && sha256File(ref.file) === sha256File(prior));
   });
   const compare = (prior, current, relative = '') => {
     const a = fs.lstatSync(prior);
     if (archives.length && !a.isSymbolicLink() && (a.isFile() || a.isDirectory())) {
-      const b = quiet(current);
       if (a.isDirectory()) {
         for (const name of fs.readdirSync(prior)) {
           if (/^(?:\._|\.DS_Store$)/.test(name)) continue;
@@ -1079,7 +1090,8 @@ function assertRedundantBackup(backup, live, archives = []) {
         }
         return;
       }
-      const same = b && b.isFile() && !b.isSymbolicLink() && a.size === b.size && sha256File(prior) === sha256File(current);
+      const ref = reference(live, relative);
+      const same = ref && a.size === ref.st.size && sha256File(prior) === sha256File(ref.file);
       if (same || archived(relative, prior, a.size)) return;
       throw new Error(`different bytes: ${prior}`);
     }

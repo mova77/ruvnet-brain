@@ -82,6 +82,17 @@ describe('#335 (a): duplicate preserved copies release down to one', () => {
     expect(fs.existsSync(b)).toBe(true);
   });
 
+  it('the sweep never treats a live directory linked into the copy as evidence (review A, footprint side)', () => {
+    const m = machine();
+    const a = preserved(m, 'kb.install-preserved-AAAAAA');
+    fs.symlinkSync(path.join(a, 'notes'), path.join(m.kbDir, 'notes'));
+    for (const archive of [false, true]) {
+      const swept = sweepFootprint(opts(m, { apply: true, archive }));
+      expect(swept.removed.map((r) => r.path)).not.toContain(a);
+      expect(fs.readFileSync(path.join(a, 'notes', 'user.txt'), 'utf8')).toBe('my own note');
+    }
+  });
+
   it('a copy is never a reference for itself, and a missing sibling accounts for nothing', () => {
     const m = machine();
     const a = preserved(m, 'kb.install-preserved-AAAAAA');
@@ -274,6 +285,32 @@ describe('#335 (c): reclaimBackups treats an archived copy as accounted for', ()
     }
     expect(reclaimBackups({ kbDir: live, env: {} }).removed).toEqual([]);
     expect(fs.existsSync(backup)).toBe(true);
+  });
+
+  // Cross-vendor review A (P1): with any archive present, the comparison used to follow a live directory link; a
+  // live/notes pointing INTO the backup compared the backup with itself and approved deleting it.
+  it('a live directory linked into the backup being judged is never evidence, even with an archive present', () => {
+    const { root, live, backup } = reclaimFixture();
+    write(path.join(backup, 'notes', 'user.txt'), 'only copy of my note');
+    archiveAt(root, { 'concepts.rvf': 'retired store', 'legacy.txt': 'unknown legacy file' });
+    fs.symlinkSync(path.join(backup, 'notes'), path.join(live, 'notes'));
+    const result = reclaimBackups({ kbDir: live, env: {} });
+    expect(result.removed).toEqual([]);
+    expect(fs.readFileSync(path.join(backup, 'notes', 'user.txt'), 'utf8')).toBe('only copy of my note');
+  });
+
+  it('an archive tree that resolves inside the backup being judged is never evidence', () => {
+    const { root, live, backup } = reclaimFixture();
+    fs.mkdirSync(path.join(root, 'kb.archive', '2026-10-25T12-00-00-000Z'), { recursive: true });
+    // An archive stamp whose label directory is the backup itself (a link): every file would "match".
+    fs.symlinkSync(backup, path.join(root, 'kb.archive', '2026-10-25T12-00-00-000Z', 'kb.bak-2026-07-13T10-47-54-235Z'));
+    // ...and a real archive dir whose subdirectory links into the backup.
+    const label = path.join(root, 'kb.archive', '2026-10-25T12-00-00-000Z', 'other');
+    fs.mkdirSync(label);
+    fs.writeFileSync(path.join(label, 'concepts.rvf'), 'retired store');
+    const result = reclaimBackups({ kbDir: live, env: {} });
+    expect(result.removed).toEqual([]);
+    expect(fs.existsSync(path.join(backup, 'legacy.txt'))).toBe(true);
   });
 
   it('one file missing from, or different in, the archive keeps the whole copy', () => {
