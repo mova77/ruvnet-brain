@@ -245,7 +245,7 @@ export function checkArtifact({ file = RESULT_FILE, repo = ROOT, maxAgeDays = 14
     return { status: VERDICT.UNKNOWN, why: recomputed.why, artifact, recomputed };
   }
   const mismatch = aggregateMismatch(artifact, recomputed);
-  if (mismatch) return { status: VERDICT.FAIL, why: mismatch, artifact, recomputed };
+  if (mismatch) return { status: VERDICT.FAIL, inconsistent: true, why: mismatch, artifact, recomputed }; // claims contradict own evidence
   return {
     status: recomputed.verdict,
     why: `${recomputed.verdict} — ${recomputed.passes}/${recomputed.n} recomputed runs on ${artifact.sha.slice(0, 8)}`,
@@ -289,9 +289,9 @@ export function checkMutantArtifacts({
       if (!file) return { status: VERDICT.UNKNOWN, why: `${trap}/${mutant}: artifact absent`, checked };
       const result = checkArtifact({ file, repo, maxAgeDays, tolerateStale });
       if (result.status === VERDICT.UNKNOWN) return { ...result, why: `${trap}/${mutant}: ${result.why}`, checked };
-      if (result.artifact?.mutant !== mutant || result.artifact?.trap !== trap) {
-        return { status: VERDICT.FAIL, why: `${trap}/${mutant}: artifact identity mismatch`, checked };
-      }
+      // Only a FAIL recomputed from self-consistent evidence is the expected one; claims that contradict the hashed transcripts are a forged receipt (Codex 4.7.21 r5 #1).
+      if (result.inconsistent) return { status: VERDICT.FAIL, why: `${trap}/${mutant}: mutant evidence is inconsistent: ${result.why}`, checked };
+      if (result.artifact?.mutant !== mutant || result.artifact?.trap !== trap) return { status: VERDICT.FAIL, why: `${trap}/${mutant}: artifact identity mismatch`, checked };
       const causal = causalMutantCheck(result.artifact, result.recomputed, mutant);
       if (causal) return { status: VERDICT.FAIL, why: `${trap}/${mutant}: ${causal}`, checked };
       checked.push(`${trap}/${mutant}`);

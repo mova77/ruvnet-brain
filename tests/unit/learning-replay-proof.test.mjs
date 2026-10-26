@@ -335,6 +335,18 @@ describe('portfolio and mutant checks consume recomputed run evidence', () => {
     expect(checked.why).toMatch(/execut|causal|expected/i);
   });
 
+  it('rejects a mutant whose claimed verdict no longer matches its recomputed evidence', () => {
+    const forged = artifact({ passing: false, mutant: 'brain-off-treated', top: { verdict: replay.VERDICT.PASS } });
+    expect(replay.checkArtifact({ file: writeArtifact(forged), repo: ROOT })).toMatchObject({ status: replay.VERDICT.FAIL, inconsistent: true });
+    const checked = replay.checkMutantArtifacts({
+      files: mutantFiles({ [`${replay.TRAP.MEMORY_SEARCH}/brain-off-treated`]: forged }),
+      repo: ROOT,
+    });
+    expect(checked.status).toBe(replay.VERDICT.FAIL);
+    expect(checked.why).toBe(`${replay.TRAP.MEMORY_SEARCH}/brain-off-treated: mutant evidence is inconsistent: verdict does not match recomputed evidence`);
+    expect(checked.checked).toEqual([`${replay.TRAP.MEMORY_SEARCH}/delete-lesson`]);
+  });
+
   it('rejects a mutant receipt containing an UNKNOWN run', () => {
     const unknown = artifact({ passing: false, mutant: 'brain-off-treated', top: { unknowns: 1, fails: 0 } });
     unknown.runs[0].verdict = replay.VERDICT.UNKNOWN;
@@ -554,6 +566,58 @@ describe('portfolio exit contract: only out-of-date evidence is softened', () =>
     expect(learned.status).toBe(1);
     expect(learned.stdout).toMatch(/hooks-post-task-persistence\/delete-lesson: mutant did not fail with zero passes/);
     expect(learned.stdout).not.toContain('STALE-TOLERATED');
+  });
+
+  // Codex 4.7.21 r5 #1: a mutant's expected FAIL and an evidence-inconsistency FAIL were both read as "the mutant
+  // failed as intended", so a mutant whose claims no longer matched its own hashed transcripts passed the portfolio.
+  const forgedMutants = {
+    'verdict mutated': (value) => { value.verdict = replay.VERDICT.PASS; },
+    'counts mutated': (value) => { value.passes = 1; value.fails = 0; value.rate = 1; },
+    'run verdict mutated': (value) => { value.runs[0].verdict = replay.VERDICT.PASS; },
+  };
+  const key = 'memory-search-query/delete-lesson';
+  const mutantOf = (top = {}) => artifact({ trap: replay.TRAP.MEMORY_SEARCH, passing: false, mutant: 'delete-lesson', top });
+  for (const [name, forge] of Object.entries(forgedMutants)) {
+    it(`a mutant whose ${name} away from its hashed evidence is exit 1, fresh or stale, never tolerated`, () => {
+      for (const [scenario, base, top] of [['fresh', healthy(), {}], ['stale mutant', healthy(), { at: old() }], ['stale trap', stale(), {}]]) {
+        const value = mutantOf(top);
+        forge(value);
+        place({ ...base, mutants: { [key]: value } });
+        // Strict mode stops at the first out-of-date artifact (exit 4, re-measure); fresh evidence and the
+        // tolerant pass, which verifies everything, must both name the inconsistency and exit 1.
+        const strict = cli();
+        expect(strict.status, `${scenario}: ${strict.stdout}`).toBe(scenario === 'fresh' ? 1 : 4);
+        const tolerated = cli('--tolerate-stale');
+        expect(tolerated.status, `${scenario} --tolerate-stale: ${tolerated.stdout}`).toBe(1);
+        for (const run of scenario === 'fresh' ? [strict, tolerated] : [tolerated]) {
+          expect(run.stdout).toMatch(/memory-search-query\/delete-lesson: mutant evidence is inconsistent: .+ does not match recomputed evidence/);
+        }
+        expect(tolerated.stdout).not.toContain('STALE-TOLERATED');
+      }
+    });
+  }
+
+  it('a mutant whose transcript hash is broken is exit 4, fresh or stale, never tolerated', () => {
+    for (const [scenario, base, top] of [['fresh', healthy(), {}], ['stale mutant', healthy(), { at: old() }]]) {
+      const value = mutantOf(top);
+      place({ ...base, mutants: { [key]: value } });
+      fs.appendFileSync(path.join(ROOT, value.runs[0].treated.transcript.path), ' ');
+      expect(cli().status, scenario).toBe(4);
+      const tolerated = cli('--tolerate-stale');
+      expect(tolerated.status, `${scenario} --tolerate-stale: ${tolerated.stdout}`).toBe(4);
+      expect(tolerated.stdout).toMatch(/memory-search-query\/delete-lesson: treated transcript hash mismatch/);
+      expect(tolerated.stdout).not.toContain('STALE-TOLERATED');
+    }
+  });
+
+  it('a legitimate expected-FAIL mutant still passes: exit 0 fresh, STALE-TOLERATED when only its age is out of date', () => {
+    place({ ...healthy(), mutants: { [key]: mutantOf() } });
+    expect(cli().status).toBe(0);
+    place({ ...healthy(), mutants: { [key]: mutantOf({ at: old() }) } });
+    expect(cli().status).toBe(4);
+    const tolerated = cli('--tolerate-stale');
+    expect(tolerated.status).toBe(0);
+    expect(tolerated.stdout).toContain('STALE-TOLERATED: every artifact verified and recomputed');
   });
 
   it('a missing artifact is an UNKNOWN that is NOT stale, so it stays exit 4 when tolerating', () => {
