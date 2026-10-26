@@ -118,6 +118,7 @@ export async function runSessionStart({
       || s.startsWith(FOOTPRINT_LINE_PREFIX)
       || s.startsWith('[RuvNet Brain — OPEN ISSUES')
       || s.startsWith('[RuvNet Brain — NTFY:')
+      || s.startsWith('[RuvNet Brain — JOBS:')
       || s.startsWith('[RuvNet Brain — TURN CAPTURE]')
       || s.startsWith(CODEX_OVERNIGHT_PREFIX)
       || /\bopen issue\(s\)/i.test(s)

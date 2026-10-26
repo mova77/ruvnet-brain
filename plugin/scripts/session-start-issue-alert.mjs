@@ -84,7 +84,7 @@ export function surfaceIssuePointer({ stateDir, emit, now, env, home, platform, 
 export function surfaceNtfyAlerts({ stateDir, emit, env, home, platform, cwd, now = Date.now() }) {
   try {
     if (!maintainerIssueEntitlement(env, home, 'stuinfla/ruvnet-brain', platform) || !isMaintainerRepo(cwd)) return;
-    surfaceJobHealth({ stateDir, emit, now });
+    surfaceJobHealth({ stateDir, emit, now, cwd });
     // The reader writes a few-byte summary (scripts/ntfy-inbox.mjs writeSummary) so a large alert list can never
     // push this banner past its read limit; the detailed list is only a fallback for an older reader.
     let total = 0; let kinds = {};
@@ -124,18 +124,41 @@ const WATCHDOG_MAX_AGE_H = 30;
 const MAX_RECEIPTS = 64;
 const MAX_RECEIPT_BYTES = 64 * 1024;
 
+/** The job labels config/scheduled-jobs.json registers, found by walking up from the session's project directory (the
+ *  maintainer gate already requires this checkout to be the repo), or null when there is no readable registry. */
+export function registeredJobLabels(cwd) {
+  if (!cwd) return null;
+  let dir = path.resolve(cwd);
+  for (let depth = 0; depth < 8; depth++) {
+    const file = path.join(dir, 'config', 'scheduled-jobs.json');
+    try {
+      if (fs.statSync(file).size <= MAX_STATUS_BYTES) {
+        const jobs = json(file)?.jobs;
+        if (Array.isArray(jobs)) return new Set(jobs.map((j) => j?.label).filter((l) => typeof l === 'string'));
+      }
+    } catch { /* not here: look one level up */ }
+    const up = path.dirname(dir);
+    if (up === dir) break;
+    dir = up;
+  }
+  return null;
+}
+
 /**
  * WHO WATCHES THE WATCHDOG (4.7.21). nightly-watchdog.mjs cannot judge its own run, and a watchdog that stopped
  * firing would be silent by construction. This reads the local heartbeat receipts (scripts/job-heartbeat.sh) —
  * no network, bounded file count and size — and says ONE line when any receipt is failed/killed or the
  * watchdog's own receipt is older than 30 h. Machines without heartbeats (every end user) get nothing.
+ * Only receipts of jobs the registry still lists count (review fix): a retired job's last failed receipt left in the
+ * heartbeat directory must not read as "failing" forever. Without a readable registry every receipt counts.
  */
-export function surfaceJobHealth({ stateDir, emit, now = Date.now() }) {
+export function surfaceJobHealth({ stateDir, emit, now = Date.now(), cwd }) {
   try {
     const dir = path.join(stateDir, 'heartbeats');
     let names;
     try { names = fs.readdirSync(dir).filter((n) => n.endsWith('.json')).slice(0, MAX_RECEIPTS); } catch { return; }
     if (!names.length) return;
+    const registered = registeredJobLabels(cwd);
     const red = [];
     let watchdogAt = null;
     for (const name of names) {
@@ -144,6 +167,7 @@ export function surfaceJobHealth({ stateDir, emit, now = Date.now() }) {
       const r = json(file);
       if (!r || typeof r !== 'object') continue;
       const label = name.slice(0, -'.json'.length);
+      if (registered && !registered.has(label)) continue;
       if (r.state === 'failed' || r.state === 'killed') red.push(label);
       if (label === WATCHDOG_LABEL) watchdogAt = Date.parse(r.ended_at || r.started_at || '');
     }

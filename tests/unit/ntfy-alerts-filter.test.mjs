@@ -2,6 +2,9 @@
 // run step) with curl and gh stubbed on PATH, over an event matrix. A page = one curl invocation.
 // The rule under test (4.7.21): page a first red, never a repeat red; never a pull_request-event run; never a star;
 // never a reopened issue/PR; and if the previous-run lookup fails, page anyway.
+// Fix round (4.7.21): a workflow_dispatch run is never deduplicated (protected-release dispatches both corpus nights and code
+// releases), the previous run is looked up across events (a green manual re-run is a recovery), and a repeat red pages
+// again when the previous red's page is not proven delivered (a non-green ntfy-alerts run since it started).
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -40,29 +43,41 @@ beforeAll(() => {
   fs.mkdirSync(path.join(work, 'bin'));
   fs.writeFileSync(path.join(work, 'send.sh'), SCRIPT);
   // curl: record the invocation, deliver nothing.
-  fs.writeFileSync(path.join(work, 'bin', 'curl'), '#!/bin/bash\nprintf "%s\\n" "$*" >> "$STUB_LOG/curl.log"\nexit 0\n', { mode: 0o755 });
+  fs.writeFileSync(path.join(work, 'bin', 'curl'), '#!/bin/bash\nprintf "%s\\n" "$*" >> "$STUB_LOG/curl.log"\nexit "${STUB_CURL_EXIT:-0}"\n', { mode: 0o755 });
   // gh: record the invocation, then answer from STUB_GH_RESPONSE (a file) or fail like an API/auth error.
   fs.writeFileSync(path.join(work, 'bin', 'gh'), [
     '#!/bin/bash', 'printf "%s\\n" "$*" >> "$STUB_LOG/gh.log"',
     'if [ "$STUB_GH_MODE" = fail ]; then echo \'{"message":"Bad credentials","status":"401"}\'; echo "gh: Bad credentials (HTTP 401)" >&2; exit 1; fi',
+    // The delivery check reads this workflow's own run history (ntfy-alerts.yml); answer it from its own file.
+    'case "$*" in *ntfy-alerts.yml*)',
+    '  if [ "$STUB_GH_SELF_MODE" = fail ]; then echo "gh: HTTP 502" >&2; exit 1; fi',
+    '  cat "$STUB_GH_SELF_RESPONSE"; exit 0 ;; esac',
     'cat "$STUB_GH_RESPONSE"', ''].join('\n'), { mode: 0o755 });
 });
 afterAll(() => { if (work) fs.rmSync(work, { recursive: true, force: true }); });
 
-const run = (id, run_number, conclusion) => ({ id, run_number, conclusion, status: 'completed' });
+const run = (id, run_number, conclusion, event = 'schedule') =>
+  ({ id, run_number, conclusion, status: 'completed', event, run_started_at: `2026-10-${String(run_number % 28 + 1).padStart(2, '0')}T08:00:00Z` });
+// ntfy-alerts' own runs, for the delivery check. `self` is this run (in progress; never counted).
+const SELF = { id: 5555, status: 'in_progress', conclusion: null };
+const nrun = (id, conclusion) => ({ id, status: 'completed', conclusion });
 const CURRENT = { WR_ID: '9000', WR_RUN_NUMBER: '90' };
 const red = (over = {}) => ({ EVENT: 'workflow_run', WR_CONC: 'failure', WR_NAME: 'learning-replay', WR_BRANCH: 'main',
   WR_URL: 'https://github.com/stuinfla/ruvnet-brain/actions/runs/9000', WR_EVENT: 'schedule', WR_WORKFLOW_ID: '777',
-  REPO: 'stuinfla/ruvnet-brain', ...CURRENT, ...over });
+  REPO: 'stuinfla/ruvnet-brain', SELF_RUN_ID: '5555', ...CURRENT, ...over });
 
 let n = 0;
-function send(vars, { history = null, ghMode = 'ok' } = {}) {
+// `self` = ntfy-alerts' own runs since the previous red started; the default is "every page since went out".
+function send(vars, { history = null, ghMode = 'ok', self = [SELF, nrun(5554, 'success')], selfTotal = null, selfMode = 'ok', curlExit = 0 } = {}) {
   const log = fs.mkdtempSync(path.join(work, `case-${n++}-`));
   const response = path.join(log, 'runs.json');
   fs.writeFileSync(response, history === null ? '' : JSON.stringify({ total_count: history.length, workflow_runs: history }));
+  const selfResponse = path.join(log, 'self-runs.json');
+  fs.writeFileSync(selfResponse, JSON.stringify({ total_count: selfTotal ?? self.length, workflow_runs: self }));
   const result = spawnSync('bash', ['-e', path.join(work, 'send.sh')], { encoding: 'utf8', timeout: 20_000,
     env: { PATH: `${path.join(work, 'bin')}${path.delimiter}${process.env.PATH}`, HOME: work, TOPIC: 'test-topic-not-real',
-      STUB_LOG: log, STUB_GH_RESPONSE: response, STUB_GH_MODE: ghMode, ...vars } });
+      STUB_LOG: log, STUB_GH_RESPONSE: response, STUB_GH_MODE: ghMode, STUB_GH_SELF_RESPONSE: selfResponse,
+      STUB_GH_SELF_MODE: selfMode, STUB_CURL_EXIT: String(curlExit), ...vars } });
   const read = (f) => fs.existsSync(path.join(log, f)) ? fs.readFileSync(path.join(log, f), 'utf8').trim().split('\n').filter(Boolean) : [];
   return { status: result.status, stderr: result.stderr, pages: read('curl.log'), gh: read('gh.log') };
 }
@@ -86,22 +101,71 @@ describe.skipIf(!hasJq)('ntfy-alerts send step', () => {
     expect(WORKFLOW).toMatch(/timeout-minutes: 5\n/);
   });
 
-  it('a first red on main pages exactly once, after looking up the same workflow, branch and event', () => {
+  it('a first red on main pages exactly once, after looking up the same workflow and branch (any event)', () => {
     const r = send(red(), { history: [run(9000, 90, 'failure'), run(8999, 89, 'success'), run(8998, 88, 'failure')] });
     expect(r.status, r.stderr).toBe(0);
     expect(r.pages).toHaveLength(1);
     expect(r.pages[0]).toContain('Title: 🔴 CI failure: learning-replay');
     expect(r.pages[0]).toContain('https://ntfy.sh/test-topic-not-real');
     expect(r.pages[0]).not.toContain('lookup failed');
-    expect(r.gh).toEqual(['api -X GET repos/stuinfla/ruvnet-brain/actions/workflows/777/runs -f branch=main -f event=schedule -f status=completed -f per_page=10']);
+    expect(r.gh).toEqual(['api -X GET repos/stuinfla/ruvnet-brain/actions/workflows/777/runs -f branch=main -f status=completed -f per_page=20']);
   });
 
-  it('a repeat red (previous completed run also red) does not page', () => {
+  it('a repeat red (previous completed run also red, its page delivered) does not page', () => {
     for (const prior of ['failure', 'timed_out', 'startup_failure']) {
       const r = send(red(), { history: [run(9000, 90, 'failure'), run(8999, 89, prior), run(8998, 88, 'success')] });
       expect(r.status, `${prior}: ${r.stderr}`).toBe(0);
       expect(r.pages, prior).toHaveLength(0);
+      // The delivery check is bounded to ntfy-alerts runs created since the previous red started.
+      expect(r.gh[1], prior).toBe(`api -X GET repos/stuinfla/ruvnet-brain/actions/workflows/ntfy-alerts.yml/runs -f created=>=${run(8999, 89).run_started_at} -f per_page=100`);
     }
+  });
+
+  it('workflow_dispatch runs always page: a corpus-night red does not silence the next code-release red (and back)', () => {
+    // protected-release: night N corpus run (dispatch) red and paged; the next day a code release (dispatch) fails.
+    const history = [run(9000, 90, 'failure', 'workflow_dispatch'), run(8999, 89, 'failure', 'workflow_dispatch')];
+    for (const name of ['protected-release', 'learning-replay']) {
+      const r = send(red({ WR_EVENT: 'workflow_dispatch', WR_NAME: name }), { history });
+      expect(r.status, r.stderr).toBe(0);
+      expect(r.pages, name).toHaveLength(1);
+      expect(r.pages[0]).toContain(`Title: 🔴 CI failure: ${name}`);
+      expect(r.gh, name).toHaveLength(0);
+    }
+  });
+
+  it('a green manual (workflow_dispatch) run between two scheduled reds is a recovery: the second red pages', () => {
+    const history = [run(9000, 90, 'failure', 'schedule'), run(8999, 89, 'success', 'workflow_dispatch'),
+      run(8998, 88, 'failure', 'schedule')];
+    const r = send(red(), { history });
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.pages).toHaveLength(1);
+    expect(r.pages[0]).not.toContain('repeat');
+    // ...while pull_request-event runs in the same history say nothing about the branch and are passed over.
+    const viaPr = [run(9000, 90, 'failure'), run(8999, 89, 'success', 'pull_request'), run(8998, 88, 'failure')];
+    expect(send(red(), { history: viaPr }).pages).toHaveLength(0);
+  });
+
+  it('a failed delivery of the first red does not silence the next red (sustained ntfy outage)', () => {
+    // Night 1: first red; ntfy refuses the POST -> the step fails (red in Actions), nothing arrived.
+    const first = send(red({ WR_ID: '8999', WR_RUN_NUMBER: '89' }), { history: [run(8999, 89, 'failure'), run(8998, 88, 'success')], curlExit: 22 });
+    expect(first.status).toBe(22);
+    expect(first.pages).toHaveLength(1);
+    // Night 2: previous red, and the ntfy-alerts run that handled it is red -> page again, and say why.
+    const history = [run(9000, 90, 'failure'), run(8999, 89, 'failure'), run(8998, 88, 'success')];
+    for (const failed of ['failure', 'timed_out', 'cancelled', 'startup_failure']) {
+      const r = send(red(), { history, self: [SELF, nrun(5554, 'success'), nrun(5550, failed)] });
+      expect(r.status, `${failed}: ${r.stderr}`).toBe(0);
+      expect(r.pages, failed).toHaveLength(1);
+      expect(r.pages[0], failed).toContain("(repeat: the previous red's page may not have arrived)");
+    }
+    // An unreadable or truncated delivery history pages too (cannot prove delivery).
+    for (const [label, opts] of [['self lookup 502', { selfMode: 'fail' }], ['truncated', { selfTotal: 500 }]]) {
+      const r = send(red(), { history, ...opts });
+      expect(r.pages, label).toHaveLength(1);
+      expect(r.pages[0], label).toContain('repeat:');
+    }
+    // This run itself (in progress) and green or skipped ntfy runs prove nothing undelivered.
+    expect(send(red(), { history, self: [SELF, nrun(5554, 'success'), nrun(5553, 'skipped')] }).pages).toHaveLength(0);
   });
 
   it('cancelled and skipped runs are passed over when finding the previous result', () => {

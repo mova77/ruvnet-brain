@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-vi.mock('node:child_process', () => ({ spawnSync: vi.fn() }));
+vi.mock('node:child_process', () => ({ spawnSync: vi.fn(), spawn: vi.fn() }));
 
 const START = Date.parse('2026-10-25T05:30:00Z'); // 1:30 a.m. ET, so the day holds exactly one 9 a.m.
 const HOUR = 3_600_000;
@@ -138,5 +138,82 @@ describe('a burst of breaches is one page', () => {
     const sleeps = vi.mocked(spawnSync).mock.calls.filter((c) => c[0] === 'sleep').map((c) => Number(c[1][0]));
     expect(sleeps).toHaveLength(2);
     expect(sleeps[1]).toBeGreaterThan(sleeps[0]); // backoff, not a fixed wait
+  });
+});
+
+// 4.7.21 review (Opus pager #4): an issue whose detail can never be read was skipped every run with exit 0 — a person
+// waiting forever with no SLA page.
+describe('an issue whose detail cannot be read is still judged', () => {
+  const failView = (numbers) => vi.mocked(spawnSync).mockImplementation((bin, args) => {
+    if (args[1] === 'list') return { status: 0, stdout: JSON.stringify(issues) };
+    if (args[1] === 'view' && numbers.includes(args[2])) return { status: 1, stderr: 'GraphQL: Something went wrong (HTTP 500)' };
+    if (args[1] === 'view') return { status: 0, stdout: JSON.stringify({ comments: [] }) };
+    if (args[1] === 'comment') return { status: 0, stdout: '' };
+    throw new Error('unexpected external command');
+  });
+
+  it('a breaching person issue with unreadable detail gets its SLA page from the list comments, and no public ack', async () => {
+    issues = [{ number: 700, title: 'unreadable detail', createdAt: new Date(START - 30 * HOUR).toISOString(), author: { login: 'alice' }, comments: [] }];
+    failView(['700']);
+    const out = await run({ now: START });
+    expect(out.degraded).toEqual([700]);
+    expect(out.results.map((r) => r.number)).toEqual([700]);
+    expect(pages()).toEqual(['SLA breach: issue #700']); // before: [] — skipped, never paged
+    expect(vi.mocked(spawnSync).mock.calls.filter((c) => c[1][1] === 'comment')).toHaveLength(0);
+    await run({ now: START + HOUR });
+    expect(pages()).toHaveLength(1); // once, like any other breach
+  });
+
+  it('an owner reply visible in the list comments counts: no page', async () => {
+    issues = [{ number: 701, title: 'answered', createdAt: new Date(START - 30 * HOUR).toISOString(), author: { login: 'alice' },
+      comments: [{ author: { login: 'stuinfla' }, body: 'Looking now.' }] }];
+    failView(['701']);
+    await run({ now: START });
+    expect(pages()).toEqual([]);
+  });
+
+  it('with no list comments either, the run reports it unreadable ONCE, on the 3rd run in a row', async () => {
+    issues = [{ number: 702, title: 'nothing readable', createdAt: new Date(START - 30 * HOUR).toISOString(), author: { login: 'alice' } }];
+    failView(['702']);
+    const seen = [];
+    for (let h = 0; h < 5; h++) seen.push((await run({ now: START + h * HOUR })).unreadable);
+    expect(seen).toEqual([[], [], [702], [], []]); // before: undefined every run (silently skipped forever)
+    // Readable again: the streak resets, so a later outage escalates again.
+    failView([]);
+    await run({ now: START + 6 * HOUR });
+    failView(['702']);
+    const again = [];
+    for (let h = 7; h < 10; h++) again.push((await run({ now: START + h * HOUR })).unreadable);
+    expect(again).toEqual([[], [], [702]]);
+  });
+
+  it("the owner's own issue never escalates", async () => {
+    issues = [{ number: 703, title: 'dream cycle', createdAt: new Date(START - 30 * HOUR).toISOString(), author: { login: 'stuinfla' } }];
+    failView(['703']);
+    const seen = [];
+    for (let h = 0; h < 4; h++) seen.push((await run({ now: START + h * HOUR })).unreadable);
+    expect(seen).toEqual([[], [], [], []]);
+  });
+});
+
+// 4.7.21 review (Opus pager #5): the inbox filed a 17-issue combined page as ONE issue alert.
+describe('the combined SLA page counts every issue in the owner\'s inbox', () => {
+  it('17 breaching issues -> one page -> 17 open issue alerts (before: 1)', async () => {
+    issues = Array.from({ length: 17 }, (_, i) => ({ number: 800 + i, title: `person issue ${i}`,
+      createdAt: new Date(START - (10 + i) * HOUR).toISOString(), author: { login: `person${i}` } }));
+    await run({ now: START });
+    expect(pages()).toHaveLength(1);
+    const [, init] = fetcher.mock.calls[0];
+    const { fold } = await import('../../scripts/ntfy-inbox.mjs');
+    const open = fold([], [{ id: 'msgAbc123', time: START / 1000, title: init.headers.Title, message: init.body, priority: 5 }],
+      { now: START, resolver: () => false });
+    const live = open.filter((a) => !a.closedAt);
+    expect(live).toHaveLength(17);
+    expect(live.every((a) => a.kind === 'issue')).toBe(true);
+    expect(live.map((a) => a.number).sort()).toEqual(issues.map((i) => i.number).sort());
+    expect(new Set(live.map((a) => a.id)).size).toBe(17); // every alert is separately ackable
+    // Folding the same message again changes nothing.
+    expect(fold(open, [{ id: 'msgAbc123', time: START / 1000, title: init.headers.Title, message: init.body, priority: 5 }],
+      { now: START, resolver: () => false }).filter((a) => !a.closedAt)).toHaveLength(17);
   });
 });

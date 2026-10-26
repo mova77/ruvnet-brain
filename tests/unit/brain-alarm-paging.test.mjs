@@ -10,6 +10,8 @@ import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 const MIN = 60_000;
 const T0 = Date.parse('2026-10-26T04:00:00Z');
@@ -94,4 +96,81 @@ describe('brain-alarm paging', () => {
     await down(8 * MIN);
     expect(requests).toHaveLength(2); // delivered once; quiet after that
   });
+
+  // 4.7.21 review (Fable P2-1): every "up" reset the outage, so a flapping brain never paged.
+  it('a brain that flaps down/up every 2 minutes pages DOWN once in 6 h (before: zero pages)', async () => {
+    for (let t = 0; t < 6 * 60 * MIN; t += 4 * MIN) { await down(t); await up(t + 2 * MIN); }
+    expect(requests.map((h) => h.title)).toEqual(['RuvNet Brain is DOWN']);
+  });
+
+  it('4-minute outages with a minute of health between them page DOWN once in 6 h; the flaps recover silently', async () => {
+    for (let t = 0; t < 6 * 60 * MIN; t += 6 * MIN) { await down(t); await down(t + 4 * MIN); await up(t + 5 * MIN); }
+    expect(requests.map((h) => h.title)).toEqual(['RuvNet Brain is DOWN']);
+  });
+
+  it('failures more than an hour apart are not a flap: one blip a day never pages', async () => {
+    for (let d = 0; d < 3; d++) { await down(d * 24 * 60 * MIN); await up(d * 24 * 60 * MIN + MIN); }
+    await down(3 * 24 * 60 * MIN); await up(3 * 24 * 60 * MIN + 61 * MIN); await down(3 * 24 * 60 * MIN + 62 * MIN);
+    expect(requests).toHaveLength(0);
+  });
+
+  // 4.7.21 review (Opus #3): read -> await push -> write was not atomic; parallel failing searches all paged.
+  it('three parallel failing searches in one process page ONCE (before: three pages)', async () => {
+    await down(0);
+    at(10 * MIN);
+    await Promise.all([1, 2, 3].map(() => alarm.reportBrainDown({ error: 'ERR: every repo failed', source: 'parallel' })));
+    expect(requests).toHaveLength(1);
+    expect(health().downPaged).toBe(true);
+  });
+
+  it('an undelivered claimed page is released: the next failure retries it', async () => {
+    let first = true;
+    server.removeAllListeners('request');
+    server.on('request', (req, res) => { req.resume(); req.on('end', () => { requests.push(req.headers); res.statusCode = first ? 503 : 200; first = false; res.end(); }); });
+    await down(0);
+    at(10 * MIN);
+    await Promise.all([1, 2, 3].map(() => alarm.reportBrainDown({ error: 'ERR', source: 'parallel' })));
+    expect(requests).toHaveLength(1); // one claimed attempt, refused
+    expect(health().downPaged).toBe(false);
+    await down(11 * MIN);
+    expect(requests).toHaveLength(2);
+    expect(health().downPaged).toBe(true);
+  });
+
+  it('a claim abandoned by a killed sender does not swallow the page for 6 h', async () => {
+    await down(0);
+    const file = path.join(dir, '.cache', 'ruvnet-brain', 'health.json');
+    const h = health();
+    fs.writeFileSync(file, JSON.stringify({ ...h, downPaged: 'pending', lastDownPageAt: T0 + 5 * MIN, claimPrevPageAt: 0 }));
+    await down(5 * MIN + 30_000); // claim still fresh (sender may be mid-POST): no second page
+    expect(requests).toHaveLength(0);
+    await down(7 * MIN);          // claim older than 60 s: abandoned, page now
+    expect(requests).toHaveLength(1);
+  });
+});
+
+describe('brain-alarm across processes', () => {
+  it('three PROCESSES failing at once page ONCE', async () => {
+    vi.useRealTimers();
+    const stateDir = path.join(dir, '.cache', 'ruvnet-brain');
+    fs.mkdirSync(stateDir, { recursive: true });
+    const now = Date.now();
+    fs.writeFileSync(path.join(stateDir, 'health.json'), JSON.stringify({ status: 'down', firstDownTs: now - 10 * MIN, failCount: 1,
+      recentFails: [now - 10 * MIN], lastDownPageAt: 0, downPaged: false }));
+    // Slow the stub so every process is mid-POST together (the window the old code double-paged in).
+    server.removeAllListeners('request');
+    server.on('request', (req, res) => { req.resume(); req.on('end', () => { requests.push(req.headers); setTimeout(() => res.end('{}'), 300); }); });
+    const mod = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'kb', 'brain-alarm.mjs');
+    const go = path.join(dir, 'go');
+    const script = `import fs from 'node:fs'; while (!fs.existsSync(${JSON.stringify(go)})) await new Promise((r) => setTimeout(r, 2));
+const a = await import(${JSON.stringify(new URL(`file://${mod}`).href)}); await a.reportBrainDown({ error: 'ERR', source: 'proc' });`;
+    const env = { ...process.env, HOME: dir, USERPROFILE: dir, NTFY_TOPIC: 'alarm-fixture', NTFY_URL: process.env.NTFY_URL };
+    const kids = [1, 2, 3].map(() => spawn(process.execPath, ['--input-type=module', '-e', script], { env, stdio: 'ignore' }));
+    const exits = kids.map((k) => new Promise((r) => k.on('exit', r)));
+    await new Promise((r) => setTimeout(r, 300));
+    fs.writeFileSync(go, '');
+    expect(await Promise.all(exits)).toEqual([0, 0, 0]);
+    expect(requests).toHaveLength(1);
+    expect(JSON.parse(fs.readFileSync(path.join(stateDir, 'health.json'), 'utf8')).downPaged).toBe(true);
+  }, 20_000);
 });

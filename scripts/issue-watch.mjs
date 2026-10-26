@@ -47,6 +47,8 @@ export const OWNER_LOGIN = 'stuinfla';
 // moved here.)
 export const BOT_MARKER = '🤖 Automated';
 const SLA_HOURS = 4;
+// A person's issue whose detail AND list comments cannot be read this many runs in a row fails the run once (review fix).
+const UNREADABLE_RUNS = 3;
 // WHO IS WAITING (owner, 2026-10-25: "10,747 notifications"). An issue opened by the owner's own account or a bot is
 // work the owner's automation filed (Dream Cycle, dependabot), not a person waiting for an answer: it never pages
 // and gets no acknowledgment. Only a person's issue pages.
@@ -176,16 +178,41 @@ export async function run({ dryRun = false, now = Date.now(), repo = REPO } = {}
   const alertsSent = [];
   const degraded = [];
   const dueBreaches = [];
+  const unreadable = []; // person issues unreadable for UNREADABLE_RUNS runs and no other way to judge them: fail once
 
   for (const issue of issues) {
-    // One issue whose detail cannot be read is skipped this run, not the whole run (4.7.21).
-    let detail;
-    try { detail = ghJson(['issue', 'view', String(issue.number), '--repo', repo, '--json', 'comments']); }
-    catch (err) { degraded.push(issue.number); console.error(`issue-watch: #${issue.number} skipped this run — ${err.message.slice(0, 160)}`); continue; }
-    const comments = detail.comments || [];
-    const { ageHours, ownerComment, breach } = judgeIssue(issue, comments, now);
     const url = `https://github.com/${repo}/issues/${issue.number}`;
     const key = String(issue.number);
+    // One issue whose detail cannot be read does not stop the run (4.7.21). It is judged from the comments the list
+    // call already returned (review fix: before, it was skipped forever and never got its SLA page); with no list
+    // comments either it is skipped, and once it has been unreadable on UNREADABLE_RUNS runs in a row the run fails
+    // ONCE so the heartbeat wrapper pages. Never acknowledged from the list copy (it may be incomplete, and a second
+    // public acknowledgment is worse than none).
+    let detail; let fromList = false;
+    try { detail = ghJson(['issue', 'view', String(issue.number), '--repo', repo, '--json', 'comments']); }
+    catch (err) {
+      degraded.push(issue.number);
+      const prev = state[key] || {};
+      const runs = (Number(prev.unreadableRuns) || 0) + 1;
+      state[key] = { ...prev, unreadableRuns: runs, unreadableSince: prev.unreadableSince || new Date(now).toISOString() };
+      if (Array.isArray(issue.comments)) {
+        detail = { comments: issue.comments }; fromList = true;
+        console.error(`issue-watch: #${issue.number} detail unreadable — judged from the list's comments — ${err.message.slice(0, 160)}`);
+      } else {
+        console.error(`issue-watch: #${issue.number} skipped this run (${runs} in a row) — ${err.message.slice(0, 160)}`);
+        if (isPersonIssue(issue) && runs >= UNREADABLE_RUNS && !prev.unreadableEscalatedAt) {
+          unreadable.push(issue.number);
+          state[key].unreadableEscalatedAt = new Date(now).toISOString();
+        }
+        continue;
+      }
+    }
+    if (!fromList && state[key]?.unreadableRuns) { // readable again: the next unreadable streak counts from zero
+      state[key] = { ...state[key] };
+      for (const f of ['unreadableRuns', 'unreadableSince', 'unreadableEscalatedAt']) delete state[key][f];
+    }
+    const comments = detail.comments || [];
+    const { ageHours, ownerComment, breach } = judgeIssue(issue, comments, now);
     // A person's issue pages ONCE when it first passes the SLA, never again (it used to repeat every 4 h, forever,
     // which with ~14 old issues and an hourly run was most of the 10,747 notifications). The morning digest below
     // carries whatever is still waiting. An existing lastAlertAt means that one page already went out.
@@ -206,7 +233,7 @@ export async function run({ dryRun = false, now = Date.now(), repo = REPO } = {}
     if (person && !state[key]?.ackAt && alreadyAcked) {
       state[key] = { ...(state[key] || {}), ackAt: new Date(now).toISOString(), ackBaselined: true, title: issue.title, url };
     }
-    const needsAck = person && !state[key]?.ackAt;
+    const needsAck = person && !fromList && !state[key]?.ackAt;
 
     results.push({ number: issue.number, title: issue.title, ageHours, ownerComment, breach, dueForAlert, firstSighting, url, person });
 
@@ -260,8 +287,11 @@ export async function run({ dryRun = false, now = Date.now(), repo = REPO } = {}
       ? `SLA breach: issue #${first.issue.number} (+${rest.length} more waiting > ${SLA_HOURS}h)`
       : `SLA breach: issue #${first.issue.number}`;
     const lines = dueBreaches.slice(0, 8).map((b) => `#${b.issue.number} (${fmtAge(b.ageHours)}) ${String(b.issue.title).slice(0, 70)}`);
+    // Past 8 lines the rest are still NAMED ("…and K more: #a #b"): scripts/ntfy-inbox.mjs files one alert per issue,
+    // so the session banner counts the breach truly (a 17-issue page used to count as 1).
     const body = `${dueBreaches.length} contributor issue(s) past ${SLA_HOURS}h with no response from ${OWNER_LOGIN}:\n${lines.join('\n')}`
-      + (dueBreaches.length > 8 ? `\n…and ${dueBreaches.length - 8} more` : '') + `\nhttps://github.com/${repo}/issues`;
+      + (dueBreaches.length > 8 ? `\n…and ${dueBreaches.length - 8} more: ${dueBreaches.slice(8).map((b) => `#${b.issue.number}`).join(' ')}` : '')
+      + `\nhttps://github.com/${repo}/issues`;
     if (dryRun) {
       for (const b of dueBreaches) alertsSent.push({ number: b.issue.number, sent: false, kind: 'sla-breach', reason: 'dry-run' });
     } else {
@@ -297,7 +327,7 @@ export async function run({ dryRun = false, now = Date.now(), repo = REPO } = {}
 
   if (!dryRun) saveState(state);
 
-  return { results, alertsSent, degraded, checkedAt: new Date(now).toISOString() };
+  return { results, alertsSent, degraded, unreadable, checkedAt: new Date(now).toISOString() };
 }
 
 /**
@@ -473,8 +503,10 @@ async function main() {
   const undeliveredAlert = !dryRun && (output.alertsSent || []).some((a) => !a.sent && a.reason !== 'dry-run');
   // Skipping one unreadable issue is a degraded run, not a failed one; reading NONE of them is a failure.
   const allDegraded = output.degraded.length > 0 && output.results.length === 0;
-  if (output.degraded.length) console.error(`issue-watch: ${output.degraded.length} issue(s) skipped this run: #${output.degraded.join(', #')}`);
-  process.exit(undeliveredAlert || allDegraded ? 1 : 0);
+  if (output.degraded.length) console.error(`issue-watch: ${output.degraded.length} issue(s) not fully readable this run: #${output.degraded.join(', #')}`);
+  const stuck = !dryRun && (output.unreadable || []).length > 0;
+  if (stuck) console.error(`issue-watch: FAILING this run once — a person's issue has been unreadable ${UNREADABLE_RUNS} runs in a row and cannot be judged: #${output.unreadable.join(', #')}`);
+  process.exit(undeliveredAlert || allDegraded || stuck ? 1 : 0);
 }
 
 if (isDirectInvocation(import.meta.url)) await main();

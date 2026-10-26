@@ -136,6 +136,38 @@ describe.skipIf(!posix)('nightly-watchdog main(): pages arrive, and the exit cod
     expect(requests[1].headers.priority).toBe('default');
   });
 
+  // 4.7.21 review (Fable P2-2): fail (wrapper pages) -> stops firing (watchdog pages STALE) -> runs OK. The wrapper sends
+  // "Recovered: X" (its last receipt was a delivered failing streak); the watchdog used to send "X is healthy again" too.
+  it('fail -> stale -> recover: the watchdog leaves the one recovery note to the wrapper', async () => {
+    const failed = (hAgo) => ({ state: 'failed', exit_code: 1, ended_at: iso(hAgo * HOUR), failing_since: iso(hAgo * HOUR), paged: true });
+    const w = world({ jobs: [JOB('com.test.a', { maxAgeHours: 3 })], receipts: { 'com.test.a': failed(1) } });
+    expect((await runWatchdog(w, ['--quiet'])).code).toBe(0); // wrapper already paged FAILING: silent
+    fs.writeFileSync(path.join(w.hb, 'com.test.a.json'), JSON.stringify({ label: 'com.test.a', ...failed(5) }));
+    expect((await runWatchdog(w, ['--quiet'])).code).toBe(0); // stopped firing: STALE, paged by the watchdog
+    expect(readState(w)._pagedBy['com.test.a']).toBe('both');
+    fs.writeFileSync(path.join(w.hb, 'com.test.a.json'), JSON.stringify({ label: 'com.test.a', state: 'ok', exit_code: 0, ended_at: iso(0.1 * HOUR) }));
+    expect((await runWatchdog(w, ['--quiet'])).code).toBe(0);
+    expect(requests.map((q) => q.headers.title)).toEqual(['STALE: com.test.a']); // before: + 'com.test.a is healthy again'
+    expect(readState(w)._pagedBy['com.test.a']).toBeUndefined();
+    expect(readState(w)['com.test.a']).toBe('OK');
+  });
+
+  it('a never-finished run whose receipt carries a delivered streak: one FAILING page, recovery left to the wrapper', async () => {
+    const w = world({ jobs: [JOB('com.test.a')], receipts: { 'com.test.a': { state: 'running', started_at: iso(9 * HOUR), pid: 999999, failing_since: iso(30 * HOUR), paged: true } } });
+    await runWatchdog(w, ['--quiet']);
+    fs.writeFileSync(path.join(w.hb, 'com.test.a.json'), JSON.stringify({ label: 'com.test.a', state: 'ok', exit_code: 0, ended_at: iso(0.1 * HOUR) }));
+    await runWatchdog(w, ['--quiet']);
+    expect(requests.map((q) => q.headers.title)).toEqual(['FAILING: com.test.a']);
+  });
+
+  it('a STALE job the wrapper never paged keeps the watchdog\'s own recovery note', async () => {
+    const w = world({ jobs: [JOB('com.test.a')], receipts: { 'com.test.a': { state: 'failed', exit_code: 1, ended_at: iso(40 * HOUR), failing_since: iso(40 * HOUR), paged: 'suppressed' } } });
+    await runWatchdog(w, ['--quiet']);
+    fs.writeFileSync(path.join(w.hb, 'com.test.a.json'), JSON.stringify({ label: 'com.test.a', state: 'ok', exit_code: 0, ended_at: iso(HOUR) }));
+    await runWatchdog(w, ['--quiet']);
+    expect(requests.map((q) => q.headers.title)).toEqual(['STALE: com.test.a', 'com.test.a is healthy again']);
+  });
+
   it('an empty `launchctl list` exits 2 with no pages and no state write', async () => {
     const w = world({ jobs: [JOB('com.test.a')], receipts: {}, loaded: null });
     const r = await runWatchdog(w, ['--quiet']);
