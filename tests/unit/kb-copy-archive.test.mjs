@@ -238,6 +238,27 @@ describe('#335 (b): --clean --archive keeps only the unique files, then releases
     expect(swept.kept.find((k) => k.path === a).reason).toMatch(/archive at .* is kept: .* no longer a real directory/);
   });
 
+  // GPT-6.1 review r2: the interleaving that loses data. Sweep A publishes the archive; sweep B sees it, proves the
+  // original redundant against it and deletes the original; A's re-proof then finds the original missing. A published
+  // archive is retained unless the original is proven intact and byte-identical (ADR-098: no unique byte lost).
+  it('two interleaved sweeps: B releases the original against A\'s archive between A\'s publish and re-proof; every unique byte survives', () => {
+    const m = machine();
+    const a = preserved(m, 'kb.install-preserved-AAAAAA');
+    const uniqueBefore = ['SOURCE.json', 'concepts.big.rvf', path.join('notes', 'user.txt')].map((rel) => sha(path.join(a, rel)));
+    let calls = 0; let sweepB = null;
+    const proveCopy = (args) => {
+      calls += 1;
+      if (calls === 2) sweepB = sweepFootprint(opts(m, { apply: true })); // B runs to completion right here
+      return kbCopyProof(args);
+    };
+    sweepFootprint(opts(m, { apply: true, archive: true, proveCopy }));
+    expect(sweepB.removed.map((r) => r.path)).toEqual([a]); // B really did release the original against the archive
+    expect(fs.existsSync(a)).toBe(false);
+    const surviving = hashesUnder(m.brainHome);
+    for (const h of uniqueBefore) expect(surviving.has(h)).toBe(true);
+    expect(archiveRoots(path.join(m.brainHome, 'kb.archive'))).toHaveLength(1);
+  });
+
   it('a copy changed between archive and re-proof: the archive is kept', () => {
     const m = machine();
     const a = preserved(m, 'kb.install-preserved-AAAAAA');
