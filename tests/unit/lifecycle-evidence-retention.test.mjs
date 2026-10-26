@@ -324,6 +324,42 @@ describe('lifecycle evidence retention', () => {
       expect(fs.readFileSync(orphan, 'utf8')).toBe('{"runId":"orphan"}');
     });
 
+    it('a temp that vanishes between the snapshot and its re-check is already gone, not a failed prune', () => {
+      const f = fixture();
+      const runId = '1791258423435-ea78236a066a7f72';
+      refresh(f, runId, { at: '2026-10-19T03:00:00Z', status: 'ABANDONED' });
+      const a = temp(f, runId);
+      const b = temp(f, runId, { suffix: '2756628-4401e88f' });
+      const real = fs.lstatSync;
+      // Another sweep removes `a` after this prune's snapshot listed it, just before the identity re-check.
+      const spy = vi.spyOn(fs, 'lstatSync').mockImplementation(function (file, ...rest) {
+        const caller = String(new Error().stack).split('\n').find((line) => line.includes('lifecycle-evidence-retention.mjs')) || '';
+        if (file === a && /at pruneLifecycleEvidence /.test(caller)) fs.rmSync(a, { force: true });
+        return real.call(this, file, ...rest);
+      });
+      let result;
+      try { result = pruneLifecycleEvidence({ ...f, now }); } finally { spy.mockRestore(); }
+      expect(fs.existsSync(a)).toBe(false);
+      expect(result.reclaimedTemporaries.map(({ path: p }) => p)).toEqual([b]);
+      expect(fs.readdirSync(path.join(f.brainHome, 'refresh-runs'))).toEqual([`${runId}.json`]);
+    });
+
+    it('a temp that vanishes between its re-check and the quarantine rename is already gone too', () => {
+      const f = fixture();
+      const runId = '1791258423435-ea78236a066a7f72';
+      refresh(f, runId, { at: '2026-10-19T03:00:00Z', status: 'ABANDONED' });
+      const a = temp(f, runId);
+      const b = temp(f, runId, { suffix: '2756628-4401e88f' });
+      const real = fs.renameSync;
+      const spy = vi.spyOn(fs, 'renameSync').mockImplementation(function (from, ...rest) {
+        if (from === a) fs.rmSync(a, { force: true });
+        return real.call(this, from, ...rest);
+      });
+      let result;
+      try { result = pruneLifecycleEvidence({ ...f, now }); } finally { spy.mockRestore(); }
+      expect(result.reclaimedTemporaries.map(({ path: p }) => p)).toEqual([b]);
+    });
+
     it('refuses a stale temp that is a symlink or hard link', () => {
       const f = fixture();
       refresh(f, 'linked', { at: '2026-10-19T03:00:00Z' });

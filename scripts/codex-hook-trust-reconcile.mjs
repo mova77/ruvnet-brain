@@ -358,27 +358,32 @@ export async function refreshSharedCodexAppServer({ codexHome, timeoutMs = 8000,
   let socketPath;
   try { socketPath = fs.realpathSync(rendezvous); if (!fs.statSync(socketPath).isSocket()) throw new Error('not a socket'); }
   catch { return { state: 'no-shared-server', changed: false }; }
-  let ws; let timer;
+  // ONE total deadline, started BEFORE connecting: a socket that accepts but never completes the WebSocket handshake
+  // must not hang the installer (cross-vendor review F). On timeout the connecting socket is terminated.
+  let ws; let timer; let timedOut = false;
+  const deadline = new Promise((_, reject) => { timer = setTimeout(() => { timedOut = true; reject(new Error('Shared Codex app-server refresh timed out')); }, timeoutMs); });
+  deadline.catch(() => {});
   try {
-    ws = connect ? await connect(socketPath) : await (async () => {
-      const { default: WebSocket } = await import('ws');
-      const socket = new WebSocket(`ws+unix://${socketPath}:/`);
-      await new Promise((resolve, reject) => { socket.once('open', resolve); socket.once('error', reject); });
-      return socket;
-    })();
-    const pending = new Map(); let nextId = 1;
-    ws.on('message', (data) => {
-      let row; try { row = JSON.parse(String(data)); } catch { return; }
-      const item = pending.get(row.id); if (!item) return;
-      pending.delete(row.id);
-      // Native error text can quote private config values; report only which call was refused.
-      if (row.error) item.reject(new Error(`Shared Codex app-server rejected ${item.method}`)); else item.resolve(row.result);
-    });
-    const rpc = (method, params) => new Promise((resolve, reject) => {
-      const id = nextId++; pending.set(id, { resolve, reject, method }); ws.send(JSON.stringify({ id, method, params }));
-    });
-    const deadline = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Shared Codex app-server refresh timed out')), timeoutMs); });
     const run = (async () => {
+      ws = connect ? await connect(socketPath) : await (async () => {
+        const { default: WebSocket } = await import('ws');
+        const socket = new WebSocket(`ws+unix://${socketPath}:/`);
+        ws = socket; // reachable by the timeout's teardown while the handshake is still pending
+        await new Promise((resolve, reject) => { socket.once('open', resolve); socket.once('error', reject); });
+        return socket;
+      })();
+      if (timedOut) { try { if (ws.terminate) ws.terminate(); else ws.close(); } catch { /* already gone */ } return; }
+      const pending = new Map(); let nextId = 1;
+      ws.on('message', (data) => {
+        let row; try { row = JSON.parse(String(data)); } catch { return; }
+        const item = pending.get(row.id); if (!item) return;
+        pending.delete(row.id);
+        // Native error text can quote private config values; report only which call was refused.
+        if (row.error) item.reject(new Error(`Shared Codex app-server rejected ${item.method}`)); else item.resolve(row.result);
+      });
+      const rpc = (method, params) => new Promise((resolve, reject) => {
+        const id = nextId++; pending.set(id, { resolve, reject, method }); ws.send(JSON.stringify({ id, method, params }));
+      });
       await rpc('initialize', { clientInfo: { name: 'rnb_host_refresh', version: '1' }, capabilities: { experimentalApi: true } });
       ws.send(JSON.stringify({ method: 'initialized' }));
       const read = await rpc('config/read', { includeLayers: true });
@@ -393,7 +398,7 @@ export async function refreshSharedCodexAppServer({ codexHome, timeoutMs = 8000,
     return { state: 'refreshed', changed: false, approvalsGranted: 0 };
   } catch (error) {
     return { state: 'failed', changed: false, reason: error.message };
-  } finally { clearTimeout(timer); try { ws?.close(); } catch { /* already closed */ } }
+  } finally { clearTimeout(timer); try { if (timedOut && ws?.terminate) ws.terminate(); else ws?.close(); } catch { /* already closed */ } }
 }
 
 // Explicit CLI only; importing the helper never starts a process or reads stdin.

@@ -157,7 +157,18 @@ export const compareReleaseTags = (a, b) => {
   if ((A[4] || '') === (B[4] || '')) return 0;
   if (!A[4]) return 1;
   if (!B[4]) return -1;
-  return A[4] > B[4] ? 1 : -1;
+  // Semver §11.4: dot-separated identifiers left to right; numeric ones numerically (alpha.10 > alpha.9),
+  // numeric below alphanumeric, alphanumeric in ASCII order; a longer set wins when all before it are equal.
+  const X = A[4].split('.'), Y = B[4].split('.');
+  for (let i = 0; i < Math.max(X.length, Y.length); i++) {
+    if (X[i] === undefined) return -1;
+    if (Y[i] === undefined) return 1;
+    const xn = /^\d+$/.test(X[i]), yn = /^\d+$/.test(Y[i]);
+    if (xn && yn) { if (Number(X[i]) !== Number(Y[i])) return Number(X[i]) > Number(Y[i]) ? 1 : -1; continue; }
+    if (xn !== yn) return xn ? -1 : 1;
+    if (X[i] !== Y[i]) return X[i] > Y[i] ? 1 : -1;
+  }
+  return 0;
 };
 
 export const newerCorpusPending = (facts) => {
