@@ -409,13 +409,13 @@ export const REQUIRED_OPERATIONAL_EXPORTS = [
 const isTestFile = (f) => /\.(test|spec)\.(mjs|js)$/.test(path.basename(f))
   || f.includes(`${path.sep}tests${path.sep}`) || f.startsWith(`tests${path.sep}`);
 
-function walk(abs, recurse, out = []) {
+function walk(abs, recurse, out = [], prune = () => false) {
   let entries = [];
   try { entries = fs.readdirSync(abs, { withFileTypes: true }); } catch { return out; }
   for (const e of entries) {
     const full = path.join(abs, e.name);
     if (e.isDirectory()) {
-      if (recurse && e.name !== 'node_modules' && !e.name.startsWith('.')) walk(full, recurse, out);
+      if (recurse && e.name !== 'node_modules' && !e.name.startsWith('.') && !prune(full)) walk(full, recurse, out, prune);
     } else out.push(full);
   }
   return out;
@@ -451,7 +451,10 @@ function callerFiles(repo = REPO) {
     // wired into pre-push and `wired-check` went on reporting it `manual`. This file's own note names
     // the remedy: "an invoker outside the roots proves the ROOTS are incomplete — the fix is to add
     // the root, never to" special-case the module. Same rule, applied to the extension filter.
-    for (const f of walk(abs, true)) {
+    // Pruned BEFORE descending (see the worktrees note below): 100+ agent worktrees under .claude/ are full
+    // repository copies, and walking them only to drop every file afterwards dominated this audit's run time.
+    const worktrees = path.join(repo, '.claude', 'worktrees');
+    for (const f of walk(abs, true, [], (dir) => dir === worktrees)) {
       // `.claude/` is a caller root because `.claude/settings.json` genuinely invokes hooks. But
       // `.claude/worktrees/<agent>/` holds FULL COPIES of this repository (Claude Code agent
       // worktrees), and a copy of the repo is not a caller of the repo. Measured 2026-09-11: with any
@@ -634,6 +637,9 @@ export function callersOf(mod, files, repo = REPO, sourceCache = createInvocatio
     const rel = path.relative(repo, f).split(path.sep).join('/');
     if (rel === mod.rel) continue;              // self
     if (isTestFile(rel)) continue;              // a test is not a caller
+    // Cheap substring pre-filter: callerPattern() only ever matches text that contains the literal file
+    // name, so skipping the regex when the name is absent cannot change the result, only its cost.
+    if (!sourceCache.read(f)?.includes(mod.file)) continue;
     const src = sourceCache.commentFree(f);
     if (src !== null && re.test(src)) hits.push(rel);
   }
