@@ -66,10 +66,14 @@ it.each(['PreCompact', 'SessionEnd'])('%s with consent on stores one checkpoint 
 it('SessionEnd under the default Claude Code budget detaches the checkpoint, and the child stores it', async () => {
   const f = fixture();
   const result = await runLifecycleBoundary('SessionEnd', { session_id: 'consent', hook_event_name: 'SessionEnd', cwd: f.origin }, { env: f.env });
-  expect(result.checkpoint).toMatchObject({ stored: false, detached: true });
-  const checkpointStores = () => f.cli.calls().filter((c) => c.argv[1] === 'store' && /^project-state-auto-\d+-[0-9a-f]{8}$/.test(c.key || ''));
-  const deadline = Date.now() + 15_000;
-  while (!checkpointStores().length && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
-  expect(checkpointStores().length).toBe(1);
-  await waitForDetached([result.turn?.launch?.pid, result.checkpoint?.pid]);
+  // In a finally, so a failing assertion cannot leave the detached workers running into cleanup (review r2).
+  try {
+    expect(result.checkpoint).toMatchObject({ stored: false, detached: true });
+    const checkpointStores = () => f.cli.calls().filter((c) => c.argv[1] === 'store' && /^project-state-auto-\d+-[0-9a-f]{8}$/.test(c.key || ''));
+    const deadline = Date.now() + 15_000;
+    while (!checkpointStores().length && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
+    expect(checkpointStores().length).toBe(1);
+  } finally {
+    await waitForDetached([result.turn?.launch?.pid, result.checkpoint?.pid]);
+  }
 }, 40_000);
