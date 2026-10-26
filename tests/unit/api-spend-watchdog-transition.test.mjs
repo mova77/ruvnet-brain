@@ -218,6 +218,26 @@ describe('a dead admin key pages on the transition, not every hour (4.7.21 revie
     expect(s.desktopAlerts()).toHaveLength(1);
   });
 
+  // Review round 2 (Opus #4): the "works again" note earned the shared one-hour cooldown, so a spend alert in the
+  // same run was swallowed for up to an hour.
+  it('the key-recovery note does not hold back a spend-over-threshold alert in the same run', () => {
+    const s = sandbox();
+    s.listingRows([]);
+    expect(s.run({ ...KEY, STUB_COST_STATUS: '401' }).status).toBe(1);
+    s.ageCooldown();
+    // Key works again AND today's spend is at the threshold (the stub reports $0; the threshold is $0).
+    const r = s.run({ ...KEY, STUB_COST_STATUS: '200', SPEND_ALERT_USD: '0' });
+    expect(r.status, r.stderr).toBe(0);
+    const alerts = s.desktopAlerts();
+    expect(alerts).toHaveLength(3); // before: 2 (the spend alert "in cooldown")
+    expect(alerts[1]).toMatch(/works again/);
+    expect(alerts[2]).toMatch(/API spend today = \$0\.00/);
+    expect(r.stdout).not.toMatch(/in cooldown/);
+    // The spend alarm keeps its own one-hour limit: the next run inside the hour does not repeat it.
+    s.run({ ...KEY, STUB_COST_STATUS: '200', SPEND_ALERT_USD: '0' });
+    expect(s.desktopAlerts()).toHaveLength(3);
+  });
+
   it('a working key never pages, and a network error is not a dead key', () => {
     const s = sandbox();
     s.listingRows([]);

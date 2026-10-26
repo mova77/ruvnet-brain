@@ -70,11 +70,14 @@ function ts() {
   return new Date().toISOString();
 }
 
-async function alert(title, body) {
+// `stamp` is the cooldown this alert reads and earns. Money and failure alarms share LAST_ALERT; the admin-key
+// "works again" note has its own (review round 2, Opus #4): it used to earn the shared hour, so a spend-over-threshold
+// alert in the same run was held back by the cooldown a reassurance note had just started.
+async function alert(title, body, stamp = LAST_ALERT) {
   // rate limit
   try {
-    if (existsSync(LAST_ALERT)) {
-      const last = Date.parse(readFileSync(LAST_ALERT, 'utf8').trim());
+    if (existsSync(stamp)) {
+      const last = Date.parse(readFileSync(stamp, 'utf8').trim());
       if (Date.now() - last < COOLDOWN_MS) {
         console.log(`[watchdog] would alert but in cooldown: ${title}`);
         return;
@@ -108,7 +111,7 @@ async function alert(title, body) {
       `display notification ${JSON.stringify(body)} with title ${JSON.stringify('⚠️ ' + title)} sound name "Basso"`]);
     delivered = true;
   } catch {}
-  if (delivered) writeFileSync(LAST_ALERT, ts());
+  if (delivered) writeFileSync(stamp, ts());
   else {
     console.error('[watchdog] ALERT DELIVERY FAILED on every channel — no cooldown recorded, next run retries; exiting degraded');
     process.exitCode = 1;
@@ -246,13 +249,14 @@ const KEY_STATE = join(STATE_DIR, 'api-spend-admin-key.json');
 let keyWasDead = false;
 try { keyWasDead = JSON.parse(readFileSync(KEY_STATE, 'utf8')).dead === true; } catch {}
 const saveKeyState = (dead) => writeFileSync(KEY_STATE, JSON.stringify({ dead, at: ts() }));
+const KEY_NOTE_STAMP = join(STATE_DIR, 'api-spend-key-recovered-last.ts');
 if (adminKey) {
   const s = await todaySpendUsd(adminKey);
   if (s.ok) {
     console.log(`[watchdog] Anthropic API spend today: $${s.usd.toFixed(2)} (threshold $${THRESHOLD_USD})`);
     if (keyWasDead) {
       const delivered = await alert('ANTHROPIC_ADMIN_KEY works again - the $ spend detector is back',
-        'cost_report answered again; the definitive spend alarm is watching.');
+        'cost_report answered again; the definitive spend alarm is watching.', KEY_NOTE_STAMP);
       if (delivered) saveKeyState(false);
     }
     if (s.usd >= THRESHOLD_USD) {

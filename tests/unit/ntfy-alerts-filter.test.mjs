@@ -5,6 +5,9 @@
 // Fix round (4.7.21): a workflow_dispatch run is never deduplicated (protected-release dispatches both corpus nights and code
 // releases), the previous run is looked up across events (a green manual re-run is a recovery), and a repeat red pages
 // again when the previous red's page is not proven delivered (a non-green ntfy-alerts run since it started).
+// Review round 2 (Codex r4 #3): proof is affirmative and tied to the previous red. An empty notifier history, a notifier
+// run still in progress, or a green run for some OTHER red proves nothing, so each pages; only the ntfy-alerts run
+// titled for the previous red's id (the workflow's run-name) that completed green counts as delivered.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -58,9 +61,14 @@ afterAll(() => { if (work) fs.rmSync(work, { recursive: true, force: true }); })
 
 const run = (id, run_number, conclusion, event = 'schedule') =>
   ({ id, run_number, conclusion, status: 'completed', event, run_started_at: `2026-10-${String(run_number % 28 + 1).padStart(2, '0')}T08:00:00Z` });
-// ntfy-alerts' own runs, for the delivery check. `self` is this run (in progress; never counted).
-const SELF = { id: 5555, status: 'in_progress', conclusion: null };
-const nrun = (id, conclusion) => ({ id, status: 'completed', conclusion });
+// ntfy-alerts' own runs, for the delivery check. Their titles come from the workflow's own run-name template, so a
+// changed template that the delivery check does not follow fails here.
+const RUN_NAME = WORKFLOW.match(/^run-name: .*format\('([^']*\{0\}[^']*)', github\.event\.workflow_run\.id\)/m)?.[1];
+// (Falls back to the expected template so the matrix still runs against a pre-fix workflow for fail-before evidence.)
+const titleFor = (triggerId) => (RUN_NAME ?? 'ntfy-alerts for run {0}').replace('{0}', String(triggerId));
+// `self` is this run (in progress; never counted).
+const SELF = { id: 5555, status: 'in_progress', conclusion: null, display_title: titleFor(9000) };
+const nrun = (id, conclusion, forRun = 8999, status = 'completed') => ({ id, status, conclusion, display_title: titleFor(forRun) });
 const CURRENT = { WR_ID: '9000', WR_RUN_NUMBER: '90' };
 const red = (over = {}) => ({ EVENT: 'workflow_run', WR_CONC: 'failure', WR_NAME: 'learning-replay', WR_BRANCH: 'main',
   WR_URL: 'https://github.com/stuinfla/ruvnet-brain/actions/runs/9000', WR_EVENT: 'schedule', WR_WORKFLOW_ID: '777',
@@ -90,6 +98,12 @@ describe.skipIf(!hasJq)('ntfy-alerts send step', () => {
     const undeclared = [...used].filter((v) => !assigned.has(v) && !ENV_KEYS.includes(v));
     expect(undeclared).toEqual([]);
     for (const key of ['GH_TOKEN', 'REPO', 'WR_ID', 'WR_RUN_NUMBER', 'WR_WORKFLOW_ID', 'EVENT']) expect(ENV_KEYS).toContain(key);
+  });
+
+  it('every notifier run is titled with the id of the run that triggered it (and nothing attacker-controlled)', () => {
+    expect(RUN_NAME).toBe('ntfy-alerts for run {0}');
+    const line = WORKFLOW.match(/^run-name: (.*)$/m)[1];
+    expect(line).not.toMatch(/title|login|body|head_commit|display_title/);
   });
 
   it('triggers: no stars, no reopened; the token can read run history and nothing else', () => {
@@ -142,7 +156,7 @@ describe.skipIf(!hasJq)('ntfy-alerts send step', () => {
     expect(r.pages[0]).not.toContain('repeat');
     // ...while pull_request-event runs in the same history say nothing about the branch and are passed over.
     const viaPr = [run(9000, 90, 'failure'), run(8999, 89, 'success', 'pull_request'), run(8998, 88, 'failure')];
-    expect(send(red(), { history: viaPr }).pages).toHaveLength(0);
+    expect(send(red(), { history: viaPr, self: [SELF, nrun(5554, 'success', 8998)] }).pages).toHaveLength(0);
   });
 
   it('a failed delivery of the first red does not silence the next red (sustained ntfy outage)', () => {
@@ -153,7 +167,8 @@ describe.skipIf(!hasJq)('ntfy-alerts send step', () => {
     // Night 2: previous red, and the ntfy-alerts run that handled it is red -> page again, and say why.
     const history = [run(9000, 90, 'failure'), run(8999, 89, 'failure'), run(8998, 88, 'success')];
     for (const failed of ['failure', 'timed_out', 'cancelled', 'startup_failure']) {
-      const r = send(red(), { history, self: [SELF, nrun(5554, 'success'), nrun(5550, failed)] });
+      // 5554 is a green notifier run for some other red; 5550 is the one that handled red 8999.
+      const r = send(red(), { history, self: [SELF, nrun(5554, 'success', 8998), nrun(5550, failed)] });
       expect(r.status, `${failed}: ${r.stderr}`).toBe(0);
       expect(r.pages, failed).toHaveLength(1);
       expect(r.pages[0], failed).toContain("(repeat: the previous red's page may not have arrived)");
@@ -165,12 +180,35 @@ describe.skipIf(!hasJq)('ntfy-alerts send step', () => {
       expect(r.pages[0], label).toContain('repeat:');
     }
     // This run itself (in progress) and green or skipped ntfy runs prove nothing undelivered.
-    expect(send(red(), { history, self: [SELF, nrun(5554, 'success'), nrun(5553, 'skipped')] }).pages).toHaveLength(0);
+    expect(send(red(), { history, self: [SELF, nrun(5554, 'success'), nrun(5553, 'skipped', 8000)] }).pages).toHaveLength(0);
+  });
+
+  it('delivery needs affirmative evidence tied to the previous red: no notifier run, an unfinished one, or another red\'s green run pages', () => {
+    const history = [run(9000, 90, 'failure'), run(8999, 89, 'failure'), run(8998, 88, 'success')];
+    const cases = [
+      ['empty notifier history', []],
+      ['only this run', [SELF]],
+      ['the previous red\'s notifier run is still in progress', [SELF, nrun(5554, null, 8999, 'in_progress')]],
+      ['the previous red\'s notifier run is queued', [SELF, nrun(5554, null, 8999, 'queued')]],
+      ['green notifier runs, all for other reds', [SELF, nrun(5554, 'success', 8998), nrun(5553, 'success', 7000)]],
+      ['a pre-4.7.21 untitled green run', [SELF, { id: 5554, status: 'completed', conclusion: 'success', display_title: 'ntfy-alerts' }]],
+      ['the previous red\'s notifier run was skipped', [SELF, nrun(5554, 'skipped')]],
+    ];
+    for (const [label, self] of cases) {
+      const r = send(red(), { history, self });
+      expect(r.status, `${label}: ${r.stderr}`).toBe(0);
+      expect(r.pages, label).toHaveLength(1);
+      expect(r.pages[0], label).toContain("(repeat: the previous red's page may not have arrived)");
+    }
+    // The proof is the previous red's own green notifier run; a red notifier run for a DIFFERENT workflow's page
+    // no longer turns a delivered repeat into a second page.
+    const proven = send(red(), { history, self: [SELF, nrun(5554, 'success'), nrun(5552, 'failure', 7777)] });
+    expect(proven.pages).toHaveLength(0);
   });
 
   it('cancelled and skipped runs are passed over when finding the previous result', () => {
     const history = [run(9000, 90, 'failure'), run(8999, 89, 'cancelled'), run(8997, 88, 'skipped'), run(8996, 87, 'failure')];
-    expect(send(red(), { history }).pages).toHaveLength(0);
+    expect(send(red(), { history, self: [SELF, nrun(5554, 'success', 8996)] }).pages).toHaveLength(0);
     const recovered = [run(9000, 90, 'failure'), run(8999, 89, 'cancelled'), run(8996, 87, 'success')];
     expect(send(red(), { history: recovered }).pages).toHaveLength(1);
   });

@@ -147,6 +147,74 @@ describe('brain-alarm paging', () => {
     await down(7 * MIN);          // claim older than 60 s: abandoned, page now
     expect(requests).toHaveLength(1);
   });
+
+  // Review round 2 (Codex r4 #4): the "ok" record dropped the pending claim but kept its timestamp, so a claim whose
+  // sender died mid-POST and was followed by one good search silenced every DOWN page for 6 h.
+  it('a claim abandoned across a recovery is still released: the next outage pages (before: silent for 6 h)', async () => {
+    await down(0);
+    const file = path.join(dir, '.cache', 'ruvnet-brain', 'health.json');
+    fs.writeFileSync(file, JSON.stringify({ ...health(), downPaged: 'pending', lastDownPageAt: T0 + 5 * MIN, claimPrevPageAt: 0 }));
+    await up(5 * MIN + 10_000);   // the sender is dead; one good search lands
+    expect(health().status).toBe('ok');
+    await down(20 * MIN); await down(26 * MIN);
+    expect(requests.map((h) => h.title)).toEqual(['RuvNet Brain is DOWN']);
+    expect(health().downPaged).toBe(true);
+  });
+
+  it('a claim still in flight survives a recovery: the up does not let a second sender page', async () => {
+    await down(0);
+    const file = path.join(dir, '.cache', 'ruvnet-brain', 'health.json');
+    fs.writeFileSync(file, JSON.stringify({ ...health(), downPaged: 'pending', lastDownPageAt: T0 + 6 * MIN, claimPrevPageAt: 0 }));
+    await up(6 * MIN + 5_000);
+    await down(6 * MIN + 20_000); await down(6 * MIN + 30_000); // claim 30 s old: its sender may still be mid-POST
+    expect(requests).toHaveLength(0);
+  });
+
+  // Review round 2 (Codex r4 #5): only the newest 50 failures were kept, so failures every few seconds never spanned the
+  // 5-minute confirm window and a brain flapping that fast never paged.
+  it('a brain failing every 4 seconds with good searches in between pages DOWN once (before: zero pages in 20 min)', async () => {
+    for (let t = 0; t < 20 * MIN; t += 4_000) { await down(t); await up(t + 2_000); }
+    expect(requests.map((h) => h.title)).toEqual(['RuvNet Brain is DOWN']);
+    expect(health().recentFails.length).toBeLessThanOrEqual(50);
+  });
+
+  // Review round 2 (Opus #8): a recovery that landed while the DOWN page was in flight lost its "recovered" note.
+  it('a DOWN page delivered while the brain recovered still earns its recovery note (outage >= 10 min)', async () => {
+    let release;
+    const held = new Promise((r) => { release = r; });
+    server.removeAllListeners('request');
+    server.on('request', (req, res) => { req.resume(); req.on('end', async () => { requests.push(req.headers);
+      if (requests.length === 1) await held; res.end('{}'); }); });
+    await down(0);
+    const paging = down(10 * MIN);                       // claims, then waits on the held POST
+    while (requests.length === 0) await new Promise((r) => setImmediate(r));
+    await up(12 * MIN);                                  // recovery lands mid-POST: it cannot know the page arrived
+    expect(requests).toHaveLength(1);
+    release(); await paging;
+    expect(requests.map((h) => h.title)).toEqual(['RuvNet Brain is DOWN', 'RuvNet Brain recovered']);
+    expect(health().status).toBe('ok');
+    expect(health().downPaged).toBeUndefined();
+    await down(13 * MIN); await down(19 * MIN);          // the 6 h DOWN-page memory still holds
+    expect(requests).toHaveLength(2);
+  });
+
+  it('a short outage recovered mid-POST stays quiet, and a refused mid-POST page is released for the next outage', async () => {
+    let release; let status = 200;
+    const held = new Promise((r) => { release = r; });
+    server.removeAllListeners('request');
+    server.on('request', (req, res) => { req.resume(); req.on('end', async () => { requests.push(req.headers);
+      if (requests.length === 1) await held; res.statusCode = status; res.end('{}'); }); });
+    await down(0);
+    const paging = down(6 * MIN);
+    while (requests.length === 0) await new Promise((r) => setImmediate(r));
+    await up(7 * MIN);                                   // a 7-minute outage: no recovery note
+    status = 503; release(); await paging;               // ...and the page was refused
+    expect(requests).toHaveLength(1);
+    expect(health().lastDownPageAt).toBe(0);             // claim released, not kept for 6 h
+    status = 200;
+    await down(30 * MIN); await down(36 * MIN);
+    expect(requests.map((h) => h.title)).toEqual(['RuvNet Brain is DOWN', 'RuvNet Brain is DOWN']);
+  });
 });
 
 describe('brain-alarm across processes', () => {

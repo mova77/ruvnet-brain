@@ -85,8 +85,24 @@ function withLock(fn) {
 // A claim whose sender died mid-POST (the push times out at 10 s) must not swallow the page for 6 h.
 const CLAIM_STALE_MS = 60_000;
 
-const recentFails = (prev, now) => (Array.isArray(prev?.recentFails) ? prev.recentFails : [])
-  .map(Number).filter((t) => Number.isFinite(t) && now - t < FLAP_WINDOW_MS && t <= now).slice(-MAX_RECENT);
+// The list is bounded, but its OLDEST in-window failure is the flap anchor and is always kept (review round 2, Codex r4
+// #5): keeping only the newest 50 meant a failure every few seconds never spanned 5 minutes, so it never paged.
+const recentFails = (prev, now) => {
+  const fails = (Array.isArray(prev?.recentFails) ? prev.recentFails : [])
+    .map(Number).filter((t) => Number.isFinite(t) && now - t < FLAP_WINDOW_MS && t <= now).sort((a, b) => a - b);
+  return fails.length > MAX_RECENT ? [fails[0], ...fails.slice(-(MAX_RECENT - 1))] : fails;
+};
+const boundFails = (fails) => (fails.length > MAX_RECENT ? [fails[0], ...fails.slice(-(MAX_RECENT - 1))] : fails);
+
+// A page claim lives beside the up/down status, never inside it (review round 2, Codex r4 #4): an "ok" record written
+// while a DOWN page is in flight keeps the claim, so the sender's settle step can still release or confirm it, and a
+// claim whose sender died is released by the next failure whatever the status was in between.
+const claimOf = (rec) => (rec?.downPaged === 'pending'
+  ? { at: Number(rec.lastDownPageAt) || 0, prevPageAt: Number(rec.claimPrevPageAt) || 0, outageStart: Number(rec.claimOutageStart) || 0 }
+  : null);
+const withClaim = (rec, claim) => (claim
+  ? { ...rec, downPaged: 'pending', claimPrevPageAt: claim.prevPageAt, claimOutageStart: claim.outageStart }
+  : rec);
 
 function ntfyTopic() {
   // Set-but-EMPTY is an explicit opt-out (job-heartbeat.sh's convention): never fall through to the topic file.
@@ -128,12 +144,12 @@ export async function reportBrainDown({ error, source }) {
       const firstDownTs = continuing ? (prev.firstDownTs || now) : now;
       const failCount = continuing ? (Number(prev.failCount) || 1) + 1 : 1;
       let lastDownPageAt = Number(prev?.lastDownPageAt) || (continuing ? Number(prev.lastNtfyTs) || 0 : 0);
-      let wasPaged = continuing ? prev.downPaged : false;
-      if (wasPaged === 'pending' && now - lastDownPageAt > CLAIM_STALE_MS) { // abandoned claim: undo it
-        wasPaged = false; lastDownPageAt = Number(prev.claimPrevPageAt) || 0;
+      let pending = claimOf(prev); // whatever the status: a recovery in between does not settle a claim
+      if (pending && now - pending.at > CLAIM_STALE_MS) { // abandoned claim (its sender died): undo it
+        lastDownPageAt = pending.prevPageAt; pending = null;
       }
-      const fails = [...recentFails(prev, now), now].slice(-MAX_RECENT);
-      const health = {
+      const fails = boundFails([...recentFails(prev, now), now]);
+      const health = withClaim({
         status: 'down',
         error: String(error || 'unknown').slice(0, 500),
         source: source || 'unknown',
@@ -142,14 +158,15 @@ export async function reportBrainDown({ error, source }) {
         failCount,
         recentFails: fails,
         lastDownPageAt,
-        downPaged: wasPaged === true || wasPaged === 'pending' ? wasPaged : false,
-        ...(wasPaged === 'pending' ? { claimPrevPageAt: Number(prev.claimPrevPageAt) || 0 } : {}),
+        downPaged: continuing && prev.downPaged === true,
         fix: 'cd ~/.cache/ruvnet-brain/kb && npm i   — then verify: npx github:stuinfla/ruvnet-brain --doctor',
-      };
+      }, pending);
       const sustained = failCount >= 2 && now - firstDownTs >= DOWN_CONFIRM_MS;
       const flapping = fails.length >= 2 && now - fails[0] >= DOWN_CONFIRM_MS;
       const due = locked && !health.downPaged && (sustained || flapping) && now - lastDownPageAt >= DOWN_PAGE_GAP_MS;
-      if (due) { health.downPaged = 'pending'; health.claimPrevPageAt = lastDownPageAt; health.lastDownPageAt = now; } // the claim
+      if (due) { // the claim
+        Object.assign(health, withClaim({ lastDownPageAt: now }, { prevPageAt: lastDownPageAt, outageStart: firstDownTs }));
+      }
       writeHealth(health);
       return due ? { previousPageAt: lastDownPageAt, health } : null;
     });
@@ -161,18 +178,28 @@ export async function reportBrainDown({ error, source }) {
       + `First error: ${health.error.slice(0, 200)}\n`
       + `Fix: ${health.fix}`,
     );
-    withLock(() => {
+    const recovered = withLock(() => {
       const cur = readHealth();
-      if (!cur || Number(cur.lastDownPageAt) !== now) return; // superseded; nothing of ours to settle
-      delete cur.claimPrevPageAt;
+      if (!cur || Number(cur.lastDownPageAt) !== now || cur.downPaged !== 'pending') return null; // superseded
+      const outageStart = Number(cur.claimOutageStart) || Number(health.firstDownTs) || now;
+      delete cur.claimPrevPageAt; delete cur.claimOutageStart;
       if (sent) {
-        if (cur.status === 'down') cur.downPaged = true;
+        cur.downPaged = cur.status === 'down';
       } else {
         cur.lastDownPageAt = claim.previousPageAt; // undelivered: release the claim so the next failure retries
-        if (cur.status === 'down') cur.downPaged = false;
+        cur.downPaged = false;
       }
+      if (cur.status === 'down') { writeHealth(cur); return null; }
+      delete cur.downPaged; // an "ok" record carries no paged flag, only the 6 h memory
       writeHealth(cur);
+      // The brain came back while this DOWN page was in flight (review round 2, Opus #8): reportBrainUp could not
+      // announce a page it did not know had arrived, so the recovery note is sent here, under the same rules.
+      const upAt = Date.parse(cur.ts) || now;
+      return sent && upAt - outageStart >= RECOVERY_MIN_OUTAGE_MS ? cur : null;
     });
+    if (recovered) {
+      await push('RuvNet Brain recovered', `Searches are working again (source: ${recovered.source || 'unknown'}).`, 'default', 'white_check_mark');
+    }
   } catch { /* never */ }
 }
 
@@ -188,8 +215,8 @@ export async function reportBrainUp({ source } = {}) {
     const prev = withLock(() => {
       const cur = readHealth();
       if (!cur || cur.status !== 'down') return null;
-      writeHealth({ status: 'ok', ts: new Date(now).toISOString(), recoveredFrom: cur.error, source: source || 'unknown',
-        lastDownPageAt: Number(cur.lastDownPageAt) || 0, recentFails: recentFails(cur, now) });
+      writeHealth(withClaim({ status: 'ok', ts: new Date(now).toISOString(), recoveredFrom: cur.error, source: source || 'unknown',
+        lastDownPageAt: Number(cur.lastDownPageAt) || 0, recentFails: recentFails(cur, now) }, claimOf(cur)));
       return cur;
     });
     if (prev && prev.downPaged === true && now - (Number(prev.firstDownTs) || now) >= RECOVERY_MIN_OUTAGE_MS) {
