@@ -78,24 +78,41 @@ RUN_ID="$$-$START_EPOCH"
 # SIGKILLed, the watchdog's started-and-never-finished detection had nothing left to see.
 PREV_HB=""
 [ -f "$HB" ] && PREV_HB="$(cat "$HB" 2>/dev/null)"
+# The failing streak and the last page time ride in EVERY receipt, including "running" (4.7.21): a run that is
+# SIGKILLed mid-streak must not erase them, or the next failure would page as a brand-new streak.
+field_str() { printf '%s' "$PREV_HB" | sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" | head -1; }
+field_num() { printf '%s' "$PREV_HB" | sed -n "s/.*\"$1\":\([0-9][0-9]*\).*/\1/p" | head -1; }
+prev_state="$(field_str state)"
+prev_since="$(field_str failing_since)"
+prev_page_epoch="$(field_num last_page_epoch)"
+prev_page_at="$(field_str last_page_at)"
+prev_paged="$(printf '%s' "$PREV_HB" | sed -nE 's/.*"paged":("[a-z]*"|true|false).*/\1/p' | head -1)"
+CARRY=""
+[ -n "$prev_page_epoch" ] && CARRY="$CARRY,\"last_page_epoch\":$prev_page_epoch"
+[ -n "$prev_page_at" ] && CARRY="$CARRY,\"last_page_at\":\"$prev_page_at\""
+case "$prev_state" in failed|killed|running)
+  [ -n "$prev_since" ] && CARRY="$CARRY,\"failing_since\":\"$prev_since\""
+  [ -n "$prev_since" ] && [ -n "$prev_paged" ] && CARRY="$CARRY,\"paged\":$prev_paged" ;;
+esac
 
 # Start receipt. If the job vanishes without ever writing an end receipt, THIS is the evidence that
 # it started and never finished — a state the watchdog reports as FAILING, not as silence.
-write_receipt "{\"label\":\"$LABEL\",\"started_at\":\"$STARTED\",\"state\":\"running\",\"pid\":$$,\"run_id\":\"$RUN_ID\",\"command\":\"$(printf '%s %s' "$1" "${2:-}" | tr -d '"\\\n\r' | cut -c1-200)\"}"
+write_receipt "{\"label\":\"$LABEL\",\"started_at\":\"$STARTED\",\"state\":\"running\",\"pid\":$$,\"run_id\":\"$RUN_ID\",\"command\":\"$(printf '%s %s' "$1" "${2:-}" | tr -d '"\\\n\r' | cut -c1-200)\"$CARRY}"
 
-notify() { # notify <title> <body> <priority>
+notify() { # notify <title> <body> <priority> — 0 delivered · 1 not delivered · 2 paging disabled (opt-out)
   # NTFY_TOPIC set-but-EMPTY is an explicit opt-out (2026-07-18): unit tests wrap this script around
   # deliberately-failing fixture commands (t-fail, t.bad, exit 7), and the topic-file fallback below
   # meant every test run PAGED Stuart's real phone — 16+ fixture pages in one morning, indistinguishable
   # from real job failures. Tests set NTFY_TOPIC="" and stay silent; production (unset) still falls
-  # through to the topic file.
-  if [ "${NTFY_TOPIC+set}" = "set" ] && [ -z "$NTFY_TOPIC" ]; then return 0; fi
+  # through to the topic file. An opt-out is NOT a delivered page: it returns 2 and the receipt records
+  # "paged":"disabled", never true (4.7.21).
+  if [ "${NTFY_TOPIC+set}" = "set" ] && [ -z "$NTFY_TOPIC" ]; then return 2; fi
   topic="${NTFY_TOPIC:-}"
   [ -z "$topic" ] && [ -f "$HOME/.cache/ruvnet-brain/ntfy-topic" ] && topic="$(cat "$HOME/.cache/ruvnet-brain/ntfy-topic")"
   [ -z "$topic" ] && return 1
   # --fail: an HTTP error is a failed delivery. The caller records whether the page landed, so a page that
   # never arrived is retried on the next run instead of muting the whole failing streak (review 2026-10-25).
-  curl -sS --fail -m 10 -H "Title: $1" -H "Priority: $3" -H "Tags: ${4:-rotating_light}" -d "$2" "https://ntfy.sh/$topic" >/dev/null 2>&1
+  curl -sS --fail -m 10 -H "Title: $1" -H "Priority: $3" -H "Tags: ${4:-rotating_light}" -d "$2" "${NTFY_URL:-https://ntfy.sh}/$topic" >/dev/null 2>&1
 }
 
 # The run_id currently on disk for this label, or empty if the receipt is missing/unreadable/has
@@ -112,8 +129,10 @@ finish() {
   timed_out=0
   if [ -f "$HB.timeout-$RUN_ID" ]; then
     # Anything the overrunning job left behind (started during its TERM handling, say) goes now.
-    timed_out=1; stop_job; rm -f "$HB.timeout-$RUN_ID"
+    timed_out=1; stop_job
   fi
+  # Always, on every exit path: the timer may have written the marker after the check above (4.7.21).
+  rm -f "$HB.timeout-$RUN_ID"
   # An overrun is a failure however the job chose to exit on TERM, including 0 and 75 (the skip code), so this
   # comes before the skip branch (GPT-6.1 review round 2).
   [ "$timed_out" -eq 1 ] && [ "$code" -le 128 ] && code=143
@@ -152,28 +171,44 @@ finish() {
   # PAGE ON THE TRANSITION, NOT ON EVERY RUN (owner, 2026-10-25: 10,747 notifications on one topic). A job that
   # starts failing pages once, urgently, while it is still tonight's problem; while it KEEPS failing it stays
   # quiet (failing_since carries the first failure; the nightly watchdog's digest still lists it); the run
-  # that passes again sends one low-priority "recovered" note. The previous run's state comes from PREV_HB.
-  prev_state="$(printf '%s' "$PREV_HB" | sed -n 's/.*"state":"\([^"]*\)".*/\1/p' | head -1)"
-  prev_since="$(printf '%s' "$PREV_HB" | sed -n 's/.*"failing_since":"\([^"]*\)".*/\1/p' | head -1)"
-  was_failing=0; case "$prev_state" in failed|killed) was_failing=1 ;; esac
-  # A failing streak counts as already paged only if that page was delivered ("paged":false = retry it).
-  # Only a page PROVEN delivered ("paged":true) keeps the streak quiet; a receipt from before this field existed
-  # counts as unknown and is paged once more (review round 2).
-  prev_unpaged=1; case "$PREV_HB" in *'"paged":true'*) prev_unpaged=0 ;; esac
+  # that passes again sends one low-priority "recovered" note — only if that streak was actually paged.
+  # FLAP DAMPING (4.7.21): a NEW streak within 6 h of the last delivered page is recorded "paged":"suppressed"
+  # instead of paging (4 fail/ok cycles were 8 notifications). A suppressed streak still failing after 6 h pages.
+  # A prior "running" receipt that carries failing_since (a SIGKILLed run) continues its streak.
+  was_failing=0
+  case "$prev_state" in failed|killed) was_failing=1 ;; running) [ -n "$prev_since" ] && was_failing=1 ;; esac
+  # A failing streak counts as already paged only if that page was PROVEN delivered ("paged":true). false (retry),
+  # "suppressed", "disabled", or a receipt from before this field existed are paged (again) when allowed.
+  prev_unpaged=1; [ "$prev_paged" = "true" ] && prev_unpaged=0
+  QUIET_SECONDS=21600
+  now_epoch="$(date +%s)"
+  page_epoch="$prev_page_epoch"; page_at="$prev_page_at"
   since=""
   if [ "$code" -ne 0 ]; then
     if [ "$was_failing" -eq 1 ] && [ -n "$prev_since" ]; then since="$prev_since"; else since="$STARTED"; fi
     extra="$extra,\"failing_since\":\"$since\""
   fi
   if [ "$code" -ne 0 ] && { [ "$was_failing" -eq 0 ] || [ "$prev_unpaged" -eq 1 ]; }; then
-    reason="exit $code after ${dur}s"; [ "$timed_out" -eq 1 ] && reason="stopped after running past its ${MAX_SECONDS}s limit"
-    if notify "🔴 SCHEDULED JOB FAILED: $LABEL" "$reason — see the job's log. Receipt: $HB. Further failures stay quiet until it recovers." "urgent"; then
-      extra="$extra,\"paged\":true"; else extra="$extra,\"paged\":false"; fi
+    if [ -n "$prev_page_epoch" ] && [ $((now_epoch - prev_page_epoch)) -lt "$QUIET_SECONDS" ] \
+       && ! { [ "$was_failing" -eq 1 ] && [ "$prev_paged" = "false" ]; }; then
+      # Inside the quiet window. (A streak whose own page simply failed to deliver is retried, not damped.)
+      extra="$extra,\"paged\":\"suppressed\""
+    else
+      reason="exit $code after ${dur}s"; [ "$timed_out" -eq 1 ] && reason="stopped after running past its ${MAX_SECONDS}s limit"
+      notify "SCHEDULED JOB FAILED: $LABEL" "$reason — see the job's log. Receipt: $HB. Further failures stay quiet until it recovers." "urgent"
+      rc=$?
+      if [ "$rc" -eq 0 ]; then
+        extra="$extra,\"paged\":true"; page_epoch="$now_epoch"; page_at="$(ts)"
+      elif [ "$rc" -eq 2 ]; then extra="$extra,\"paged\":\"disabled\""
+      else extra="$extra,\"paged\":false"; fi
+    fi
   elif [ "$code" -ne 0 ]; then
     extra="$extra,\"paged\":true"
-  elif [ "$was_failing" -eq 1 ]; then
-    notify "✅ Recovered: $LABEL" "passed again after failing since ${prev_since:-an earlier run}" "low" "white_check_mark" || true
+  elif [ "$was_failing" -eq 1 ] && [ "$prev_paged" = "true" ]; then
+    notify "Recovered: $LABEL" "passed again after failing since ${prev_since:-an earlier run}" "low" "white_check_mark" || true
   fi
+  [ -n "$page_epoch" ] && extra="$extra,\"last_page_epoch\":$page_epoch"
+  [ -n "$page_at" ] && extra="$extra,\"last_page_at\":\"$page_at\""
   write_receipt "{\"label\":\"$LABEL\",\"started_at\":\"$STARTED\",\"ended_at\":\"$ended\",\"state\":\"$state\",\"exit_code\":$code,\"duration_sec\":$dur,\"run_id\":\"$RUN_ID\"$extra}"
   exit "$code"
 }

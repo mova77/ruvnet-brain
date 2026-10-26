@@ -25,7 +25,14 @@ import os from 'node:os';
 
 const STATE_DIR = path.join(os.homedir(), '.cache', 'ruvnet-brain');
 export const HEALTH_PATH = path.join(STATE_DIR, 'health.json');
-const NTFY_THROTTLE_MS = 60 * 60 * 1000; // at most one push per hour per direction
+// PAGE DAMPING (4.7.21). The pages below never left the machine before 4.7.21 (an emoji Title made fetch() throw
+// before sending), so these rules were never exercised. Now that pages arrive, a flapping brain must not flap the
+// phone: DOWN pages only after two failures at least 5 min apart, at most once per 6 h (remembered across "up"
+// states), and a recovery is announced only for a DOWN page that was delivered and an outage of 10 min or more.
+const MIN = 60_000;
+const DOWN_CONFIRM_MS = 5 * MIN;
+const DOWN_PAGE_GAP_MS = 6 * 60 * MIN;
+const RECOVERY_MIN_OUTAGE_MS = 10 * MIN;
 
 function readHealth() {
   try { return JSON.parse(fs.readFileSync(HEALTH_PATH, 'utf8')); } catch { return null; }
@@ -39,7 +46,8 @@ function writeHealth(obj) {
 }
 
 function ntfyTopic() {
-  if (process.env.NTFY_TOPIC) return process.env.NTFY_TOPIC.trim();
+  // Set-but-EMPTY is an explicit opt-out (job-heartbeat.sh's convention): never fall through to the topic file.
+  if (process.env.NTFY_TOPIC !== undefined) return process.env.NTFY_TOPIC.trim() || null;
   try {
     const t = fs.readFileSync(path.join(STATE_DIR, 'ntfy-topic'), 'utf8').trim();
     if (t) return t;
@@ -47,48 +55,54 @@ function ntfyTopic() {
   return null;
 }
 
+/** Delivered means a 2xx. The Title is plain ASCII (an HTTP header must be a ByteString); Tags carry the emoji. */
 async function push(title, message, priority = 'urgent', tags = 'rotating_light') {
   const topic = ntfyTopic();
   if (!topic) return false;
+  const base = (process.env.NTFY_URL || 'https://ntfy.sh').replace(/\/+$/, '');
   try {
-    await fetch(`https://ntfy.sh/${topic}`, {
+    const res = await fetch(`${base}/${encodeURIComponent(topic)}`, {
       method: 'POST',
-      headers: { Title: title, Priority: priority, Tags: tags },
+      headers: { Title: String(title).replace(/[^\x20-\x7e]+/g, ' ').trim(), Priority: priority, Tags: tags },
       body: message,
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(10_000),
     });
-    return true;
+    return res.ok;
   } catch { return false; }
 }
 
 /**
  * Ring the gong: the brain failed a real search (total failure — retrieval itself is broken).
- * Writes health.json (which the session-start banner reads) and sends a throttled urgent push.
+ * Writes health.json on EVERY call (the session-start banner is never damped) and pages per the rules above.
  * Never throws. Await it from a CLI that is about to exit; fire-and-forget from a server.
  */
 export async function reportBrainDown({ error, source }) {
   try {
     const prev = readHealth();
     const now = Date.now();
-    const firstDownTs = prev?.status === 'down' ? (prev.firstDownTs || now) : now;
-    const lastNtfyTs = prev?.status === 'down' ? (prev.lastNtfyTs || 0) : 0;
+    const continuing = prev?.status === 'down';
+    const firstDownTs = continuing ? (prev.firstDownTs || now) : now;
+    const failCount = continuing ? (Number(prev.failCount) || 1) + 1 : 1;
+    const lastDownPageAt = Number(prev?.lastDownPageAt) || (continuing ? Number(prev.lastNtfyTs) || 0 : 0);
     const health = {
       status: 'down',
       error: String(error || 'unknown').slice(0, 500),
       source: source || 'unknown',
       ts: new Date(now).toISOString(),
       firstDownTs,
-      lastNtfyTs,
+      failCount,
+      lastDownPageAt,
+      downPaged: continuing ? !!prev.downPaged : false,
       fix: 'cd ~/.cache/ruvnet-brain/kb && npm i   — then verify: npx github:stuinfla/ruvnet-brain --doctor',
     };
-    if (now - lastNtfyTs > NTFY_THROTTLE_MS) {
+    if (!health.downPaged && failCount >= 2 && now - firstDownTs >= DOWN_CONFIRM_MS && now - lastDownPageAt >= DOWN_PAGE_GAP_MS) {
       const sent = await push(
-        '🚨 RuvNet Brain is DOWN',
+        'RuvNet Brain is DOWN',
         `Every repo failed to search (source: ${health.source}). This is NOT an empty result — retrieval itself is broken.\n`
         + `First error: ${health.error.slice(0, 200)}\n`
         + `Fix: ${health.fix}`,
       );
-      if (sent) health.lastNtfyTs = now;
+      if (sent) { health.lastDownPageAt = now; health.downPaged = true; }
     }
     writeHealth(health);
   } catch { /* never */ }
@@ -96,14 +110,18 @@ export async function reportBrainDown({ error, source }) {
 
 /**
  * All-clear: a real search succeeded with zero repo errors. Only writes on a down→ok transition
- * (no write churn on every healthy query) and sends one recovery push so the DOWN alert is closed out.
+ * (no write churn on every healthy query). The 6 h DOWN-page memory survives the "ok" record.
  */
 export async function reportBrainUp({ source } = {}) {
   try {
     const prev = readHealth();
     if (!prev || prev.status !== 'down') return;
-    writeHealth({ status: 'ok', ts: new Date().toISOString(), recoveredFrom: prev.error, source: source || 'unknown' });
-    await push('✅ RuvNet Brain recovered', `Searches are working again (source: ${source || 'unknown'}).`, 'default', 'white_check_mark');
+    const now = Date.now();
+    writeHealth({ status: 'ok', ts: new Date(now).toISOString(), recoveredFrom: prev.error, source: source || 'unknown',
+      lastDownPageAt: Number(prev.lastDownPageAt) || 0 });
+    if (prev.downPaged && now - (Number(prev.firstDownTs) || now) >= RECOVERY_MIN_OUTAGE_MS) {
+      await push('RuvNet Brain recovered', `Searches are working again (source: ${source || 'unknown'}).`, 'default', 'white_check_mark');
+    }
   } catch { /* never */ }
 }
 

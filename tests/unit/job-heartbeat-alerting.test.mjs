@@ -49,8 +49,10 @@ function makeHarness({ withTopic }) {
   fs.mkdirSync(binDir, { recursive: true });
   const curlLog = path.join(workDir, 'curl-calls.log');
   const fakeCurl = path.join(binDir, 'curl');
-  // Records every invocation (one line of JSON-ish args) instead of making a network call.
-  fs.writeFileSync(fakeCurl, `#!/bin/sh\necho "$@" >> "${curlLog}"\nexit 0\n`);
+  // Records every invocation (one line of JSON-ish args) instead of making a network call. Like real curl, an HTTP
+  // error (CURL_HTTP_STATUS >= 400) is exit 22 ONLY when --fail was passed — so dropping --fail is caught (4.7.21).
+  fs.writeFileSync(fakeCurl, `#!/bin/sh\necho "$@" >> "${curlLog}"\nfail=0; for a in "$@"; do [ "$a" = "--fail" ] && fail=1; done\n`
+    + `[ "\${CURL_HTTP_STATUS:-200}" -ge 400 ] && [ "$fail" = 1 ] && exit 22\nexit 0\n`);
   fs.chmodSync(fakeCurl, 0o755);
 
   const hbDir = path.join(workDir, 'heartbeats');
@@ -63,9 +65,10 @@ function makeHarness({ withTopic }) {
     return p;
   };
 
-  const run = (label, exitCode) => spawnSync('/bin/sh', [WRAPPER, label, '--', script(exitCode)], {
+  const run = (label, exitCode, extraEnv = {}) => spawnSync('/bin/sh', [WRAPPER, label, '--', script(exitCode)], {
     encoding: 'utf8',
     env: {
+      ...extraEnv,
       PATH: `${binDir}:/usr/bin:/bin`,
       HOME: home,
       JOB_HEARTBEAT_DIR: hbDir,
@@ -121,7 +124,84 @@ describe('job-heartbeat.sh — a failing job must actually page, not just record
     run('com.test.flaky', 0);
     expect(curlCalls().length).toBe(2); // staying green is silent
     run('com.test.flaky', 3);
-    expect(curlCalls().length).toBe(3); // a NEW streak pages again
+    // A NEW streak within 6 h of the last page is damped (4.7.21): recorded, not paged.
+    expect(curlCalls().length).toBe(2);
+    expect(receipt('com.test.flaky').paged).toBe('suppressed');
+  });
+
+  it('flap damping: 4 fail/ok cycles produce at most 2 notifications (before: 8)', () => {
+    const { run, curlCalls, receipt } = makeHarness({ withTopic: true });
+    for (let i = 0; i < 4; i += 1) { run('com.test.flap', 1); run('com.test.flap', 0); }
+    const calls = curlCalls();
+    expect(calls).toHaveLength(2); // one failure page, one recovery note for that paged streak
+    expect(calls[0]).toContain('SCHEDULED JOB FAILED: com.test.flap');
+    expect(calls[1]).toContain('Recovered: com.test.flap');
+    expect(typeof receipt('com.test.flap').last_page_epoch).toBe('number'); // carried through every receipt
+  });
+
+  it('a new failing streak more than 6 h after the last page pages again', () => {
+    const { run, curlCalls, receipt } = makeHarness({ withTopic: true });
+    const hbDir = path.join(workDir, 'heartbeats');
+    const old = Math.floor(Date.now() / 1000) - 7 * 3600;
+    fs.writeFileSync(path.join(hbDir, 'com.test.later.json'), JSON.stringify({ label: 'com.test.later', state: 'ok', exit_code: 0, run_id: 'old', last_page_epoch: old, last_page_at: '2026-10-25T00:00:00Z' }));
+    run('com.test.later', 1);
+    expect(curlCalls()).toHaveLength(1);
+    expect(receipt('com.test.later').paged).toBe(true);
+    expect(receipt('com.test.later').last_page_epoch).toBeGreaterThan(old);
+  });
+
+  it('a damped streak that is still failing after 6 h is paged then', () => {
+    const { run, curlCalls } = makeHarness({ withTopic: true });
+    const hbDir = path.join(workDir, 'heartbeats');
+    const old = Math.floor(Date.now() / 1000) - 7 * 3600;
+    fs.writeFileSync(path.join(hbDir, 'com.test.damped.json'), JSON.stringify({ label: 'com.test.damped', state: 'failed', exit_code: 1, run_id: 'old', failing_since: '2026-10-25T00:00:00Z', paged: 'suppressed', last_page_epoch: old }));
+    run('com.test.damped', 1);
+    expect(curlCalls()).toHaveLength(1);
+  });
+
+  it('NTFY_TOPIC="" records paged:"disabled", never paged:true, and sends nothing (before: paged:true)', () => {
+    const { run, curlCalls, receipt } = makeHarness({ withTopic: true });
+    run('com.test.optout', 1, { NTFY_TOPIC: '' });
+    expect(curlCalls()).toHaveLength(0);
+    expect(receipt('com.test.optout').paged).toBe('disabled');
+    run('com.test.optout', 1, { NTFY_TOPIC: '' });
+    expect(receipt('com.test.optout').paged).toBe('disabled');
+  });
+
+  it('an HTTP error from ntfy is an undelivered page (curl --fail): paged:false', () => {
+    const { run, curlCalls, receipt } = makeHarness({ withTopic: true });
+    run('com.test.http429', 1, { CURL_HTTP_STATUS: '429' });
+    expect(curlCalls()).toHaveLength(1);
+    expect(receipt('com.test.http429').paged).toBe(false);
+  });
+
+  it('no recovery note for a streak that was never paged', () => {
+    const { run, curlCalls } = makeHarness({ withTopic: true });
+    run('com.test.quietrec', 1, { NTFY_TOPIC: '' }); // opted out: not paged
+    run('com.test.quietrec', 0);
+    expect(curlCalls()).toHaveLength(0); // before: a "Recovered" note for a failure nobody was told about
+  });
+
+  it('a "running" receipt left by a killed run continues the failing streak instead of paging anew', () => {
+    const { run, curlCalls, receipt } = makeHarness({ withTopic: true });
+    const hbDir = path.join(workDir, 'heartbeats');
+    const now = Math.floor(Date.now() / 1000);
+    fs.writeFileSync(path.join(hbDir, 'com.test.cont.json'), JSON.stringify({ label: 'com.test.cont', state: 'running', pid: 999999, run_id: 'killed', failing_since: '2026-10-25T00:00:00Z', paged: true, last_page_epoch: now - 600 }));
+    run('com.test.cont', 1);
+    expect(curlCalls()).toHaveLength(0);
+    expect(receipt('com.test.cont').failing_since).toBe('2026-10-25T00:00:00Z');
+    expect(receipt('com.test.cont').paged).toBe(true);
+  });
+
+  it('the running receipt carries the streak forward, so a SIGKILLed run cannot lose it', () => {
+    makeHarness({ withTopic: false });
+    const hbDir = path.join(workDir, 'heartbeats');
+    fs.writeFileSync(path.join(hbDir, 'com.test.carry.json'), JSON.stringify({ label: 'com.test.carry', state: 'failed', exit_code: 1, run_id: 'x', failing_since: '2026-10-25T00:00:00Z', paged: true, last_page_epoch: 1792900000 }));
+    const peek = path.join(workDir, 'peek-carry.sh');
+    fs.writeFileSync(peek, `#!/bin/sh\ncp "${path.join(hbDir, 'com.test.carry.json')}" "${path.join(workDir, 'carry.json')}"\nexit 1\n`); fs.chmodSync(peek, 0o755);
+    spawnSync('/bin/sh', [WRAPPER, 'com.test.carry', '--', peek], { encoding: 'utf8', env: { PATH: '/usr/bin:/bin', HOME: path.join(workDir, 'home'), JOB_HEARTBEAT_DIR: hbDir, NTFY_TOPIC: '' } });
+    const running = JSON.parse(fs.readFileSync(path.join(workDir, 'carry.json'), 'utf8'));
+    expect(running).toMatchObject({ state: 'running', failing_since: '2026-10-25T00:00:00Z', paged: true, last_page_epoch: 1792900000 });
   });
 
   it('a job that never exits is stopped at JOB_MAX_SECONDS and recorded as timed out (2026-10-25)', () => {
