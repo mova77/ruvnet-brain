@@ -78,6 +78,34 @@ export function inspectRefreshOwner(owner, { hostname = os.hostname(), inspectPr
   return ownerState(owner, { hostname, inspectProcess, isAlive });
 }
 
+// A lock nobody can prove alive must not wedge every later run (4.7.21, audit C). Liveness cannot be proven
+// across hosts (and on macOS os.hostname() follows the network, so "another host" is often this Mac on
+// another Wi-Fi), but a refresh run cannot outlive the updater's own deadlines. An owner.json that cannot be
+// read or lacks its identity is debris once no writer could still be publishing it.
+export const REMOTE_OWNER_DEAD_MS = 3 * 3600_000;
+export const INCOMPLETE_OWNER_RECLAIM_MS = 3600_000;
+const ownerComplete = (owner) => owner?.schemaVersion === 3 && Boolean(owner.runId && owner.token && owner.host
+  && Number.isSafeInteger(owner.pid) && owner.receiptPath && owner.brainHome);
+const removalCommand = (lockPath) => (process.platform === 'win32'
+  ? `Remove-Item -Recurse -Force "${lockPath}"` : `rm -rf "${lockPath}"`);
+function newestMtimeMs(...files) {
+  let newest = Number.NaN;
+  for (const file of files) {
+    try { const ms = fs.lstatSync(file).mtimeMs; if (!(newest >= ms)) newest = ms; } catch { /* absent */ }
+  }
+  return newest;
+}
+
+/** 'dead' also for a remote owner past REMOTE_OWNER_DEAD_MS; every other answer is ownerState's. */
+function ownerVerdict(owner, { hostname, inspectProcess, isAlive, nowMs }) {
+  const state = ownerState(owner, { hostname, inspectProcess, isAlive });
+  if (state !== 'unknown' || !ownerComplete(owner) || owner.host === hostname) return { state, reason: 'exact-dead-owner' };
+  const startedMs = Date.parse(owner.startedAt || '');
+  return Number.isFinite(startedMs) && nowMs - startedMs > REMOTE_OWNER_DEAD_MS
+    ? { state: 'dead', reason: 'stale-remote-owner' }
+    : { state, reason: null };
+}
+
 /**
  * The ONE physical-path rule for brain directories. A user may reach the brain through a symlink
  * (`~/.cache -> /Volumes/<disk>`) while the updater knows it by its real path (Node resolves
@@ -110,8 +138,9 @@ function abandonDeadOwner({ lockPath, owner, hostname, inspectProcess, isAlive, 
   const fd = fs.openSync(claimFile, 'wx', 0o600);
   try { fs.writeFileSync(fd, `${JSON.stringify(claim, null, 2)}\n`); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
   const observed = JSON.parse(fs.readFileSync(path.join(lockPath, 'owner.json'), 'utf8'));
+  const verdict = ownerVerdict(observed, { hostname, inspectProcess, isAlive, nowMs: Date.parse(now()) });
   if (observed.schemaVersion !== 3 || observed.runId !== owner.runId || observed.token !== owner.token
-    || ownerState(observed, { hostname, inspectProcess, isAlive }) !== 'dead') {
+    || verdict.state !== 'dead') {
     throw new Error('refresh owner changed or is no longer exactly dead during takeover');
   }
   const expectedReceipt = refreshReceiptPath(observed.brainHome, observed.runId);
@@ -136,7 +165,7 @@ function abandonDeadOwner({ lockPath, owner, hostname, inspectProcess, isAlive, 
     receipt.status = 'ABANDONED';
     receipt.terminalVerdict = 'abandoned';
     receipt.finishedAt = now();
-    receipt.detail = { reason: 'exact-dead-owner', abandonedOwner: { host: observed.host, pid: observed.pid,
+    receipt.detail = { reason: verdict.reason, abandonedOwner: { host: observed.host, pid: observed.pid,
       processStart: observed.processStart, executable: observed.executable }, takeoverToken: claim.token };
     delete receipt.intendedStatus;
     delete receipt.intendedTerminalVerdict;
@@ -205,15 +234,23 @@ export function acquireRefreshLock({
       // codes as contention, then inspect the owner through the same liveness fence.
       if (!['EEXIST', 'ENOTEMPTY', 'EPERM', 'EACCES'].includes(error?.code)) throw error;
       let owner = null;
-      try { owner = JSON.parse(fs.readFileSync(path.join(lockPath, 'owner.json'), 'utf8')); } catch {
-        throw new Error(`refresh lock owner is incomplete or unreadable; refusing stale takeover (${lockPath})`);
+      try { owner = JSON.parse(fs.readFileSync(path.join(lockPath, 'owner.json'), 'utf8')); } catch { /* judged below */ }
+      const nowMs = Date.parse(now());
+      if (!ownerComplete(owner)) {
+        const ageMs = nowMs - newestMtimeMs(lockPath, path.join(lockPath, 'owner.json'));
+        if (!(ageMs > INCOMPLETE_OWNER_RECLAIM_MS)) {
+          throw new Error(`refresh lock owner is incomplete or unreadable; refusing takeover until it is 1 h old `
+            + `(lock ${lockPath}). If no update is running, remove it:  ${removalCommand(lockPath)}`);
+        }
+      } else {
+        const verdict = ownerVerdict(owner, { hostname, inspectProcess, isAlive, nowMs });
+        if (verdict.state !== 'dead') {
+          throw new Error(`${verdict.state === 'live' ? 'another refresh run is active' : 'refresh lock owner is ambiguous'} `
+            + `(pid ${owner.pid || '?'} on ${owner.host || '?'}, started ${owner.startedAt || '?'}, lock ${lockPath}). `
+            + `If no update is running${owner.host && owner.host !== hostname ? ` on ${owner.host}` : ''}, remove it:  ${removalCommand(lockPath)}`);
+        }
+        abandonDeadOwner({ lockPath, owner, hostname, inspectProcess, isAlive, now });
       }
-      const state = ownerState(owner, { hostname, inspectProcess, isAlive });
-      if (state !== 'dead') {
-        throw new Error(`${state === 'live' ? 'another refresh run is active' : 'refresh lock owner is ambiguous'} `
-          + `(pid ${owner.pid || '?'}, lock ${lockPath})`);
-      }
-      abandonDeadOwner({ lockPath, owner, hostname, inspectProcess, isAlive, now });
       const stale = `${lockPath}.stale-${pid}-${Date.now()}`;
       try {
         fs.renameSync(lockPath, stale);
