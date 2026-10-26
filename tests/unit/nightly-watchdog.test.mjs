@@ -387,7 +387,9 @@ describe('the job registry (config/scheduled-jobs.json) matches what is actually
   const job = (label) => registry.jobs.find((j) => j.label === label);
   it('every job declares a run limit, and the long ones get more', () => {
     for (const j of registry.jobs) expect(j.maxRunHours, j.label).toBeGreaterThan(0);
-    expect(job('com.ruvnet.brain-gists').maxRunHours).toBe(4);
+    // brain-gists was retired 2026-10-26: the registry must not watch a job that is deliberately not loaded.
+    expect(job('com.ruvnet.brain-gists')).toBeUndefined();
+    expect(registry._retired.map((r) => r.label)).toContain('com.ruvnet.brain-gists');
     expect(job('com.ruvnet.goldie-weekly').maxRunHours).toBe(3);
     expect(job('com.ruvnet.model-refresh').maxRunHours).toBe(1);
   });

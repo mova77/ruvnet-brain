@@ -5,18 +5,6 @@
   "heartbeatDir": "~/.cache/ruvnet-brain/heartbeats",
   "jobs": [
     {
-      "label": "com.ruvnet.brain-gists",
-      "what": "Pulls rUv's new gists into the brain and re-embeds when they change",
-      "schedule": "daily 21:47",
-      "maxAgeHours": 26,
-      "required": true,
-      "legacyLog": "logs/gists-nightly.log",
-      "progressGlob": "kb/ruv-gists.big.progress.*.json",
-      "stallMinutes": 15,
-      "_stall_note": "2026-09-11 incident: this job's 8-shard re-embed sat at 0% CPU for six hours with a live wrapper pid and a heartbeat that still said 'running' — OK by every check that existed before this field. kb/forge-big.mjs's shard-all mode writes kb/ruv-gists.big.progress.<shard>-<of>.json after every completed batch; if the OLDEST still-incomplete one goes stallMinutes without advancing, judge() reports STALLED even though the pid is alive.",
-      "maxRunHours": 4
-    },
-    {
       "label": "com.ruvnet.goldie-weekly",
       "what": "Re-researches the cheapest/best models and refreshes the router catalog",
       "schedule": "Mondays 07:30",
@@ -140,6 +128,11 @@
       "label": "com.ruvnet.npx-72h-verdict",
       "retired": "2026-10-26",
       "why": "A one-shot 72-hour verdict job: its script boots itself out after reporting, and its receipt sat at \"running\" from 2026-10-17. Its plist is no longer in ~/Library/LaunchAgents. Retired so a finished one-shot job is never read as a stuck one."
+    },
+    {
+      "label": "com.ruvnet.brain-gists",
+      "retired": "2026-10-26",
+      "why": "The local re-embed wrote the developer checkout's kb/ruv-gists.big.rvf, which no installed brain reads (installed brains get fresh gists from the nightly cloud corpus). Measured: 6-10 minute batches against a 15 minute stall watcher, runs killed on a loaded machine, and no consumer of the result. The plist was unloaded and archived on the owner Mac. scripts/nightly-gists.sh stays for a manual run."
     }
   ],
   "_maxRunHours_note": "maxRunHours (4.7.21): a receipt still 'running' past this many hours with a LIVE wrapper pid is STUCK (nightly-watchdog judge()); a gone pid is FAILING. job-heartbeat.sh stops a job at JOB_MAX_SECONDS (default 2 h), so 1 h is a warning before that kill for the short jobs."
