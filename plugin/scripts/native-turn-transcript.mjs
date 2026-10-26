@@ -37,8 +37,12 @@ function toolItemLines(record, uncertain) {
     return [message('assistant', [{ type: 'tool_use', id: item.id, name: 'apply_patch', input: { input: '' } }])];
   }
   if (item.type === 'McpToolCall') {
+    // A completed transport is not a successful tool: CallToolResult.isError:true (a failed run_tests) is a failure,
+    // and the field is kept on the result so no reader can mistake it for success (cross-vendor review D, 4.7.21).
+    const toolFailed = item.result?.isError === true;
     return [message('assistant', [{ type: 'tool_use', id: item.id, name: `mcp__${item.server}__${item.tool}`, input: {} }]),
-      message('user', [{ type: 'tool_result', tool_use_id: item.id, status, is_error: item.status !== 'completed' || Boolean(item.error),
+      message('user', [{ type: 'tool_result', tool_use_id: item.id, status, ...(toolFailed ? { isError: true } : {}),
+        is_error: item.status !== 'completed' || Boolean(item.error) || toolFailed,
         content: item.result === undefined ? '' : JSON.stringify(item.result) }])];
   }
   const argv = Array.isArray(item.command) ? item.command : [item.command];

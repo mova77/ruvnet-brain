@@ -104,3 +104,20 @@ describe('Codex read-only tools are not change boundaries', () => {
     expect(fire(repo(), SCOPED, rollout(user, patch(100, 110), run(200, 300), call('tool_search', { query: 'x' }), call('wait_agent', { timeout_ms: 1 }, 'collaboration')))).toBe('');
   });
 });
+
+// Cross-vendor review D (4.7.21): a Codex MCP call can complete as a transport while the tool itself failed
+// (CallToolResult.isError). A failed run_tests must never count as the observed check.
+describe('a Codex MCP tool failure is a failure even when the call completed', () => {
+  const SCOPED_MCP = 'Targeted unit tests are passing.\nVerified: run_tests — 5 passed.\nNot verified: the complete consumer path.';
+  const mcp = (start, end, result, status = 'completed') => ev({ type: 'item_completed', started_at_ms: start, completed_at_ms: end,
+    item: { type: 'McpToolCall', id: `mcp-${start}`, server: 'qa', tool: 'run_tests', status, result } });
+  const audit = (...lines) => auditCompletionClaims(SCOPED_MCP, { turn: readClaudeTurn(rollout(user, patch(100, 110), ...lines), { host: 'codex' }), host: 'codex' });
+  it('completed + isError:true is not a passing check', () => {
+    const v = audit(mcp(200, 300, { content: [{ type: 'text', text: '3 failed' }], isError: true }));
+    expect(v.verification.checks).toEqual([]);
+    expect(v.verdict).not.toBe('OBSERVED_CHECK');
+  });
+  it('completed + isError:false still counts as the observed check', () => {
+    expect(audit(mcp(200, 300, { content: [{ type: 'text', text: '5 passed' }], isError: false })).verdict).toBe('OBSERVED_CHECK');
+  });
+});
