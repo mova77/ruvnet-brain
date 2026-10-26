@@ -49,7 +49,7 @@ describeOnPosix('classify', () => {
     expect(mod.classify(msg('g', '⭐ New star')).actionable).toBe(false);
   });
   it("maps the nightly watchdog's titles to job alerts and job recovery (scripts/nightly-watchdog.mjs push())", () => {
-    for (const state of ['FAILING', 'NEVER-RAN', 'STALE', 'MISSING', 'STALLED']) {
+    for (const state of ['FAILING', 'NEVER-RAN', 'STALE', 'MISSING', 'STALLED', 'STUCK']) {
       expect(mod.classify(msg('w', `🔴 ${state}: com.ruvnet.issue-watch`))).toMatchObject({ kind: 'job', key: 'job:com.ruvnet.issue-watch', label: 'com.ruvnet.issue-watch', actionable: true });
     }
     expect(mod.classify(msg('h', '✅ com.ruvnet.issue-watch is healthy again'))).toMatchObject({ resolves: true, key: 'job:com.ruvnet.issue-watch' });

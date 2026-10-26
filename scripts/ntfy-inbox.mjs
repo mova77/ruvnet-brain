@@ -62,7 +62,7 @@ export function classify(msg) {
   let m;
   // job-heartbeat.sh pages "SCHEDULED JOB FAILED: X" / "Recovered: X"; nightly-watchdog.mjs pages "🔴 <STATE>: X" /
   // "✅ X is healthy again". Same cause, same key, so either recovery closes either failure.
-  if ((m = /SCHEDULED JOB FAILED: (\S+)/.exec(title)) || (m = /^\W*(?:FAILING|NEVER-RAN|STALE|MISSING|STALLED): (\S+)/.exec(title))) return { kind: 'job', key: `job:${m[1]}`, label: m[1], actionable: true };
+  if ((m = /SCHEDULED JOB FAILED: (\S+)/.exec(title)) || (m = /^\W*(?:FAILING|NEVER-RAN|STALE|MISSING|STALLED|STUCK): (\S+)/.exec(title))) return { kind: 'job', key: `job:${m[1]}`, label: m[1], actionable: true };
   if ((m = /Recovered: (\S+)/.exec(title)) || (m = /^\W*(\S+) is healthy again/.exec(title))) return { kind: 'job-recovered', key: `job:${m[1]}`, label: m[1], actionable: false, resolves: true };
   if ((m = /CI \w+: (.+)$/.exec(title))) {
     const b = /branch ([\w./-]{1,100})/.exec(body);
