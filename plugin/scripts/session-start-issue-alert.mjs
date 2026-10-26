@@ -89,7 +89,11 @@ export function surfaceNtfyAlerts({ stateDir, emit, env, home, platform, cwd, no
     let total = 0; let kinds = {};
     const summaryPath = path.join(stateDir, 'ntfy-open-summary.json');
     const summary = (() => { try { return fs.statSync(summaryPath).size <= 4096 ? json(summaryPath) : null; } catch { return null; } })();
-    if (summary && Number.isInteger(summary.open)) {
+    // The summary is written before the list; if the list is newer anyway (an interrupted write), trust the list.
+    const listNewer = (() => { try { return fs.statSync(path.join(stateDir, 'ntfy-open-alerts.json')).mtimeMs > Date.parse(summary?.at || 0) + 5000; } catch { return false; } })();
+    let dropped = 0;
+    if (summary && Number.isInteger(summary.open) && !listNewer) {
+      if (Number.isInteger(summary.dropped)) dropped = summary.dropped;
       total = summary.open;
       for (const [k, n] of Object.entries(summary.kinds || {})) if (['job', 'ci', 'issue', 'pr', 'other'].includes(k) && Number.isInteger(n)) kinds[k] = n;
     } else {
@@ -103,10 +107,11 @@ export function surfaceNtfyAlerts({ stateDir, emit, env, home, platform, cwd, no
       // be a way to put words into the session (review 2026-10-25). The owner's tool prints the details.
       for (const a of open) { const k = ['job', 'ci', 'issue', 'pr'].includes(a.kind) ? a.kind : 'other'; kinds[k] = (kinds[k] || 0) + 1; }
     }
-    if (!total) return;
+    if (!total && !dropped) return;
     const summaryText = Object.entries(kinds).map(([k, n]) => `${n} ${k}`).join(', ');
     const polled = json(path.join(stateDir, 'ntfy-inbox-state.json'), {})?.polledAt;
     const age = polled ? `, read ${((now - Date.parse(polled)) / 3_600_000).toFixed(1)}h ago` : '';
-    emit(`[RuvNet Brain — NTFY: ${total} open alert(s) (${summaryText})${age}. Details: node scripts/ntfy-inbox.mjs --open]`);
+    const over = dropped ? `; ${dropped} more dropped past the cap` : '';
+    emit(`[RuvNet Brain — NTFY: ${total} open alert(s) (${summaryText || 'none listed'})${over}${age}. Details: node scripts/ntfy-inbox.mjs --open]`);
   } catch { /* advisory only */ }
 }

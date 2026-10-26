@@ -439,6 +439,19 @@ describe.skipIf(process.platform === 'win32')('host-neutral SessionStart core pa
     expect(result.output).toMatch(/NTFY: 3 open alert\(s\) \(2 issue, 1 job\)/);
   });
 
+  it('trusts the detailed list when it is newer than the summary (an interrupted write)', () => {
+    const result = parity((f) => {
+      warmed(f);
+      entitledRepo(f);
+      write(path.join(f.cache, 'ntfy-open-summary.json'), { at: new Date(Date.now() - 3_600_000).toISOString(), open: 0, kinds: {} });
+      write(path.join(f.cache, 'ntfy-open-alerts.json'), [{ id: 'a1', kind: 'job', key: 'job:x', title: 't', lastAt: new Date().toISOString() }]);
+      const entitlement = path.join(f.state, 'maintainer-issues.json');
+      write(entitlement, { enabled: true, repos: ['stuinfla/ruvnet-brain'] });
+      fs.chmodSync(entitlement, 0o600);
+    });
+    expect(result.output).toMatch(/NTFY: 1 open alert\(s\) \(1 job\)/);
+  });
+
   it('never shows ntfy alerts to a normal end user', () => {
     const result = parity((f) => {
       warmed(f);

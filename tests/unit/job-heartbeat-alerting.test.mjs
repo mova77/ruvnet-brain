@@ -240,6 +240,18 @@ describe('job-heartbeat.sh — a failing job must actually page, not just record
     expect(hb('com.test.dash').state).toBe('killed');
   }, 40_000);
 
+  it('run outside launchd (not a group leader), a TERM-proof grandchild that outlives its parent is still killed', () => {
+    makeHarness({ withTopic: false });
+    const marker = path.join(workDir, 'orphan.pid');
+    const f = path.join(workDir, 'orphan.sh');
+    fs.writeFileSync(f, `#!/bin/sh\nsh -c 'trap "" TERM; echo $$ > ${marker}; sleep 120' &\nsleep 60 & wait\n`); fs.chmodSync(f, 0o755);
+    spawnSync('/bin/sh', [WRAPPER, 'com.test.orphan', '--', f], { encoding: 'utf8',
+      env: { PATH: '/usr/bin:/bin', HOME: path.join(workDir, 'home'), JOB_HEARTBEAT_DIR: path.join(workDir, 'heartbeats'), NTFY_TOPIC: '', JOB_MAX_SECONDS: '2' } });
+    const pid = Number(fs.readFileSync(marker, 'utf8'));
+    let alive = true; try { process.kill(pid, 0); } catch { alive = false; }
+    expect(alive).toBe(false);
+  }, 40_000);
+
   it('the run-time timer never outlives the wrapper', () => {
     makeHarness({ withTopic: false });
     runWith('com.test.short', 'exit 0', { JOB_MAX_SECONDS: '7321' });

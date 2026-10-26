@@ -203,10 +203,18 @@ job_pids() {
 tree_of() { kill -0 "$1" 2>/dev/null && printf '%s ' "$1"
   for k in $(ps -A -o pid= -o ppid= 2>/dev/null | awk -v p="$1" '$2==p {print $1}'); do tree_of "$k"; done; }
 # stop_job: TERM everything the job owns, give it up to 10 s (inside launchd's 20 s exit allowance), then KILL.
+# Every pid seen during the stop is remembered, so a descendant that outlives its parent (and so drops out of the
+# process tree in the fallback mode) still gets the final KILL. The full guarantee, including processes started
+# later, holds when this wrapper leads its group, as under launchd.
 stop_job() {
-  pids="$(job_pids)"; [ -n "$pids" ] && kill -TERM $pids 2>/dev/null
-  i=0; while [ "$i" -lt 10 ]; do [ -z "$(job_pids)" ] && return 0; sleep 1; i=$((i + 1)); done
-  pids="$(job_pids)"; [ -n "$pids" ] && kill -KILL $pids 2>/dev/null
+  seen="$(job_pids)"; [ -n "$seen" ] && kill -TERM $seen 2>/dev/null
+  i=0; while [ "$i" -lt 10 ]; do
+    now_pids="$(job_pids)"; seen="$seen $now_pids"
+    alive=""; for p in $seen; do kill -0 "$p" 2>/dev/null && alive="$alive $p"; done
+    [ -z "$alive" ] && return 0
+    sleep 1; i=$((i + 1))
+  done
+  for p in $seen $(job_pids); do kill -KILL "$p" 2>/dev/null; done
   return 0
 }
 trap 'FORCED_CODE=143; [ -n "${TIMER:-}" ] && kill "$TIMER" 2>/dev/null; stop_job; exit 143' TERM

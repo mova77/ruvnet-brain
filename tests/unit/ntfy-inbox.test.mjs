@@ -82,6 +82,32 @@ describe('round-2 review fixes', () => {
     mod.fold([], many, { resolver: (a) => { calls.push(a.key); t += 100; return false; }, budgetMs: 250, clock: () => t });
     expect(calls.length).toBeLessThan(5);
   });
+  it('CI failures on different branches are separate alerts (review round 4)', () => {
+    const open = mod.fold([], [
+      msg('c1', '🔴 CI failure: ci', 1_792_900_000, 'branch main — x'),
+      msg('c2', '🔴 CI failure: ci', 1_792_900_010, 'branch release/4.7.20 — x'),
+    ], { resolver: (a) => (a.branch === undefined || a.branch === 'main' ? 'workflow green on main' : false) });
+    const live = open.filter((a) => !a.closedAt);
+    expect(live).toHaveLength(1);
+    expect(live[0].branch).toBe('release/4.7.20');
+  });
+  it('alerts past the cap are kept as dropped and counted, never silently erased', () => {
+    const now = Date.parse('2026-10-25T12:00:00Z');
+    const many = Array.from({ length: mod.MAX_OPEN_ALERTS + 1 }, (_, i) => msg(`s${i}`, `SLA breach: issue #${100 + i}`, now / 1000 - 1000 + i));
+    const out = mod.fold([], many, { resolver: never, now });
+    expect(out.filter((a) => !a.closedAt)).toHaveLength(mod.MAX_OPEN_ALERTS);
+    expect(out.filter((a) => /^dropped:/.test(a.closedBy || ''))).toHaveLength(1);
+    mod.writeSummary(out, now);
+    expect(JSON.parse(fs.readFileSync(mod.SUMMARY_FILE(), 'utf8'))).toMatchObject({ open: mod.MAX_OPEN_ALERTS, dropped: 1 });
+  });
+  it('the time budget rotates: alerts not checked last poll are checked first next poll', () => {
+    let t = 0; const seen = [];
+    let now = Date.parse('2026-10-25T12:00:00Z');
+    let open = mod.fold([], Array.from({ length: 6 }, (_, i) => msg(`r${i}`, `🔴 FAILING: com.r${i}`)), { resolver: never, now });
+    const slow = (a) => { seen.push(a.key); t += 100; return false; };
+    for (let poll = 0; poll < 3; poll += 1) { now += 60_000; open = mod.fold(open, [], { resolver: slow, budgetMs: 250, clock: () => t, now }); }
+    expect(new Set(seen).size).toBe(6);
+  });
   it('the open list is capped so SessionStart can always read it', () => {
     const now = Date.parse('2026-10-25T12:00:00Z');
     const many = Array.from({ length: mod.MAX_OPEN_ALERTS + 50 }, (_, i) => msg(`o${i}`, `odd thing ${i}`, now / 1000 - i));

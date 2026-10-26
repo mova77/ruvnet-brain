@@ -39,7 +39,8 @@ export function writeSummary(open, now = Date.now()) {
   const live = open.filter((a) => !a.closedAt);
   const kinds = {};
   for (const a of live) { const k = ['job', 'ci', 'issue', 'pr'].includes(a.kind) ? a.kind : 'other'; kinds[k] = (kinds[k] || 0) + 1; }
-  writeJson(SUMMARY_FILE(), { at: new Date(now).toISOString(), open: live.length, kinds });
+  const dropped = open.filter((a) => a.closedAt && /^dropped:/.test(a.closedBy || '')).length;
+  writeJson(SUMMARY_FILE(), { at: new Date(now).toISOString(), open: live.length, kinds, dropped });
 }
 const MAX_SEEN = 1000;
 const MAX_ATTEMPTS = 2;
@@ -64,7 +65,8 @@ export function classify(msg) {
   if ((m = /Recovered: (\S+)/.exec(title)) || (m = /^\W*(\S+) is healthy again/.exec(title))) return { kind: 'job-recovered', key: `job:${m[1]}`, label: m[1], actionable: false, resolves: true };
   if ((m = /CI \w+: (.+)$/.exec(title))) {
     const b = /branch ([\w./-]{1,100})/.exec(body);
-    return { kind: 'ci', key: `ci:${m[1].trim()}`, workflow: m[1].trim(), ...(b ? { branch: b[1] } : {}), actionable: true };
+    // Keyed by workflow AND branch: a green main must never close a still-red release branch (review round 4).
+    return { kind: 'ci', key: `ci:${m[1].trim()}@${b ? b[1] : 'main'}`, workflow: m[1].trim(), ...(b ? { branch: b[1] } : {}), actionable: true };
   }
   if ((m = /(?:New issue|SLA breach: issue) #(\d+)/.exec(title))) return { kind: 'issue', key: `issue:${m[1]}`, number: Number(m[1]), actionable: true };
   if ((m = /New PR #(\d+)/.exec(title))) return { kind: 'pr', key: `pr:${m[1]}`, number: Number(m[1]), actionable: true };
@@ -131,11 +133,13 @@ export function fold(open, messages, { now = Date.now(), resolver = resolvedNow,
     }
     byKey.set(c.key, { id: msg.id, ...c, firstAt: at, lastAt: at, count: 1, title: msg.title || '', body: String(msg.message || '').slice(0, 200), msgIds: [msg.id], attempts: 0 });
   }
-  for (const a of byKey.values()) {
+  const byOldestCheck = [...byKey.values()].sort((x, y) => Date.parse(x.lastCheckedAt || 0) - Date.parse(y.lastCheckedAt || 0));
+  for (const a of byOldestCheck) {
     if (a.closedAt) continue;
     if (a.kind === 'other' && now - Date.parse(a.lastAt) > 3 * 86_400_000) { a.closedAt = new Date(now).toISOString(); a.closedBy = 'expired (unrecognised message, 3 days)'; continue; }
     // Live checks stop at the budget; the rest are checked on the next poll (a poll never outlives its lock).
     if (clock() > resolveUntil) continue; // skip only the live check; expiry above still runs for every alert
+    a.lastCheckedAt = new Date(now).toISOString();
     const why = resolver(a);
     if (why) { a.closedAt = new Date(now).toISOString(); a.closedBy = typeof why === 'string' ? why : 'cause cleared'; }
   }
@@ -147,8 +151,10 @@ export function fold(open, messages, { now = Date.now(), resolver = resolvedNow,
   const over = new Set(openOnes.slice(MAX_OPEN_ALERTS).map((a) => a.key));
   for (const a of kept) if (over.has(a.key)) { a.closedAt = new Date(now).toISOString(); a.closedBy = `dropped: more than ${MAX_OPEN_ALERTS} open alerts`; }
   const stillOpen = kept.filter((a) => !a.closedAt);
+  // Overflowed alerts stay in the record as "dropped" (not erased) and are counted in the summary and banner.
+  const dropped = kept.filter((a) => over.has(a.key));
   const history = kept.filter((a) => a.closedAt && !over.has(a.key)).sort((x, y) => Date.parse(x.closedAt) - Date.parse(y.closedAt)).slice(-MAX_CLOSED_KEPT);
-  return [...stillOpen, ...history];
+  return [...stillOpen, ...dropped.slice(-MAX_CLOSED_KEPT), ...history];
 }
 
 // ── LOCK: one writer of the inbox state at a time ──────────────────────────────────────────────────────────────
@@ -225,7 +231,7 @@ async function pollLocked(topic, { fetcher, now, resolver, launcher, known, avai
   state.polledAt = new Date(now).toISOString();
   const open = fold(readJson(OPEN_FILE(), []), messages, { now, ...(resolver ? { resolver } : {}) });
   // Inbox, open list and cursor are on disk before the responder is touched: nothing it does can lose them.
-  writeJson(OPEN_FILE(), open); writeSummary(open, now); writeJson(STATE_FILE(), state);
+  writeSummary(open, now); writeJson(OPEN_FILE(), open); writeJson(STATE_FILE(), state);
 
   let responded;
   try {
@@ -235,7 +241,7 @@ async function pollLocked(topic, { fetcher, now, resolver, launcher, known, avai
     responded = { started: false, why: `responder launch failed: ${error.message}` };
     state.responderError = { at: new Date(now).toISOString(), message: String(error.message).slice(0, 500) };
   }
-  writeJson(OPEN_FILE(), open); writeSummary(open, now); writeJson(STATE_FILE(), state);
+  writeSummary(open, now); writeJson(OPEN_FILE(), open); writeJson(STATE_FILE(), state);
   return { received: messages.length, open: open.filter((a) => !a.closedAt), responder: responded };
 }
 
@@ -482,7 +488,7 @@ export function ack(idOrAll, note = '', now = Date.now(), { wait = 120_000 } = {
     const open = readJson(OPEN_FILE(), []);
     let n = 0;
     for (const a of open) if (!a.closedAt && (idOrAll === 'all' || a.id === idOrAll || a.key === idOrAll)) { a.closedAt = new Date(now).toISOString(); a.closedBy = note || 'acknowledged by a session'; n += 1; }
-    if (n) { writeJson(OPEN_FILE(), open); writeSummary(open, now); }
+    if (n) { writeSummary(open, now); writeJson(OPEN_FILE(), open); }
     return n;
   } finally { releaseLock(lock); }
 }
