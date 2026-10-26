@@ -83,21 +83,77 @@ function receipt(event, data) {
   try { fs.appendFileSync(RECEIPTS, JSON.stringify({ ts: new Date().toISOString(), event, ...data }) + '\n'); } catch { /* ledger must not break the engine */ }
 }
 
-// ── the lock (finding 5): atomic mkdir; stale-pid reclaim (issue-fix.mjs house pattern) ──────────
+// ── the lock (finding 5): atomic mkdir; the owner is judged by PROCESS IDENTITY, not pid alone ────
+// 4.7.21 (audit C-opus, reproduced): a pid-only check let any unrelated process that reused the pid hold
+// the spine forever, and an empty owner.json (the window between mkdir and the owner write) was deleted out
+// from under a live writer. The owner now records its process start time; a live pid whose start differs is
+// a reused pid. A lock held by a genuinely live owner is BUSY (exit 75), never success: host convergence
+// must not read "nothing applied" as "applied".
+export const BUSY_EXIT = 75; // EX_TEMPFAIL
+const OWNER_PUBLISH_GRACE_MS = 60_000;
+function processStartOf(pid) {
+  try {
+    const r = process.platform === 'win32'
+      ? spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command',
+        `(Get-Process -Id ${Number(pid)} -ErrorAction Stop).StartTime.ToUniversalTime().ToString('o')`], { encoding: 'utf8' })
+      : spawnSync('ps', ['-p', String(pid), '-o', 'lstart='], { encoding: 'utf8', env: { ...process.env, TZ: 'UTC', LC_ALL: 'C', LANG: 'C' } });
+    return r.status === 0 ? String(r.stdout || '').trim() || null : null;
+  } catch { return null; }
+}
+const startMs = (text) => Date.parse(/T.*Z$/.test(text) ? text : `${text} UTC`);
+function lockOwnerState(owner) {
+  if (!owner || !Number.isSafeInteger(owner.pid) || owner.pid < 1) return 'incomplete';
+  try { process.kill(owner.pid, 0); } catch (error) { if (error?.code !== 'EPERM') return 'stale'; }
+  const observed = processStartOf(owner.pid);
+  if (!observed) return 'live'; // alive and unprovable: never steal it
+  if (owner.processStart) return observed === owner.processStart ? 'live' : 'stale';
+  // A pre-4.7.21 owner has only startedAt. Its process existed when it wrote that, so a process that
+  // started later (lstart has 1 s resolution) is a different process holding a reused pid.
+  const written = Date.parse(owner.startedAt || '');
+  return Number.isFinite(written) && startMs(observed) > written + 2000 ? 'stale' : 'live';
+}
+function lockAgeMs() {
+  let newest = 0;
+  for (const p of [LOCK, path.join(LOCK, 'owner.json')]) { try { newest = Math.max(newest, fs.lstatSync(p).mtimeMs); } catch { /* absent */ } }
+  return Date.now() - newest;
+}
 function acquireLock(target) {
   fs.mkdirSync(BRAIN_HOME, { recursive: true });
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       fs.mkdirSync(LOCK); // atomic: exists → EEXIST
-      writeAtomic(path.join(LOCK, 'owner.json'), JSON.stringify({ pid: process.pid, host: os.hostname(), target, startedAt: new Date().toISOString() }));
-      return true;
-    } catch {
-      const owner = readJSON(path.join(LOCK, 'owner.json'));
-      try { if (owner && owner.pid) { process.kill(owner.pid, 0); return false; } } catch { /* stale */ }
-      try { fs.rmSync(LOCK, { recursive: true, force: true }); } catch { /* race — retry once */ }
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+      const raw = (() => { try { return fs.readFileSync(path.join(LOCK, 'owner.json'), 'utf8'); } catch { return null; } })();
+      let owner = null;
+      try { owner = raw === null ? null : JSON.parse(raw); } catch { /* incomplete */ }
+      const state = lockOwnerState(owner);
+      if (state === 'live') return { acquired: false, owner };
+      if (state === 'incomplete' && lockAgeMs() < OWNER_PUBLISH_GRACE_MS) return { acquired: false, owner: null };
+      // Quarantine, then confirm the quarantined owner is the one judged: a contender that reclaimed and
+      // re-acquired first must not lose its fresh lock to this run's stale judgement.
+      const quarantine = `${LOCK}.stale-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
+      try { fs.renameSync(LOCK, quarantine); } catch { continue; }
+      let moved = null;
+      try { moved = fs.readFileSync(path.join(quarantine, 'owner.json'), 'utf8'); } catch { /* none */ }
+      if (moved !== raw) {
+        try { if (!fs.existsSync(LOCK)) fs.renameSync(quarantine, LOCK); } catch { /* keep as evidence */ }
+        continue;
+      }
+      receipt('StaleLockReclaimed', { owner: owner ? { pid: owner.pid, host: owner.host, startedAt: owner.startedAt } : null, state });
+      try { fs.rmSync(quarantine, { recursive: true, force: true }); } catch { /* best effort */ }
+      continue;
     }
+    try {
+      writeAtomic(path.join(LOCK, 'owner.json'), JSON.stringify({ pid: process.pid, host: os.hostname(), target,
+        processStart: processStartOf(process.pid), startedAt: new Date().toISOString() }));
+    } catch (error) {
+      try { fs.rmSync(LOCK, { recursive: true, force: true }); } catch { /* leave it to the publication grace */ }
+      throw error;
+    }
+    return { acquired: true };
   }
-  return false;
+  return { acquired: false, owner: null };
 }
 function releaseLock() { try { fs.rmSync(LOCK, { recursive: true, force: true }); } catch { /* gone */ } }
 
@@ -377,7 +433,11 @@ function main() {
     return 0;
   }
 
-  if (!acquireLock(argv.join(' '))) { console.log('another update is in progress — exiting (concurrency 1).'); return 0; }
+  const lock = acquireLock(argv.join(' '));
+  if (!lock.acquired) {
+    console.log(`another update is in progress${lock.owner?.pid ? ` (pid ${lock.owner.pid})` : ''} — nothing was applied; exiting busy (${BUSY_EXIT}, concurrency 1).`);
+    return BUSY_EXIT;
+  }
   try {
     recoverTxn();
 

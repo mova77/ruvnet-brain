@@ -2124,7 +2124,7 @@ export function runCodexJson(args, {
     }
     if (repaired.length) r = run(codexBin, args, options);
   }
-  if (r.missingBinary) return { ok: false, error: r.message };
+  if (r.missingBinary) return { ok: false, error: r.message, missingBinary: true };
   if (r.error || r.status !== 0) {
     let detail = String(r.stderr || r.stdout || r.error?.message || `exit ${r.status}`).trim();
     if (snapshotFailure(r)) {
@@ -2142,7 +2142,8 @@ export function runCodexJson(args, {
 export function codexPluginStatus(options = {}) {
   const { runJson = runCodexJson, ...commandOptions } = options;
   const listed = runJson(['plugin', 'list', '--json'], commandOptions);
-  if (!listed.ok) return { available: false, installed: false, enabled: false, error: listed.error };
+  if (!listed.ok) return { available: false, installed: false, enabled: false, error: listed.error,
+    ...(listed.missingBinary ? { missingBinary: true } : {}) };
   const rows = Array.isArray(listed.value?.installed) ? listed.value.installed : [];
   const row = rows.find((candidate) => candidate?.pluginId === CODEX_PLUGIN_ID);
   return {
@@ -3628,7 +3629,7 @@ async function doctorRun({ json }) {
     ...(cx.host ? [check('codex', 'Codex', codexFailed, codexFailed ? (codexWiringFailed ? 'host detected but NOT wired'
       : codexReadinessFailed ? 'MCP readiness blocked' : 'lifecycle hooks unhealthy') : 'wired', 'npx ruvnet-brain')] : []),
     check('nightly', 'Nightly', nightlyFailed, `${nightlyHealth.state}${nightlyHealth.runHealth?.state ? `, last run ${nightlyHealth.runHealth.state}` : ''}`,
-      nightlyHealth.state === 'degraded' ? 'npx ruvnet-brain --enable-nightly' : 'npx ruvnet-brain --update'),
+      nightlyFix(nightlyHealth)),
     // Scheduler ON but running yesterday's code: an advisory naming the exact fix, never a failing verdict.
     ...(nightlyHealth.state === 'on' && nightlyCode.state !== 'unregistered' ? [check('nightly-code', 'Nightly code', nightlyCode.state !== 'current',
       nightlyCode.state === 'current' ? 'registered update modules match the installed set' : `${nightlyCode.state}: registered ${String(nightlyCode.registered || '?').slice(0, 12)}, installed ${String(nightlyCode.current || '?').slice(0, 12)}`,
@@ -3913,6 +3914,17 @@ const TEST_MODE = process.env.RUVNET_BRAIN_TEST === '1';
 // failure mode for a stranger's first contact. With the variable unset, behavior is unchanged.
 const IMPORT_ONLY = process.env.RUVNET_BRAIN_IMPORT_ONLY === '1';
 
+/**
+ * The doctor's fix for the Nightly line. Re-enabling repairs a job that cannot fire (not loaded, command drift);
+ * a job that is loaded, verified, FIRED and exited non-zero (`lastExitCode`) is a failed update run, and
+ * re-enabling it changes nothing — the update itself is the fix (4.7.21).
+ */
+export function nightlyFix(nightlyHealth) {
+  const fired = Number.isInteger(nightlyHealth?.lastExitCode) && nightlyHealth.lastExitCode !== 0;
+  if (fired) return 'npx ruvnet-brain@latest --update';
+  return nightlyHealth?.state === 'degraded' ? 'npx ruvnet-brain --enable-nightly' : 'npx ruvnet-brain --update';
+}
+
 export function classifyUpdaterExit(status, { fallbackAllowed = true, result = null, requireResult = false } = {}) {
   if (status === 12 && result?.terminalVerdict === 'cleanup-pending') {
     return { verdict: 'cleanup-pending', fallback: false, exitCode: 12 };
@@ -3945,6 +3957,16 @@ export function classifyUpdaterExit(status, { fallbackAllowed = true, result = n
   if (status === 2 && /returned HTTP (?:403|408|429|5\d\d)\b|network failure/.test(String(result?.reason || ''))) {
     return { verdict: 'transient-network', fallback: false, exitCode: 2 };
   }
+  // Neither of these is a broken updater, so a fresh reinstall cannot fix them; it only re-downloads ~745 MB
+  // into the same wall, every night (4.7.21, audit C: a `.prune-*` left by a killed run made retention
+  // `unsafe`, which forge-update reported as recovery-required, and the fallback reinstall hit it again).
+  // - recovery-required: the updater stopped on evidence it must not discard; it names the recovery.
+  // - exit 5: the offered corpus is incompatible with (or was already refused by) the runtime this run has
+  //   just re-stamped (ensureUpdaterPrerequisites), and a reinstall of the same package stamps the same one.
+  if (result?.terminalVerdict === 'recovery-required') {
+    return { verdict: 'recovery-required', fallback: false, exitCode: status || 1 };
+  }
+  if (status === 5) return { verdict: 'refused-incompatible', fallback: false, exitCode: 5 };
   return { verdict: 'failed', fallback: fallbackAllowed, exitCode: status || 1 };
 }
 
@@ -4078,7 +4100,12 @@ export function syncHostsAfterUpdate(cacheDir = resolvedKbDir(), {
         return fail({ error: `Codex host convergence failed: ${results.codexHost.action || 'unknown action'}` });
       }
       results.codex = installCodexPlugin({ expectedVersion: PACKAGE_VERSION });
-      if (!['unchanged', 'installed', 'updated', 'disabled'].includes(results.codex.action)) {
+      // ~/.codex exists but no `codex` binary is on PATH (an uninstalled CLI, or a desktop-only setup whose shell
+      // cannot see it): there is no Codex host to converge here, which is absence, not a failed update (4.7.21,
+      // audit C-opus #6). Any other unavailability (the binary ran and failed) still fails.
+      if (results.codex.action === 'codex-unavailable' && results.codex.missingBinary === true) {
+        results.codexAbsent = true;
+      } else if (!['unchanged', 'installed', 'updated', 'disabled'].includes(results.codex.action)) {
         return fail();
       }
     }
@@ -4092,7 +4119,7 @@ export function syncHostsAfterUpdate(cacheDir = resolvedKbDir(), {
   const applied = runStableSpine(apply);
   const okApplied = !applied.error && applied.status === 0;
   const codexReceipt = {
-    state: results.codex?.action === 'disabled' ? 'disabled' : (results.codexHost?.host ? 'ready' : 'absent'),
+    state: results.codex?.action === 'disabled' ? 'disabled' : (results.codexHost?.host && !results.codexAbsent ? 'ready' : 'absent'),
     version: results.codex?.version || null,
   };
   if (results.codex?.restartRequired === true) {
@@ -4178,17 +4205,22 @@ export function syncHostsAfterUpdate(cacheDir = resolvedKbDir(), {
       }
     }
   }
-  if (!okApplied) return fail({ applyStatus: applied.status, error: applied.error?.message || 'Stable Spine activation failed' });
-  const convergence = classifyHostConvergence({
+  // update-apply exits 75 when another live run holds the spine lock: nothing was applied, so it is not success.
+  if (!okApplied) return fail({ applyStatus: applied.status, error: applied.error?.message || (applied.status === 75
+    ? 'Stable Spine is busy (another update holds its lock); nothing was applied — re-run when it finishes'
+    : 'Stable Spine activation failed') });
+  const convergedReceipt = {
     desiredVersion: PACKAGE_VERSION,
     hosts: {
       claude: claudeReceipt,
       codex: codexReceipt,
     },
     consoleRuntime: results.consoleRuntime,
-  });
+  };
+  const convergence = classifyHostConvergence(convergedReceipt);
   hostLock.release();
   return { ok: convergence.healthy === true, convergence, results, applyStatus: applied.status,
+    ...(convergence.healthy !== true && hostRestartIsOnlyGap(convergedReceipt) ? { restartOnly: true } : {}),
     error: convergence.healthy === true ? null : `host convergence is ${convergence.state}: ${convergence.action}` };
 }
 
@@ -4217,6 +4249,20 @@ export async function convergeHostsAfterUpdate(cacheDir = resolvedKbDir(), { ref
   const note = codexHostRefreshMessage(hostRefresh, convergence.results.codex);
   if (note) (note.level === 'warn' ? warn : info)(note.text);
   return { ...convergence, hostRefresh };
+}
+
+/**
+ * True when a host restart is the ONLY gap in a convergence receipt: every restart-flagged host is ready at the
+ * expected version, and with those hosts read as "already-open windows only" everything else (other hosts, the
+ * Console) is converged. `--update` records that as an advisory and keeps the knowledge update's success; any
+ * other gap behind the restart keeps the failure (4.7.21, audit C: Codex's restartScope is always 'unproven').
+ */
+export function hostRestartIsOnlyGap(receipt, expectedVersion = PACKAGE_VERSION) {
+  const flagged = Object.values(receipt?.hosts || {}).filter((host) => host?.restartRequired === true);
+  if (!flagged.length || flagged.some((host) => host.state !== 'ready' || !versionSatisfies(host.version, expectedVersion))) return false;
+  const hosts = Object.fromEntries(Object.entries(receipt.hosts).map(([name, host]) => [name,
+    host?.restartRequired === true ? { ...host, restartScope: 'open-sessions' } : host]));
+  return classifyHostConvergence({ ...receipt, hosts }, expectedVersion).healthy === true;
 }
 
 export function classifyHostConvergence(receipt, expectedVersion = PACKAGE_VERSION) {
@@ -4422,6 +4468,30 @@ async function runUpdate() {
       detail: { reason: 'process exited before terminal settlement' } }); } catch { /* retained lock and receipt are recovery evidence */ }
   };
   process.once('exit', exitGuard);
+  // SIGTERM/SIGINT (4.7.21): the SessionStart self-heal kills this process group at its TTL (detach.mjs), and the
+  // default disposition ends Node without an 'exit' event, so the refresh receipt stayed RUNNING and its lock
+  // stayed held until a later run proved the owner dead. Settle FAILED with the signal, release the lock, exit
+  // 128+n. While a child runs under spawnSync the handler cannot run, so the same settlement is applied as soon
+  // as a child is seen to have died of one of these signals (a group kill reaches both).
+  const signalGuard = (signal) => {
+    if (!refreshSettled) {
+      try {
+        settleRefreshRun({ handle: refreshReceipt, lock: refreshLock, status: 'FAILED',
+          detail: { reason: 'signal', signal, phase: 'interrupted', terminalVerdict: 'failed' } });
+        refreshSettled = true;
+      } catch { /* retained lock and receipt are recovery evidence */ }
+    }
+    console.error(`\n${c.red('✗ update interrupted by')} ${signal} — the refresh run was recorded FAILED; nothing is left locked.`);
+    process.exit(128 + (os.constants.signals[signal] || 15));
+  };
+  process.once('SIGTERM', signalGuard);
+  process.once('SIGINT', signalGuard);
+  const settleIfSignalled = (child) => { if (['SIGTERM', 'SIGINT'].includes(child?.signal)) signalGuard(child.signal); };
+  const detachGuards = () => {
+    process.removeListener('exit', exitGuard);
+    process.removeListener('SIGTERM', signalGuard);
+    process.removeListener('SIGINT', signalGuard);
+  };
   info(`brain dir: ${c.bold(kbDir)}`);
   // RECOVER AN INTERRUPTED UPDATE FIRST, before anything below writes into the brain. Two measured
   // reasons: (1) a kill between the two directory renames leaves no usable kb/ — the brain sits in a
@@ -4482,6 +4552,7 @@ async function runUpdate() {
   const r = spawnSync(process.execPath, updaterArgs, {
     cwd: kbDir, stdio: 'inherit', env: refreshEnv,
   });
+  settleIfSignalled(r);
   updateStatus = r.error ? 1 : (r.status === null ? 1 : r.status);
   const updaterExit = updateStatus;
   let updaterResult = null;
@@ -4556,6 +4627,7 @@ async function runUpdate() {
       fr = spawnSync(process.execPath, [self, '--force'], { stdio: 'inherit',
         env: { ...refreshEnv, RUVNET_BRAIN_NO_UPDATE_FALLBACK: '1' } });
     }
+    settleIfSignalled(fr);
     updateStatus = fr.error ? 1 : (fr.status === null ? 1 : fr.status);
   } else {
     updateStatus = outcome.exitCode;
@@ -4566,8 +4638,9 @@ async function runUpdate() {
       updaterExit, finalExit: updateStatus, fallback: outcome.fallback, verdict: outcome.verdict,
       updateResult: updaterResult,
     });
-    settleRefresh(updateStatus, { phase: 'source-enumeration', terminalVerdict: 'failed' });
-    process.removeListener('exit', exitGuard);
+    settleRefresh(updateStatus, { phase: 'source-enumeration',
+      terminalVerdict: outcome.verdict === 'recovery-required' ? 'recovery-required' : 'failed' });
+    detachGuards();
     return;
   }
   if (cleanupPending) updateStatus = 0;
@@ -4605,7 +4678,7 @@ async function runUpdate() {
       recordRefreshPhase(refreshReceipt, 'source-enumeration', 'FAIL', { failures: installed.failures,
         reason: 'legacy updater returned success without a valid installed ReleaseCoverage projection' });
       settleRefresh(1, { phase: 'source-enumeration', terminalVerdict: 'failed' });
-      process.removeListener('exit', exitGuard);
+      detachGuards();
       return;
     }
     phaseEvidence = Object.fromEntries(UPDATE_REFRESH_PHASES.map((phase) => [phase, {
@@ -4619,26 +4692,76 @@ async function runUpdate() {
     if (!phaseEvidence[phase]) {
       recordRefreshPhase(refreshReceipt, phase, 'FAIL', { reason: `updater omitted ${phase} evidence` });
       settleRefresh(1, { phase, terminalVerdict: 'failed' });
-      process.removeListener('exit', exitGuard);
+      detachGuards();
       return;
     }
     recordRefreshPhase(refreshReceipt, phase, 'PASS', phaseEvidence[phase]);
   }
-  if (updateStatus === 0) {
-    info(c.dim('\nsynchronizing every detected host to this exact published version…\n'));
-    const convergence = await convergeHostsAfterUpdate(kbDir);
-    if (!convergence.ok) {
-      let active;
-      try { active = JSON.parse(fs.readFileSync(path.join(footprintRoots().brainHome, 'active.json'), 'utf8')); } catch { /* report unknown activation */ }
-      warn(hostSynchronizationFailureMessage(convergence, active));
-      updateStatus = 1;
-    } else if (convergence.convergence?.notice) info(convergence.convergence.notice);
-    recordRefreshPhase(refreshReceipt, 'host-convergence', convergence.ok && convergence.convergence?.healthy === true ? 'PASS' : 'FAIL', {
-      state: convergence.convergence?.state || null, error: convergence.error || null,
-      ...(convergence.convergence?.openSessions ? { openSessions: convergence.convergence.openSessions } : {}),
-      execution: { kind: 'executed', runId: refreshReceipt.runId },
-    });
+  const finished = await finishUpdate({ kbDir, brainHome, refreshReceipt, outcome, updaterResult, cleanupPending,
+    settle: settleRefresh, converge: async () => await convergeHostsAfterUpdate(kbDir) });
+  detachGuards();
+  await printConfirmation({ footprint: finished.footprint?.after || null });
+}
+
+/**
+ * What host convergence means for an `--update` whose knowledge phases all PASSED (the shared 4.7.21 exit
+ * contract). Converged: PASS. A host restart as the ONLY gap (Codex reports restartScope 'unproven' on every
+ * boot-level change): the knowledge update stands, exit 0, and the phase is recorded required:false with
+ * restartPending, so the nightly no longer reports a good update as FAILED and still reconciles its modules
+ * (audit C, real receipt on the owner's Mac, Oct 24). Anything else: a required FAIL, exit 1.
+ */
+export function hostConvergenceUpdateVerdict(convergence) {
+  if (convergence?.ok && convergence.convergence?.healthy === true) return { status: 'PASS', required: true, exitCode: 0 };
+  if (convergence?.restartOnly === true && convergence.convergence?.state === 'host-restart-required') {
+    return { status: 'PASS', required: false, restartPending: true, exitCode: 0 };
   }
+  return { status: 'FAIL', required: true, exitCode: 1 };
+}
+
+/**
+ * The part of `--update` after every knowledge phase has PASSED: host convergence, managed router additions,
+ * nightly module reconciliation, lifecycle retention, footprint, terminal settlement. Exported with its effects
+ * injectable so the exit contract is testable without a network or a real host:
+ *   0 knowledge updated (a host restart as the only gap is an advisory); 12 cleanup pending; 1 a real failure.
+ * Lifecycle-evidence retention is an ADVISORY here, never the terminal verdict: it used to turn every good
+ * update into recovery-required exit 1 and a ~745 MB reinstall, nightly (audit C). The updater's own
+ * `retentionAdvisory` (forge-update, 4.7.21) is recorded beside the installer's measurement.
+ */
+export async function finishUpdate({ kbDir, brainHome, refreshReceipt, outcome, updaterResult = null, cleanupPending = false,
+  settle,
+  converge = convergeHostsAfterUpdate,
+  reconcile = reconcileNightlyModules,
+  routerDefault = refreshManagedRouterDefault,
+  managedCatalog = () => applyManagedCatalogUpdate({ routerDir: path.join(os.homedir(), '.claude', 'model-router'), packageRoot: REPO_ROOT }),
+  prune = pruneLifecycleEvidence,
+  enforce = enforceFootprint,
+  enroll = () => {
+    // `--update --auto` = update now AND enroll in Evergreen, so this is the LAST time it's ever run by
+    // hand. enableNightly() prints its own real verification (plist path + launchctl result).
+    if (!FLAG_AUTO) return;
+    info(c.dim("\n--auto set: enrolling in Evergreen auto-update so you never run this again…\n"));
+    enableNightly(); // exits on its own with verified output; if it returns, fall through to the update verdict
+  },
+} = {}) {
+  let updateStatus = 0;
+  info(c.dim('\nsynchronizing every detected host to this exact published version…\n'));
+  const convergence = await converge(kbDir);
+  const host = hostConvergenceUpdateVerdict(convergence);
+  if (host.exitCode !== 0) {
+    let active;
+    try { active = JSON.parse(fs.readFileSync(path.join(footprintRoots().brainHome, 'active.json'), 'utf8')); } catch { /* report unknown activation */ }
+    warn(hostSynchronizationFailureMessage(convergence, active));
+    updateStatus = 1;
+  } else if (host.restartPending) {
+    warn(`the knowledge update succeeded; a host restart is still pending — ${convergence.convergence.action}`);
+  } else if (convergence.convergence?.notice) info(convergence.convergence.notice);
+  recordRefreshPhase(refreshReceipt, 'host-convergence', host.status, {
+    state: convergence?.convergence?.state || null, error: convergence?.error || null,
+    ...(host.restartPending ? { restartPending: true, advisory: 'host restart pending; knowledge update succeeded' } : {}),
+    ...(convergence?.convergence?.openSessions ? { openSessions: convergence.convergence.openSessions } : {}),
+    execution: { kind: 'executed', runId: refreshReceipt.runId },
+    required: host.required,
+  });
   // Issue #87: a normal lifecycle update must also carry MANAGED MODEL additions to an existing
   // user. This call used to live only in offerRouterProfile() — the fresh-install path — so someone
   // who already had ~/.claude/model-router/catalog.json (i.e. every existing user, the only ones who
@@ -4646,13 +4769,10 @@ async function runUpdate() {
   // updated. Additive and non-interactive; their overrides win, metered rows are never auto-enabled,
   // and a failure here is reported but never fails an otherwise-good update.
   if (updateStatus === 0) {
-    const defaultReceipt = refreshManagedRouterDefault();
+    const defaultReceipt = routerDefault();
     recordRefreshAdvisory(refreshReceipt, 'managed-router-default', defaultReceipt.action === 'failed' ? 'SKIP' : 'PASS', defaultReceipt);
     try {
-      const managed = applyManagedCatalogUpdate({
-        routerDir: path.join(os.homedir(), '.claude', 'model-router'),
-        packageRoot: REPO_ROOT,
-      });
+      const managed = managedCatalog();
       if (managed.action === 'merged' && managed.added.length) {
         ok(`model router: added ${managed.added.length} managed model(s) — ${managed.added.join(', ')} (your catalog edits were preserved)`);
       }
@@ -4662,37 +4782,41 @@ async function runUpdate() {
       recordRefreshAdvisory(refreshReceipt, 'managed-catalog', 'SKIP', { reason: e.message });
     }
   }
-  // `--update --auto` = update now AND enroll in Evergreen, so this is the LAST time it's ever run by
-  // hand. Only enroll if the update itself succeeded — never promise "you're set forever" on a failed
-  // update. enableNightly() prints its own real verification (plist path + launchctl result).
-  if (updateStatus === 0 && FLAG_AUTO) {
-    info(c.dim("\n--auto set: enrolling in Evergreen auto-update so you never run this again…\n"));
-    enableNightly(); // exits on its own with verified output; if it returns, fall through to the update verdict
-  }
-  if (updateStatus === 0) reconcileNightlyModules({ brainHome, refreshReceipt });
+  // Only enroll if the update itself succeeded — never promise "you're set forever" on a failed update.
+  if (updateStatus === 0) enroll();
+  // The knowledge phases passed, so the nightly must run the installed modules even when a host did not
+  // converge; otherwise a host problem froze the 03:30 job on yesterday's coordinator (audit C).
+  reconcile({ brainHome, refreshReceipt });
   let retention;
   try {
-    retention = pruneLifecycleEvidence({ brainHome, kbDir, preserveRefreshRunIds: [refreshReceipt.runId],
+    retention = prune({ brainHome, kbDir, preserveRefreshRunIds: [refreshReceipt.runId],
       preserveTransactionPaths: updaterResult?.transactionReceipts ? [updaterResult.transactionReceipts] : [] });
   } catch (error) {
     retention = { schemaVersion: 1, kind: 'ruvnet-brain-lifecycle-evidence-retention',
       withinBudget: false, unsafe: [{ path: brainHome, reason: error.message }] };
   }
-  const retentionFailed = retention.withinBudget !== true;
-  const cleanupFailed = cleanupPending || retentionFailed;
-  recordRefreshPhase(refreshReceipt, 'cleanup', cleanupFailed ? 'FAIL' : (updateStatus === 0 ? 'PASS' : 'SKIP'), {
+  const retentionFailed = retention?.withinBudget !== true;
+  const updaterRetention = updaterResult?.retentionAdvisory || null;
+  recordRefreshPhase(refreshReceipt, 'cleanup', cleanupPending ? 'FAIL' : (updateStatus === 0 ? 'PASS' : 'SKIP'), {
     reason: cleanupPending ? 'verified live generation has redundant rollback cleanup pending'
-      : retentionFailed ? 'lifecycle evidence exceeds its fixed retention safety budget'
-        : (updateStatus === 0 ? 'transaction settled' : 'upstream required phase failed'),
+      : (updateStatus === 0 ? 'transaction settled' : 'upstream required phase failed'),
     storageDelta: updaterResult?.storageDelta || null,
     lifecycleRetention: retention,
     execution: { kind: 'executed', runId: refreshReceipt.runId },
-    required: cleanupFailed || updateStatus === 0,
+    required: cleanupPending || updateStatus === 0,
   });
+  if (retentionFailed || updaterRetention) {
+    const unsafe = (retentionFailed ? retention?.unsafe || [] : []).map((entry) => entry?.path).filter(Boolean);
+    warn(`lifecycle evidence could not be fully pruned (advisory; the update itself stands)${unsafe.length ? `: ${unsafe.slice(0, 3).join(', ')}` : ''}`);
+    try {
+      recordRefreshAdvisory(refreshReceipt, 'lifecycle-retention', 'FAIL', {
+        installer: retentionFailed ? retention : null, updater: updaterRetention });
+    } catch { /* the advisory never blocks settlement */ }
+  }
   // ADR-0098: after the swap, enforce the footprint (the updater just released its own rollback; this
   // releases everything else that must not exist) and record the result on the receipt as an advisory —
   // a footprint problem is reported, it never fails an otherwise-good update.
-  const footprint = enforceFootprint({ holdingRefreshLock: true });
+  const footprint = enforce({ holdingRefreshLock: true });
   try {
     const after = footprint?.after;
     recordRefreshAdvisory(refreshReceipt, 'footprint', after && after.kbCopies === 1 && !after.cruft.length && after.withinBudget ? 'PASS' : 'FAIL', {
@@ -4700,13 +4824,12 @@ async function runUpdate() {
       budgetBytes: after?.budgetBytes ?? null, removed: footprint?.removed.length ?? 0, freedBytes: footprint?.freedBytes ?? 0,
     });
   } catch { /* the advisory never blocks settlement */ }
-  settleRefresh(cleanupPending ? 12 : (retentionFailed ? 1 : updateStatus), {
-    phase: cleanupFailed ? 'cleanup' : (updateStatus === 0 ? 'complete' : 'failed'),
-    terminalVerdict: cleanupPending ? 'cleanup-pending' : retentionFailed ? 'recovery-required'
-      : (outcome.verdict === 'noop' ? 'noop' : 'applied'),
+  const exitCode = cleanupPending ? 12 : updateStatus;
+  settle(exitCode, {
+    phase: cleanupPending ? 'cleanup' : (updateStatus === 0 ? 'complete' : 'failed'),
+    terminalVerdict: cleanupPending ? 'cleanup-pending' : (outcome?.verdict === 'noop' ? 'noop' : 'applied'),
     storageDelta: updaterResult?.storageDelta || null, lifecycleRetention: retention });
-  process.removeListener('exit', exitGuard);
-  await printConfirmation({ footprint: footprint?.after || null });
+  return { exitCode, footprint, hostConvergence: host };
 }
 
 /**
@@ -4811,15 +4934,56 @@ const SPEND_GUARD_LABEL = 'com.ruvnet.spend-watchdog';
 const spendGuardScriptPath = () => path.join(os.homedir(), '.claude', 'scripts', 'api-spend-watchdog.mjs');
 const spendGuardPlistPath = () => path.join(os.homedir(), 'Library', 'LaunchAgents', `${SPEND_GUARD_LABEL}.plist`);
 
-function enableSpendGuard() {
+/**
+ * Every LaunchAgent that already runs an api-spend-watchdog.mjs, under ANY label (the owner's runs as
+ * com.stuartkerr.api-spend-watchdog). Matched on ProgramArguments, so a second hourly job is never added beside
+ * an existing one. Read-only; a binary plist is converted with plutil, an unreadable one is skipped.
+ */
+export function spendGuardAgents({ agentsDir = path.join(os.homedir(), 'Library', 'LaunchAgents') } = {}) {
+  let names = [];
+  try { names = fs.readdirSync(agentsDir).filter((name) => name.endsWith('.plist')); } catch { return []; }
+  const found = [];
+  for (const name of names) {
+    const file = path.join(agentsDir, name);
+    let text;
+    try {
+      const bytes = fs.readFileSync(file);
+      text = bytes.subarray(0, 6).toString('latin1') === 'bplist'
+        ? spawnSync('plutil', ['-convert', 'xml1', '-o', '-', file], { encoding: 'utf8' }).stdout || ''
+        : bytes.toString('utf8');
+    } catch { continue; }
+    const args = /<key>\s*ProgramArguments\s*<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(text)?.[1] || '';
+    if (!/api-spend-watchdog\.mjs/.test(args)) continue;
+    const label = /<key>\s*Label\s*<\/key>\s*<string>([^<]*)<\/string>/.exec(text)?.[1]?.trim() || name.replace(/\.plist$/, '');
+    found.push({ label, plist: file });
+  }
+  return found;
+}
+
+export function enableSpendGuard() {
+  // A spend watchdog already scheduled under another label (the owner's own job, or an earlier hand install)
+  // is the same safety net: say where it is and add nothing. Two hourly jobs mean two alerts per event.
+  const foreign = spendGuardAgents().filter((agent) => agent.label !== SPEND_GUARD_LABEL);
+  if (foreign.length) {
+    ok(`spend watchdog already installed as ${c.bold(foreign[0].label)} (${foreign[0].plist}) — not adding a second hourly job`);
+    return 'already-on';
+  }
   // The npx checkout is ephemeral, so copy the bundled watchdog to a persistent home the launchd
-  // job can point at for good.
+  // job can point at for good — but NEVER over a different file already there: it may be the user's own
+  // fixed copy (the owner's 2026-10-25 flood fix was one interactive install away from being reverted).
   const src = path.join(__dirname, 'api-spend-watchdog.mjs');
   const dst = spendGuardScriptPath();
   if (!fs.existsSync(src)) { warn('spend-watchdog source missing from this bundle — skipping (non-fatal)'); return 'no-source'; }
   fs.mkdirSync(path.dirname(dst), { recursive: true });
-  fs.copyFileSync(src, dst);
-  ok(`installed the spend watchdog → ${c.bold(dst)}`);
+  let existing = null;
+  try { existing = fs.readFileSync(dst); } catch { /* absent */ }
+  if (existing && !existing.equals(fs.readFileSync(src))) {
+    warn(`kept your existing ${c.bold(dst)} — it differs from the bundled watchdog, so it was not overwritten`);
+    info(`to use the bundled one instead:  ${c.bold(`rm ${dst}`)}  then  ${c.bold('npx ruvnet-brain --enable-spend-guard')}`);
+  } else if (!existing) {
+    fs.copyFileSync(src, dst);
+    ok(`installed the spend watchdog → ${c.bold(dst)}`);
+  } else ok(`spend watchdog script already current → ${c.bold(dst)}`);
 
   const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -4872,6 +5036,8 @@ function disableSpendGuard() {
   const plistPath = spendGuardPlistPath();
   const scriptPath = spendGuardScriptPath();
   const existed = fs.existsSync(plistPath);
+  // The script stays when another LaunchAgent runs it: that job is not ours to break.
+  const sharedWith = spendGuardAgents().filter((agent) => agent.label !== SPEND_GUARD_LABEL);
   if (TEST_MODE) {
     warn('RUVNET_BRAIN_TEST=1 — skipping launchctl bootout (plist removal only)');
   } else {
@@ -4879,7 +5045,8 @@ function disableSpendGuard() {
     spawnSync('launchctl', ['bootout', `gui/${process.getuid()}/${SPEND_GUARD_LABEL}`], { stdio: 'ignore' });
   }
   let failed = false;
-  for (const p of [plistPath, scriptPath]) {
+  if (sharedWith.length && fs.existsSync(scriptPath)) info(`kept ${scriptPath} — ${sharedWith[0].label} runs it`);
+  for (const p of sharedWith.length ? [plistPath] : [plistPath, scriptPath]) {
     if (!fs.existsSync(p)) continue;
     try { fs.rmSync(p); } catch (e) {
       failed = true;
@@ -4996,7 +5163,10 @@ export function machineFootprint() {
   }
   if (process.platform === 'darwin') {
     add('Spend watchdog (LaunchAgent)', spendGuardPlistPath(), 'npx ruvnet-brain --disable-spend-guard');
-    add('Spend watchdog script', spendGuardScriptPath(), 'npx ruvnet-brain --disable-spend-guard');
+    // A script another LaunchAgent runs is not ours to list for removal (disableSpendGuard keeps it).
+    if (!spendGuardAgents().some((agent) => agent.label !== SPEND_GUARD_LABEL)) {
+      add('Spend watchdog script', spendGuardScriptPath(), 'npx ruvnet-brain --disable-spend-guard');
+    }
   }
   const cmds = pluginCommandsDir();
   if (cmds) items.push({
@@ -5277,9 +5447,16 @@ function uninstallAll() {
 // Exported (testable under RUVNET_BRAIN_IMPORT_ONLY=1, like offerNightly). Never throws — the caller
 // also guards, because a finished install must never be broken by an optional safety offer.
 export async function offerSpendGuard() {
+  // Read-only detection first, so an existing guard under ANY label is reported as on (and never offered twice).
+  if (process.platform === 'darwin') {
+    const existing = spendGuardAgents();
+    if (existing.length || fs.existsSync(spendGuardPlistPath())) {
+      ok(`spend watchdog already installed${existing.length ? ` as ${existing[0].label}` : ''} — runaway API spend will alert you`);
+      return 'already-on';
+    }
+  }
   if (FLAG_NO_NIGHTLY_PROMPT || TEST_MODE) return 'suppressed';
   if (process.platform !== 'darwin') return 'unsupported';
-  if (fs.existsSync(spendGuardPlistPath())) { ok('spend watchdog already installed — runaway API spend will alert you'); return 'already-on'; }
 
   step(
     'One more safety net — a spend watchdog',
