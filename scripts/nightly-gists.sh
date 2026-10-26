@@ -17,7 +17,10 @@
 set -eu
 
 cd "$(dirname "$0")/.."
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+# The owner's macOS-approved node (~/.local/share/ruvnet-brain/job-bin) and Apple's tools come first: this repo and
+# the model cache live on an external volume, and launchd-started Homebrew node is held at its first read there
+# (2026-10-25: every embedding shard "stalled" for 15 min, then the run failed after 1 h 49 min).
+export PATH="$HOME/.local/share/ruvnet-brain/job-bin:/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin"
 export KB_MODEL_CACHE="${KB_MODEL_CACHE:-/Users/stuartkerr/Code/PowerPlatePulse/scripts/models-cache}"
 
 mkdir -p logs

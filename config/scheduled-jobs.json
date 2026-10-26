@@ -31,28 +31,12 @@
       "required": true
     },
     {
-      "label": "com.ruvnet.npm-token-renew",
-      "what": "Renews the npm publish token before it expires (silently lets publishing die if it stops)",
-      "schedule": "daily 03:33",
-      "maxAgeHours": 26,
-      "required": true,
-      "_was_blind": "THE PUREST CASE OF THE BUG. On a healthy day this script returns early and writes ZERO BYTES anywhere — its log and state file sat frozen 2+ days stale while it fired on schedule every night. 'Ran and did nothing (healthy)' was literally indistinguishable from 'never ran', ~76 days out of every 90. The heartbeat wrapper fixes this for free: the RECEIPT is written by the wrapper, so the job no longer has to remember to report."
-    },
-    {
       "label": "com.stuartkerr.api-spend-watchdog",
       "what": "Hourly guard against runaway API spend and agent bursts — the one that actually pages the phone",
       "schedule": "hourly",
       "maxAgeHours": 3,
       "required": true,
       "_note": "It has been pushing '4 scheduled jobs failing silently' every hour, correctly — but off launchctl's exit-code field, which CANNOT see a job that never ran. It alerts; it just can't see the hole. Now it is itself watched: nothing supervised the supervisor."
-    },
-    {
-      "label": "com.stuartkerr.ak-sync",
-      "what": "The ONE machine updater: agentic-kit upgrades the RuvNet/Ruflo npm stack and refreshes the installed RuvNet Brain (plugin + knowledge), then heals and verifies",
-      "schedule": "daily 03:30",
-      "maxAgeHours": 26,
-      "required": true,
-      "_why": "2026-09-26 single-source consolidation: replaced com.stuartkerr.ruflo-autoupdate (a second npm-stack updater that failed daily on the first one's npx cache) and the brain's own com.ruvnet.brain-update (which agentic-kit removes by design as the single update owner, but never scheduled itself). One owner, scheduled, watched."
     },
     {
       "label": "com.cognitum.ruvector-autoupdate",
