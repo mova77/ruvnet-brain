@@ -25,7 +25,7 @@ import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createHash, createPublicKey, verify as verifySignature } from 'node:crypto';
-import { fetchJsonWithRetry, fetchBytesWithRetry } from './download-retry.mjs';
+import { fetchJsonWithRetry, fetchBytesWithRetry, downloadFileWithRetry } from './download-retry.mjs';
 import { extractZip, zipDeclaredBytes } from './zip-extract.mjs';
 import { applyBrainProfile, discoverStoreFamilies, readBrainProfile } from './brain-profile.mjs';
 import { acquireRefreshLock, releaseRefreshLock } from './refresh-run.mjs';
@@ -80,11 +80,26 @@ const SIGNING_PUBKEY_PEM = `-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEAgse9TAtehXUvUfTrJFY2CCHiCbmelR8yCgS//sen5/w=
 -----END PUBLIC KEY-----`;
 
+// Hash a file in fixed-size chunks: the bundle is ~745 MB and must never be held in memory whole.
+function digestFile(file, algorithms = ['sha256']) {
+  const hashes = algorithms.map((algorithm) => [algorithm, createHash(algorithm)]);
+  const chunk = Buffer.allocUnsafe(8 * 1024 * 1024);
+  const fd = fs.openSync(file, 'r');
+  let bytes = 0;
+  try {
+    for (let read; (read = fs.readSync(fd, chunk, 0, chunk.length, null)) > 0;) {
+      bytes += read;
+      for (const [, hash] of hashes) hash.update(chunk.subarray(0, read));
+    }
+  } finally { fs.closeSync(fd); }
+  return { bytes, digests: Object.fromEntries(hashes.map(([algorithm, hash]) => [algorithm, hash.digest('hex')])) };
+}
+
 export function verifyDownloadedBundle(bundlePath, signaturePath) {
   try {
     if (!fs.existsSync(bundlePath)) return { ok: false, reason: `bundle not found: ${bundlePath}` };
     if (!fs.existsSync(signaturePath)) return { ok: false, reason: 'signature missing (fail-closed)' };
-    const digest = createHash('sha256').update(fs.readFileSync(bundlePath)).digest('hex');
+    const digest = digestFile(bundlePath).digests.sha256;
     const ok = verifySignature(null, Buffer.from(digest, 'hex'), createPublicKey(SIGNING_PUBKEY_PEM), fs.readFileSync(signaturePath));
     return ok ? { ok: true, reason: `signature valid (sha256 ${digest.slice(0, 12)}…)` }
       : { ok: false, reason: 'signature does NOT match — bundle may be tampered' };
@@ -103,11 +118,20 @@ let updateLock = null;
 let updateOutcomeWritten = false;
 let lifecycleRetention = null;
 let legacyBackupRetention = null;
+// The bundle's temp directory (zip, signature, extraction). Removed on EVERY exit, including die() and a signal.
+let downloadDir = null;
 
-function writeUpdateOutcome(outcome) {
+/**
+ * Lifecycle-evidence retention is housekeeping of receipts ABOUT updates. It never changes the verdict of
+ * the update itself (4.7.21 RC2.3): a `.DS_Store` or a stranded quarantine used to turn every applied and
+ * no-op run into `recovery-required` exit 1, and the installer then re-downloaded 745 MB every night into
+ * the same wall. Over budget or unsafe evidence is recorded as `retentionAdvisory`, and the verdict and exit
+ * code stay exactly what the update produced.
+ */
+function writeUpdateOutcome(outcome, { prune = true } = {}) {
   if (updateOutcomeWritten) return outcome;
   if (legacyBackupRetention) outcome = { ...outcome, legacyBackupRetention };
-  if (!lifecycleRetention) {
+  if (!lifecycleRetention && prune) {
     try {
       lifecycleRetention = pruneLifecycleEvidence({ brainHome: path.dirname(KB_DIR), kbDir: KB_DIR,
         preserveRefreshRunIds: updateLock?.runId ? [updateLock.runId] : [],
@@ -117,10 +141,14 @@ function writeUpdateOutcome(outcome) {
         withinBudget: false, unsafe: [{ path: path.dirname(KB_DIR), reason: error.message }] };
     }
   }
-  const finalOutcome = lifecycleRetention.withinBudget === true ? { ...outcome, lifecycleRetention }
-    : { ...outcome, terminalVerdict: 'recovery-required', exitCode: 1,
-      reason: `lifecycle evidence retention failed: ${lifecycleRetention.unsafe?.map(({ reason }) => reason).join('; ') || 'budget exceeded'}`,
-      lifecycleRetention };
+  let finalOutcome = lifecycleRetention ? { ...outcome, lifecycleRetention } : outcome;
+  if (lifecycleRetention && lifecycleRetention.withinBudget !== true) {
+    const retentionAdvisory = { withinBudget: false,
+      reason: `lifecycle evidence retention is over budget or unsafe: ${lifecycleRetention.unsafe?.map(({ path: entry, reason }) => `${entry}: ${reason}`).join('; ') || 'budget exceeded'}`,
+      unsafe: lifecycleRetention.unsafe?.length || 0, foreign: lifecycleRetention.foreign?.length || 0 };
+    finalOutcome = { ...finalOutcome, retentionAdvisory };
+    console.error(`\n  ⚠ advisory (the update verdict is unchanged): ${retentionAdvisory.reason}`);
+  }
   if (!RESULT_FILE) return finalOutcome;
   fs.mkdirSync(path.dirname(RESULT_FILE), { recursive: true });
   atomicJson(RESULT_FILE, { schemaVersion: 1, kind: 'ruvnet-brain-update-result',
@@ -158,7 +186,24 @@ export function releaseUpdateLock(lock = updateLock) {
   return released;
 }
 
-process.on('exit', () => { releaseUpdateLock(); });
+process.on('exit', () => {
+  releaseUpdateLock();
+  if (downloadDir) { try { fs.rmSync(downloadDir, { recursive: true, force: true }); } catch { /* best effort at exit */ } }
+});
+
+// A time-limit kill (SessionStart TTL, the nightly runner) sends SIGTERM to the process group. Without a
+// handler Node exits without running 'exit' listeners, so the update lock stayed behind and the result
+// file never said why. Settle the same way die() does: record the outcome, keep any rollback copy, exit.
+function interruptedBySignal(signal) {
+  const exitCode = signal === 'SIGINT' ? 130 : 143;
+  console.error(`\n[forge-update] interrupted by ${signal} — the live KB is left as the storage transaction left it.`);
+  // --check records only its currency verdict; an interrupted poll has none to record.
+  if (APPLY || STAGED_RELEASE_FILE) {
+    try { writeUpdateOutcome({ terminalVerdict: 'interrupted', exitCode, reason: `interrupted by ${signal}` }, { prune: false }); } catch { /* exit wins */ }
+  }
+  try { settleRollback({ reclaimable: false, keepReason: `the update was interrupted by ${signal}` }); } catch { /* exit wins */ }
+  process.exit(exitCode);
+}
 function settleRollback({ reclaimable, keepReason = null, intentionallyRemovedStores = [] }) {
   if (rollbackSettled) return;
   rollbackSettled = true;
@@ -781,12 +826,28 @@ async function fetchJson(url) {
     die(`network failure fetching ${url}: ${error.message} — nothing changed locally.`, 2);
   }
 }
+function downloadFailed(error, url, kind, failureCode) {
+  if (error.status) die(`${kind} download returned HTTP ${error.status} for ${url} — nothing changed.`, failureCode);
+  die(`network failure downloading ${kind} ${url}: ${error.message} — nothing changed locally.`, failureCode);
+}
 async function fetchBuffer(url, { failureCode = 2, kind = 'bundle' } = {}) {
-  try { return await fetchBytesWithRetry(url); }
-  catch (error) {
-    if (error.status) die(`${kind} download returned HTTP ${error.status} for ${url} — nothing changed.`, failureCode);
-    die(`network failure downloading ${kind} ${url}: ${error.message} — nothing changed locally.`, failureCode);
-  }
+  try { return await fetchBytesWithRetry(url, { deadlineMs: 5 * 60_000 }); }
+  catch (error) { downloadFailed(error, url, kind, failureCode); }
+}
+// The bundle streams to disk: no-progress timeout, Range resume across retries, and a deadline scaled to
+// its size (kb/download-retry.mjs) — never the old whole-attempt 5-minute cap over a buffer in memory.
+async function fetchFile(url, destination, { failureCode = 2, kind = 'bundle' } = {}) {
+  let lastShown = -1;
+  try {
+    await downloadFileWithRetry(url, destination, {
+      headers: { 'User-Agent': 'ruvnet-brain-updater', Accept: 'application/octet-stream' },
+      onRetry: ({ attempt, error }) => console.error(`  download interrupted (${error.message}); retry ${attempt + 1}/3, resuming where it stopped when the server allows`),
+      onProgress: ({ received, total }) => {
+        const pct = total ? Math.floor(received / total * 10) * 10 : -1;
+        if (total && pct !== lastShown) { lastShown = pct; console.log(`  …${pct}% (${(received / 1e6).toFixed(0)} MB / ${(total / 1e6).toFixed(0)} MB)`); }
+      },
+    });
+  } catch (error) { downloadFailed(error, url, kind, failureCode); }
 }
 
 // The canonical manifest can be ONE of three shapes — handle all three:
@@ -1481,14 +1542,26 @@ function archiveVerifierFromDigests(actualDigests, bytes) {
 
 // Capture the closed transaction algorithm inventory synchronously. Never retain mutable bytes:
 // the capability attests only to this creation-time snapshot, not a later caller-owned Buffer.
-export function createDownloadedArchiveVerifier(downloadedBuffer, expectedDigests = []) {
-  if (!Buffer.isBuffer(downloadedBuffer) || !Array.isArray(expectedDigests)) throw new TypeError('archive bytes and digest inventory required');
+function archiveAlgorithms(expectedDigests) {
   const algorithms = new Set(['sha256']);
   for (const expected of expectedDigests) {
     if (expected == null) continue;
     if (typeof expected !== 'string' || !expected) throw new TypeError('invalid archive digest');
     algorithms.add(expected.includes(':') ? expected.split(':')[0] : 'sha256');
   }
+  return algorithms;
+}
+
+/** The same capability, computed from the downloaded file in chunks (the bundle is never held in memory). */
+export function createDownloadedArchiveVerifierFromFile(file, expectedDigests = []) {
+  if (typeof file !== 'string' || !Array.isArray(expectedDigests)) throw new TypeError('archive path and digest inventory required');
+  const { bytes, digests } = digestFile(file, [...archiveAlgorithms(expectedDigests)]);
+  return archiveVerifierFromDigests(Object.freeze(digests), bytes);
+}
+
+export function createDownloadedArchiveVerifier(downloadedBuffer, expectedDigests = []) {
+  if (!Buffer.isBuffer(downloadedBuffer) || !Array.isArray(expectedDigests)) throw new TypeError('archive bytes and digest inventory required');
+  const algorithms = archiveAlgorithms(expectedDigests);
   const actualDigests = Object.freeze(Object.fromEntries([...algorithms].map(algorithm =>
     [algorithm, createHash(algorithm).update(downloadedBuffer).digest('hex')])));
   return archiveVerifierFromDigests(actualDigests, downloadedBuffer.length);
@@ -1716,13 +1789,11 @@ async function main() {
   if (verdict.verdict === 'REFUSED') {
     console.log(`REFUSED — ${verdict.reason}`);
     console.log('Nothing was downloaded; the live brain is untouched.');
-    const refusedOutcome = APPLY
-      ? writeUpdateOutcome({ terminalVerdict: 'refused', reason: verdict.reason,
+    if (APPLY) writeUpdateOutcome({ terminalVerdict: 'refused', reason: verdict.reason,
         currencyVerdict: verdict.verdict, currencyReason: verdict.reason, candidateKind: candidateIdentity.kind,
-        storeCount: targets.length })
-      : writeCheckOutcome({ currencyVerdict: verdict.verdict, currencyReason: verdict.reason,
-        candidateKind: candidateIdentity.kind, candidateTag: candidateIdentity.tag, storeCount: targets.length });
-    if (refusedOutcome?.terminalVerdict === 'recovery-required') die(refusedOutcome.reason);
+        storeCount: targets.length });
+    else writeCheckOutcome({ currencyVerdict: verdict.verdict, currencyReason: verdict.reason,
+      candidateKind: candidateIdentity.kind, candidateTag: candidateIdentity.tag, storeCount: targets.length });
     process.exit(0);
   }
 
@@ -1761,11 +1832,10 @@ async function main() {
     if (!installed.valid) die(`already-current KB failed integrity: ${installed.failures.join('; ')}`);
     // No transaction paths are created: the inventory still counts every retained managed copy.
     const measuredDelta = storageDelta({ live: KB_DIR }, { prior: inventoryBefore.active, inventoryBefore });
-    const noopOutcome = writeUpdateOutcome({ terminalVerdict: 'noop', reason: 'already-current', storeCount: targets.length,
+    writeUpdateOutcome({ terminalVerdict: 'noop', reason: 'already-current', storeCount: targets.length,
       currencyVerdict: verdict.verdict, currencyReason: verdict.reason, candidateKind: candidateIdentity.kind,
       storageDelta: measuredDelta,
       phaseEvidence: phaseEvidenceFor({ root: KB_DIR, terminalVerdict: 'noop', storageDelta: measuredDelta }) });
-    if (noopOutcome?.terminalVerdict === 'recovery-required') die(noopOutcome.reason);
     console.log(`\nNothing to apply — already current.`); process.exit(0);
   }
 
@@ -1799,27 +1869,26 @@ async function main() {
   const originLabel = resolved.origin === 'latest-release-asset' ? `live release asset "${resolved.assetName}"`
     : resolved.origin === 'live-manifest' ? 'live manifest' : 'PINNED FALLBACK (see warning above)';
   console.log(`\n[${behindStores.length} store(s)] downloading ${resolved.url}\n  (source: ${originLabel}) ...`);
-  let buf = await fetchBuffer(resolved.url);
-  const sigBuf = await fetchBuffer(`${resolved.url}.sig`, { failureCode: 3, kind: 'signature' });
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-update-release-'));
+  downloadDir = tmp;
   const zipPath = path.join(tmp, 'bundle.zip');
   const sigPath = path.join(tmp, 'bundle.zip.sig');
   const extractDir = path.join(tmp, 'extracted');
-  fs.writeFileSync(zipPath, buf);
+  await fetchFile(resolved.url, zipPath);
+  const sigBuf = await fetchBuffer(`${resolved.url}.sig`, { failureCode: 3, kind: 'signature' });
   fs.writeFileSync(sigPath, sigBuf);
   fs.mkdirSync(extractDir);
-  console.log(`  downloaded ${(buf.length / 1e6).toFixed(1)} MB.`);
+  console.log(`  downloaded ${(fs.statSync(zipPath).size / 1e6).toFixed(1)} MB.`);
   const signature = verifyDownloadedBundle(zipPath, sigPath);
   if (!signature.ok) { fs.rmSync(tmp, { recursive: true, force: true }); die(`✗ SIGNATURE VERIFICATION FAILED: ${signature.reason}`, 4); }
   console.log(`  ✓ signature verified — ${signature.reason}`);
   let archiveVerifier;
-  try { archiveVerifier = createDownloadedArchiveVerifier(buf, resolvedTargets.map(({ resolved: target }) => target.digest)); }
+  try { archiveVerifier = createDownloadedArchiveVerifierFromFile(zipPath, resolvedTargets.map(({ resolved: target }) => target.digest)); }
   catch (error) {
     fs.rmSync(tmp, { recursive: true, force: true });
     die(`archive digest snapshot failed: ${error.message} — local files untouched.`, 4);
   }
   const bundleSha256 = archiveVerifier.digest();
-  buf = null; // Snapshot owns only immutable digest strings; release the downloaded bytes before validation.
   // DISK-SPACE PREFLIGHT, before a single byte is unpacked: the bundle unpacks in temp, then a whole
   // candidate generation is built beside the live one: the bundle, plus what prepareCandidate carries into
   // it from live — node_modules, and every private/local-ingest store file (restorePrivateFilesIntoCandidate
@@ -1974,12 +2043,11 @@ async function main() {
   fs.rmSync(tmp, { recursive: true, force: true });
   console.log(`  storage transaction: ${transaction.terminalVerdict}`);
   if (transaction.terminalVerdict === 'cleanup-pending') {
-    const cleanupOutcome = writeUpdateOutcome({ terminalVerdict: 'cleanup-pending', storageDelta: transaction.storageDelta,
+    writeUpdateOutcome({ terminalVerdict: 'cleanup-pending', storageDelta: transaction.storageDelta,
       transactionReceipts: transaction.paths.receipts, bundleSha256,
       phaseEvidence: phaseEvidenceFor({ root: KB_DIR, terminalVerdict: 'cleanup-pending', bundleSha256,
         transactionReceipts: transaction.paths.receipts, overlay: privateOverlay,
         storageDelta: transaction.storageDelta }) });
-    if (cleanupOutcome?.terminalVerdict === 'recovery-required') die(cleanupOutcome.reason);
     console.error('\nVerified live generation is active, but redundant rollback cleanup is pending.');
     process.exitCode = 12;
     return;
@@ -2044,7 +2112,7 @@ async function main() {
     console.log(`\n${unchangedStores.length} of ${behindStores.length} store(s) were already at the canonical build and did not change: ${unchangedStores.join(', ')}`);
     console.log(`  (stores are forged independently — an unchanged store means its upstream repo did not move, not a failed update.)`);
   }
-  const finalOutcome = writeUpdateOutcome({ terminalVerdict: transaction.terminalVerdict, storeCount: behindStores.length, retiredStores,
+  writeUpdateOutcome({ terminalVerdict: transaction.terminalVerdict, storeCount: behindStores.length, retiredStores,
     currencyVerdict: verdict.verdict, currencyReason: verdict.reason, candidateKind: candidateIdentity.kind,
     storageDelta: transaction.storageDelta,
     transactionReceipts: transaction.paths.receipts,
@@ -2054,7 +2122,6 @@ async function main() {
       bundleSha256,
       transactionReceipts: transaction.paths.receipts, overlay: privateOverlay,
       storageDelta: transaction.storageDelta }) });
-  if (finalOutcome?.terminalVerdict === 'recovery-required') die(finalOutcome.reason);
   console.log(`\n(the above is read back from disk, verified — not a tag lookup)`);
   process.exit(0);
 }
@@ -2066,6 +2133,7 @@ async function main() {
 // Ships in the brain bundle, where only kb/ modules exist, so it cannot import
 // plugin/scripts/entrypoint.mjs; this is that helper's comparison, inline: real paths on both sides.
 const invokedDirectly = (() => { try { return Boolean(process.argv[1]) && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url)); } catch { return false; } })();
+if (invokedDirectly) for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, () => interruptedBySignal(signal));
 if (invokedDirectly && STAGED_RELEASE_FILE) {
   (async () => {
     const input = JSON.parse(fs.readFileSync(STAGED_RELEASE_FILE, 'utf8'));

@@ -13,6 +13,10 @@ const ATOMIC_TEMP = /^([A-Za-z0-9._-]+)\.json\.tmp-(\d+)-([a-f0-9]{8})$/;
 // The write+rename takes milliseconds; a temp this old was abandoned by a crash or a failed write,
 // whatever its PID (PIDs are reused, so the age is the evidence, not process liveness).
 export const ABANDONED_TEMP_AGE_MS = 60 * 60 * 1000;
+// Files an operating system or a file browser drops into any folder it shows (Finder, exFAT/SMB shadows,
+// Explorer). They are never evidence and never ours to judge: ignored, and removed when a plain file.
+const VOLUME_METADATA = /^(?:\.DS_Store|\._.*|Thumbs\.db|desktop\.ini)$/i;
+export const isVolumeMetadata = (name) => VOLUME_METADATA.test(String(name));
 
 export const LIFECYCLE_EVIDENCE_RETENTION_POLICY = Object.freeze({
   schemaVersion: 1,
@@ -79,13 +83,45 @@ function classifyAtomicTemp(root, file, match, nowMs, unsafe, temporaries) {
   temporaries.push({ ...row, disposition: 'abandoned', canonicalReceipt: canonical });
 }
 
-function scanRefresh(root, unsafe, temporaries = [], nowMs = Date.now()) {
+/**
+ * A `.prune-<id>-<16 hex>` entry is the rename quarantineAndRemove() makes immediately before it deletes.
+ * Only an interruption between the two leaves one behind (a time-limit kill of the updater is the realistic
+ * cause, 4.7.21 RC2.3). It is reclaimed when it is older than ABANDONED_TEMP_AGE_MS (no prune is still
+ * between rename and delete), has the exact shape this module quarantines (a plain file under refresh-runs;
+ * a directory of phase files under the transactions root), and the run it came from is not live again
+ * (its canonical entry is absent or terminal). Anything else stays unsafe and is preserved, as before.
+ */
+function classifyQuarantine(root, entry, name, kind, nowMs, unsafe, quarantines) {
+  const preserve = (reason) => unsafe.push({ path: entry, reason });
+  try {
+    const stat = fs.lstatSync(entry);
+    const ageMs = nowMs - Math.max(stat.mtimeMs, stat.ctimeMs);
+    if (!(ageMs >= ABANDONED_TEMP_AGE_MS)) return preserve('recognized pruning quarantine remains');
+    const id = /^\.prune-(.+)-[a-f0-9]{16}$/.exec(name)[1];
+    if (kind === 'refresh') {
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) return preserve('recognized pruning quarantine remains (not a quarantined receipt)');
+      try {
+        const { value } = regularJson(path.join(root, `${id}.json`));
+        if (!TERMINAL_REFRESH.has(value?.status)) return preserve('recognized pruning quarantine remains (its run is active)');
+      } catch (error) { if (error?.code !== 'ENOENT') return preserve('recognized pruning quarantine remains (its run receipt is unreadable)'); }
+    } else {
+      if (!stat.isDirectory() || stat.isSymbolicLink()) return preserve('recognized pruning quarantine remains (not a quarantined transaction)');
+      const names = fs.readdirSync(entry).filter((file) => !isVolumeMetadata(file));
+      if (names.some((file) => !PHASE_FILE.test(file))) return preserve('recognized pruning quarantine remains (not a quarantined transaction)');
+      if (fs.existsSync(path.join(root, id))) return preserve('recognized pruning quarantine remains (its transaction is present)');
+    }
+    quarantines.push({ path: entry, kind, id, bytes: treeBytes(entry), identity: { dev: stat.dev, ino: stat.ino } });
+  } catch (error) { preserve(`recognized pruning quarantine remains (${error.message})`); }
+}
+
+function scanRefresh(root, unsafe, temporaries = [], nowMs = Date.now(), extras = { quarantines: [], foreign: [], volumeMetadata: [] }) {
   if (!fs.existsSync(root)) return [];
   const rows = [];
   for (const name of fs.readdirSync(root).sort()) {
     const file = path.join(root, name);
+    if (isVolumeMetadata(name)) { extras.volumeMetadata.push(file); continue; }
     if (QUARANTINE.test(name)) {
-      unsafe.push({ path: file, reason: 'recognized pruning quarantine remains' });
+      classifyQuarantine(root, file, name, 'refresh', nowMs, unsafe, extras.quarantines);
       continue;
     }
     const temp = ATOMIC_TEMP.exec(name);
@@ -94,7 +130,13 @@ function scanRefresh(root, unsafe, temporaries = [], nowMs = Date.now()) {
       continue;
     }
     try {
-      if (!name.endsWith('.json')) throw new Error('unexpected refresh evidence entry');
+      if (!name.endsWith('.json')) {
+        // Not evidence and not ours (a note, a copy someone made): reported and kept, never a reason to
+        // fail an update. Only a non-file (directory, link, device) stays unsafe.
+        const stat = fs.lstatSync(file);
+        if (stat.isFile() && !stat.isSymbolicLink()) { extras.foreign.push({ path: file, bytes: stat.size }); continue; }
+        throw new Error('unexpected refresh evidence entry');
+      }
       const { value: receipt, bytes } = regularJson(file);
       const runId = name.slice(0, -5);
       if (!SAFE_ID.test(runId) || receipt?.schemaVersion !== 3 || receipt?.kind !== 'ruvnet-brain-refresh-run'
@@ -108,21 +150,25 @@ function scanRefresh(root, unsafe, temporaries = [], nowMs = Date.now()) {
   return rows;
 }
 
-function scanTransactions(root, unsafe) {
+function scanTransactions(root, unsafe, nowMs = Date.now(), extras = { quarantines: [], foreign: [], volumeMetadata: [] }) {
   if (!fs.existsSync(root)) return [];
   const rows = [];
   for (const name of fs.readdirSync(root).sort()) {
     const dir = path.join(root, name);
+    if (isVolumeMetadata(name)) { extras.volumeMetadata.push(dir); continue; }
     if (QUARANTINE.test(name)) {
-      unsafe.push({ path: dir, reason: 'recognized pruning quarantine remains' });
+      classifyQuarantine(root, dir, name, 'transaction', nowMs, unsafe, extras.quarantines);
       continue;
     }
     try {
       const stat = fs.lstatSync(dir);
+      if (stat.isFile() && !stat.isSymbolicLink()) { extras.foreign.push({ path: dir, bytes: stat.size }); continue; }
       if (!SAFE_ID.test(name) || !stat.isDirectory() || stat.isSymbolicLink()) {
         throw new Error('malformed transaction evidence entry');
       }
-      const names = fs.readdirSync(dir).sort();
+      const all = fs.readdirSync(dir).sort();
+      for (const file of all) if (isVolumeMetadata(file)) extras.volumeMetadata.push(path.join(dir, file));
+      const names = all.filter((file) => !isVolumeMetadata(file));
       if (!names.length || names.some((file) => !PHASE_FILE.test(file))) throw new Error('transaction phase inventory is malformed');
       const phases = names.map((file) => regularJson(path.join(dir, file)).value);
       const latest = phases.at(-1);
@@ -173,9 +219,10 @@ function snapshot(options) {
   const roots = rootsFor(options);
   const unsafe = [];
   const temporaries = [];
+  const extras = { quarantines: [], foreign: [], volumeMetadata: [] };
   const nowMs = Date.parse((options.now || (() => new Date().toISOString()))());
-  const refresh = trustedEvidenceRoot(roots.refresh, unsafe) ? scanRefresh(roots.refresh, unsafe, temporaries, nowMs) : [];
-  const transactions = trustedEvidenceRoot(roots.transactions, unsafe) ? scanTransactions(roots.transactions, unsafe) : [];
+  const refresh = trustedEvidenceRoot(roots.refresh, unsafe) ? scanRefresh(roots.refresh, unsafe, temporaries, nowMs, extras) : [];
+  const transactions = trustedEvidenceRoot(roots.transactions, unsafe) ? scanTransactions(roots.transactions, unsafe, nowMs, extras) : [];
   const preserveRefresh = new Set((options.preserveRefreshRunIds || []).map(String));
   const preserveTransactions = new Set((options.preserveTransactionPaths || []).map((entry) => physicalPath(entry)));
   const protectedRefresh = new Map();
@@ -207,11 +254,11 @@ function snapshot(options) {
     if (preserveTransactions.has(physicalPath(row.path))) protectedTransactions.set(row.path, 'explicitly preserved transaction');
     if (retainedTransactionPaths.has(physicalPath(row.path))) protectedTransactions.set(row.path, 'referenced by retained refresh receipt');
   }
-  const bytes = [...refresh, ...transactions, ...temporaries].reduce((sum, row) => sum + row.bytes, 0)
+  const bytes = [...refresh, ...transactions, ...temporaries, ...extras.quarantines].reduce((sum, row) => sum + row.bytes, 0)
     + unsafe.filter(({ reason }) => /quarantine remains/.test(reason)).reduce((sum, { path: entry }) => {
       try { return sum + treeBytes(entry); } catch { return sum; }
     }, 0);
-  return { roots, unsafe, refresh, transactions, temporaries, bytes, protectedRefresh, protectedTransactions };
+  return { roots, unsafe, refresh, transactions, temporaries, bytes, protectedRefresh, protectedTransactions, ...extras };
 }
 
 function counts(state) {
@@ -241,6 +288,8 @@ export function assessLifecycleEvidence(options = {}) {
     },
     abandonedTemporaries: state.temporaries.filter((row) => row.disposition === 'abandoned')
       .map(({ path: entryPath, runId, writerPid, bytes, sha256, canonicalReceipt }) => ({ path: entryPath, runId, writerPid, bytes, sha256, canonicalReceipt })),
+    abandonedQuarantines: state.quarantines.map(({ path: entryPath, kind, id, bytes }) => ({ path: entryPath, kind, id, bytes })),
+    foreign: state.foreign, volumeMetadata: state.volumeMetadata,
     removed: { refresh: [], transactions: [] }, after: counts(state), unsafe: state.unsafe,
     withinBudget: isWithin(state, policy) };
 }
@@ -264,6 +313,7 @@ function quarantineAndRemove(entry, root, removeEntry, afterQuarantine) {
 function compactTerminalPhases(row) {
   const compacted = [];
   for (const name of fs.readdirSync(row.path).sort()) {
+    if (isVolumeMetadata(name)) continue;
     const file = path.join(row.path, name);
     const stat = fs.lstatSync(file);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw new Error('phase is not an exclusive regular file');
@@ -320,6 +370,27 @@ export function pruneLifecycleEvidence(options = {}) {
     reclaimedTemporaries.push({ path: row.path, runId: row.runId, writerPid: row.writerPid, bytes: row.bytes,
       sha256: row.sha256, canonicalReceipt: row.canonicalReceipt });
   }
+  // Volume metadata (.DS_Store and friends) is removed when it is a plain file; anything else by that
+  // name is left alone (it was never counted as evidence either way).
+  const removedVolumeMetadata = [];
+  for (const entry of snapshot(options).volumeMetadata) {
+    try {
+      const stat = fs.lstatSync(entry);
+      if (!stat.isFile() || stat.isSymbolicLink()) continue;
+      fs.rmSync(entry, { force: true });
+      removedVolumeMetadata.push(entry);
+    } catch (error) { if (error?.code !== 'ENOENT') throw error; }
+  }
+  // Abandoned quarantines of this module's own interrupted prunes (classifyQuarantine), identity re-checked
+  // immediately before removal and reported, never silent.
+  const reclaimedQuarantines = [];
+  for (const row of snapshot(options).quarantines) {
+    let current;
+    try { current = fs.lstatSync(row.path); } catch (error) { if (error?.code === 'ENOENT') continue; throw error; }
+    if (current.isSymbolicLink() || current.dev !== row.identity.dev || current.ino !== row.identity.ino) continue;
+    removeEntry(row.path);
+    reclaimedQuarantines.push({ path: row.path, kind: row.kind, id: row.id, bytes: row.bytes });
+  }
   const compacted = [];
   const compactState = snapshot(options);
   if (!compactState.unsafe.length && compactState.bytes > policy.maxEvidenceBytes) {
@@ -355,6 +426,6 @@ export function pruneLifecycleEvidence(options = {}) {
     removed[candidate.kind === 'refresh' ? 'refresh' : 'transactions'].push(candidate.path);
   }
   const final = assessLifecycleEvidence({ ...options, policy });
-  return { ...final, before: initial.before, removed, reclaimedTemporaries, compacted,
+  return { ...final, before: initial.before, removed, reclaimedTemporaries, reclaimedQuarantines, removedVolumeMetadata, compacted,
     after: final.after, withinBudget: final.withinBudget, ...(stopped ? { stopped } : {}) };
 }

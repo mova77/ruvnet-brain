@@ -403,3 +403,77 @@ describe('the vanished-entry retry loop is bounded', () => {
     expect(fs.readdirSync(runs).sort()).toEqual(before);
   });
 });
+
+// 4.7.21 (RC2.3): one `.DS_Store`, or a `.prune-*` quarantine our own time-limit kill left behind, made the state
+// unsafe forever, and the updater turned EVERY outcome (even a no-op) into recovery-required + a 745 MB reinstall.
+describe('volume metadata, foreign files and abandoned quarantines', () => {
+  const now = () => '2026-10-20T12:00:00Z';
+  // Quarantine age is measured from the entry's own mtime/ctime (a rename sets ctime), which is wall-clock:
+  // three hours from now makes every entry this test creates older than ABANDONED_TEMP_AGE_MS.
+  const later = () => new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString();
+  it('.DS_Store and ._ shadows are ignored and removed; a stray note is foreign (kept, reported), never unsafe', () => {
+    const f = fixture();
+    refresh(f, 'r1', { at: '2026-10-19T03:00:00Z' });
+    const tx = transaction(f, 't1', { at: '2026-10-19T03:00:00Z' });
+    const runs = path.join(f.brainHome, 'refresh-runs');
+    for (const file of [path.join(runs, '.DS_Store'), path.join(runs, '._r1.json'), path.join(tx, '.DS_Store'),
+      path.join(f.brainHome, '.kb.update-transactions', 'Thumbs.db')]) fs.writeFileSync(file, 'finder');
+    fs.writeFileSync(path.join(runs, 'notes.txt'), 'mine');
+    const assessed = assessLifecycleEvidence({ ...f, now });
+    expect(assessed.unsafe).toEqual([]);
+    expect(assessed.withinBudget).toBe(true);
+    expect(assessed.foreign).toEqual([{ path: path.join(runs, 'notes.txt'), bytes: 4 }]);
+    expect(assessed.before).toEqual({ refreshReceipts: 1, transactionDirectories: 1, bytes: assessed.before.bytes });
+    const result = pruneLifecycleEvidence({ ...f, now });
+    expect(result.withinBudget).toBe(true);
+    expect(result.removedVolumeMetadata).toHaveLength(4);
+    expect(fs.readdirSync(runs).sort()).toEqual(['notes.txt', 'r1.json']);
+    expect(fs.readdirSync(tx)).toEqual(['001-COMMITTED.json']);
+    expect(result.removed).toEqual({ refresh: [], transactions: [] });
+  });
+
+  it('compaction over budget skips a .DS_Store inside a transaction directory instead of failing', () => {
+    const f = fixture();
+    const dir = transaction(f, 'big', { at: '2026-02-01T00:00:00Z' });
+    const file = path.join(dir, '001-COMMITTED.json');
+    fs.writeFileSync(file, JSON.stringify(JSON.parse(fs.readFileSync(file, 'utf8')), null, 8));
+    fs.writeFileSync(path.join(dir, '.DS_Store'), Buffer.alloc(64));
+    const result = pruneLifecycleEvidence({ ...f, preserveTransactionPaths: [dir], policy: policy({ maxEvidenceBytes: 150 }) });
+    expect(result.unsafe).toEqual([]);
+    expect(result.compacted).toEqual([file]);
+  });
+
+  it('an abandoned .prune-* receipt quarantine (>1 h, run terminal or gone) is reclaimed and retention fits again', () => {
+    const f = fixture();
+    const runs = path.join(f.brainHome, 'refresh-runs');
+    refresh(f, 'kept', { at: '2026-10-19T03:00:00Z' });
+    const stranded = path.join(runs, '.prune-old-0123456789abcdef');
+    fs.writeFileSync(stranded, JSON.stringify({ schemaVersion: 3, kind: 'ruvnet-brain-refresh-run', runId: 'old', status: 'SUCCEEDED' }));
+    const txQuarantine = path.join(f.brainHome, '.kb.update-transactions', '.prune-gone-fedcba9876543210');
+    fs.mkdirSync(txQuarantine); fs.writeFileSync(path.join(txQuarantine, '001-COMMITTED.json'), '{}');
+    expect(assessLifecycleEvidence({ ...f }).withinBudget, 'young: a prune may still be between rename and delete').toBe(false);
+    const result = pruneLifecycleEvidence({ ...f, now: later });
+    expect(result.unsafe).toEqual([]);
+    expect(result.withinBudget).toBe(true);
+    expect(result.reclaimedQuarantines.map(({ path: p }) => p).sort()).toEqual([stranded, txQuarantine].sort());
+    expect(fs.existsSync(stranded)).toBe(false);
+    expect(fs.existsSync(txQuarantine)).toBe(false);
+    expect(fs.readdirSync(runs)).toEqual(['kept.json']);
+  });
+
+  it('an old quarantine whose run is live again, or that is not the shape we quarantine, is still preserved as unsafe', () => {
+    const f = fixture();
+    const runs = path.join(f.brainHome, 'refresh-runs');
+    refresh(f, 'live', { at: '2026-10-20T14:00:00Z', status: 'RUNNING' });
+    const liveQuarantine = path.join(runs, '.prune-live-0123456789abcdef');
+    fs.writeFileSync(liveQuarantine, '{}');
+    const dirQuarantine = path.join(runs, '.prune-private-0123456789abcdef'); // a directory under refresh-runs: never ours
+    fs.mkdirSync(dirQuarantine); fs.writeFileSync(path.join(dirQuarantine, 'private.txt'), 'private original');
+    const result = pruneLifecycleEvidence({ ...f, now: later });
+    expect(result.withinBudget).toBe(false);
+    expect(result.unsafe.map(({ path: p }) => p).sort()).toEqual([dirQuarantine, liveQuarantine].sort());
+    expect(result.reclaimedQuarantines).toEqual([]);
+    expect(fs.readFileSync(path.join(dirQuarantine, 'private.txt'), 'utf8')).toBe('private original');
+    expect(fs.existsSync(liveQuarantine)).toBe(true);
+  });
+});
