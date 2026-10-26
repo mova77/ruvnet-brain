@@ -97,6 +97,22 @@ describe('the scheduled wire gate measures HEAD and never passes on a guess', ()
   });
 });
 
+describe('the replay never runs ruflo inside the checkout', () => {
+  it.skipIf(process.platform === 'win32')('verifyRufloFlag starts ruflo in the temp dir (ruflo writes .claude-flow/ into its cwd, which dirtied the qualified checkout on CI)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-ruflo-'));
+    const marker = path.join(dir, 'cwd.txt');
+    const bin = path.join(dir, 'ruflo');
+    fs.writeFileSync(bin, `#!/bin/sh\npwd -P > "${marker}"\necho "  -q, --query   the query"\n`, { mode: 0o755 });
+    try {
+      const { verifyRufloFlag } = await import('../../scripts/learning-replay-execution.mjs');
+      expect(verifyRufloFlag(bin).ok).toBe(true);
+      const ranIn = fs.readFileSync(marker, 'utf8').trim();
+      expect(ranIn).toBe(fs.realpathSync(os.tmpdir()));
+      expect(ranIn).not.toBe(fs.realpathSync(process.cwd()));
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
 describe('CLI help is side-effect free', () => {
   it('--help prints usage, exits zero, and does not overwrite the replay artifact', () => {
     const artifact = path.resolve(import.meta.dirname, '../../data/learning-replay-result.json');

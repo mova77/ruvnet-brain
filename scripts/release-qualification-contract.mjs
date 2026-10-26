@@ -39,8 +39,8 @@ export const RELEASE_REQUIREMENTS = Object.freeze({
       "reason": "Captured owner policy never falls back on read failures; installed-only automation avoids npx; transient GET and body failures retry without weakening trust; POSIX executable aliases retain interpreter identity",
       "files": ["tests/unit/automatic-update.test.mjs", "tests/unit/download-retry.test.mjs"],
       "platformFiles": {
-        "linux": ["tests/unit/automatic-update-node-alias.test.mjs"],
-        "macos": ["tests/unit/automatic-update-node-alias.test.mjs"]
+        "linux": ["tests/unit/automatic-update-node-alias.test.mjs", "tests/unit/host-update-knowledge-exit.test.mjs"],
+        "macos": ["tests/unit/automatic-update-node-alias.test.mjs", "tests/unit/host-update-knowledge-exit.test.mjs"]
       }
     },
     {
@@ -137,12 +137,11 @@ export const RELEASE_REQUIREMENTS = Object.freeze({
         "tests/unit/forge-update-archive-digest.test.mjs",
         "tests/unit/kb-copy-proof-legacy-sidecars.test.mjs",
         "tests/unit/kb-copy-proof-unknown-content.test.mjs",
-        "tests/unit/user-model-hook-install.test.mjs",
-        "tests/unit/console-runtime-transaction.test.mjs"
+        "tests/unit/user-model-hook-install.test.mjs"
       ],
       "platformFiles": {
-        "linux": ["tests/unit/codex-wrapper-upgrade-ownership-links.test.mjs", "tests/unit/forge-update-signal.test.mjs"],
-        "macos": ["tests/unit/codex-wrapper-upgrade-ownership-links.test.mjs", "tests/unit/forge-update-signal.test.mjs"]
+        "linux": ["tests/unit/codex-wrapper-upgrade-ownership-links.test.mjs", "tests/unit/forge-update-signal.test.mjs", "tests/unit/console-runtime-transaction.test.mjs"],
+        "macos": ["tests/unit/codex-wrapper-upgrade-ownership-links.test.mjs", "tests/unit/forge-update-signal.test.mjs", "tests/unit/console-runtime-transaction.test.mjs"]
       }
     },
     {
@@ -254,7 +253,11 @@ export const RELEASE_REQUIREMENTS = Object.freeze({
       "reason": "Recorded learning evidence rejects forged, absent and mismatched causal transcripts",
       "files": [
         "tests/unit/learning-replay-proof.test.mjs"
-      ]
+      ],
+      "platformFiles": {
+        "linux": ["tests/unit/learning-replay-workflow-step.test.mjs"],
+        "macos": ["tests/unit/learning-replay-workflow-step.test.mjs"]
+      }
     },
     {
       "id": "qualification-topology",
