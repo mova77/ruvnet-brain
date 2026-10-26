@@ -111,9 +111,8 @@ finish() {
   [ -n "${TIMER:-}" ] && kill "$TIMER" 2>/dev/null
   timed_out=0
   if [ -f "$HB.timeout-$RUN_ID" ]; then
-    # Finish the KILL phase on the job's own process group: the child may have exited on TERM while processes it
-    # started (even ones started during TERM handling) linger.
-    timed_out=1; sleep 1; kill -KILL -"$CHILD" 2>/dev/null; rm -f "$HB.timeout-$RUN_ID"
+    # Anything the overrunning job left behind (started during its TERM handling, say) goes now.
+    timed_out=1; stop_job; rm -f "$HB.timeout-$RUN_ID"
   fi
   # An overrun is a failure however the job chose to exit on TERM, including 0 and 75 (the skip code), so this
   # comes before the skip branch (GPT-6.1 review round 2).
@@ -183,8 +182,38 @@ trap finish EXIT
 # The exit codes (143 = 128+15 TERM, 130 = 128+2 INT) intentionally reuse the same 128+signal
 # convention `wait` uses for a directly-signalled child, so finish() classifies BOTH as "killed"
 # with the right signal number, whether the signal reached the child directly or via this wrapper.
-trap 'FORCED_CODE=143; [ -n "${TIMER:-}" ] && kill "$TIMER" 2>/dev/null; kill -TERM -"$CHILD" 2>/dev/null || kill -TERM "$CHILD" 2>/dev/null; exit 143' TERM
-trap 'FORCED_CODE=130; [ -n "${TIMER:-}" ] && kill "$TIMER" 2>/dev/null; kill -TERM -"$CHILD" 2>/dev/null || kill -TERM "$CHILD" 2>/dev/null; exit 130' INT
+# The job stays in this wrapper's process group, so launchd's own cleanup of a dead job (it kills the job's whole
+# group) still covers everything, even if this wrapper is SIGKILLed (Opus review round 3: a separate group escaped it).
+# job_pids: every process the job owns. Under launchd this wrapper leads its group, so that is every group member
+# except this wrapper, its timer, and this wrapper's own helper processes (ps/awk/command substitutions) — which
+# catches processes the job started late or that were reparented. Run any other way (a terminal, a test harness),
+# it falls back to the job's current process tree.
+OWN_GROUP=0; [ "$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')" = "$$" ] && OWN_GROUP=1
+job_pids() {
+  if [ "$OWN_GROUP" = 1 ]; then
+    ps -A -o pid= -o ppid= -o pgid= 2>/dev/null | awk -v me=$$ -v t="${TIMER:-0}" -v c="${CHILD:-0}" '
+      { pid[NR]=$1; pp[NR]=$2; pg[NR]=$3 }
+      END { helper[t]=1
+            for (i=1;i<=NR;i++) if (pp[i]==me && pid[i]!=c) helper[pid[i]]=1
+            for (i=1;i<=NR;i++) if (pg[i]==me && pid[i]!=me && !(pid[i] in helper) && !(pp[i] in helper)) print pid[i] }'
+  else
+    tree_of "$CHILD"
+  fi
+}
+tree_of() { kill -0 "$1" 2>/dev/null && printf '%s ' "$1"
+  for k in $(ps -A -o pid= -o ppid= 2>/dev/null | awk -v p="$1" '$2==p {print $1}'); do tree_of "$k"; done; }
+# stop_job: TERM everything the job owns, give it up to 10 s (inside launchd's 20 s exit allowance), then KILL.
+stop_job() {
+  pids="$(job_pids)"; [ -n "$pids" ] && kill -TERM $pids 2>/dev/null
+  i=0; while [ "$i" -lt 10 ]; do [ -z "$(job_pids)" ] && return 0; sleep 1; i=$((i + 1)); done
+  pids="$(job_pids)"; [ -n "$pids" ] && kill -KILL $pids 2>/dev/null
+  return 0
+}
+trap 'FORCED_CODE=143; [ -n "${TIMER:-}" ] && kill "$TIMER" 2>/dev/null; stop_job; exit 143' TERM
+trap 'FORCED_CODE=130; [ -n "${TIMER:-}" ] && kill "$TIMER" 2>/dev/null; stop_job; exit 130' INT
+# The timer never kills anything itself: it marks the overrun and signals this wrapper, which stops the job.
+OVERRUN=0
+trap 'OVERRUN=1' USR1
 
 # Run the job in the BACKGROUND and `wait` for it — do NOT run it in the foreground.
 # Break-test finding (2026-07-13): a POSIX shell blocked on a FOREGROUND child does not run its trap
@@ -193,12 +222,8 @@ trap 'FORCED_CODE=130; [ -n "${TIMER:-}" ] && kill "$TIMER" 2>/dev/null; kill -T
 # The one death nothing can catch is SIGKILL (-9) / power loss, by definition: no handler runs. That
 # case is caught one level up — nightly-watchdog.mjs reports a receipt stuck in "running" as FAILING
 # ("started and never finished"). Trap for catchable deaths, watchdog for uncatchable ones.
-# The job gets its own process group (job control on just for this launch) so a timeout or a signal to this
-# wrapper reaches everything the job started.
-set -m
 "$@" &
 CHILD=$!
-set +m
 # RUN-TIME LIMIT (2026-10-25: five jobs finished their work and then never exited, each holding its own
 # next run off for 7-9 hours). After JOB_MAX_SECONDS (default 2 h; a plist may set less) the job is
 # stopped: TERM, then KILL 10 s later. It is recorded as killed and pages once like any other failure.
@@ -208,15 +233,18 @@ case "$MAX_SECONDS" in ''|*[!0-9]*) MAX_SECONDS=7200 ;; esac
 (
   # Short sleeps, not one long one: killing this shell then leaves at most a 2 s sleep behind, never a 2 h one
   # holding the job's output open (review round 2).
-  n=0; while [ "$n" -lt "$MAX_SECONDS" ]; do sleep 2; n=$((n + 2)); done
-  # Only ever signal OUR child: still alive and still parented by this wrapper. If the wrapper died (the child
-  # is reparented) or the PID was reused, do nothing.
+  # A wrapper that is gone (SIGKILLed: launchd then cleans the group itself) ends the timer at the next tick.
+  n=0; while [ "$n" -lt "$MAX_SECONDS" ]; do sleep 2; n=$((n + 2)); kill -0 "$WRAPPER_PID" 2>/dev/null || exit 0; done
+  # Only for OUR child: still alive and still parented by this wrapper. If the PID was reused, do nothing.
   [ "$(ps -o ppid= -p "$CHILD" 2>/dev/null | tr -d ' ')" = "$WRAPPER_PID" ] || exit 0
   : > "$HB.timeout-$RUN_ID"
-  # The job runs in its own process group (set -m above), so the whole group goes: every descendant, including
-  # ones started after this point.
-  kill -TERM -"$CHILD" 2>/dev/null || kill -TERM "$CHILD" 2>/dev/null; sleep 10
-  kill -KILL -"$CHILD" 2>/dev/null
+  kill -USR1 "$WRAPPER_PID" 2>/dev/null
 ) &
 TIMER=$!
-wait "$CHILD"
+# `wait` returns early when USR1 arrives; stop the job, then wait again for its real exit status.
+while :; do
+  wait "$CHILD"; RC=$?
+  if [ "$OVERRUN" = 1 ]; then OVERRUN=0; stop_job; continue; fi
+  break
+done
+exit "$RC"

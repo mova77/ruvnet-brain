@@ -152,7 +152,8 @@ describe('job-heartbeat.sh — a failing job must actually page, not just record
   const runWith = (label, body, extraEnv = {}) => {
     const f = path.join(workDir, `${label}.sh`);
     fs.writeFileSync(f, `#!/bin/sh\n${body}\n`); fs.chmodSync(f, 0o755);
-    return spawnSync('/bin/sh', [WRAPPER, label, '--', f, 'line one\nline "two"'], {
+    // Started as its own process-group leader, exactly as launchd starts a job (perl is on macOS and every CI image).
+    return spawnSync('/usr/bin/perl', ['-e', 'setpgrp(0,0); exec @ARGV', extraEnv.SHELL_BIN || '/bin/sh', WRAPPER, label, '--', f, 'line one\nline "two"'], {
       encoding: 'utf8',
       env: { PATH: `${path.join(workDir, 'bin')}:/usr/bin:/bin`, HOME: path.join(workDir, 'home'), JOB_HEARTBEAT_DIR: path.join(workDir, 'heartbeats'), NTFY_TOPIC: '', ...extraEnv },
     });
@@ -214,6 +215,30 @@ describe('job-heartbeat.sh — a failing job must actually page, not just record
     run('com.test.legacy', 1);
     expect(curlCalls()).toHaveLength(1);
   });
+
+  it('stopping the wrapper (launchd bootout) stops a job that ignores TERM, leaving nothing behind', () => {
+    makeHarness({ withTopic: false });
+    const marker = path.join(workDir, 'stubborn.pid');
+    const f = path.join(workDir, 'stubborn.sh');
+    fs.writeFileSync(f, `#!/bin/sh\ntrap '' TERM\necho $$ > ${marker}\nsleep 120 & wait\n`); fs.chmodSync(f, 0o755);
+    const t0 = Date.now();
+    const r = spawnSync('/bin/sh', ['-c', `/usr/bin/perl -e 'setpgrp(0,0); exec @ARGV' /bin/sh ${WRAPPER} com.test.bootout -- ${f} & W=$!; sleep 2; kill -TERM $W; wait $W; echo rc=$?`], {
+      encoding: 'utf8', env: { PATH: '/usr/bin:/bin', HOME: path.join(workDir, 'home'), JOB_HEARTBEAT_DIR: path.join(workDir, 'heartbeats'), NTFY_TOPIC: '' } });
+    expect(Date.now() - t0).toBeLessThan(25_000);
+    expect(r.stdout).toContain('rc=143');
+    const pid = Number(fs.readFileSync(marker, 'utf8'));
+    let alive = true; try { process.kill(pid, 0); } catch { alive = false; }
+    expect(alive).toBe(false);
+    expect(hb('com.test.bootout').state).toBe('killed');
+  }, 40_000);
+
+  it.runIf(fs.existsSync('/bin/dash'))('the overrun limit also works under dash (Ubuntu /bin/sh)', () => {
+    makeHarness({ withTopic: false });
+    const t0 = Date.now();
+    runWith('com.test.dash', "trap '' TERM\nsleep 60 & wait", { JOB_MAX_SECONDS: '1', SHELL_BIN: '/bin/dash' });
+    expect(Date.now() - t0).toBeLessThan(25_000);
+    expect(hb('com.test.dash').state).toBe('killed');
+  }, 40_000);
 
   it('the run-time timer never outlives the wrapper', () => {
     makeHarness({ withTopic: false });
