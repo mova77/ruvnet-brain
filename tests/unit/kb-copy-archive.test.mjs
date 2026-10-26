@@ -5,13 +5,14 @@
 //   (b) `--clean --archive` (opt-in, never automatic) copies only the unique files into kb.archive/<stamp>/ and
 //       then releases the copy;
 //   (c) kb/forge-update.mjs reclaimBackups treats a copy whose bytes all survive in live or an archive as accounted for.
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { inventoryFootprint, sweepFootprint } from '../../plugin/scripts/brain-footprint.mjs';
 import { kbCopyProof } from '../../plugin/scripts/kb-copy-proof.mjs';
+import { archiveRoots } from '../../plugin/scripts/footprint-io.mjs';
 import { reclaimBackups } from '../../kb/forge-update.mjs';
 
 const dirs = [];
@@ -157,6 +158,67 @@ describe('#335 (b): --clean --archive keeps only the unique files, then releases
     for (const h of before) expect(hashesUnder(m.brainHome).has(h)).toBe(true);
   });
 
+  // Review fix (4.7.21): an archive is all or nothing. A half-written <stamp>/<label> used to stay behind and every
+  // later sweep compared copies against it.
+  const archiveEntries = (m) => {
+    const dir = path.join(m.brainHome, 'kb.archive');
+    return fs.existsSync(dir) ? fs.readdirSync(dir).flatMap((stamp) => fs.readdirSync(path.join(dir, stamp))) : [];
+  };
+  it('a copy failure partway leaves no archive (no label tree, no receipt, no temp) and keeps the copy', () => {
+    const m = machine();
+    const a = preserved(m, 'kb.install-preserved-AAAAAA');
+    const before = hashesUnder(m.brainHome);
+    const real = fs.copyFileSync; let calls = 0;
+    const spy = vi.spyOn(fs, 'copyFileSync').mockImplementation(function (...args) {
+      calls += 1;
+      if (calls === 2) throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' });
+      return real.apply(this, args);
+    });
+    let swept;
+    try { swept = sweepFootprint(opts(m, { apply: true, archive: true })); } finally { spy.mockRestore(); }
+    expect(calls).toBeGreaterThanOrEqual(2);
+    expect(swept.removed).toEqual([]);
+    expect(swept.kept.find((k) => k.path === a).reason).toMatch(/not archived: archive failed: ENOSPC/);
+    expect(archiveEntries(m)).toEqual([]);
+    for (const h of before) expect(hashesUnder(m.brainHome).has(h)).toBe(true);
+  });
+
+  it('a copy the re-proof still keeps (unreadable metadata) leaves no archive behind', () => {
+    const m = machine();
+    const a = preserved(m, 'kb.install-preserved-AAAAAA');
+    const seen = new Map();
+    const proveCopy = (args) => {
+      seen.set(args.copyDir, (seen.get(args.copyDir) || 0) + 1);
+      return seen.get(args.copyDir) === 1 ? kbCopyProof(args)
+        : { disposable: false, unique: [], reason: `unreadable or malformed metadata in ${args.copyDir}: not a metadata object` };
+    };
+    const swept = sweepFootprint(opts(m, { apply: true, archive: true, proveCopy }));
+    expect(seen.get(a)).toBe(2);
+    expect(swept.removed).toEqual([]);
+    expect(swept.kept.find((k) => k.path === a).reason).toMatch(/unreadable or malformed metadata.*its archive was removed/);
+    expect(fs.existsSync(a)).toBe(true);
+    expect(archiveEntries(m)).toEqual([]);
+  });
+
+  it('a half-written (dot-named) archive a killed sweep left is never a reference', () => {
+    const m = machine();
+    const a = preserved(m, 'kb.install-preserved-AAAAAA');
+    const partial = path.join(m.brainHome, 'kb.archive', '2026-10-25T00-00-00-000Z', '.kb.install-preserved-AAAAAA.partial-1-abcd');
+    for (const rel of ['SOURCE.json', 'concepts.big.rvf', path.join('notes', 'user.txt')]) write(path.join(partial, rel), fs.readFileSync(path.join(a, rel)));
+    expect(archiveRoots(path.join(m.brainHome, 'kb.archive'))).toEqual([]);
+    expect(sweepFootprint(opts(m, { apply: true })).removed).toEqual([]);
+    expect(fs.existsSync(a)).toBe(true);
+  });
+
+  it('a quarantined copy is archived under the same <quarantine>--<child> label its rescued logs use', () => {
+    const m = machine();
+    const quarantine = path.join(m.brainHome, 'kb-quarantine-20260901');
+    preserved(m, path.join('kb-quarantine-20260901', 'kb'));
+    const swept = sweepFootprint(opts(m, { apply: true, archive: true }));
+    expect(swept.removed.map((r) => r.path)).toEqual([path.join(quarantine, 'kb')]);
+    expect(archiveEntries(m).sort()).toEqual(['kb-quarantine-20260901--kb', 'kb-quarantine-20260901--kb.json']);
+  });
+
   it('a dry run (apply:false) never writes an archive', () => {
     const m = machine();
     preserved(m, 'kb.install-preserved-AAAAAA');
@@ -202,6 +264,15 @@ describe('#335 (c): reclaimBackups treats an archived copy as accounted for', ()
     const { root, live, backup } = reclaimFixture();
     archiveAt(root, { 'concepts.rvf': 'retired store', 'legacy.txt': 'unknown legacy file' });
     expect(reclaimBackups({ kbDir: live, env: {}, dryRun: true }).wouldRemove).toEqual([backup]);
+    expect(fs.existsSync(backup)).toBe(true);
+  });
+
+  it('a half-written (dot-named) archive tree is not counted as an archive', () => {
+    const { root, live, backup } = reclaimFixture();
+    for (const [rel, body] of Object.entries({ 'concepts.rvf': 'retired store', 'legacy.txt': 'unknown legacy file' })) {
+      write(path.join(root, 'kb.archive', '2026-10-25T12-00-00-000Z', '.kb.bak-2026-07-13T10-47-54-235Z.partial-1-abcd', rel), body);
+    }
+    expect(reclaimBackups({ kbDir: live, env: {} }).removed).toEqual([]);
     expect(fs.existsSync(backup)).toBe(true);
   });
 

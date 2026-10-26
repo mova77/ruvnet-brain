@@ -1214,7 +1214,8 @@ export function reclaimBackups({
   const realDir = (dir) => { try { const st = fs.lstatSync(dir); return st.isDirectory() && !st.isSymbolicLink(); } catch { return false; } };
   const listDirs = (dir) => { try { return fs.readdirSync(dir).sort().map((n) => path.join(dir, n)).filter(realDir); } catch { return []; } };
   const archiveDir = path.join(parent, `${base}.archive`);
-  const archives = realDir(archiveDir) ? listDirs(archiveDir).flatMap(listDirs) : [];
+  // A dot-named entry is an archive still being written, or one a killed sweep left half-written: never a reference.
+  const archives = realDir(archiveDir) ? listDirs(archiveDir).flatMap(listDirs).filter((dir) => !path.basename(dir).startsWith('.')) : [];
 
   // A store the live release's own COVERAGE.json marks ineligible is absent from live BY POLICY
   // (excluded-no-corpus, fork, archived…), not lost by an update; its presence in a backup must not

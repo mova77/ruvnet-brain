@@ -1,4 +1,4 @@
-Updated: 2026-10-25 19:02:43 EDT | Version 1.5.0
+Updated: 2026-10-25 22:37:14 EDT | Version 1.5.1
 Created: 2026-07-07 09:22:01 EDT
 
 # Contributing to RuvNet Brain — the one rulebook
@@ -358,6 +358,9 @@ artifact only together with its classification there, or `--doctor` will report 
   `forge-guard-injection.log`, and ruflo's `.claude-flow/` scratch, each at most 2 MiB, 16 MiB per copy):
   they do not keep a copy, they are copied to `kb-copy-rescued/<copy>/` in the brain home and verified
   before the copy goes (kept for the newest five released copies), and a failed rescue keeps the copy.
+  For a copy inside a quarantine, `<copy>` is `<quarantine>--<child>` in both `kb.archive/` and `kb-copy-rescued/`.
+  An archive is written to a dot-named temp beside it and renamed into place only once every file verifies;
+  a dot-named entry is never treated as an archive.
   Links are never followed; trees of an in-progress storage transaction, a foreign refresh lock, an
   install that is activating (`.kb.install-activation.lock` with a live pid), and live leases are kept; plugin generations go only through `prunePluginGenerations` (lease-aware).
 - **Enforced automatically**: after install/forced reinstall (the installer releases its own preserved

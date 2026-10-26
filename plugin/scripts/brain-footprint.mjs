@@ -29,7 +29,7 @@ import { isKbTree, kbCopyProof } from './kb-copy-proof.mjs';
 import { brainLocation } from './brain-location.mjs';
 import { RUFLO_CWD_ARTIFACTS } from './ruflo-bin.mjs';
 import { isDirectInvocation } from './entrypoint.mjs';
-import { RESCUE_DIR, archiveRoots, archiveUniqueFiles, assessMoveLeftovers, cachedKept, cmpVersion, isVolumeMetadata,
+import { RESCUE_DIR, archiveRoots, archiveUniqueFiles, assessMoveLeftovers, discardArchive, cachedKept, cmpVersion, isVolumeMetadata,
   keptCopyFix, physical, pidAlive, readProofCache, rememberKept, removeWithin, rescueOperationalFiles, rotate,
   treeBytes, truncateToTail } from './footprint-io.mjs';
 
@@ -458,6 +458,9 @@ export function sweepFootprint({ apply = false, archive = false, collectPluginGe
   const stampDir = path.join(archiveDir, new Date(options.now ?? Date.now()).toISOString().replace(/[:.]/g, '-'));
   const archiving = apply && archive;
   const reArchive = (item) => archiving && ['kb-copy', 'quarantine'].includes(item.kind) && item.keptUnique && !item.blocked;
+  // Correctness relies on SORTED directory order across concurrent sweeps: inventory and archiveRoots list
+  // entries sorted, so two sweeps evaluate copies in the same order and agree which copy of a duplicate pair
+  // is the kept reference; with unsorted order each could release the copy the other kept as its reference.
   const refs = [...archiveRoots(archiveDir), ...before.items.filter((i) => i.kind === 'kb-copy' && i.keptUnique && !reArchive(i)).map((i) => i.path)];
   const prove = (copyDir, label = path.basename(copyDir)) => {
     let proof = proveCopy({ copyDir, liveDir: roots.kbDir, keptSiblings: [...refs] });
@@ -466,7 +469,11 @@ export function sweepFootprint({ apply = false, archive = false, collectPluginGe
       if (archived.ok) {
         refs.push(archived.root);
         const again = proveCopy({ copyDir, liveDir: roots.kbDir, keptSiblings: [...refs] });
-        proof = again.disposable ? { ...again, reason: `archived ${archived.files.length} unique file(s) to ${archived.root}; ${again.reason}` } : again;
+        if (again.disposable) proof = { ...again, reason: `archived ${archived.files.length} unique file(s) to ${archived.root}; ${again.reason}` };
+        else { // the copy is kept (e.g. unreadable metadata on the re-proof): it still holds every byte, so no archive is left behind
+          refs.pop(); discardArchive(archived.root);
+          proof = { ...again, reason: `${again.reason}; not archived: the copy is kept, so its archive was removed` };
+        }
       } else proof = { ...proof, reason: `${proof.reason}; not archived: ${archived.reason}` };
     }
     if (!proof.disposable) refs.push(copyDir);
@@ -501,7 +508,7 @@ export function sweepFootprint({ apply = false, archive = false, collectPluginGe
       const quarantineReal = physical(item.path);
       for (const child of names(item.path)) {
         const childPath = path.join(item.path, child);
-        const proof = isKbTree(childPath) ? prove(childPath, `${path.basename(item.path)}__${child}`)
+        const proof = isKbTree(childPath) ? prove(childPath, `${path.basename(item.path)}--${child}`)
           : { disposable: false, unique: [], reason: 'not a KB copy; not ours to judge' };
         if (!proof.disposable) { uniqueLeft = true; kept.push({ path: childPath, kind: 'quarantined-copy', reason: `KEPT: ${proof.reason}`, unique: proof.unique }); continue; }
         if (apply) rescueOperationalFiles(childPath, proof.rescue, roots.brainHome, `${path.basename(item.path)}--${child}`); // throws -> kept

@@ -227,12 +227,22 @@ export const keptCopyFix = (copyDir, hit) => `npx ruvnet-brain --clean --archive
   (hit.unique || []).slice(0, 3).map((u) => u.file).join(', ') || hit.reason}); that copies only those files into kb.archive/ and releases the copy (or restore them into the live brain yourself)`;
 
 const sha256File = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
-/** Every `<archiveDir>/<stamp>/<label>` tree `--clean --archive` wrote: real directories only, links never entered. */
+/**
+ * Every `<archiveDir>/<stamp>/<label>` tree `--clean --archive` wrote: real directories only, links never entered.
+ * A dot-named entry is an archive still being written (or one a killed sweep left half-written); it is never
+ * a reference, so a partial archive can never account for a copy's bytes.
+ */
 export function archiveRoots(archiveDir) {
   const real = (p) => { const st = lstat(p); return Boolean(st && st.isDirectory() && !st.isSymbolicLink()); };
   if (!real(archiveDir)) return [];
   return names(archiveDir).map((s) => path.join(archiveDir, s)).filter(real)
-    .flatMap((stampDir) => names(stampDir).map((n) => path.join(stampDir, n)).filter(real));
+    .flatMap((stampDir) => names(stampDir).filter((n) => !n.startsWith('.')).map((n) => path.join(stampDir, n)).filter(real));
+}
+
+/** Undo an archive this sweep wrote (the copy it came from is being kept, so the archive holds nothing unique). */
+export function discardArchive(root) {
+  fs.rmSync(root, { recursive: true, force: true });
+  fs.rmSync(`${root}.json`, { force: true });
 }
 
 /**
@@ -240,6 +250,9 @@ export function archiveRoots(archiveDir) {
  * `<stampDir>/<label>/<same relative path>`, verify each byte-for-byte, and write `<stampDir>/<label>.json`.
  * Moves and deletes nothing: the caller re-proves the copy against this archive before releasing it. A link,
  * an unsafe ancestor, a non-regular file, too little free space or any copy error archives nothing usable.
+ * ALL OR NOTHING: the files go to a dot-named temp sibling and are renamed to `<label>` only after every one
+ * verifies (the receipt likewise); a failure removes the temp, so no half-written `<label>` is ever left for a
+ * later sweep to compare against.
  */
 export function archiveUniqueFiles({ copyDir, unique, stampDir, label, now = Date.now() }) {
   if (!Array.isArray(unique) || !unique.length) return { ok: false, reason: 'no file is named unique; the copy is kept for another reason' };
@@ -251,6 +264,9 @@ export function archiveUniqueFiles({ copyDir, unique, stampDir, label, now = Dat
     if (/link|ancestor/i.test(String(why)) || !st || !st.isFile() || st.isSymbolicLink()) return { ok: false, reason: `${file} is not a regular file that can be archived (${why})` };
     need += st.size;
   }
+  const temp = path.join(stampDir, `.${label}.partial-${process.pid}-${crypto.randomBytes(4).toString('hex')}`);
+  const receipt = path.join(stampDir, `${label}.json`); const receiptTemp = `${temp}.json`;
+  let renamed = false;
   try {
     fs.mkdirSync(stampDir, { recursive: true });
     const free = typeof fs.statfsSync === 'function' ? fs.statfsSync(stampDir) : null;
@@ -259,15 +275,22 @@ export function archiveUniqueFiles({ copyDir, unique, stampDir, label, now = Dat
     }
     const files = [];
     for (const { file } of unique) {
-      const src = path.join(copyDir, file); const dst = path.join(root, file);
+      const src = path.join(copyDir, file); const dst = path.join(temp, file);
       fs.mkdirSync(path.dirname(dst), { recursive: true });
       fs.copyFileSync(src, dst, fs.constants.COPYFILE_EXCL);
       const sha256 = sha256File(src);
       if (sha256File(dst) !== sha256) throw new Error(`archived bytes of ${file} differ from the source`);
       files.push({ file, bytes: fs.lstatSync(dst).size, sha256 });
     }
-    fs.writeFileSync(path.join(stampDir, `${label}.json`), `${JSON.stringify({ schemaVersion: 1, kind: 'ruvnet-brain-kb-archive',
-      source: copyDir, archivedAt: new Date(now).toISOString(), files }, null, 2)}\n`);
+    fs.writeFileSync(receiptTemp, `${JSON.stringify({ schemaVersion: 1, kind: 'ruvnet-brain-kb-archive',
+      source: copyDir, archivedAt: new Date(now).toISOString(), files }, null, 2)}\n`, { flag: 'wx' });
+    if (lstat(root) || lstat(receipt)) throw new Error(`${root} appeared while archiving`);
+    fs.renameSync(temp, root); renamed = true;
+    fs.renameSync(receiptTemp, receipt);
     return { ok: true, root, files, bytes: need };
-  } catch (error) { return { ok: false, reason: `archive failed: ${error.message}` }; }
+  } catch (error) {
+    fs.rmSync(temp, { recursive: true, force: true }); fs.rmSync(receiptTemp, { force: true });
+    if (renamed) fs.rmSync(root, { recursive: true, force: true });
+    return { ok: false, reason: `archive failed: ${error.message}` };
+  }
 }
