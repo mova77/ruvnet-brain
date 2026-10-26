@@ -23,6 +23,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { isPersonIssue, judgeIssue } from './issue-watch.mjs';
+import { isDirectInvocation } from '../plugin/scripts/entrypoint.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const REPO = 'stuinfla/ruvnet-brain';
@@ -506,7 +507,7 @@ export function formatOpen(alerts) {
     + `${a.count > 1 ? `  (×${a.count}, since ${clean(a.firstAt, 30)})` : ''}\n    ${clean(String(a.body || '').split('\n')[0], 160)}`).join('\n') + tail;
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (isDirectInvocation(import.meta.url)) {
   const args = process.argv.slice(2);
   try {
     if (args[0] === '--open') {
