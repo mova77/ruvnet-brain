@@ -4187,6 +4187,23 @@ export function syncHostsAfterUpdate(cacheDir = resolvedKbDir(), {
     error: convergence.healthy === true ? null : `host convergence is ${convergence.state}: ${convergence.action}` };
 }
 
+/**
+ * The ONE host-convergence entry for `--update` and `--host-sync-only`: syncHostsAfterUpdate, then the #492 reload of a
+ * running shared Codex app-server when the Codex plugin or its hook trust changed (fresh installs reload it in the
+ * main flow; before this, every existing user's `--update` skipped it — cross-vendor review E). The reload never
+ * grants an approval and never starts, stops or restarts a server (refreshSharedCodexAppServer).
+ */
+export async function convergeHostsAfterUpdate(cacheDir = resolvedKbDir(), { refreshHost = refreshCodexSharedHost, ...options } = {}) {
+  const convergence = syncHostsAfterUpdate(cacheDir, options);
+  if (!convergence.results?.codex) return convergence;
+  let hostRefresh;
+  try { hostRefresh = await refreshHost(convergence.results.codex); }
+  catch (error) { hostRefresh = { state: 'failed', changed: false, reason: error?.message || String(error) }; }
+  const note = codexHostRefreshMessage(hostRefresh);
+  if (note) (note.level === 'warn' ? warn : info)(note.text);
+  return { ...convergence, hostRefresh };
+}
+
 export function classifyHostConvergence(receipt, expectedVersion = PACKAGE_VERSION) {
   // Same 'ahead is not behind' rule as host convergence above (#123). A receipt written by a
   // NEWER generation than the installer currently running is not a version mismatch — it is a
@@ -4321,7 +4338,7 @@ async function runUpdate() {
   }
   if (FLAG_HOST_SYNC_ONLY) {
     info(c.dim('repairing host shells and managed model catalog without mutating KB bytes…\n'));
-    const convergence = syncHostsAfterUpdate(kbDir);
+    const convergence = await convergeHostsAfterUpdate(kbDir);
     if (!convergence.ok) {
       warn(`host synchronization is incomplete${convergence.error ? ` (${convergence.error})` : ''}`);
       process.exitCode = 1;
@@ -4594,7 +4611,7 @@ async function runUpdate() {
   }
   if (updateStatus === 0) {
     info(c.dim('\nsynchronizing every detected host to this exact published version…\n'));
-    const convergence = syncHostsAfterUpdate(kbDir);
+    const convergence = await convergeHostsAfterUpdate(kbDir);
     if (!convergence.ok) {
       let active;
       try { active = JSON.parse(fs.readFileSync(path.join(footprintRoots().brainHome, 'active.json'), 'utf8')); } catch { /* report unknown activation */ }

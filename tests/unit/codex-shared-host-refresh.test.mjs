@@ -101,3 +101,35 @@ describe('the installer says plainly what the reload does to sessions already op
     for (const state of ['no-shared-server', 'not-needed', 'blocked']) expect(installer.codexHostRefreshMessage({ state })).toBeNull();
   });
 });
+
+// Cross-vendor review E (4.7.21): only a fresh install reloaded the running Codex app-server; `--update` (the path
+// every existing user takes) converges hosts through syncHostsAfterUpdate and skipped it.
+describe('--update reloads the running Codex app-server through the shared host-convergence path', () => {
+  const ROOT = path.resolve(import.meta.dirname, '../..');
+  const VERSION = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version;
+  it('convergeHostsAfterUpdate refreshes after the Codex plugin changed, and returns what happened', async () => {
+    expect(typeof installer.convergeHostsAfterUpdate).toBe('function');
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cxu-')));
+    cleanups.push(() => fs.rmSync(home, { recursive: true, force: true }));
+    const kb = path.join(home, 'kb'); fs.mkdirSync(kb, { recursive: true });
+    const calls = [];
+    const result = await installer.convergeHostsAfterUpdate(kb, {
+      sourceRoot: ROOT, brainHome: path.join(home, 'brain'),
+      wireClaude: () => ({ host: true, wired: true, version: VERSION }),
+      wireCodexHost: () => ({ host: true, wired: true, action: 'unchanged' }),
+      wireCodexPlugin: () => ({ action: 'updated', installed: true, enabled: true, version: VERSION }),
+      runStableSpine: () => ({ status: 0, error: undefined }),
+      refreshHost: async (codexPlugin) => { calls.push(codexPlugin.action); return { state: 'refreshed', changed: false, approvalsGranted: 0 }; },
+    });
+    expect(result.ok).toBe(true);
+    expect(calls).toEqual(['updated']);
+    expect(result.hostRefresh).toMatchObject({ state: 'refreshed', approvalsGranted: 0 });
+  });
+  it('the real --update caller (runUpdate) converges only through it', () => {
+    const src = fs.readFileSync(path.join(ROOT, 'bin', 'install.mjs'), 'utf8');
+    const start = src.indexOf('async function runUpdate(');
+    const body = src.slice(start, src.indexOf('\n}\n', start));
+    expect(body).not.toMatch(/\bsyncHostsAfterUpdate\(/);
+    expect(body.match(/await convergeHostsAfterUpdate\(kbDir\)/g)).toHaveLength(2);
+  });
+});
