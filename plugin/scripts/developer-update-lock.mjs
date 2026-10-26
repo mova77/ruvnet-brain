@@ -8,6 +8,8 @@ const brainRoot = brainHome => brainHome || process.env.RUVNET_BRAIN_HOME || pat
 const pidAlive = pid => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
 // A dead or reclaimable owner must have been gone this long; an unreadable owner is judged by the directory's age.
 export const STALE_RECLAIM_MS = 10 * 60 * 1000;
+// An owner-less lock younger than this is another process between creating the lock and writing its owner.
+export const OWNERLESS_GRACE_MS = 5 * 1000;
 /** The OS start time of `pid` (`ps -o lstart=`, as kb/refresh-run.mjs records it), or null when it cannot be read (Windows). */
 export function processStartOf(pid, { platform = process.platform } = {}) {
   if (platform === 'win32' || !Number.isSafeInteger(pid) || pid < 1) return null;
@@ -92,19 +94,34 @@ function removeObservedLock(directory, observed, { afterClaim = null } = {}) {
 const CONTENDED = new Set(['EEXIST', 'ENOTEMPTY', 'EPERM', 'EACCES']);
 function publishLock(directory, content) {
   const staged = `${directory}.acquire-${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
+  const dropStaged = () => { try { fs.rmSync(staged, { recursive: true, force: true }); } catch { /* best effort */ } };
   try {
     fs.mkdirSync(staged, { mode: 0o700 });
     fs.writeFileSync(path.join(staged, 'owner.json'), content, { flag: 'wx', mode: 0o600 });
-    fs.renameSync(staged, directory);
-    return true;
-  } catch (error) {
-    try { fs.rmSync(staged, { recursive: true, force: true }); } catch { /* best effort */ }
-    if (CONTENDED.has(error.code) && fs.existsSync(directory)) return false; // another owner got there first: re-judge
+  } catch (error) { dropStaged(); throw error; } // staging failures are real errors, never contention
+  try { fs.renameSync(staged, directory); return true; } catch (error) {
+    dropStaged();
+    // A refused publication is contention even if the lock is gone a moment later: its owner can release in between,
+    // and re-checking existsSync here threw a raw ENOTEMPTY at the caller (Opus r3 P2-1). Re-judge (bounded by the caller).
+    if (CONTENDED.has(error.code)) return false;
     throw error;
   }
 }
 export function sharedLockStatus({ brainHome, alive = pidAlive, startOf = processStartOf } = {}) {
   const directory = path.join(brainRoot(brainHome), 'developer-update.lock');
+  let status = judgeLock(directory, alive, startOf);
+  // An owner-less reading can be the instant between one owner's release and the next owner's publication: the lock was
+  // gone (or moved aside before owner.json was read) and a new owner's lock was there when existence was checked. That
+  // live lock was judged "unknown" and the refusal offered rm -rf (Opus r3 P2-2). Look again before calling it unknown.
+  for (let look = 0; look < 2 && status.state === 'unknown' && (status.observed === null || status.observed.raw === null); look++) {
+    let again = null;
+    try { again = observeDirectory(directory); } catch { /* vanished or unjudgeable: judged afresh */ }
+    if (again && status.observed && again.identity === status.observed.identity && again.raw === null) break; // the same owner-less directory
+    status = judgeLock(directory, alive, startOf);
+  }
+  return status;
+}
+function judgeLock(directory, alive, startOf) {
   let observed = null;
   try {
     observed = observeDirectory(directory);
@@ -133,6 +150,11 @@ export function acquireDeveloperLock({ brainHome, token = process.env.RUVNET_DEV
       if (!Number.isFinite(ageMs)) try { ageMs = now - fs.lstatSync(status.directory).mtimeMs; } catch { ageMs = NaN; }
     }
     const refuse = state => Error(`developer update lock ${state}; ${status.directory}. If no update is running on this machine, remove it: ${removal(status.directory)}`);
+    // A lock with no owner yet that is seconds old is another process mid-creation (agentic-kit writes its owner after its
+    // mkdir), not debris: never offer to remove it (Opus r3 P2-2).
+    if (status.state === 'unknown' && status.observed?.raw === null && Number.isFinite(ageMs) && ageMs < OWNERLESS_GRACE_MS) {
+      throw Error(`developer update lock is being created by another process; ${status.directory}. Retry shortly.`);
+    }
     if ((status.state === 'stale' || status.state === 'unknown') && Number.isFinite(ageMs) && ageMs >= STALE_RECLAIM_MS) {
       if (!status.observed) throw refuse(status.state); // not a lock directory this protocol can judge (a symlink or a file)
       const outcome = removeObservedLock(status.directory, status.observed, { afterClaim: afterTakeoverClaim });

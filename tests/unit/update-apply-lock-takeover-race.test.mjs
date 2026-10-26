@@ -39,6 +39,7 @@ if (workerData.pauseAt === 'publish') {
   hook('renameSync', (from, to) => to === lock); // or: one rename publishes the populated lock
 }
 if (workerData.pauseAt === 'claim') hook('readdirSync', (dir) => dir === lock); // judged, not yet claimed
+if (workerData.pauseAt === 'publish-failed') hook('rmSync', (dir) => String(dir).startsWith(lock + '.acquire-')); // rename refused, staging not yet removed
 import(workerData.module).then((m) => parentPort.postMessage({ acquired: Boolean(m.acquireLock('race-' + workerData.role).acquired) }),
   (error) => parentPort.postMessage({ error: String(error && error.stack || error) }));
 `;
@@ -148,3 +149,37 @@ describe('update-apply lock: a takeover claim', () => {
     expect(JSON.parse(fs.readFileSync(path.join(lock, 'owner.json'), 'utf8')).target).toBe('race-B');
   }, 40_000);
 });
+
+// Opus r3 P2-1: a publication rename refused because a holder was there, and the holder released before the refusal was
+// looked at again. The run re-checked fs.existsSync(LOCK), found nothing, and rethrew the raw ENOTEMPTY: main exited 1
+// instead of BUSY_EXIT 75 (the reviewer's stress run: 7 of 8 runs crashed this way). A refused publication is contention
+// whatever is there a moment later; the run re-observes, and a vanished lock is simply tried again.
+describe('update-apply lock: the holder releases while a publication is being refused', () => {
+  it('the refused run re-judges and acquires the freed lock instead of throwing ENOTEMPTY', async () => {
+    const { home, lock, start, paused, resume } = harness();
+    fs.mkdirSync(lock); // a live holder's populated lock
+    fs.writeFileSync(path.join(lock, 'owner.json'), JSON.stringify({ pid: process.pid, target: 'holder', token: 'h'.repeat(32) }));
+    const b = start('B', 'publish-failed');
+    await waitFor(() => paused(0) || b.done);
+    expect(b.done, JSON.stringify(b.value)).toBe(false); // B's rename was refused by the holder's lock
+    fs.renameSync(lock, `${lock}.released-holder`); fs.rmSync(`${lock}.released-holder`, { recursive: true }); // the holder releases
+    resume(1);
+    await waitFor(() => b.done);
+    expect(b.value).toEqual({ acquired: true }); // before: { error: 'Error: ENOTEMPTY: directory not empty, rename ...' }
+    expect(JSON.parse(fs.readFileSync(path.join(lock, 'owner.json'), 'utf8')).target).toBe('race-B');
+    expect(fs.readdirSync(home).filter((name) => name.startsWith('.update.lock.'))).toEqual([]); // no staging left
+  }, 40_000);
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)('a staging directory that cannot be created is a real error, not "busy"', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spine-perm-'));
+    homes.push(home);
+    fs.chmodSync(home, 0o500);
+    try {
+      const script = `import(${JSON.stringify(pathToFileURL(ENGINE).href)}).then((m) => { try { console.log(JSON.stringify(m.acquireLock('perm'))); } catch (e) { console.log('THREW ' + e.code); } });`;
+      const r = spawnSync(process.execPath, ['-e', script], { encoding: 'utf8',
+        env: { ...process.env, RUVNET_BRAIN_HOME: home, RUVNET_BRAIN_IMPORT_ONLY: 'update-shell-test' } });
+      expect(r.stdout.trim(), r.stderr).toBe('THREW EACCES'); // a fix that called every publication failure contention would say busy here
+    } finally { fs.chmodSync(home, 0o700); }
+  });
+});
+

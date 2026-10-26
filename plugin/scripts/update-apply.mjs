@@ -190,13 +190,17 @@ function removeObservedLock(observed) {
 const CONTENDED = new Set(['EEXIST', 'ENOTEMPTY', 'EPERM', 'EACCES']);
 function publishLock(content) {
   const staged = `${LOCK}.acquire-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
+  const dropStaged = () => { try { fs.rmSync(staged, { recursive: true, force: true }); } catch { /* best effort */ } };
   try {
     fs.mkdirSync(staged);
     fs.writeFileSync(path.join(staged, 'owner.json'), content, { flag: 'wx' });
-    fs.renameSync(staged, LOCK);
-  } catch (error) {
-    try { fs.rmSync(staged, { recursive: true, force: true }); } catch { /* best effort */ }
-    if (CONTENDED.has(error?.code) && fs.existsSync(LOCK)) throw Object.assign(new Error('the update lock is held'), { code: 'EEXIST' });
+  } catch (error) { dropStaged(); throw error; } // staging failures are real errors, never contention
+  try { fs.renameSync(staged, LOCK); } catch (error) {
+    dropStaged();
+    // A refused publication is contention even if LOCK is gone a moment later: its holder can release in between, and
+    // re-checking existsSync here rethrew a raw ENOTEMPTY (exit 1, not BUSY_EXIT) (Opus r3 P2-1). The caller re-observes
+    // and tries again when the lock has vanished, as kb/refresh-run.mjs does.
+    if (CONTENDED.has(error?.code)) throw Object.assign(new Error('the update lock is held'), { code: 'EEXIST' });
     throw error;
   }
 }
