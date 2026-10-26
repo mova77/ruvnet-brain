@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { knowledge } from '../../plugin/scripts/developer-update.mjs';
+import { knowledge, validateDeveloperUpdateConfig } from '../../plugin/scripts/developer-update.mjs';
 import { compare, selectTag, discover, identity, upgradePackage, pluginScopes, scopeKey, runDeveloperUpdate, locateExecutable, resolvePluginTarget, pluginUpdateDecision, synchronizePlugins, marketplaceRemoteCommit, atomic, claudeProviderCommand } from '../../plugin/scripts/developer-update.mjs';
 import { acquireDeveloperLock, sharedLockStatus } from '../../plugin/scripts/developer-update-lock.mjs';
 import { automaticInvocation, automaticPath } from '../../plugin/scripts/automatic-update.mjs';
@@ -210,6 +210,18 @@ test('explicit local modification policy preserves installed Kit without claimin
   const before=fixture('@pacphi/agentic-kit');
   const receipt=upgradePackage(before,{latest:'2.0.0',next:'2.1.0-alpha.1'},[],{preservePackages:['@pacphi/agentic-kit'],run:()=>assert.fail()});
   assert.equal(receipt.reason,'preservedLocalModification');assert.equal(receipt.state,'local-modification-preserved');assert.equal(receipt.after.version,'1.0.0');
+});
+test('#319: the documented preservePackages example validates and a preserved package is reported, never installed, even on --check', () => {
+  const doc=fs.readFileSync(new URL('../../CONTRIBUTING.md',import.meta.url),'utf8');
+  const example=/```json\n(\{[^\n]*"preservePackages"[^\n]*\})\n```/.exec(doc);
+  assert.ok(example,'CONTRIBUTING.md documents a preservePackages example');
+  for(const term of ['ruvnet-brain-update --check','--update-source installed','local-modification-preserved']) assert.ok(doc.includes(term),term);
+  const config=validateDeveloperUpdateConfig(JSON.parse(example[1]));
+  assert.deepEqual(config.preservePackages,['ruflo','ruvnet-brain']);
+  for(const dryRun of [true,false]){
+    const receipt=upgradePackage(fixture('ruflo'),{latest:'2.0.0'},[],{preservePackages:config.preservePackages,dryRun,run:()=>assert.fail('preserved package must not be installed')});
+    assert.equal(receipt.state,'local-modification-preserved');assert.equal(receipt.target.version,'2.0.0');assert.equal(receipt.after.version,'1.0.0');
+  }
 });
 
 test('registered coordinator bridges automatic hooks to the same bytes; corrupted source never falls back to npx', () => {

@@ -22,8 +22,8 @@ export const RELEASE_REQUIREMENTS = Object.freeze({
     },
     {
       "id": "honest-currency-lesson-and-metrics-evidence",
-      "reason": "Foreign KB roots remain isolated; panel currency derives from measured completion rather than checkout time; exact lesson readback binds this shell-free write; public metrics never fabricate performance or a competing product score",
-      "files": ["tests/unit/forge-currency-selected-root.test.mjs", "tests/unit/brain-score-producer.test.mjs", "tests/unit/brain-grade-groundtruth-timestamp.test.mjs", "tests/unit/record-lesson.test.mjs", "tests/unit/lesson-presentation-budget.test.mjs", "tests/unit/metrics-truth.test.mjs", "tests/unit/issue-watch-retry.test.mjs"]
+      "reason": "Foreign KB roots remain isolated; panel currency derives from measured completion rather than checkout time; exact lesson readback binds this shell-free write; public metrics never fabricate performance or a competing product score; SessionStart reports a host-sync-only failure after a passed knowledge update separately from knowledge currency",
+      "files": ["tests/unit/forge-currency-selected-root.test.mjs", "tests/unit/brain-score-producer.test.mjs", "tests/unit/brain-grade-groundtruth-timestamp.test.mjs", "tests/unit/record-lesson.test.mjs", "tests/unit/lesson-presentation-budget.test.mjs", "tests/unit/metrics-truth.test.mjs", "tests/unit/issue-watch-retry.test.mjs", "tests/unit/session-start-knowledge-currency.test.mjs"]
     },
     {
       "id": "owner-alerting-volume-and-trust",
@@ -68,11 +68,12 @@ export const RELEASE_REQUIREMENTS = Object.freeze({
     },
     {
       "id": "canonical-learning-capture",
-      "reason": "Fixed metadata capture, canonical scope, consent, exact readback and loud refusal retain privacy; learning is handed straight to ruflo memory store with no local queue",
+      "reason": "Fixed metadata capture, canonical scope, consent, exact readback and loud refusal retain privacy; learning is handed straight to ruflo memory store with no local queue; the SessionEnd checkpoint plans for Claude Code's real 1.5 s budget and detaches instead of being cancelled",
       "files": [
         "tests/unit/learn-capture-project-root.test.mjs",
         "tests/unit/learn-capture-redaction.test.mjs",
-        "tests/unit/learner-scope-agreement.test.mjs"
+        "tests/unit/learner-scope-agreement.test.mjs",
+        "tests/unit/claude-session-end-budget.test.mjs"
       ]
     },
     {
@@ -127,7 +128,7 @@ export const RELEASE_REQUIREMENTS = Object.freeze({
     },
     {
       "id": "safe-install-update",
-      "reason": "Installation and update preserve prior and private state and reject invalid dependencies; the Codex hook bridge a retained Brain generation shipped upgrades reversibly while edited, linked, shared or foreign-owned bridges stay preserved",
+      "reason": "Installation and update preserve prior and private state and reject invalid dependencies; the Codex hook bridge a retained Brain generation shipped upgrades reversibly while edited, linked, shared or foreign-owned bridges stay preserved; a failed host sync rolls the Console runtime back and records its reason",
       "files": [
         "tests/unit/automatic-hook-retirement.test.mjs",
         "tests/unit/codex-wrapper-upgrade-ownership.test.mjs",
@@ -136,7 +137,8 @@ export const RELEASE_REQUIREMENTS = Object.freeze({
         "tests/unit/forge-update-archive-digest.test.mjs",
         "tests/unit/kb-copy-proof-legacy-sidecars.test.mjs",
         "tests/unit/kb-copy-proof-unknown-content.test.mjs",
-        "tests/unit/user-model-hook-install.test.mjs"
+        "tests/unit/user-model-hook-install.test.mjs",
+        "tests/unit/console-runtime-transaction.test.mjs"
       ],
       "platformFiles": {
         "linux": ["tests/unit/codex-wrapper-upgrade-ownership-links.test.mjs"],
@@ -240,9 +242,10 @@ export const RELEASE_REQUIREMENTS = Object.freeze({
     },
     {
       "id": "lossless-lifecycle-retention",
-      "reason": "Evidence compaction preserves tokens, private state and atomic transaction recovery",
+      "reason": "Evidence compaction preserves tokens, private state and atomic transaction recovery; an abandoned atomic receipt temporary is reclaimed or preserved, never a permanent blocker",
       "files": [
         "tests/unit/lifecycle-evidence-retention.test.mjs",
+        "tests/unit/refresh-run.test.mjs",
         "tests/unit/update-storage-transaction.test.mjs"
       ]
     },
@@ -358,10 +361,11 @@ export const RELEASE_REQUIREMENTS = Object.freeze({
     },
     {
       "id": "installed-routing-and-hook-trust",
-      "reason": "Actual installer update converges managed routing while preserving private overrides; POSIX archive and native metadata subprocess probes bind authorized hook trust to verified released bytes and preserve concurrent or disabled owner state",
+      "reason": "Actual installer update converges managed routing while preserving private overrides; POSIX archive and native metadata subprocess probes bind authorized hook trust to verified released bytes and preserve concurrent or disabled owner state; a running shared Codex app-server is reloaded after a plugin or trust change without granting approval (#492)",
       "files": [
         "tests/unit/model-router-update-convergence.test.mjs",
-        "tests/unit/codex-hook-trust-reconcile.test.mjs"
+        "tests/unit/codex-hook-trust-reconcile.test.mjs",
+        "tests/unit/codex-shared-host-refresh.test.mjs"
       ]
     },
     {

@@ -1053,9 +1053,36 @@ function dirSize(dir) {
 // A backup-looking name and matching RVF paths are not evidence that its other
 // bytes are disposable. Legacy backups have no authenticated complete ownership
 // receipt: reclaim only a tree whose every entry survives identically in live.
-function assertRedundantBackup(backup, live) {
-  const compare = (prior, current) => {
+//
+// #335: `archives` are `--clean --archive` trees (<kb>.archive/<stamp>/<copy>/). A regular file whose exact
+// bytes sit at the same relative path in one of them is accounted for even when live lacks or changed it.
+function assertRedundantBackup(backup, live, archives = []) {
+  const quiet = (file) => { try { return fs.lstatSync(file); } catch { return null; } };
+  const archived = (relative, prior, size) => archives.some((root) => {
+    let dir = root;
+    for (const part of relative.split(path.sep).slice(0, -1)) {
+      dir = path.join(dir, part);
+      const st = quiet(dir);
+      if (!st || !st.isDirectory() || st.isSymbolicLink()) return false;
+    }
+    const st = quiet(path.join(root, relative));
+    return Boolean(st && st.isFile() && !st.isSymbolicLink() && st.size === size && sha256File(path.join(root, relative)) === sha256File(prior));
+  });
+  const compare = (prior, current, relative = '') => {
     const a = fs.lstatSync(prior);
+    if (archives.length && !a.isSymbolicLink() && (a.isFile() || a.isDirectory())) {
+      const b = quiet(current);
+      if (a.isDirectory()) {
+        for (const name of fs.readdirSync(prior)) {
+          if (/^(?:\._|\.DS_Store$)/.test(name)) continue;
+          compare(path.join(prior, name), path.join(current, name), path.join(relative, name));
+        }
+        return;
+      }
+      const same = b && b.isFile() && !b.isSymbolicLink() && a.size === b.size && sha256File(prior) === sha256File(current);
+      if (same || archived(relative, prior, a.size)) return;
+      throw new Error(`different bytes: ${prior}`);
+    }
     const b = fs.lstatSync(current);
     if (a.isSymbolicLink() || b.isSymbolicLink()) {
       // Compare links themselves, never dereference them. Store symlinks are
@@ -1068,7 +1095,7 @@ function assertRedundantBackup(backup, live) {
       // written by an exFAT/FAT round trip is not Brain data, so it is never what makes a copy unique.
       for (const name of fs.readdirSync(prior)) {
         if (/^(?:\._|\.DS_Store$)/.test(name)) continue;
-        compare(path.join(prior, name), path.join(current, name));
+        compare(path.join(prior, name), path.join(current, name), path.join(relative, name));
       }
     } else if (a.isFile() && b.isFile()) {
       if (a.size !== b.size || sha256File(prior) !== sha256File(current)) {
@@ -1183,6 +1210,11 @@ export function reclaimBackups({
   const safePreserved = new Map();
   const retentionPolicy = rollbackRetentionPolicy(kbDir, env);
   const liveInventory = storeInventory(kbDir);
+  // #335: trees written by the explicit `npx ruvnet-brain --clean --archive` (never automatically).
+  const realDir = (dir) => { try { const st = fs.lstatSync(dir); return st.isDirectory() && !st.isSymbolicLink(); } catch { return false; } };
+  const listDirs = (dir) => { try { return fs.readdirSync(dir).sort().map((n) => path.join(dir, n)).filter(realDir); } catch { return []; } };
+  const archiveDir = path.join(parent, `${base}.archive`);
+  const archives = realDir(archiveDir) ? listDirs(archiveDir).flatMap(listDirs) : [];
 
   // A store the live release's own COVERAGE.json marks ineligible is absent from live BY POLICY
   // (excluded-no-corpus, fork, archived…), not lost by an update; its presence in a backup must not
@@ -1234,6 +1266,19 @@ export function reclaimBackups({
         if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`not a real directory: ${dir}`);
       }
     } catch (error) { kept.push([b, `unsafe reclaim target: ${error.message}`]); continue; }
+    // #335: a copy whose every byte survives in live or in an archive tree is accounted for, whatever
+    // its store inventory says; anything still unproven falls through to the unchanged checks below.
+    let archivedCopy = false;
+    if (archives.length && liveInventory.complete) {
+      try { assertRedundantBackup(b, kbDir, archives); archivedCopy = true; } catch { /* not fully accounted for */ }
+    }
+    if (archivedCopy) {
+      const size = dirSize(b);
+      if (dryRun) { wouldRemove.push(b); freed += size; continue; }
+      try { fs.rmSync(b, { recursive: true, force: true }); removed.push(b); freed += size; }
+      catch (e) { kept.push([b, `could not remove: ${e.message}`]); }
+      continue;
+    }
     const backupInventory = storeInventory(b);
     if (!liveInventory.complete || !backupInventory.complete) {
       kept.push([b, `inventory is incomplete; refusing destructive reclaim (${backupInventory.reason || liveInventory.reason || 'unknown'})`]);
@@ -2005,7 +2050,9 @@ async function main() {
 // guard merely importing this file would start a live update — a network fetch, a directory swap, and
 // a process.exit() inside whatever imported it. (Found exactly that way: the reclaim test's import
 // began racing a real update against the test run.)
-const invokedDirectly = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+// Ships in the brain bundle, where only kb/ modules exist, so it cannot import
+// plugin/scripts/entrypoint.mjs; this is that helper's comparison, inline: real paths on both sides.
+const invokedDirectly = (() => { try { return Boolean(process.argv[1]) && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url)); } catch { return false; } })();
 if (invokedDirectly && STAGED_RELEASE_FILE) {
   (async () => {
     const input = JSON.parse(fs.readFileSync(STAGED_RELEASE_FILE, 'utf8'));

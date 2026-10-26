@@ -8,6 +8,11 @@ const TERMINAL_TRANSACTION = new Set(['NOOP', 'COMMITTED', 'ROLLED_BACK']);
 const SAFE_ID = /^[A-Za-z0-9._-]+$/;
 const PHASE_FILE = /^\d{3}-[A-Z_]+\.json$/;
 const QUARANTINE = /^\.prune-[A-Za-z0-9._-]+-[a-f0-9]{16}$/;
+// refresh-run.mjs atomicJson(): `<runId>.json.tmp-<pid>-<8 hex>`, written, fsynced, then renamed (#434).
+const ATOMIC_TEMP = /^([A-Za-z0-9._-]+)\.json\.tmp-(\d+)-([a-f0-9]{8})$/;
+// The write+rename takes milliseconds; a temp this old was abandoned by a crash or a failed write,
+// whatever its PID (PIDs are reused, so the age is the evidence, not process liveness).
+export const ABANDONED_TEMP_AGE_MS = 60 * 60 * 1000;
 
 export const LIFECYCLE_EVIDENCE_RETENTION_POLICY = Object.freeze({
   schemaVersion: 1,
@@ -49,13 +54,43 @@ function stamp(value, label) {
   return parsed;
 }
 
-function scanRefresh(root, unsafe) {
+/**
+ * An abandoned atomic-write temporary (#434) is classified, not treated as foreign evidence. It is
+ * reclaimable only when it is an exclusive regular file older than ABANDONED_TEMP_AGE_MS and either
+ * empty or shadowed by a valid canonical receipt of the same run; a young one is an in-flight write
+ * (left alone), and a non-empty orphan with no canonical receipt is preserved as unsafe.
+ */
+function classifyAtomicTemp(root, file, match, nowMs, unsafe, temporaries) {
+  const stat = fs.lstatSync(file);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw new Error('atomic-write temporary is not an exclusive regular file');
+  const identity = { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs };
+  const row = { path: file, runId: match[1], writerPid: Number(match[2]), bytes: stat.size, identity,
+    sha256: crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex') };
+  if (!(nowMs - stat.mtimeMs >= ABANDONED_TEMP_AGE_MS)) { temporaries.push({ ...row, disposition: 'in-flight' }); return; }
+  let canonical = false;
+  try {
+    const { value } = regularJson(path.join(root, `${match[1]}.json`));
+    canonical = value?.kind === 'ruvnet-brain-refresh-run' && value.runId === match[1];
+  } catch { /* no valid canonical receipt */ }
+  if (stat.size !== 0 && !canonical) {
+    unsafe.push({ path: file, reason: 'abandoned atomic-write temporary has content and no canonical receipt; preserved' });
+    return;
+  }
+  temporaries.push({ ...row, disposition: 'abandoned', canonicalReceipt: canonical });
+}
+
+function scanRefresh(root, unsafe, temporaries = [], nowMs = Date.now()) {
   if (!fs.existsSync(root)) return [];
   const rows = [];
   for (const name of fs.readdirSync(root).sort()) {
     const file = path.join(root, name);
     if (QUARANTINE.test(name)) {
       unsafe.push({ path: file, reason: 'recognized pruning quarantine remains' });
+      continue;
+    }
+    const temp = ATOMIC_TEMP.exec(name);
+    if (temp) {
+      try { classifyAtomicTemp(root, file, temp, nowMs, unsafe, temporaries); } catch (error) { unsafe.push({ path: file, reason: error.message }); }
       continue;
     }
     try {
@@ -137,7 +172,9 @@ function trustedEvidenceRoot(root, unsafe) {
 function snapshot(options) {
   const roots = rootsFor(options);
   const unsafe = [];
-  const refresh = trustedEvidenceRoot(roots.refresh, unsafe) ? scanRefresh(roots.refresh, unsafe) : [];
+  const temporaries = [];
+  const nowMs = Date.parse((options.now || (() => new Date().toISOString()))());
+  const refresh = trustedEvidenceRoot(roots.refresh, unsafe) ? scanRefresh(roots.refresh, unsafe, temporaries, nowMs) : [];
   const transactions = trustedEvidenceRoot(roots.transactions, unsafe) ? scanTransactions(roots.transactions, unsafe) : [];
   const preserveRefresh = new Set((options.preserveRefreshRunIds || []).map(String));
   const preserveTransactions = new Set((options.preserveTransactionPaths || []).map((entry) => physicalPath(entry)));
@@ -170,11 +207,11 @@ function snapshot(options) {
     if (preserveTransactions.has(physicalPath(row.path))) protectedTransactions.set(row.path, 'explicitly preserved transaction');
     if (retainedTransactionPaths.has(physicalPath(row.path))) protectedTransactions.set(row.path, 'referenced by retained refresh receipt');
   }
-  const bytes = [...refresh, ...transactions].reduce((sum, row) => sum + row.bytes, 0)
+  const bytes = [...refresh, ...transactions, ...temporaries].reduce((sum, row) => sum + row.bytes, 0)
     + unsafe.filter(({ reason }) => /quarantine remains/.test(reason)).reduce((sum, { path: entry }) => {
       try { return sum + treeBytes(entry); } catch { return sum; }
     }, 0);
-  return { roots, unsafe, refresh, transactions, bytes, protectedRefresh, protectedTransactions };
+  return { roots, unsafe, refresh, transactions, temporaries, bytes, protectedRefresh, protectedTransactions };
 }
 
 function counts(state) {
@@ -202,6 +239,8 @@ export function assessLifecycleEvidence(options = {}) {
         && !state.protectedTransactions.has(row.path)).sort((a, b) => a.timestamp - b.timestamp)
         .map(({ path: entryPath }) => entryPath),
     },
+    abandonedTemporaries: state.temporaries.filter((row) => row.disposition === 'abandoned')
+      .map(({ path: entryPath, runId, writerPid, bytes, sha256, canonicalReceipt }) => ({ path: entryPath, runId, writerPid, bytes, sha256, canonicalReceipt })),
     removed: { refresh: [], transactions: [] }, after: counts(state), unsafe: state.unsafe,
     withinBudget: isWithin(state, policy) };
 }
@@ -265,6 +304,17 @@ export function pruneLifecycleEvidence(options = {}) {
   // the exact entry it just quarantined. Recovery must not guess away private data.
   const initial = assessLifecycleEvidence({ ...options, policy });
   const removed = { refresh: [], transactions: [] };
+  // #434: reclaim abandoned atomic-write temporaries first (reported with size and sha256, never
+  // silent). The file identity is rechecked immediately before it is quarantined.
+  const reclaimedTemporaries = [];
+  for (const row of snapshot(options).temporaries.filter((entry) => entry.disposition === 'abandoned')) {
+    const current = fs.lstatSync(row.path);
+    if (!current.isFile() || current.isSymbolicLink() || current.nlink !== 1 || current.dev !== row.identity.dev
+      || current.ino !== row.identity.ino || current.size !== row.identity.size || current.mtimeMs !== row.identity.mtimeMs) continue;
+    quarantineAndRemove(row.path, path.dirname(row.path), removeEntry, options.afterQuarantine);
+    reclaimedTemporaries.push({ path: row.path, runId: row.runId, writerPid: row.writerPid, bytes: row.bytes,
+      sha256: row.sha256, canonicalReceipt: row.canonicalReceipt });
+  }
   const compacted = [];
   const compactState = snapshot(options);
   if (!compactState.unsafe.length && compactState.bytes > policy.maxEvidenceBytes) {
@@ -289,6 +339,6 @@ export function pruneLifecycleEvidence(options = {}) {
     removed[candidate.kind === 'refresh' ? 'refresh' : 'transactions'].push(candidate.path);
   }
   const final = assessLifecycleEvidence({ ...options, policy });
-  return { ...final, before: initial.before, removed, compacted,
+  return { ...final, before: initial.before, removed, reclaimedTemporaries, compacted,
     after: final.after, withinBudget: final.withinBudget };
 }

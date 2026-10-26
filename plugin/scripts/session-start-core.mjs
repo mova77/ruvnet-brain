@@ -43,6 +43,7 @@ import { sessionStartDeadlineAt, STAGE_BUDGETS_MS } from './session-start-budget
 import { loadSettings } from './user-settings.mjs';
 import { sessionStartProofRecorder } from './session-start-proof.mjs';
 import { ALIAS_NOTICE, probeCodexConsoleAlias, readSessionSource } from './codex-console-alias.mjs';
+import { isDirectInvocation } from './entrypoint.mjs';
 
 // Re-exported for callers/tests that import the entitlement check directly from this file's own
 // long-standing public surface (tests/unit/session-start-core-parity.test.mjs).
@@ -452,21 +453,7 @@ export async function runSessionStart({
   return { ok: true, outputBytes: Buffer.byteLength(output, 'utf8'), platform };
 }
 
-// Entry-point guard. Compares REALPATHS on both sides: path.resolve() normalizes a path but does
-// NOT follow symlinks, while import.meta.url IS symlink-resolved by Node. Through a symlink (npm bin
-// shims, wrapper scripts, and every os.tmpdir() path on macOS) the two sides disagree, so main()
-// never runs -- and because nothing throws, the process exits 0. A silent exit 0 is indistinguishable
-// from "ran, found nothing". Reproduced live 2026-07-27; pinned by tests/unit/entrypoint-symlink.test.mjs.
-function isDirectInvocation() {
-  try {
-    if (!process.argv[1]) return false;
-    return fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));
-  } catch {
-    return false;
-  }
-}
-
-const direct = isDirectInvocation();
+const direct = isDirectInvocation(import.meta.url);
 if (direct) {
   const sessionSource = await readSessionSource();
   runSessionStart({ sessionSource, startedAt: performance.timeOrigin }).catch((error) => {

@@ -89,6 +89,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readStdinBounded, isHarnessGenerated } from './hook-input.mjs';
 import { resolveBash } from './hook-shim-bash.mjs';
+import { ADVISORY_CONTRACT } from './advisory-contract.mjs';
 
 // WHERE THIS FILE'S SIBLINGS LIVE. Resolved from THIS file's own location so it is correct under the
 // Stable Spine (an immutable versions/<gen> tree) and in a dev checkout alike — hook-shim.mjs has
@@ -471,9 +472,13 @@ const hookEventName = EVENT ? EVENT.split('-')[0] : 'UserPromptSubmit';
 
 // SYNCHRONOUS write — the truncation fix on the byte-owner itself (see the block path above).
 if (!advisories.length) silent();
-const additionalContext = advisories.map((a) => a.copy).join('\n\n');
+// #489: optional recommendations carry the advisory contract into the model-visible context, once,
+// so a suggestion is never promoted into a question/approval dialog. Alarms and lessons are not offers.
+const delivered = advisories.some((a) => a.channel === 'advocacy')
+  ? [...advisories, { copy: ADVISORY_CONTRACT, channel: 'advisory-contract' }] : advisories;
+const additionalContext = delivered.map((a) => a.copy).join('\n\n');
 try { fs.writeSync(1, process.env.RUVNET_HOOK_CONTEXT_BUDGET === '1'
-  ? emitOwnedContext(contextFrame('unprompted-speech', hookEventName, advisories.map((a) => contextBlock(a.copy, { id: a.channel, critical: a.channel === 'alarm' }))))
+  ? emitOwnedContext(contextFrame('unprompted-speech', hookEventName, delivered.map((a) => contextBlock(a.copy, { id: a.channel, critical: a.channel === 'alarm' }))))
   : JSON.stringify({ hookSpecificOutput: { hookEventName, additionalContext } })); }
 catch { /* if even the final write fails, silence is the fail-safe */ }
 process.exit(0);

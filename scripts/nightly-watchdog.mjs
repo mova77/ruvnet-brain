@@ -40,6 +40,7 @@ import { spawnSync, execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { NIGHTLY_LABEL, schedulerStatus, updateOwnedByAgenticKit } from '../plugin/scripts/nightly-scheduler.mjs';
 import { oldestIncompleteProgress } from '../kb/shard-progress.mjs';
+import { isDirectInvocation } from '../plugin/scripts/entrypoint.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const REGISTRY = process.env.WATCHDOG_REGISTRY || path.join(ROOT, 'config', 'scheduled-jobs.json');
@@ -302,4 +303,4 @@ async function main() {
   process.exit(bad.length || undelivered.size ? 1 : 0);
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) await main();
+if (isDirectInvocation(import.meta.url)) await main();

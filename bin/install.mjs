@@ -30,7 +30,7 @@ import { saveUpdateSource, stableNode } from '../plugin/scripts/automatic-update
 import { acquireDeveloperLock } from '../plugin/scripts/developer-update-lock.mjs';
 import { footprintRoots, inventoryFootprint, sweepFootprint } from '../plugin/scripts/brain-footprint.mjs';
 import { kbCopyProof } from '../plugin/scripts/kb-copy-proof.mjs';
-import { assessMoveLeftovers, isVolumeMetadata } from '../plugin/scripts/footprint-io.mjs';
+import { assessMoveLeftovers, isVolumeMetadata, rescueOperationalFiles } from '../plugin/scripts/footprint-io.mjs';
 import { confirm, doctorVerdict, formatBytes, formatConfirmation, signatureEvidenceFromReceipts, signatureRecordValid, writeSignatureRecord } from '../plugin/scripts/brain-confirmation.mjs';
 import {
   requiredEmbedderModels,
@@ -83,11 +83,13 @@ import {
   CONSOLE_RUNTIME_SURFACE, CONSOLE_RUNTIME_IDENTITY_FILE, consoleRuntimeDigest,
 } from '../scripts/console-runtime-identity.mjs';
 import { shellDiff as pluginShellDiff } from '../plugin/scripts/host-shell-boundary.mjs';
-import { codexTrustChanges, CODEX_TRUST_ACTION } from '../scripts/codex-hook-trust.mjs';
+import { codexPluginContentChanged, codexTrustChanges, codexUsesContentTrust, CODEX_TRUST_ACTION } from '../scripts/codex-hook-trust.mjs';
 import { probeFreshCodexDeclarations } from '../scripts/codex-fresh-host-proof.mjs';
+import { refreshSharedCodexAppServer } from '../scripts/codex-hook-trust-reconcile.mjs';
 import { repairSecurityGuidance } from '../scripts/security-guidance-codex-compat.mjs';
 import { installNativeLaunchers, installRoutingRuntime, runtimeSnapshot } from '../scripts/model-routing-launchers.mjs';
 import { installTerminalLaunchers } from '../scripts/model-terminal-launchers.mjs';
+import { addGrokAgentsLine, grokPaths, grokStatus, grokStatusLine, GROK_AGENTS_LINE } from '../scripts/grok-host.mjs';
 import { readConsoleReceipts, replaceStaleConsoles } from '../scripts/console-instances.mjs';
 import { moveBrain, MoveRefused } from '../scripts/move-brain.mjs';
 import { brainLocation } from '../plugin/scripts/brain-location.mjs';
@@ -96,6 +98,7 @@ import { runHostCli, waitForHostCli } from '../scripts/host-cli.mjs';
 import {
   writeInstalledRuntimeIdentity, recordCorpusTransportIdentity, isCorpusReleaseTag, rejectedReleasePath,
 } from '../kb/corpus-release-identity.mjs';
+import { isDirectInvocation } from '../plugin/scripts/entrypoint.mjs';
 
 // SEC-0010 #6 — the Ed25519 PUBLIC key is EMBEDDED here (not a separate file) so the installer's
 // trust root travels with the installer code itself: an attacker who swaps the downloaded bundle
@@ -166,6 +169,7 @@ const FLAG_MOVE_BRAIN = argv.includes('--move-brain');
 const MOVE_BRAIN_TO = (() => { const i = argv.indexOf('--move-brain'); const v = i === -1 ? null : argv[i + 1]; return v && !v.startsWith('-') ? v : null; })();
 const FLAG_CLEAN = argv.includes('--clean'); // enforce the footprint guarantee now (ADR-0098), then confirm
 const FLAG_JSON = argv.includes('--json'); // with --doctor / --clean: machine-readable confirmation only
+const FLAG_ARCHIVE = argv.includes('--archive'); // with --clean only (#335): archive files unique to old KB copies, then release them
 // ── onboarding-experience flags (all optional; every offer is safe to decline) ──
 const FLAG_YES = argv.includes('--yes') || argv.includes('-y'); // accept every optional offer non-interactively
 const FLAG_PLAN = argv.includes('--plan') || argv.includes('--dry-run'); // show the interactive checklist, then exit — install NOTHING
@@ -173,6 +177,7 @@ const FLAG_WITH_STACK = argv.includes('--with-stack'); // add missing Ruflo/RuVe
 const FLAG_NO_STACK = argv.includes('--no-stack'); // skip the toolkit offer entirely
 const FLAG_ENHANCE_CLAUDE_MD = argv.includes('--enhance-claude-md'); // add the CLAUDE.md section without prompting
 const FLAG_NO_ENHANCE = argv.includes('--no-enhance'); // skip the CLAUDE.md offer entirely
+const FLAG_GROK_AGENTS_MD = argv.includes('--grok-agents-md'); // opt in: add the search-first line to ~/.grok/AGENTS.md (#301)
 const FLAG_STATUSLINE = argv.includes('--statusline'); // opt in to the status-bar version segment, non-interactively
 const FLAG_NO_STATUSLINE = argv.includes('--no-statusline'); // decline the status-bar offer without prompting
 // --version <tag> forces a specific Release tag (e.g. --version v0.5.0-dev); --pin <tag> is the same.
@@ -804,6 +809,10 @@ export async function unzipInto(zipPath, cacheDir, sourceDir = null, { releaseTa
     const proof = kbCopyProof({ copyDir: preservedDir, liveDir: cacheDir });
     if (proof.disposable) {
       try {
+        // Its logs and ruflo scratch are copied out and verified first; a failed rescue keeps the copy. The
+        // rescue root is the sweep's (footprintRoots: links resolved, as after --move-brain), so the inventory
+        // finds and bounds kb-copy-rescued/ wherever the installer put it.
+        rescueOperationalFiles(preservedDir, proof.rescue, footprintRoots().brainHome);
         fs.rmSync(preservedDir, { recursive: true, force: true });
         ok(`released the prior generation (${proof.reason})`);
         priorGeneration = { status: 'RELEASED', path: preservedDir, reason: proof.reason };
@@ -1380,6 +1389,40 @@ export function claudePluginStatus({ home = os.homedir() } = {}) {
   }
 }
 
+// #420 item 4: Claude Code also records per-project installs (scope "local"/"project", keyed by projectPath), and --update
+// moves only the user row above, so a project row keeps running its old generation. `claude plugin update --scope local`
+// acts on the project in its cwd, i.e. on someone's repo: REPORTED with the exact command, never run for them. A row whose
+// projectPath is gone cannot be running anything; it is listed, never counted as behind and never given a `cd` that fails.
+export function claudeProjectInstalls({ home = os.homedir(), referenceVersion = null } = {}) {
+  let rows;
+  try { rows = JSON.parse(fs.readFileSync(path.join(home, '.claude', 'plugins', 'installed_plugins.json'), 'utf8'))?.plugins?.['ruvnet-brain@ruvnet-brain']; } catch { return []; }
+  if (!Array.isArray(rows)) return [];
+  return rows.filter((row) => (row?.scope === 'local' || row?.scope === 'project') && typeof row.projectPath === 'string' && row.projectPath).map((row) => {
+    let version = null;
+    try { version = JSON.parse(fs.readFileSync(path.join(row.installPath, '.claude-plugin', 'plugin.json'), 'utf8'))?.version || null; } catch { /* registry metadata below */ }
+    version ||= typeof row.version === 'string' ? row.version : null;
+    let exists = false;
+    try { exists = fs.statSync(row.projectPath).isDirectory(); } catch { /* gone */ }
+    return { scope: row.scope, projectPath: row.projectPath, version, exists,
+      behind: exists && Boolean(referenceVersion) && !versionSatisfies(version, referenceVersion),
+      command: exists ? `cd '${row.projectPath.replace(/'/g, `'\\''`)}' && claude plugin update ruvnet-brain@ruvnet-brain --scope ${row.scope}` : null };
+  });
+}
+
+/** The doctor's advisory line for claudeProjectInstalls(): '!' while any existing project lags, never a ✗ (it is the user's project). */
+export function projectInstallsCheck(projects, referenceVersion) {
+  if (!projects.length) return null;
+  const behind = projects.filter((p) => p.behind);
+  const gone = projects.filter((p) => !p.exists);
+  const named = (p) => `${p.projectPath} (${p.scope}, ${p.version || 'unknown'})`;
+  const detail = behind.length
+    ? `${behind.length} per-project Claude Code install(s) behind ${referenceVersion}: ${behind.map(named).join(', ')}`
+    : `${projects.length - gone.length} per-project Claude Code install(s) at ${referenceVersion} or newer`;
+  return { id: 'project-installs', label: 'Projects', state: behind.length ? 'warn' : 'ok',
+    detail: `${detail}${gone.length ? `; ${gone.length} registered for a folder that no longer exists: ${gone.map(named).join(', ')}` : ''}`,
+    fix: behind.length ? behind.map((p) => p.command).join(' ; ') : null };
+}
+
 // A plugin version can change without changing anything a running host freezes at boot. Compare
 // the actual installed payload with this candidate before updating it so body-only releases do not
 // manufacture a restart requirement. Unknown paths fail closed: if we cannot prove the boundary,
@@ -1432,7 +1475,7 @@ function codexInstalledPluginRoot({ codexHome = codexHomeDir(), status } = {}) {
 function wirePlugin({ expectedVersion = PACKAGE_VERSION, requireManaged = false } = {}) {
   step(
     'Wiring the Claude Code plugin',
-    'this registers search_ruvnet, native skills, and slash commands without automatic lifecycle hooks',
+    `this registers search_ruvnet, native skills, slash commands, and the allowlisted lifecycle hooks (${shippedHookHandlerCounts().claude ?? 'unknown number of'} handlers)`,
   );
   const marketplaceSource = process.env.RUVNET_CLAUDE_MARKETPLACE_SOURCE || 'stuinfla/ruvnet-brain';
   const manualMarketplace = `claude plugin marketplace add ${marketplaceSource}`;
@@ -1484,6 +1527,11 @@ function wirePlugin({ expectedVersion = PACKAGE_VERSION, requireManaged = false 
       info('  body-only update: the Stable Spine is live on the next hook/MCP call; no restart is required.');
     }
     info(`  commands available${shellBoundary.restartRequired ? ' in new sessions' : ' immediately'}: ${c.bold('/rnbc')} (also /rnb, /rvbc), ${c.bold('/ruvnet-brain:configure')}`);
+    // #420 item 4: the user row moved; per-project rows did not. Name each lagging one with its own command (never run here).
+    const projectsBehind = claudeProjectInstalls({ referenceVersion: installed.version }).filter((p) => p.behind);
+    for (const p of projectsBehind) {
+      warn(`per-project install still on ${p.version || 'an unknown version'} (${p.scope} scope, ${p.projectPath}); --update moves only the user install. To update it: ${c.bold(p.command)}`);
+    }
     return {
       host: true, wired: true, version: installed.version, manualMarketplace, manualInstall,
       shellChanged: shellBoundary.changed, shellChangedPaths: shellBoundary.paths,
@@ -1973,9 +2021,20 @@ const CODEX_MARKETPLACE_SOURCE = 'stuinfla/ruvnet-brain';
  * [{ key, status: 'modified'|'untrusted' }]. No installed root = a fresh install = every hook untrusted.
  * An unreadable file is treated as absent (fail toward telling the user to review, never toward silence).
  */
-export function codexHooksNeedingReview(installedRoot, candidateRoot) {
+export function codexHooksNeedingReview(installedRoot, candidateRoot, { contentTrust = false } = {}) {
   const read = (root) => { try { return root ? JSON.parse(fs.readFileSync(path.join(root, 'hooks', 'codex-hooks.json'), 'utf8')) : {}; } catch { return {}; } };
-  return codexTrustChanges(read(installedRoot), read(candidateRoot));
+  // Codex 0.164+ (or a version we could not read) also holds back every hook whose plugin bytes changed (#492).
+  const contentChanged = contentTrust !== false && codexPluginContentChanged(installedRoot, candidateRoot);
+  return codexTrustChanges(read(installedRoot), read(candidateRoot), undefined, { contentChanged });
+}
+
+/** codex --version → whether it approves plugin hooks by content too (true/false), or null when unknown. */
+export function codexHostContentTrust({ codexBin = process.env.CODEX_BIN || 'codex', codexHome = codexHomeDir(), run = runHostCli } = {}) {
+  try {
+    const r = run(codexBin, ['--version'], { stdio: 'pipe', shell: false, encoding: 'utf8', timeout: 10_000,
+      env: { ...process.env, CODEX_HOME: codexHome } });
+    return r?.status === 0 ? codexUsesContentTrust(r.stdout) : null;
+  } catch { return null; }
 }
 
 function codexMarketplaceTarget() {
@@ -2131,6 +2190,8 @@ export function wireCodexPlugin({
   announce = true,
   runJson = runCodexJson,
   aliasHome,
+  // true/false/null (unknown): does this Codex pin plugin contents in hook approval (0.164+)? Probed for a real host.
+  contentTrust,
 } = {}) {
   if (!fs.existsSync(codexDir)) return { host: false, action: 'no-host' };
   const options = { codexBin, codexHome, cwd, repair: true };
@@ -2169,11 +2230,6 @@ export function wireCodexPlugin({
       path.join(REPO_ROOT, 'plugin'),
     )
     : { known: true, changed: false, paths: [], restartRequired: false, reason: 'new host installation' };
-  // Which Brain hooks will Codex hold back after this update until the user re-reviews them? Codex keys
-  // trust to a hash of each hook's definition (scripts/codex-hook-trust.mjs), and codex-hooks.json is not
-  // a boot-surface path, so the shell boundary above cannot see it. Computed from the two files, offline.
-  const hooksNeedingReview = codexHooksNeedingReview(before.installed
-    ? codexInstalledPluginRoot({ codexHome, status: before }) : null, path.join(REPO_ROOT, 'plugin'));
   if (before.installed && before.enabled && versionSatisfies(before.version, expectedVersion)) {
     const hookTrust = runJson === runCodexJson ? repairReleasedCodexHookTrust(before, options) : null;
     if (announce) {
@@ -2187,6 +2243,13 @@ export function wireCodexPlugin({
     };
   }
 
+  // Which Brain hooks will Codex hold back after this update until the user re-reviews them? Codex keys
+  // trust to a hash of each hook's definition (scripts/codex-hook-trust.mjs), and codex-hooks.json is not
+  // a boot-surface path, so the shell boundary above cannot see it. Computed offline, before the install
+  // replaces the installed folder; on Codex 0.164+ a change to any plugin byte holds back every hook too (#492).
+  const hooksNeedingReview = codexHooksNeedingReview(before.installed
+    ? codexInstalledPluginRoot({ codexHome, status: before }) : null, path.join(REPO_ROOT, 'plugin'),
+    { contentTrust: contentTrust ?? (runJson === runCodexJson ? codexHostContentTrust({ codexBin, codexHome }) : false) });
   if (runJson === runCodexJson && !localMarketplace) {
     try { localMarketplace = prepareCodexMarketplace(); }
     catch (error) {
@@ -2236,7 +2299,9 @@ export function wireCodexPlugin({
     }
     if (hooksNeedingReview.length && !trustVerified) {
       warn(`Codex will NOT run ${hooksNeedingReview.length} Brain hook${hooksNeedingReview.length === 1 ? '' : 's'} until you review`
-        + ` ${hooksNeedingReview.length === 1 ? 'it' : 'them'} (${hooksNeedingReview.map((h) => `${h.key.split(':').slice(-3).join(':')} ${h.status}`).join(', ')}).`);
+        + ` ${hooksNeedingReview.length === 1 ? 'it' : 'them'} (${hooksNeedingReview.map((h) => `${h.key.split(':').slice(-3).join(':')} ${h.status}`).join(', ')}).`
+        + (hooksNeedingReview.some((h) => h.reason === 'plugin-content')
+          ? ' This update changed the plugin\'s files, and Codex 0.164+ approves those bytes as well as each hook\'s definition.' : ''));
       info(`  ${CODEX_TRUST_ACTION}`);
     }
   }
@@ -2258,6 +2323,18 @@ export function wireCodexPlugin({
       restartScope: 'unproven',
     } : {}),
   };
+}
+
+/**
+ * After the Brain changed Codex's view of its plugin (new bytes, or hook trust written from another process), tell an
+ * already-running shared Codex app-server to reload, so its open sessions stop reporting the previous hooks (#492).
+ * Never starts, stops or restarts a server, and never grants an approval (scripts/codex-hook-trust-reconcile.mjs).
+ */
+export async function refreshCodexSharedHost(codexPlugin, { codexHome = codexHomeDir(), refresh = refreshSharedCodexAppServer } = {}) {
+  const pluginChanged = ['installed', 'updated'].includes(codexPlugin?.action);
+  const trustChanged = codexPlugin?.hookTrust?.changed === true || codexPlugin?.hookTrust?.changed === 'unknown';
+  if (!pluginChanged && !trustChanged) return { state: 'not-needed', changed: false };
+  return refresh({ codexHome });
 }
 
 export function codexSessionSafety(status) {
@@ -2545,6 +2622,61 @@ export function retireManagedHookRegistrations({ home = os.homedir(), codexDir =
     changedFiles.push(file);
   }
   return { removed, changedFiles, conflicts };
+}
+
+/** Grok's state for --doctor and the install summary (#301): reported, never wired automatically. */
+function currentGrokStatus() {
+  return grokStatus({ pluginInstalled: Boolean(pluginCommandsDir()), hookCount: shippedHookHandlerCounts().grok });
+}
+function grokCheckLines(check) {
+  const status = currentGrokStatus();
+  const line = grokStatusLine(status);
+  if (!line) return [];
+  // Advisory only when the Brain cannot reach Grok at all; the AGENTS.md line is the user's choice.
+  return [check('grok', 'Grok', !status.pluginInstalled, line, 'npx ruvnet-brain', { advisory: true })];
+}
+
+/** Opt-in, never automatic: offer the search-first line when Grok is here and the line is not. */
+async function offerGrokAgentsMd() {
+  const status = currentGrokStatus();
+  if (!status.present || status.groundingLine || !status.pluginInstalled) return;
+  step('Optional — a search-first line for Grok', 'Grok drops prompt-time context, so this line is what makes it ground itself');
+  info(`Adds ${c.bold('one line')} (between ruvnet-brain markers) to the bottom of ${c.bold(status.agentsFile)}:`);
+  info(c.dim(`  ${GROK_AGENTS_LINE}`));
+  info('Backed up first; --uninstall removes it.');
+  const yes = FLAG_GROK_AGENTS_MD || (await ask('Add it?', false, { blanketYes: false }));
+  if (!yes) { info(`Skipped — add it any time with  ${c.bold('npx ruvnet-brain --grok-agents-md')}`); return; }
+  reportGrokAgentsLine(addGrokAgentsLine());
+}
+function reportGrokAgentsLine(result) {
+  if (result === 'added') ok(`added the search-first line to ${grokPaths().agents}`);
+  else if (result === 'present') ok('~/.grok/AGENTS.md already has a search_ruvnet line — left unchanged');
+  else if (result === 'no-grok') info('Grok CLI not detected (~/.grok/bin/grok) — nothing changed');
+  else warn('could not update ~/.grok/AGENTS.md — your file is untouched');
+}
+
+/**
+ * How many lifecycle handlers each SHIPPED host manifest registers, counted from the manifests
+ * themselves so help and progress text can never again claim "zero" while they carry handlers
+ * (#400). A missing or unreadable manifest is null ("unknown"), never 0.
+ */
+export function shippedHookHandlerCounts(root = REPO_ROOT) {
+  const count = (relative) => {
+    try {
+      const doc = JSON.parse(fs.readFileSync(path.join(root, relative), 'utf8'));
+      return Object.values(doc?.hooks || {}).flat().reduce((n, group) => n + (Array.isArray(group?.hooks) ? group.hooks.length : 0), 0);
+    } catch { return null; }
+  };
+  return {
+    claude: count('plugin/hooks/hooks.json'),
+    codex: count('plugin/hooks/codex-hooks.json'),
+    grok: count('plugin/hooks/grok-hooks.json'),
+  };
+}
+
+function hookCountPhrase({ claude, codex } = shippedHookHandlerCounts()) {
+  const n = (v) => (Number.isInteger(v) ? String(v) : 'an unknown number of');
+  return `${n(claude)} Claude Code, ${n(codex)} Codex handlers`;
 }
 
 export function automaticHookRetirementStatus(root = REPO_ROOT, { scope = 'source' } = {}) {
@@ -3397,8 +3529,9 @@ async function doctorRun({ json }) {
   const turnLine = { id: 'turn-recording', label: 'Turn recording', state: turnStatus.state, detail: turnStatus.line, fix: null };
 
   // ── THE MECHANICAL VERDICT ────────────────────────────────────────────────────────────────────
-  // `--hooks` is retained as a compatibility alias for a read-only zero-registration proof. It must
-  // never execute dormant hook bodies.
+  // `--hooks` is a read-only proof that every registration in the shipped manifests is on the
+  // continuity allowlist (#400: it is not, and never was, a zero-registration proof). It must never
+  // execute hook bodies.
   let hookResult = null;
   if (FLAG_HOOKS) {
     const retirement = automaticHookRetirementStatus(REPO_ROOT, { scope: 'installed' });
@@ -3460,6 +3593,9 @@ async function doctorRun({ json }) {
   const nightlyFailed = nightlyHealth.state === 'degraded'
     || (nightlyHealth.state === 'on' && !['ok', 'running'].includes(nightlyHealth.runHealth?.state));
   const codexFailed = codexWiringFailed || codexReadinessFailed || (codexLifecycleFailed && !codexTrustBypassed);
+  // #420 item 4: per-project Claude installs lag silently behind the user one; advisory, with each project's own command.
+  const projectReference = claudePluginStatus().version || PACKAGE_VERSION;
+  const projectLine = projectInstallsCheck(claudeProjectInstalls({ referenceVersion: projectReference }), projectReference);
   const checks = [
     // With --hooks the install reading was never part of the verdict (release install verification); keep that.
     check('install', 'Install', !allGreen, `${v.repos} store(s), reader ${v.reader ? 'present' : 'MISSING'}, search server ${v.mcp ? 'present' : 'MISSING'}`,
@@ -3477,7 +3613,9 @@ async function doctorRun({ json }) {
       nightlyCode.state === 'current' ? 'registered update modules match the installed set' : `${nightlyCode.state}: registered ${String(nightlyCode.registered || '?').slice(0, 12)}, installed ${String(nightlyCode.current || '?').slice(0, 12)}`,
       nightlyCode.fix || 'npx ruvnet-brain@latest --update', { advisory: true })] : []),
     check('host-convergence', 'Hosts sync', !hostConvergence.healthy, hostConvergence.state, 'npx ruvnet-brain --update'),
+    ...grokCheckLines(check),
     ...(rufloOperational ? [rufloCheckLine(rufloOperational)] : []),
+    ...(projectLine ? [projectLine] : []),
     ...(agentdbLine ? [agentdbLine] : []),
     turnLine,
   ];
@@ -4318,7 +4456,7 @@ async function runUpdate() {
   });
   if (outcome.verdict === 'refused-retained-copies') {
     warn('nothing was changed: full copies of earlier brain generations already sit beside this one (listed above).');
-    info('Check that you no longer need them, remove them, then re-run  npx ruvnet-brain --update');
+    info('Run  npx ruvnet-brain --clean --archive  (keeps only the files they alone hold, in kb.archive/), then re-run  npx ruvnet-brain --update');
   }
   if (outcome.fallback && FLAG_HOST_SYNC_ONLY) {
     // Host synchronization has a narrower contract than a full update: it must converge the
@@ -4748,10 +4886,10 @@ function footprintEvidence() {
 
 /** Enforce the footprint now: remove what must not exist (proof-gated), rotate over-cap logs, collect
  * lease-free plugin generations. Narrates every removal and every refusal; never throws. */
-export function enforceFootprint({ holdingRefreshLock = false, pruneEvidence = false, quiet = false } = {}) {
+export function enforceFootprint({ holdingRefreshLock = false, pruneEvidence = false, quiet = false, archive = false } = {}) {
   let result;
   try {
-    result = sweepFootprint({ apply: true, holdingRefreshLock, now: footprintNow(), evidence: footprintEvidence(),
+    result = sweepFootprint({ apply: true, archive, holdingRefreshLock, now: footprintNow(), evidence: footprintEvidence(),
       collectPluginGenerations: ({ registryPath, apply }) => prunePluginGenerations({ registryPath, apply }),
       pruneEvidence: pruneEvidence ? (args) => pruneLifecycleEvidence(args) : null });
   } catch (error) {
@@ -4829,6 +4967,12 @@ export function machineFootprint() {
   try {
     if (fs.existsSync(cmdPath) && fs.readFileSync(cmdPath, 'utf8').includes(CLAUDE_MD_START)) {
       items.push({ label: 'CLAUDE.md block (6 lines, between markers)', path: cmdPath, undo: 'npx ruvnet-brain --uninstall' });
+    }
+  } catch { /* unreadable */ }
+  try {
+    const grokAgents = grokPaths().agents;
+    if (fs.existsSync(grokAgents) && fs.readFileSync(grokAgents, 'utf8').includes(CLAUDE_MD_START)) {
+      items.push({ label: 'Grok AGENTS.md search-first line (between markers)', path: grokAgents, undo: 'npx ruvnet-brain --uninstall' });
     }
   } catch { /* unreadable */ }
   add('Usage-counts preference', telemetryConsentPath(), 'delete this file');
@@ -4935,8 +5079,7 @@ function showWhatsNew() {
  * Backed up and written atomically, same as when it was added — taking something away is at least
  * as sensitive as putting it there.
  */
-function removeClaudeMdBlock() {
-  const p = path.join(os.homedir(), '.claude', 'CLAUDE.md');
+function removeClaudeMdBlock(p = path.join(os.homedir(), '.claude', 'CLAUDE.md')) {
   let src = '';
   try { src = fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : ''; } catch { return 'unreadable'; }
   // PAIR THE MARKERS PROPERLY. The first version took the FIRST start and the FIRST end, unpaired.
@@ -5015,6 +5158,7 @@ function uninstallAll() {
 
   const claudeMd = removeClaudeMdBlock();
   if (claudeMd === 'removed') ok('removed our block from ~/.claude/CLAUDE.md (your content untouched, backup saved)');
+  if (removeClaudeMdBlock(grokPaths().agents) === 'removed') ok('removed our line from ~/.grok/AGENTS.md (your content untouched, backup saved)');
 
   // GAP FIX: this used to be permanently "manual" — machineFootprint() treated ANY settings.json edit
   // as something only the user could safely touch. That blanket rule was right for edits we cannot
@@ -6262,6 +6406,8 @@ function success({ cacheDir, isCustom, plugin, codexHost, codexPlugin, env, nigh
       `    • the Codex host ${hostReady && pluginReady ? c.green('wired at user scope') : c.yellow('needs attention')} — search_ruvnet + native Brain skills`,
     );
   }
+  const grokLine = grokStatusLine(currentGrokStatus());
+  if (grokLine) console.log(`    • ${grokLine}`);
   if (env) {
     const t = (okv) => (okv ? c.green('✓ present') : c.yellow('not added (optional)'));
     console.log(`    • rUv build toolkit — Ruflo: ${t(env.ruflo)} · RuVector: ${t(env.ruvector)}  ${c.dim('answers work without them')}`);
@@ -6276,8 +6422,8 @@ function success({ cacheDir, isCustom, plugin, codexHost, codexPlugin, env, nigh
   console.log(`\n  ${c.bold('Where it runs:')} ${c.bold(`everywhere you use ${hostLabel}`)} — CLI and supported editor/desktop surfaces.`);
   console.log(`    It's ${c.bold('user-level (global)')}: open ANY repo or folder and it's already there. Nothing per project,`);
   console.log(`    nothing to copy in, nothing to git-ignore. ${c.dim('(Runs locally — it is not active in the claude.ai web app.)')}`);
-  console.log(`\n  ${c.bold('How it runs:')} ${c.bold('explicitly')} — use search_ruvnet, a Brain skill, or a proof command when you want`);
-  console.log(`    source-grounded RuvNet context. Brain code does not run on host lifecycle events.`);
+  console.log(`\n  ${c.bold('How it runs:')} search_ruvnet, Brain skills and proof commands when you ask, plus the allowlisted`);
+  console.log(`    lifecycle hooks (${hookCountPhrase()}): grounding reminders, a write gate, and continuity snapshots.`);
   console.log(`\n  ${c.bold('Keep it fresh:')} re-run ${c.bold('npx ruvnet-brain')} any time — the brain itself always pulls the latest`);
   console.log(`  Release regardless (that part isn't cached). For the bleeding-edge installer too, use ${c.bold('npx github:stuinfla/ruvnet-brain')}.`);
 
@@ -6294,12 +6440,12 @@ function success({ cacheDir, isCustom, plugin, codexHost, codexPlugin, env, nigh
   console.log(`\n  ${c.bold('How you\'ll know it\'s working:')}`);
   console.log(`    ${c.green('✓')} ${c.bold('search_ruvnet')} returns cited source paths when invoked.`);
   console.log(`    ${c.green('✓')} Brain skills and slash commands remain available.`);
-  console.log(`    ${c.green('✓')} ${c.bold('No Brain hook message or tool-call refusal appears by itself.')}`);
+  console.log(`    ${c.green('✓')} Writing rUv-product code the Brain has not looked up is refused until search_ruvnet grounds it.`);
 
   // ── honest expectations ──
   console.log(`\n  ${c.bold('What to expect (honestly):')}`);
-  console.log(`    • Grounding is available on demand; it is no longer injected into every turn.`);
-  console.log(`    • Host work proceeds normally unless you explicitly invoke a Brain command or skill.`);
+  console.log(`    • Grounding reminders are added only to prompts that touch the rUv stack.`);
+  console.log(`    • Other work proceeds normally; the write gate is the only hook that refuses by default.`);
   console.log(`    • Not sure it's on?  Run  ${c.bold('npx ruvnet-brain --doctor')}  any time for a health check.
     • Want to see it answer, live, right now?  ${c.bold('npx ruvnet-brain --demo')}  — 2 real questions, real cited answers.`);
 
@@ -6325,7 +6471,7 @@ function success({ cacheDir, isCustom, plugin, codexHost, codexPlugin, env, nigh
   console.log(`\n  ${c.bold('If it earns it:')} a GitHub star helps other people find the brain —`);
   console.log(`    ${c.bold('https://github.com/stuinfla/ruvnet-brain')}   ${c.dim('· feedback in one command: npx ruvnet-brain --feedback')}`);
 
-  console.log(`\n  ${c.dim('The plugin is disable-able and installs no automatic lifecycle handlers.')}`);
+  console.log(`\n  ${c.dim(`The plugin is disable-able. It registers lifecycle hooks (${hookCountPhrase()}), only the allowlisted set in continuity-hook-policy.mjs; Codex runs its set once trusted in /hooks.`)}`);
   console.log('');
 }
 
@@ -6345,11 +6491,15 @@ Usage:
                               footprint within budget, no cruft. --doctor --json prints only that, as JSON.
   npx ruvnet-brain --clean    Remove everything that must not exist (old KB copies — never one holding
                               private files the live brain lacks — old installers, over-cap logs), then confirm.
+  npx ruvnet-brain --clean --archive
+                              Same, and for a kept copy: copy only the files it alone holds into
+                              kb.archive/<stamp>/ (verified byte-for-byte), then release that copy.
                               EXITS NON-ZERO when the install is genuinely broken, so it can gate a
                               script:  npx ruvnet-brain --doctor && ./deploy.sh
   npx ruvnet-brain --doctor --hooks
-                              Backward-compatible, read-only proof that both shipped Brain hook
-                              manifests contain zero automatic registrations. Executes no hook body.
+                              Read-only proof that the shipped hook manifests register only the
+                              allowlisted continuity handlers (${hookCountPhrase()}).
+                              Executes no hook body.
   npx ruvnet-brain --demo     Guided walkthrough — 2 real questions, real cited answers
   npx ruvnet-brain --feedback Tell us how it went — prefills a GitHub Discussion with your brain
                               version, platform, and a 3-line health summary (you see exactly
@@ -6366,6 +6516,8 @@ Usage:
                               block only — your own CLAUDE.md content is preserved and backed up)
   npx ruvnet-brain --enable-spend-guard   Install the hourly runaway-agent spend alarm (alert-only)
   npx ruvnet-brain --disable-spend-guard  Remove it (safe to run any time)
+  npx ruvnet-brain --grok-agents-md       Grok CLI only, opt-in: add one search-first line to ~/.grok/AGENTS.md
+                              (only if no search_ruvnet line is there; backed up; --uninstall removes it)
   npx ruvnet-brain --enhance-claude-md    Add the 6-line RuvNet-Brain block to ~/.claude/CLAUDE.md
                               (appended at the bottom between markers; your file is backed up first)
                               (a default install RECOMMENDS nightly and asks, defaulting to yes)
@@ -6412,11 +6564,7 @@ the installer reports that boot-level declarations changed.
   // in a unit test ran a real install against the maintainer's HOME. Direct argv identity is the
   // authority boundary. The old IMPORT_ONLY flag may still be present in a long-lived test worker;
   // it must never suppress a genuinely direct CLI execution.
-  const canonical = (value) => {
-    try { return fs.realpathSync(value); } catch { return path.resolve(value); }
-  };
-  const invokedDirectly = Boolean(process.argv[1])
-    && canonical(process.argv[1]) === canonical(fileURLToPath(import.meta.url));
+  const invokedDirectly = isDirectInvocation(import.meta.url);
   if (!invokedDirectly) return;
   if (FLAG_HELP) return showHelp();
   if (NAMED_RELEASE?.error) {
@@ -6461,7 +6609,7 @@ the installer reports that boot-level declarations changed.
   // remains and nothing that must not exist is left (a private-unique copy kept for safety is a 1).
   if (FLAG_CLEAN) {
     if (!FLAG_JSON) printBanner('clean');
-    const swept = enforceFootprint({ pruneEvidence: true, quiet: FLAG_JSON });
+    const swept = enforceFootprint({ pruneEvidence: true, quiet: FLAG_JSON, archive: FLAG_ARCHIVE });
     const result = await printConfirmation({ footprint: swept?.after || null, json: FLAG_JSON });
     process.exitCode = swept && result.footprint.kbCopies === 1 && result.footprint.cruft.length === 0 ? 0 : 1;
     return;
@@ -6489,6 +6637,7 @@ the installer reports that boot-level declarations changed.
   if (FLAG_ENABLE_SPEND_GUARD) { enableSpendGuard(); return; }
   if (FLAG_DISABLE_SPEND_GUARD) { disableSpendGuard(); return; }
   if (FLAG_UNINSTALL) { uninstallAll(); return; }
+  if (FLAG_GROK_AGENTS_MD) { reportGrokAgentsLine(addGrokAgentsLine()); return; }
   if (FLAG_WHAT_CHANGED) { printBanner('what RuvNet Brain put on this machine'); printFootprint(); return; }
   if (FLAG_WHATS_NEW) { showWhatsNew(); return; }
 
@@ -6686,6 +6835,9 @@ the installer reports that boot-level declarations changed.
     codexHost = wireCodexHost();
     if (codexHost.host) {
       codexPlugin = wireCodexPlugin();
+      const hostRefresh = await refreshCodexSharedHost(codexPlugin);
+      if (hostRefresh.state === 'refreshed') info('  Running Codex app-server reloaded: its open sessions now see the installed Brain plugin (no approval granted, nothing restarted).');
+      else if (hostRefresh.state === 'failed') warn(`Running Codex app-server not reloaded (${hostRefresh.reason}); its open sessions may report the previous Brain hooks until Codex restarts.`);
       if (codexPlugin.available) printCodexLifecycle(await codexLifecycleStatus());
     }
   } catch (e) {
@@ -6711,6 +6863,7 @@ the installer reports that boot-level declarations changed.
   const env = detectEnvironment();
   try { await offerStack(env); } catch (e) { warn(`(toolkit check skipped: ${e && e.message})`); }
   try { await offerClaudeMd(); } catch { /* non-fatal — never let an offer break the install */ }
+  try { await offerGrokAgentsMd(); } catch { /* non-fatal — never let an offer break the install */ }
   // Stuart's requirement: a default install must end by clearly recommending nightly auto-updates
   // and asking, DEFAULTING TO YES (TTY + macOS + not already on). Non-fatal like every other offer.
   let nightly = 'skipped';
