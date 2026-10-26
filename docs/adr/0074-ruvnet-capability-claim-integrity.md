@@ -3,7 +3,7 @@ id: ADR-074
 title: RuvNet capability claims require live evidence
 status: Accepted
 date: 2026-08-22
-updated: 2026-10-25
+updated: 2026-10-26
 updated_source: derived-from-git
 reviewed_digest: 38329ebc9caa
 version: 1.1.2
@@ -69,7 +69,7 @@ One evidence source cannot prove every kind of claim:
 | Installed, registered, or present | Complete `CapabilityInventoryReceipt` over the active host's discoverable RuvNet skill/plugin surfaces | Present bytes contradict absence; complete absence contradicts presence; incomplete enumeration is `UNKNOWN` |
 | Behavior, API, support, or limitation | Fresh source-grounding receipt whose exact source path and content identity bind the claim | No binding or design-only evidence is `UNKNOWN`; absence of retrieval never proves absence of capability |
 | Current version, latest, healthy, or reachable | Fresh live command/registry/round-trip receipt for the exact installed/public surface | A stale document, version string alone, or adjacent path is `UNKNOWN` |
-| Completion ("fixed", "done", "shipped", "live", "it will now…") | This turn's host transcript shows a verification command executed after the last state-changing action with a present, non-error result; the answer names that check and discloses what is NOT verified | No post-change check, no named check, or no disclosure is `FAIL` (one correction); an unparsed host transcript (Codex) is `UNKNOWN` for that half |
+| Completion ("fixed", "done", "shipped", "live", "it will now…") | This turn's host transcript shows a verification command executed after the last state-changing action with a present, non-error result; the answer names that check and discloses what is NOT verified | No post-change check, no named check, or no disclosure is `FAIL` (one correction); a Codex rollout is read through `nativeTurnLines` (4.7.21, #423) under a stricter rule (explicit exit 0, completed non-error MCP call); a rollout with no current-turn boundary is `UNKNOWN` for that half |
 
 The current implementation covers the first row, exact-source behavior claims, installed-current
 version, managed-CLI health observations, and a dedicated public-registry latest-version probe.

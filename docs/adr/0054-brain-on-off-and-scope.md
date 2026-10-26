@@ -176,7 +176,7 @@ The console changes the files first and saves the preference second; if the mirr
 reports the half-failure and the on-disk RVFs remain authoritative. Complete restore copies from the
 full release bundle. Fresh installs and `forge-update.mjs` reapply the durable selection after
 verified extraction. The rollback reclaimer may ignore stores intentionally removed by the selected
-public profile, but it still keeps any backup containing an unknown private/local RVF.
+public profile, but it still keeps any backup containing an unknown private/local RVF, except after an explicit `--clean --archive`: then a backup whose every regular-file byte survives in live or in `kb.archive/` is released, and the private bytes remain in `kb.archive/` (4.7.21, #335).
 
 ## Risks register — superseded by the duel record
 

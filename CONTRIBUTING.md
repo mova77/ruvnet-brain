@@ -1,4 +1,4 @@
-Updated: 2026-10-25 22:37:14 EDT | Version 1.5.1
+Updated: 2026-10-26 03:30:00 EDT | Version 1.5.2
 Created: 2026-07-07 09:22:01 EDT
 
 # Contributing to RuvNet Brain — the one rulebook
@@ -42,6 +42,8 @@ npm run version:set -- X.Y.Z && npm run convergence:write      # commit these fi
 npm run release:qualify -- --suite source --report /tmp/source-qualification-UNIQUE.json
 npm run release:qualify -- --suite integration --report /tmp/integration-qualification-UNIQUE.json
 npm test && npm run single-source:check                    # distinct grounding and rule checks
+# before the FIRST push, run what preflight runs first (the ADR-0103 review row is the usual first-push red):
+node --check scripts/release.mjs && npm run version:check && npm run release:authority && node scripts/architecture-review-lock.mjs
 git push origin release/X.Y.Z                                # triggers release-candidate-preflight
 ```
 
@@ -542,6 +544,8 @@ missing prerequisites or skipped cases fail qualification. Use new receipt paths
 The historical whole suite (`npx vitest run` / `scripts/full-suite-gate.mjs`) remains an explicit
 developer diagnostic, not a second release gate. Public, signed-artifact, native-host and OS
 verification remain required independently; a local subset never means shipped.
+
+The 500-line source ceiling is enforced by `tests/unit/lesson-gate.test.mjs` for `lesson-gate`, `lesson-command-scope`, `lesson-presentation`, `lesson-store`, `lesson-bridge`, `decision-gate` and `decision-outcomes` (lines are counted with `split('\n')`). Shrink such a file by moving cohesive code out; never by trimming blank lines.
 
 ## The fail-closed private fence
 
