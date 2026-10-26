@@ -53,6 +53,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: send
+        id: send
         # SECURITY: issue/PR titles and user logins are ATTACKER-CONTROLLED on a public repo, and
         # this fires on pull_request_target. They must reach the shell only via env (quoted "$VAR"
         # expansion, never ${{ }} interpolation inside run:) or a crafted title executes here.
@@ -79,7 +80,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         # The whole block is exercised by tests/unit/ntfy-alerts-filter.test.mjs with stubbed curl and gh.
         run: |
-          [ -z "$TOPIC" ] && exit 0
+          # No topic: nothing is sent, and the "page delivered" step below is skipped, so this run can never be read as
+          # proof that a red was paged (4.7.21 review round 3).
+          if [ -z "$TOPIC" ]; then echo "::warning::NTFY_TOPIC is not set; nothing was paged"; exit 0; fi
           # PAGE ONLY WHAT NEEDS THE OWNER (2026-10-25: 10,747 notifications on this topic). Not paged:
           #  - issues/PRs opened by the owner's own account or a bot (Dream Cycle, release PRs, dependabot):
           #    nobody is waiting on them;
@@ -116,9 +119,13 @@ jobs:
               #  - a workflow_dispatch run: protected-release is always dispatched, for a corpus night AND for a code
               #    release, so "the previous run" may be the other kind; a dispatch is a deliberate act worth one page;
               #  - a red whose previous red's page is not PROVEN delivered. Proof is affirmative and tied to that red:
-              #    the ntfy-alerts run titled "ntfy-alerts for run <previous red's id>" (run-name above) completed
-              #    green. This step fails when ntfy refuses the POST, so green means the page went out (or that red was
-              #    itself a proven repeat). No such run, one still running, or one that ended any other way: page again.
+              #    the ntfy-alerts run titled "ntfy-alerts for run <previous red's id>" (run-name above) completed green
+              #    AND its "page delivered" step succeeded. That step runs only after this step recorded a POST ntfy
+              #    accepted (or a proven repeat of a delivered page). A green run alone proves nothing: with no topic, or
+              #    on any filtered path, this step exits 0 without sending (review round 3). No such run, one still
+              #    running, one that ended any other way, or one without that step: page again.
+              #    The notifier history read is one page of 100 runs created since the previous red started (about four
+              #    days at ~25 runs a day). An older previous red reads "unknown" and pages again: over-page, never a drop.
               # If any lookup fails, page anyway: a lost first red is worse than a repeat.
               NOTE=""
               set -o pipefail
@@ -136,10 +143,18 @@ jobs:
                             -f created=">=$PREV_AT" -f per_page=100 2>/dev/null \
                           | jq -er --arg title "ntfy-alerts for run $PREV_ID" \
                             'if .total_count > (.workflow_runs | length) then "unknown"
-                             elif any(.workflow_runs[]; .display_title == $title and .status == "completed"
-                                      and .conclusion == "success") then "delivered"
-                             else "undelivered" end'); then
-                        if [ "$DELIVERY" = "delivered" ]; then echo "previous run was also $PREV_CONC and its page went out; already paged"; exit 0; fi
+                             else [.workflow_runs[] | select(.display_title == $title and .status == "completed"
+                                      and .conclusion == "success") | .id | tostring] | join(" ") end'); then
+                        # Each candidate run must show its own "page delivered" step succeeded.
+                        if [ "$DELIVERY" != "unknown" ]; then
+                          for NID in $DELIVERY; do
+                            if gh api -X GET "repos/$REPO/actions/runs/$NID/jobs" 2>/dev/null \
+                                | jq -e 'any(.jobs[].steps[]?; .name == "page delivered" and .conclusion == "success")' >/dev/null; then
+                              echo "previous run was also $PREV_CONC and its page went out; already paged"
+                              echo "delivered=repeat" >> "$GITHUB_OUTPUT"; exit 0
+                            fi
+                          done
+                        fi
                         NOTE=" (repeat: the previous red's page may not have arrived)"
                       else
                         NOTE=" (repeat: delivery lookup failed)"
@@ -160,3 +175,11 @@ jobs:
           # (a POST accepted but its reply lost) to a timeout case; a lost page is worse than a duplicate.
           curl -sS --fail --retry 3 --retry-connrefused --retry-delay 5 -m 20 \
             -H "Title: $TITLE" -H "Priority: $PRIO" -H "Tags: $TAGS" --data-raw "$BODY" "https://ntfy.sh/$TOPIC" >/dev/null
+          echo "delivered=sent" >> "$GITHUB_OUTPUT"
+      # The delivery receipt a later red reads (by this step's name, through the jobs API). It runs only when the send
+      # step recorded an accepted POST or a proven repeat, so a skipped "page delivered" means nothing reached the phone.
+      - name: page delivered
+        if: steps.send.outputs.delivered != ''
+        env:
+          DELIVERED: ${{ steps.send.outputs.delivered }}
+        run: echo "page receipt - $DELIVERED"

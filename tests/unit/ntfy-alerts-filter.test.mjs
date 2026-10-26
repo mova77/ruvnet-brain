@@ -8,6 +8,10 @@
 // Review round 2 (Codex r4 #3): proof is affirmative and tied to the previous red. An empty notifier history, a notifier
 // run still in progress, or a green run for some OTHER red proves nothing, so each pages; only the ntfy-alerts run
 // titled for the previous red's id (the workflow's run-name) that completed green counts as delivered.
+// Review round 3 (Codex r5 #3): a green run alone is not a receipt (an empty topic exits 0 without sending). The previous
+// red's notifier run must also show its "page delivered" step succeeded; that step runs only when the send step wrote
+// delivered=sent (POST accepted) or delivered=repeat (proven repeat) to $GITHUB_OUTPUT. The receipt step's `if:` is read
+// from the YAML and evaluated against the outputs the real block wrote, so the chain below is the workflow's own.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -36,6 +40,14 @@ function sendStep() {
   return { env, run };
 }
 const { env: ENV_KEYS, run: RUN } = sendStep();
+/** The receipt step that follows `send`: its name and its `if:`, as GitHub would see them. */
+const RECEIPT = (() => {
+  const m = WORKFLOW.match(/^ {6}- name: (page delivered)\n {8}if: (.*)$/m);
+  return m ? { name: m[1], cond: m[2] } : null;
+})();
+const SEND_ID = WORKFLOW.match(/^ {6}- name: send\n {8}id: (\S+)$/m)?.[1];
+/** GitHub's evaluation of the receipt step's `if:` for one send-step result (only the form the workflow uses). */
+const receiptRan = (outputs) => RECEIPT?.cond === `steps.${SEND_ID}.outputs.delivered != ''` && (outputs.delivered ?? '') !== '';
 // Pre-4.7.21 the block interpolated `${{ github.event_name }}`; translate that one expression so the same matrix
 // runs against the old file (fail-before evidence). The new file must contain no interpolation at all.
 const SCRIPT = RUN.replaceAll('${{ github.event_name }}', '${EVENT}');
@@ -52,6 +64,11 @@ beforeAll(() => {
     '#!/bin/bash', 'printf "%s\\n" "$*" >> "$STUB_LOG/gh.log"',
     'if [ "$STUB_GH_MODE" = fail ]; then echo \'{"message":"Bad credentials","status":"401"}\'; echo "gh: Bad credentials (HTTP 401)" >&2; exit 1; fi',
     // The delivery check reads this workflow's own run history (ntfy-alerts.yml); answer it from its own file.
+    // A notifier run's jobs (the delivery receipt): answered per run id from STUB_JOBS_DIR, else no jobs.
+    'case "$*" in *actions/runs/*/jobs*)',
+    '  if [ "$STUB_GH_JOBS_MODE" = fail ]; then echo "gh: HTTP 502" >&2; exit 1; fi',
+    '  id=$(printf "%s" "$*" | sed -n "s|.*actions/runs/\\([0-9]*\\)/jobs.*|\\1|p")',
+    '  if [ -f "$STUB_JOBS_DIR/$id.json" ]; then cat "$STUB_JOBS_DIR/$id.json"; else echo \'{"total_count":0,"jobs":[]}\'; fi; exit 0 ;; esac',
     'case "$*" in *ntfy-alerts.yml*)',
     '  if [ "$STUB_GH_SELF_MODE" = fail ]; then echo "gh: HTTP 502" >&2; exit 1; fi',
     '  cat "$STUB_GH_SELF_RESPONSE"; exit 0 ;; esac',
@@ -68,7 +85,12 @@ const RUN_NAME = WORKFLOW.match(/^run-name: .*format\('([^']*\{0\}[^']*)', githu
 const titleFor = (triggerId) => (RUN_NAME ?? 'ntfy-alerts for run {0}').replace('{0}', String(triggerId));
 // `self` is this run (in progress; never counted).
 const SELF = { id: 5555, status: 'in_progress', conclusion: null, display_title: titleFor(9000) };
-const nrun = (id, conclusion, forRun = 8999, status = 'completed') => ({ id, status, conclusion, display_title: titleFor(forRun) });
+// `receipt`: the conclusion of that run's "page delivered" step (null = no such step, as in a pre-round-3 run). A green
+// notifier run defaults to a successful receipt (a page that went out); anything else defaults to a skipped one.
+const nrun = (id, conclusion, forRun = 8999, status = 'completed', receipt = conclusion === 'success' ? 'success' : 'skipped') =>
+  ({ id, status, conclusion, display_title: titleFor(forRun), receipt });
+const jobsFor = (r) => ({ total_count: 1, jobs: [{ name: 'notify', conclusion: r.conclusion,
+  steps: [{ name: 'send', conclusion: r.conclusion }, ...(r.receipt ? [{ name: 'page delivered', conclusion: r.receipt }] : [])] }] });
 const CURRENT = { WR_ID: '9000', WR_RUN_NUMBER: '90' };
 const red = (over = {}) => ({ EVENT: 'workflow_run', WR_CONC: 'failure', WR_NAME: 'learning-replay', WR_BRANCH: 'main',
   WR_URL: 'https://github.com/stuinfla/ruvnet-brain/actions/runs/9000', WR_EVENT: 'schedule', WR_WORKFLOW_ID: '777',
@@ -76,8 +98,11 @@ const red = (over = {}) => ({ EVENT: 'workflow_run', WR_CONC: 'failure', WR_NAME
 
 let n = 0;
 // `self` = ntfy-alerts' own runs since the previous red started; the default is "every page since went out".
-function send(vars, { history = null, ghMode = 'ok', self = [SELF, nrun(5554, 'success')], selfTotal = null, selfMode = 'ok', curlExit = 0 } = {}) {
+function send(vars, { history = null, ghMode = 'ok', self = [SELF, nrun(5554, 'success')], selfTotal = null, selfMode = 'ok', jobsMode = 'ok', curlExit = 0 } = {}) {
   const log = fs.mkdtempSync(path.join(work, `case-${n++}-`));
+  const jobsDir = path.join(log, 'jobs'); fs.mkdirSync(jobsDir);
+  for (const r of self) fs.writeFileSync(path.join(jobsDir, `${r.id}.json`), JSON.stringify(jobsFor(r)));
+  const output = path.join(log, 'github-output'); fs.writeFileSync(output, '');
   const response = path.join(log, 'runs.json');
   fs.writeFileSync(response, history === null ? '' : JSON.stringify({ total_count: history.length, workflow_runs: history }));
   const selfResponse = path.join(log, 'self-runs.json');
@@ -85,17 +110,21 @@ function send(vars, { history = null, ghMode = 'ok', self = [SELF, nrun(5554, 's
   const result = spawnSync('bash', ['-e', path.join(work, 'send.sh')], { encoding: 'utf8', timeout: 20_000,
     env: { PATH: `${path.join(work, 'bin')}${path.delimiter}${process.env.PATH}`, HOME: work, TOPIC: 'test-topic-not-real',
       STUB_LOG: log, STUB_GH_RESPONSE: response, STUB_GH_MODE: ghMode, STUB_GH_SELF_RESPONSE: selfResponse,
-      STUB_GH_SELF_MODE: selfMode, STUB_CURL_EXIT: String(curlExit), ...vars } });
+      STUB_GH_SELF_MODE: selfMode, STUB_JOBS_DIR: jobsDir, STUB_GH_JOBS_MODE: jobsMode, GITHUB_OUTPUT: output,
+      STUB_CURL_EXIT: String(curlExit), ...vars } });
   const read = (f) => fs.existsSync(path.join(log, f)) ? fs.readFileSync(path.join(log, f), 'utf8').trim().split('\n').filter(Boolean) : [];
-  return { status: result.status, stderr: result.stderr, pages: read('curl.log'), gh: read('gh.log') };
+  const outputs = Object.fromEntries(read('github-output').map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
+  return { status: result.status, stderr: result.stderr, stdout: result.stdout, pages: read('curl.log'), gh: read('gh.log'), outputs };
 }
 
 describe.skipIf(!hasJq)('ntfy-alerts send step', () => {
   it('reads every variable it uses from the step env, with no ${{ }} interpolation inside run:', () => {
     expect(RUN).not.toContain('${{');
     const assigned = new Set([...RUN.matchAll(/(?:^|\s|;)([A-Z][A-Z0-9_]*)=/g)].map((m) => m[1]));
+    for (const m of RUN.matchAll(/\bfor ([A-Z][A-Z0-9_]*) in\b/g)) assigned.add(m[1]);
     const used = new Set([...RUN.matchAll(/\$\{?([A-Z][A-Z0-9_]*)/g)].map((m) => m[1]));
-    const undeclared = [...used].filter((v) => !assigned.has(v) && !ENV_KEYS.includes(v));
+    // GITHUB_OUTPUT is provided by the runner to every step.
+    const undeclared = [...used].filter((v) => !assigned.has(v) && !ENV_KEYS.includes(v) && v !== 'GITHUB_OUTPUT');
     expect(undeclared).toEqual([]);
     for (const key of ['GH_TOKEN', 'REPO', 'WR_ID', 'WR_RUN_NUMBER', 'WR_WORKFLOW_ID', 'EVENT']) expect(ENV_KEYS).toContain(key);
   });
@@ -272,7 +301,82 @@ describe.skipIf(!hasJq)('ntfy-alerts send step', () => {
     expect(send({ EVENT: 'pull_request_target', PR_NUM: '2', PR_TITLE: 't', PR_USER: 'dependabot[bot]', PR_USER_TYPE: 'Bot' }).pages).toHaveLength(0);
   });
 
-  it('an empty topic sends nothing', () => {
-    expect(send({ ...red(), TOPIC: '' }, { history: [] }).pages).toHaveLength(0);
+  it('an empty topic sends nothing, warns, and leaves no delivery receipt', () => {
+    const r = send({ ...red(), TOPIC: '' }, { history: [] });
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.pages).toHaveLength(0);
+    expect(r.outputs).toEqual({});
+    expect(receiptRan(r.outputs)).toBe(false);
+    expect(r.stdout).toContain('::warning::NTFY_TOPIC is not set');
+  });
+
+  it('the receipt step follows send, runs only on a recorded delivery, and reads nothing attacker-controlled', () => {
+    expect(SEND_ID).toBe('send');
+    expect(RECEIPT).toEqual({ name: 'page delivered', cond: "steps.send.outputs.delivered != ''" });
+    // The lookup checks the receipt by the step's exact name.
+    expect(RUN).toContain(`.name == "${RECEIPT.name}" and .conclusion == "success"`);
+    expect(WORKFLOW.slice(WORKFLOW.indexOf('- name: page delivered'))).not.toMatch(/github\.event/);
+  });
+
+  it('Codex r5 #3: an empty-topic green run for a red does not silence the next red once the topic is configured', () => {
+    // Night 1: red 8999 arrives while NTFY_TOPIC is empty. The real block exits 0 (a green notifier run), sends nothing.
+    const night1 = send(red({ WR_ID: '8999', WR_RUN_NUMBER: '89', TOPIC: '' }), { history: [run(8999, 89, 'failure'), run(8998, 88, 'success')] });
+    expect(night1.status, night1.stderr).toBe(0);
+    expect(night1.pages).toHaveLength(0);
+    // Its notifier run is green; its receipt step is whatever GitHub's `if:` makes of the outputs it actually wrote.
+    const n1 = nrun(5550, 'success', 8999, 'completed', receiptRan(night1.outputs) ? 'success' : 'skipped');
+    expect(n1.receipt).toBe('skipped');
+    // Night 2: topic configured, red 9000. The earlier green run is not a receipt: page, and say why.
+    const history = [run(9000, 90, 'failure'), run(8999, 89, 'failure'), run(8998, 88, 'success')];
+    const night2 = send(red(), { history, self: [SELF, n1] });
+    expect(night2.status, night2.stderr).toBe(0);
+    expect(night2.pages).toHaveLength(1);
+    expect(night2.pages[0]).toContain("(repeat: the previous red's page may not have arrived)");
+    expect(night2.outputs).toEqual({ delivered: 'sent' });
+    // The receipt was read from the candidate run's own jobs.
+    expect(night2.gh[2]).toBe('api -X GET repos/stuinfla/ruvnet-brain/actions/runs/5550/jobs');
+    // Night 3: night 2's page went out, so a third consecutive red is a proven repeat and does not page.
+    const n2 = nrun(5560, 'success', 9000, 'completed', receiptRan(night2.outputs) ? 'success' : 'skipped');
+    const night3 = send(red({ WR_ID: '9001', WR_RUN_NUMBER: '91' }),
+      { history: [run(9001, 91, 'failure'), ...history], self: [SELF, n1, n2] });
+    expect(night3.pages).toHaveLength(0);
+    expect(night3.outputs).toEqual({ delivered: 'repeat' });
+  });
+
+  it('a delivered page still deduplicates a whole red streak (each repeat carries the receipt forward)', () => {
+    const first = send(red({ WR_ID: '8999', WR_RUN_NUMBER: '89' }), { history: [run(8999, 89, 'failure'), run(8998, 88, 'success')] });
+    expect(first.pages).toHaveLength(1);
+    expect(first.outputs).toEqual({ delivered: 'sent' });
+    let self = [SELF, nrun(5550, 'success', 8999, 'completed', receiptRan(first.outputs) ? 'success' : 'skipped')];
+    let history = [run(8999, 89, 'failure'), run(8998, 88, 'success')];
+    for (let night = 0; night < 3; night++) {
+      const id = 9000 + night; const num = 90 + night;
+      history = [run(id, num, 'failure'), ...history];
+      const r = send(red({ WR_ID: String(id), WR_RUN_NUMBER: String(num) }), { history, self });
+      expect(r.status, `night ${night}: ${r.stderr}`).toBe(0);
+      expect(r.pages, `night ${night}`).toHaveLength(0);
+      expect(r.outputs, `night ${night}`).toEqual({ delivered: 'repeat' });
+      self = [...self, nrun(5560 + night, 'success', id, 'completed', receiptRan(r.outputs) ? 'success' : 'skipped')];
+    }
+  });
+
+  it('a green notifier run without a successful receipt step, or an unreadable receipt, pages', () => {
+    const history = [run(9000, 90, 'failure'), run(8999, 89, 'failure'), run(8998, 88, 'success')];
+    for (const [label, self, opts] of [
+      ['receipt skipped', [SELF, nrun(5554, 'success', 8999, 'completed', 'skipped')], {}],
+      ['no receipt step (pre-round-3 run)', [SELF, nrun(5554, 'success', 8999, 'completed', null)], {}],
+      ['receipt step failed', [SELF, nrun(5554, 'success', 8999, 'completed', 'failure')], {}],
+      ['jobs lookup 502', [SELF, nrun(5554, 'success')], { jobsMode: 'fail' }],
+      // A receipt on a DIFFERENT red's notifier run proves nothing for this one.
+      ['receipt only on another red\'s run', [SELF, nrun(5554, 'success', 8999, 'completed', 'skipped'), nrun(5553, 'success', 8998)], {}],
+    ]) {
+      const r = send(red(), { history, self, ...opts });
+      expect(r.status, `${label}: ${r.stderr}`).toBe(0);
+      expect(r.pages, label).toHaveLength(1);
+      expect(r.pages[0], label).toContain("(repeat: the previous red's page may not have arrived)");
+    }
+    // Two green runs titled for the same red (a re-run): one receipt is enough.
+    const twice = send(red(), { history, self: [SELF, nrun(5554, 'success', 8999, 'completed', 'skipped'), nrun(5556, 'success')] });
+    expect(twice.pages).toHaveLength(0);
   });
 });
