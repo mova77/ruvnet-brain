@@ -238,10 +238,23 @@ try {
 }
 
 const adminKey = process.env.ANTHROPIC_ADMIN_KEY;
+// Admin-key health is a TRANSITION, like detector 3 (4.7.21 review): a dead key paged on every hourly run, ~24 pages a
+// day until rotated. Now: one page when the key goes working -> dead, one note when it comes back, and the run still exits
+// 1 every hour while it is dead, so the heartbeat wrapper's single streak page and the watchdog keep seeing it.
+// The state flips only once the page really went out, so a failed or cooled-down delivery is retried next run.
+const KEY_STATE = join(STATE_DIR, 'api-spend-admin-key.json');
+let keyWasDead = false;
+try { keyWasDead = JSON.parse(readFileSync(KEY_STATE, 'utf8')).dead === true; } catch {}
+const saveKeyState = (dead) => writeFileSync(KEY_STATE, JSON.stringify({ dead, at: ts() }));
 if (adminKey) {
   const s = await todaySpendUsd(adminKey);
   if (s.ok) {
     console.log(`[watchdog] Anthropic API spend today: $${s.usd.toFixed(2)} (threshold $${THRESHOLD_USD})`);
+    if (keyWasDead) {
+      const delivered = await alert('ANTHROPIC_ADMIN_KEY works again - the $ spend detector is back',
+        'cost_report answered again; the definitive spend alarm is watching.');
+      if (delivered) saveKeyState(false);
+    }
     if (s.usd >= THRESHOLD_USD) {
       await alert(
         `API spend today = $${s.usd.toFixed(2)}`,
@@ -252,10 +265,15 @@ if (adminKey) {
     // DERIVED, not asserted (F10c): a 401/403 on the admin key means the DEFINITIVE $ detector is
     // dead — the old code logged one line and exited 0 forever, a permanently green job with its
     // main sensor dark. A dead key is its own alarm (key-canary class) and a degraded exit.
-    await alert(
-      'ANTHROPIC_ADMIN_KEY is DEAD - the $ spend detector is dark',
-      `cost_report returned ${s.reason}. The definitive spend alarm cannot see anything until the key is rotated. Burst detector still active, but it is the weaker signal.`
-    );
+    if (keyWasDead) {
+      console.error(`[watchdog] ANTHROPIC_ADMIN_KEY still dead (${s.reason}); already paged, exiting degraded`);
+    } else {
+      const delivered = await alert(
+        'ANTHROPIC_ADMIN_KEY is DEAD - the $ spend detector is dark',
+        `cost_report returned ${s.reason}. The definitive spend alarm cannot see anything until the key is rotated. Burst detector still active, but it is the weaker signal.`
+      );
+      if (delivered) saveKeyState(true);
+    }
     process.exitCode = 1;
   } else {
     console.log(`[watchdog] admin cost check unavailable: ${s.reason}`);

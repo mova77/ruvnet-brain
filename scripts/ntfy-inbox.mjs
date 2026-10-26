@@ -69,7 +69,20 @@ export function classify(msg) {
     // Keyed by workflow AND branch: a green main must never close a still-red release branch (review round 4).
     return { kind: 'ci', key: `ci:${m[1].trim()}@${b ? b[1] : 'main'}`, workflow: m[1].trim(), ...(b ? { branch: b[1] } : {}), actionable: true };
   }
-  if ((m = /(?:New issue|SLA breach: issue) #(\d+)/.exec(title))) return { kind: 'issue', key: `issue:${m[1]}`, number: Number(m[1]), actionable: true };
+  if ((m = /(?:New issue|SLA breach: issue) #(\d+)/.exec(title))) {
+    // ONE combined SLA page names every breaching issue (scripts/issue-watch.mjs: a "#N (age) title" line each, and
+    // "…and K more: #a #b" past 8). Each named issue is its own alert, so a 17-issue breach counts 17, not 1.
+    const numbers = [Number(m[1])];
+    if (/^SLA breach/.test(title)) {
+      for (const line of body.split('\n')) {
+        const listed = /^#(\d+) \(/.exec(line);
+        if (listed) numbers.push(Number(listed[1]));
+        else if (/^…and \d+ more:/.test(line)) for (const x of line.matchAll(/#(\d+)/g)) numbers.push(Number(x[1]));
+      }
+    }
+    const unique = [...new Set(numbers.filter((n) => Number.isSafeInteger(n) && n > 0))].slice(0, MAX_OPEN_ALERTS);
+    return { kind: 'issue', key: `issue:${unique[0]}`, number: unique[0], actionable: true, ...(unique.length > 1 ? { numbers: unique } : {}) };
+  }
   if ((m = /New PR #(\d+)/.exec(title))) return { kind: 'pr', key: `pr:${m[1]}`, number: Number(m[1]), actionable: true };
   if (/^Waiting on a reply/.test(title)) return { kind: 'digest', key: 'digest:issues', actionable: false };
   if (/New star/.test(title)) return { kind: 'info', key: `info:${msg.id}`, actionable: false };
@@ -116,23 +129,32 @@ export function fold(open, messages, { now = Date.now(), resolver = resolvedNow,
   for (const msg of messages) {
     if (!msg || typeof msg.id !== 'string' || folded.has(msg.id)) continue;
     folded.add(msg.id);
-    const c = classify(msg);
+    const classified = classify(msg);
     const at = new Date((msg.time || now / 1000) * 1000).toISOString();
-    if (c.resolves) {
-      const a = byKey.get(c.key);
-      if (a && !a.closedAt && Date.parse(at) >= Date.parse(a.lastAt) && resolver(a)) { a.closedAt = at; a.closedBy = 'recovered notice (confirmed)'; a.closedByMsg = msg.id; }
-      continue;
+    // A combined SLA page becomes one alert per issue it names; the first keeps the message id, the rest get id-N.
+    const parts = classified.numbers ? classified.numbers.map((n, i) => {
+      const one = { ...classified, key: `issue:${n}`, number: n, alertId: i === 0 ? msg.id : `${msg.id}-${n}` };
+      delete one.numbers;
+      return one;
+    }) : [classified];
+    for (const c of parts) {
+      if (c.resolves) {
+        const a = byKey.get(c.key);
+        if (a && !a.closedAt && Date.parse(at) >= Date.parse(a.lastAt) && resolver(a)) { a.closedAt = at; a.closedBy = 'recovered notice (confirmed)'; a.closedByMsg = msg.id; }
+        continue;
+      }
+      if (!c.actionable) continue;
+      const existing = byKey.get(c.key);
+      if (existing && !existing.closedAt) {
+        // lastAt only moves forward: a delayed older message must not make a newer failure look resolved.
+        existing.count += 1;
+        if (Date.parse(at) > Date.parse(existing.lastAt)) { existing.lastAt = at; existing.lastTitle = msg.title; }
+        existing.msgIds = [...(existing.msgIds || []), msg.id].slice(-10);
+        continue;
+      }
+      const { alertId, ...fields } = c;
+      byKey.set(c.key, { id: alertId || msg.id, ...fields, firstAt: at, lastAt: at, count: 1, title: msg.title || '', body: String(msg.message || '').slice(0, 200), msgIds: [msg.id], attempts: 0 });
     }
-    if (!c.actionable) continue;
-    const existing = byKey.get(c.key);
-    if (existing && !existing.closedAt) {
-      // lastAt only moves forward: a delayed older message must not make a newer failure look resolved.
-      existing.count += 1;
-      if (Date.parse(at) > Date.parse(existing.lastAt)) { existing.lastAt = at; existing.lastTitle = msg.title; }
-      existing.msgIds = [...(existing.msgIds || []), msg.id].slice(-10);
-      continue;
-    }
-    byKey.set(c.key, { id: msg.id, ...c, firstAt: at, lastAt: at, count: 1, title: msg.title || '', body: String(msg.message || '').slice(0, 200), msgIds: [msg.id], attempts: 0 });
   }
   const byOldestCheck = [...byKey.values()].sort((x, y) => Date.parse(x.lastCheckedAt || 0) - Date.parse(y.lastCheckedAt || 0));
   for (const a of byOldestCheck) {

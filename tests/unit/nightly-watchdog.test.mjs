@@ -435,6 +435,18 @@ describe('SessionStart job-health line', () => {
     expect(f.lines).toHaveLength(1);
     expect(f.lines[0]).toMatch(/2 scheduled job\(s\) failing/);
   });
+  it('only receipts of jobs the registry lists count; a retired job\'s failed receipt is ignored (4.7.21 review #6)', () => {
+    const f = setup({ 'com.ruvnet.nightly-watchdog': { state: 'ok', ended_at: ago(3) }, 'com.ruvnet.brain-gists': { state: 'failed', ended_at: ago(30) },
+      'com.ruvnet.issue-watch': { state: 'killed', ended_at: ago(1) } });
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'ss-jobs-repo-'));
+    fs.mkdirSync(path.join(repo, 'config'));
+    fs.mkdirSync(path.join(repo, 'plugin', 'scripts'), { recursive: true });
+    fs.writeFileSync(path.join(repo, 'config', 'scheduled-jobs.json'), JSON.stringify({ jobs: [{ label: 'com.ruvnet.nightly-watchdog' }, { label: 'com.ruvnet.issue-watch' }],
+      _retired: [{ label: 'com.ruvnet.brain-gists' }] }));
+    issueAlert.surfaceJobHealth({ ...f, now, cwd: path.join(repo, 'plugin', 'scripts') }); // found walking up from a subdirectory
+    expect(f.lines).toEqual(['[RuvNet Brain — JOBS: 1 scheduled job(s) failing (com.ruvnet.issue-watch). Details: node scripts/nightly-watchdog.mjs --no-push]']);
+    fs.rmSync(repo, { recursive: true, force: true });
+  });
   it('one line when the watchdog itself has not run for more than 30 h', () => {
     const f = setup({ 'com.ruvnet.nightly-watchdog': { state: 'ok', ended_at: ago(31) } });
     issueAlert.surfaceJobHealth({ ...f, now });

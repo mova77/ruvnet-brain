@@ -467,6 +467,30 @@ describe.skipIf(process.platform === 'win32')('host-neutral SessionStart core pa
     expect(result.output).toMatch(/NTFY: 2 open alert\(s\) \(2 job\)/);
   });
 
+  // 4.7.21 review (Codex #4): the JOBS line was produced but the default SessionStart status filter dropped it.
+  // (Opus pager #6): only jobs the registry still lists count, so a retired job's last red receipt is not "failing".
+  const jobsFixture = (receipts) => (f) => {
+    warmed(f);
+    entitledRepo(f);
+    write(path.join(f.project, 'config', 'scheduled-jobs.json'), { jobs: [{ label: 'com.ruvnet.nightly-watchdog' }, { label: 'com.ruvnet.issue-watch' }],
+      _retired: [{ label: 'com.ruvnet.brain-gists' }] });
+    const ended = new Date(Date.now() - 3_600_000).toISOString();
+    for (const [label, state] of Object.entries(receipts)) write(path.join(f.cache, 'heartbeats', `${label}.json`), { label, state, ended_at: ended });
+    const entitlement = path.join(f.state, 'maintainer-issues.json');
+    write(entitlement, { enabled: true, repos: ['stuinfla/ruvnet-brain'] });
+    fs.chmodSync(entitlement, 0o600);
+  };
+
+  it('a failing registered job reaches the session through the DEFAULT SessionStart filter (before: dropped)', () => {
+    const result = parity(jobsFixture({ 'com.ruvnet.nightly-watchdog': 'ok', 'com.ruvnet.issue-watch': 'failed' }));
+    expect(result.output).toContain('[RuvNet Brain — JOBS: 1 scheduled job(s) failing (com.ruvnet.issue-watch). Details: node scripts/nightly-watchdog.mjs --no-push]');
+  });
+
+  it('a retired job\'s leftover failed receipt is not reported as failing', () => {
+    const result = parity(jobsFixture({ 'com.ruvnet.nightly-watchdog': 'ok', 'com.ruvnet.brain-gists': 'failed' }));
+    expect(result.output).not.toMatch(/JOBS:/);
+  });
+
   it('never shows ntfy alerts to a normal end user', () => {
     const result = parity((f) => {
       warmed(f);

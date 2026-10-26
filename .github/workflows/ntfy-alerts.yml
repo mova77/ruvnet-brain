@@ -70,6 +70,7 @@ jobs:
           WR_ID: ${{ github.event.workflow_run.id }}
           WR_RUN_NUMBER: ${{ github.event.workflow_run.run_number }}
           WR_WORKFLOW_ID: ${{ github.event.workflow_run.workflow_id }}
+          SELF_RUN_ID: ${{ github.run_id }}
           EVENT: ${{ github.event_name }}
           REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
@@ -105,21 +106,43 @@ jobs:
               [ "$WR_EVENT" = "pull_request" ] && exit 0
               case "$WR_BRANCH" in main|release/*) ;; *) [ "$WR_EVENT" != "schedule" ] && exit 0 ;; esac
               # PAGE ON CHANGE (4.7.21): learning-replay paged the same red 23 nights running. Look up the previous
-              # completed run of this workflow on the same branch and event; if it was red too, the owner already
-              # has this page. Cancelled/skipped runs say nothing about health and are passed over. If the lookup
-              # itself fails, page anyway: a lost first red is worse than a repeat.
+              # completed run of this workflow on the same branch (any event but pull_request, so a green manual re-run
+              # in between counts as the recovery it is); if it was red too AND that red's page provably went out, the
+              # owner already has this page. Cancelled/skipped runs say nothing about health and are passed over.
+              # Never deduplicated (review round 4.7.21-fix):
+              #  - a workflow_dispatch run: protected-release is always dispatched, for a corpus night AND for a code
+              #    release, so "the previous run" may be the other kind; a dispatch is a deliberate act worth one page;
+              #  - a red whose previous red was not provably delivered: this step fails when ntfy refuses the POST, so a
+              #    non-green ntfy-alerts run since the previous red started means that page may never have arrived.
+              # If any lookup fails, page anyway: a lost first red is worse than a repeat.
               NOTE=""
               set -o pipefail
-              if PREV=$(gh api -X GET "repos/$REPO/actions/workflows/$WR_WORKFLOW_ID/runs" \
-                    -f branch="$WR_BRANCH" -f event="$WR_EVENT" -f status=completed -f per_page=10 2>/dev/null \
-                  | jq -er --argjson id "$WR_ID" --argjson n "$WR_RUN_NUMBER" \
-                    '[.workflow_runs[] | select(.id != $id and .run_number < $n)
-                      | select(.conclusion != "cancelled" and .conclusion != "skipped")][0].conclusion // "none"'); then
-                case "$PREV" in
-                  failure|timed_out|startup_failure) echo "previous run was also $PREV; already paged"; exit 0 ;;
-                esac
-              else
-                NOTE=" (previous-run lookup failed)"
+              if [ "$WR_EVENT" != "workflow_dispatch" ]; then
+                if PREV=$(gh api -X GET "repos/$REPO/actions/workflows/$WR_WORKFLOW_ID/runs" \
+                      -f branch="$WR_BRANCH" -f status=completed -f per_page=20 2>/dev/null \
+                    | jq -er --argjson id "$WR_ID" --argjson n "$WR_RUN_NUMBER" \
+                      '[.workflow_runs[] | select(.id != $id and .run_number < $n and .event != "pull_request")
+                        | select(.conclusion != "cancelled" and .conclusion != "skipped")][0]
+                        | if . == null then "none" else "\(.conclusion) \(.run_started_at // .created_at)" end'); then
+                  PREV_CONC="${PREV%% *}"; PREV_AT="${PREV#* }"
+                  case "$PREV_CONC" in
+                    failure|timed_out|startup_failure)
+                      if DELIVERY=$(gh api -X GET "repos/$REPO/actions/workflows/ntfy-alerts.yml/runs" \
+                            -f created=">=$PREV_AT" -f per_page=100 2>/dev/null \
+                          | jq -er --argjson self "$SELF_RUN_ID" \
+                            'if .total_count > (.workflow_runs | length) then "unknown"
+                             elif any(.workflow_runs[]; .id != $self and .status == "completed"
+                                      and .conclusion != "success" and .conclusion != "skipped") then "undelivered"
+                             else "delivered" end'); then
+                        if [ "$DELIVERY" = "delivered" ]; then echo "previous run was also $PREV_CONC and its page went out; already paged"; exit 0; fi
+                        NOTE=" (repeat: the previous red's page may not have arrived)"
+                      else
+                        NOTE=" (repeat: delivery lookup failed)"
+                      fi ;;
+                  esac
+                else
+                  NOTE=" (previous-run lookup failed)"
+                fi
               fi
               TITLE="🔴 CI ${WR_CONC}: ${WR_NAME}"
               BODY="branch ${WR_BRANCH} — ${WR_URL}${NOTE}"

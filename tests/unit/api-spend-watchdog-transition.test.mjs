@@ -42,6 +42,11 @@ function sandbox() {
   const stub = path.join(root, 'fetch-stub.mjs');
   fs.writeFileSync(stub, `import fs from 'node:fs';
 globalThis.fetch = async (url, init = {}) => {
+  // The Admin Cost API answers with STUB_COST_STATUS (default 200, an empty report); it is not a page.
+  if (String(url).startsWith('https://api.anthropic.com/')) {
+    const status = Number(process.env.STUB_COST_STATUS || 200);
+    return { ok: status < 400, status, json: async () => ({ data: [] }) };
+  }
   let title;
   try { title = new Headers(init.headers).get('title'); }
   catch (error) { fs.appendFileSync(${JSON.stringify(posts)}, JSON.stringify({ threw: error.message }) + '\\n'); throw error; }
@@ -174,5 +179,50 @@ describe('the shipped copy reads only its own topic config', () => {
     s.run();
     expect(s.posts()).toHaveLength(1);
     expect(s.posts()[0].url).toBe('https://ntfy.sh/topic-from-own-config');
+  });
+});
+
+describe('a dead admin key pages on the transition, not every hour (4.7.21 review P1-2)', () => {
+  const KEY = { ANTHROPIC_ADMIN_KEY: 'sk-ant-admin-test-not-real' };
+  for (const code of ['401', '403']) {
+    it(`HTTP ${code}: 1 page over 4 hourly runs, every run exits 1; recovery: exactly 1 note; a later death pages again`, () => {
+      const s = sandbox();
+      s.listingRows([]);
+      const statuses = [];
+      for (let hour = 0; hour < 4; hour++) {
+        const r = s.run({ ...KEY, STUB_COST_STATUS: code });
+        statuses.push(r.status);
+        s.ageCooldown(); // judge each hour on the transition rule, not the 1-hour cooldown
+      }
+      expect(statuses).toEqual([1, 1, 1, 1]); // still degraded every hour, so the wrapper and watchdog see it
+      expect(s.desktopAlerts()).toHaveLength(1); // before: 4 (one every hour)
+      expect(s.desktopAlerts()[0]).toMatch(/ADMIN_KEY is DEAD/);
+      for (let hour = 0; hour < 3; hour++) {
+        expect(s.run({ ...KEY, STUB_COST_STATUS: '200' }).status).toBe(0);
+        s.ageCooldown();
+      }
+      expect(s.desktopAlerts()).toHaveLength(2);
+      expect(s.desktopAlerts()[1]).toMatch(/works again/);
+      s.run({ ...KEY, STUB_COST_STATUS: code });
+      expect(s.desktopAlerts()).toHaveLength(3);
+      expect(s.desktopAlerts()[2]).toMatch(/ADMIN_KEY is DEAD/);
+    });
+  }
+
+  it('an undelivered dead-key page is retried next run (state flips only on delivery)', () => {
+    const s = sandbox();
+    s.listingRows([]);
+    expect(s.run({ ...KEY, STUB_COST_STATUS: '401', OSASCRIPT_FAIL: '1' }).status).toBe(1);
+    expect(s.desktopAlerts()).toHaveLength(0);
+    expect(s.run({ ...KEY, STUB_COST_STATUS: '401' }).status).toBe(1);
+    expect(s.desktopAlerts()).toHaveLength(1);
+  });
+
+  it('a working key never pages, and a network error is not a dead key', () => {
+    const s = sandbox();
+    s.listingRows([]);
+    expect(s.run({ ...KEY, STUB_COST_STATUS: '200' }).status).toBe(0);
+    expect(s.run({ ...KEY, STUB_COST_STATUS: '500' }).status).toBe(0);
+    expect(s.desktopAlerts()).toHaveLength(0);
   });
 });

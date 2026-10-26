@@ -235,7 +235,12 @@ export function checkAll(now, { registry = REGISTRY, loaded = loadedLabels(), hb
     // the wrapper never saw that death, so the watchdog must page it.
     const wrapperPaged = verdict.state === FAILING && (hb?.state === 'failed' || hb?.state === 'killed')
       && !!hb.failing_since && (hb.paged === true || hb.paged === 'suppressed');
-    return { ...job, ...verdict, ...(wrapperPaged ? { wrapperPaged: true } : {}) };
+    // The wrapper will send its own "Recovered: X" when this job next passes: its receipt carries a failing streak
+    // whose page was delivered (job-heartbeat.sh announces recovery exactly then, also after a never-finished run).
+    // A watchdog page sent meanwhile (STALE, STUCK, ...) is then recorded as 'both', and its recovery note is left to
+    // the wrapper, so one recovery is announced once (4.7.21 review, Fable P2-2).
+    const wrapperRecovers = ['failed', 'killed', 'running'].includes(hb?.state) && !!hb.failing_since && hb.paged === true;
+    return { ...job, ...verdict, ...(wrapperPaged ? { wrapperPaged: true } : {}), ...(wrapperRecovers ? { wrapperRecovers: true } : {}) };
   });
 }
 
@@ -364,13 +369,15 @@ async function main() {
   if (!noPush && !optedOut) {
     const prev = loadState();
     const pagedBy = { ...(prev._pagedBy || {}) };
-    const sends = []; const owners = [];
+    const sends = []; const owners = []; const viaBoth = new Set();
     for (const c of transitions(results, prev)) {
       if (c.wrapperPaged) { pagedBy[c.label] = 'wrapper'; continue; }
       if (c.state === OK) {
+        if (pagedBy[c.label] === 'both') { delete pagedBy[c.label]; continue; } // the wrapper's "Recovered" covers it
         if (prev[c.label] === FAILING && pagedBy[c.label] !== 'watchdog') { delete pagedBy[c.label]; continue; }
         sends.push([`${c.label} is healthy again`, c.detail, 'default']); owners.push(c.label);
       } else {
+        if (c.wrapperRecovers) viaBoth.add(c.label);
         sends.push([`${c.state}: ${c.label}`, `${c.what}\n\n${c.detail}\n\nschedule: ${c.schedule}`, 'urgent']); owners.push(c.label);
       }
     }
@@ -378,7 +385,7 @@ async function main() {
     undelivered = new Set([...failed].map((i) => owners[i]));
     for (const [i, label] of owners.entries()) {
       if (failed.has(i)) continue;
-      if (sends[i][2] === 'urgent') pagedBy[label] = 'watchdog'; else delete pagedBy[label];
+      if (sends[i][2] === 'urgent') pagedBy[label] = viaBoth.has(label) ? 'both' : 'watchdog'; else delete pagedBy[label];
     }
     const next = Object.fromEntries(results.map((r) => [r.label,
       r.self || undelivered.has(r.label) ? (prev[r.label] ?? OK) : r.state]));
