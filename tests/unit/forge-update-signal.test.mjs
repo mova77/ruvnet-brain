@@ -31,7 +31,17 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '.
 // 2026-09-12 this file hand-copied plugin/scripts/coverage-integrity.mjs into the fixture and into
 // every fixture BUNDLE — which is exactly why the suite never saw that no production path placed it.
 process.env.RUVNET_BRAIN_IMPORT_ONLY = '1';
-const { placeTrustedCoverageValidator } = await import('../../bin/install.mjs');
+const { placeTrustedCoverageValidator, serverDependencies } = await import('../../bin/install.mjs');
+// The updater's module graph is DERIVED (never hand-listed: a new sibling import would silently rot a hand list).
+function copyUpdater(fromDir, toDir) {
+  const entry = path.join(fromDir, 'forge-update.mjs');
+  fs.copyFileSync(entry, path.join(toDir, 'forge-update.mjs'));
+  for (const dep of serverDependencies(entry)) {
+    const target = path.resolve(toDir, dep.spec);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.copyFileSync(dep.from, target);
+  }
+}
 const TRUSTED_VALIDATOR_BYTES = fs.readFileSync(path.join(ROOT, 'plugin', 'scripts', 'coverage-integrity.mjs'));
 // Use each host's real archive writer; Windows does not ship the POSIX zip command.
 function archiveDirectory(stage, zipPath) {
@@ -94,10 +104,7 @@ beforeEach(() => {
   root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'forge-apply-')));
   kbDir = path.join(root, 'kb');
   fs.mkdirSync(kbDir, { recursive: true });
-  for (const f of ['forge-update.mjs', 'zip-extract.mjs', 'brain-profile.mjs', 'refresh-run.mjs',
-    'update-storage-transaction.mjs', 'lifecycle-evidence-retention.mjs', 'corpus-release-identity.mjs', 'download-retry.mjs']) {
-    fs.copyFileSync(path.join(ROOT, 'kb', f), path.join(kbDir, f));
-  }
+  copyUpdater(path.join(ROOT, 'kb'), kbDir);
   const updater = path.join(kbDir, 'forge-update.mjs');
   const updaterSource = fs.readFileSync(updater, 'utf8').replace(
     /const SIGNING_PUBKEY_PEM = `-----BEGIN PUBLIC KEY-----[\s\S]*?-----END PUBLIC KEY-----`;/,
@@ -179,10 +186,7 @@ if (!doc.stores?.[value('--name')]) { console.error('no entry for store "'+value
   if (path.resolve(dir) !== path.resolve(kbDir)) {
     // A published bundle ships the updater's module graph — and NOT coverage-integrity.mjs, which
     // build-bundle.mjs cannot see behind the updater's dynamic load. The fixture bundle must match.
-    for (const file of ['forge-update.mjs', 'zip-extract.mjs', 'brain-profile.mjs', 'refresh-run.mjs',
-      'update-storage-transaction.mjs', 'lifecycle-evidence-retention.mjs', 'corpus-release-identity.mjs', 'download-retry.mjs']) {
-      fs.copyFileSync(path.join(kbDir, file), path.join(dir, file));
-    }
+    copyUpdater(kbDir, dir);
   }
 }
 
