@@ -11,8 +11,8 @@ export const RELEASE_REQUIREMENTS = Object.freeze({
       "reason": "Allowed channels and immutable Claude artifact paths reject downgrades, ambiguous registry records, changed bytes, extra active resources and escape paths; Console success requires the exact launched source closure. POSIX owner fixtures additionally enforce original-prefix installs, existing-tool-only policy, shared locks and source-bound scheduler receipts",
       "files": ["tests/unit/developer-update-policy-portable.test.mjs", "tests/unit/plugin-artifact-proof.test.mjs", "tests/unit/console-suite-update.test.mjs", "tests/unit/developer-update-scheduled-receipt.test.mjs"],
       "platformFiles": {
-        "linux": ["tests/unit/developer-update.test.mjs", "tests/unit/developer-update-codex-launcher.test.mjs", "tests/unit/developer-update-lock-reclaim.test.mjs", "tests/unit/developer-update-stage-isolation.test.mjs"],
-        "macos": ["tests/unit/developer-update.test.mjs", "tests/unit/developer-update-codex-launcher.test.mjs", "tests/unit/developer-update-lock-reclaim.test.mjs", "tests/unit/developer-update-stage-isolation.test.mjs"]
+        "linux": ["tests/unit/developer-update.test.mjs", "tests/unit/developer-update-codex-launcher.test.mjs", "tests/unit/developer-update-lock-reclaim.test.mjs", "tests/unit/developer-update-lock-release-race.test.mjs", "tests/unit/developer-update-stage-isolation.test.mjs"],
+        "macos": ["tests/unit/developer-update.test.mjs", "tests/unit/developer-update-codex-launcher.test.mjs", "tests/unit/developer-update-lock-reclaim.test.mjs", "tests/unit/developer-update-lock-release-race.test.mjs", "tests/unit/developer-update-stage-isolation.test.mjs"]
       }
     },
     {
