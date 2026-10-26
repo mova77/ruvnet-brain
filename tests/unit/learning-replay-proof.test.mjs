@@ -425,3 +425,96 @@ describe('learning replay source boundaries', () => {
     }
   });
 });
+
+// Codex 4.7.21 r3 #5 + review F2: the scheduled workflow softened EVERY non-zero portfolio result, including a
+// recomputed FAIL. Run the real CLI against hash-consistent evidence, then the workflow's own step script.
+describe('portfolio exit contract: only out-of-date evidence is softened', () => {
+  const files = () => replay.PORTFOLIO_RESULT_FILES;
+  const cli = (...args) => spawnSync(process.execPath, [path.join(ROOT, 'scripts/learning-replay.mjs'), '--check-portfolio', ...args],
+    { cwd: ROOT, encoding: 'utf8', timeout: 60_000 });
+  function place({ memory, post }) {
+    fs.mkdirSync(path.join(ROOT, 'data'), { recursive: true });
+    for (const [trap, value] of [[replay.TRAP.MEMORY_SEARCH, memory], [replay.TRAP.POST_TASK, post]]) {
+      if (value === null) fs.rmSync(files()[trap], { force: true });
+      else fs.writeFileSync(files()[trap], `${JSON.stringify(value, null, 2)}\n`);
+    }
+  }
+  const failing = () => ({ memory: artifact({ passing: false }), post: artifact({ trap: replay.TRAP.POST_TASK }) });
+  const stale = () => ({
+    memory: artifact({ top: { at: new Date(Date.now() - 30 * 86_400_000).toISOString() } }),
+    post: artifact({ trap: replay.TRAP.POST_TASK }),
+  });
+  afterEach(() => place({ memory: null, post: null }));
+
+  it('a recomputed FAIL exits 1 with or without --tolerate-stale', () => {
+    place(failing());
+    expect(replay.checkPortfolio({ repo: ROOT }).status).toBe(replay.VERDICT.FAIL);
+    expect(cli().status).toBe(1);
+    const tolerated = cli('--tolerate-stale');
+    expect(tolerated.status).toBe(1);
+    expect(tolerated.stdout).not.toContain('STALE-TOLERATED');
+  });
+
+  it('out-of-date evidence is UNKNOWN (exit 4), and exit 0 + STALE-TOLERATED only when asked', () => {
+    place(stale());
+    const checked = replay.checkPortfolio({ repo: ROOT });
+    expect(checked).toMatchObject({ status: replay.VERDICT.UNKNOWN, stale: true });
+    expect(cli().status).toBe(4);
+    const tolerated = cli('--tolerate-stale');
+    expect(tolerated.status).toBe(0);
+    expect(tolerated.stdout).toContain('STALE-TOLERATED');
+  });
+
+  it('a missing artifact is an UNKNOWN that is NOT stale, so it stays exit 4 when tolerating', () => {
+    place({ memory: null, post: null });
+    expect(replay.checkPortfolio({ repo: ROOT }).stale).toBeUndefined();
+    expect(cli('--tolerate-stale').status).toBe(4);
+  });
+
+  describe.skipIf(process.platform === 'win32')('the workflow step itself', () => {
+    const YML = path.resolve(import.meta.dirname, '../../.github/workflows/learning-replay.yml');
+    function stepScript() {
+      const lines = fs.readFileSync(YML, 'utf8').split('\n');
+      const start = lines.findIndex((l) => l.includes('- name: LEARNING-REPLAY-PORTFOLIO'));
+      const run = lines.findIndex((l, i) => i > start && /^\s+run: \|\s*$/.test(l));
+      const indent = lines[run + 1].match(/^\s*/)[0].length;
+      const body = [];
+      for (let i = run + 1; i < lines.length && (lines[i].trim() === '' || lines[i].match(/^\s*/)[0].length >= indent); i++) body.push(lines[i].slice(indent));
+      return body.join('\n');
+    }
+    function step(strict) {
+      const bin = fs.mkdtempSync(path.join(dir, 'bin-'));
+      // `npm run --silent learning:replay:check -- [args]` → the real CLI in the fixture source.
+      fs.writeFileSync(path.join(bin, 'npm'), `#!/bin/bash\nwhile [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done; [ "$1" = "--" ] && shift\n`
+        + `exec "${process.execPath}" "${path.join(ROOT, 'scripts/learning-replay.mjs')}" --check-portfolio "$@"\n`, { mode: 0o755 });
+      const summary = path.join(bin, 'summary.md');
+      const r = spawnSync('bash', ['-e', '-c', stepScript()], { cwd: ROOT, encoding: 'utf8', timeout: 60_000,
+        env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}`, STRICT: strict, GITHUB_STEP_SUMMARY: summary } });
+      return { status: r.status, out: r.stdout };
+    }
+
+    it('the STRICT input defaults off and only a manual dispatch can turn it on', () => {
+      expect(fs.readFileSync(YML, 'utf8')).toMatch(/STRICT: \$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.strict_portfolio == true \}\}/);
+    });
+
+    it('schedule/push/dispatch: a recomputed FAIL is red', () => {
+      place(failing());
+      const r = step('false');
+      expect(r.status).toBe(1);
+      expect(r.out).toContain('::error title=LEARNING-REPLAY portfolio');
+    });
+
+    it('schedule/push/dispatch: out-of-date evidence is green and annotated; strict_portfolio makes it red', () => {
+      place(stale());
+      const soft = step('false');
+      expect(soft.status).toBe(0);
+      expect(soft.out).toContain('::warning title=LEARNING-REPLAY portfolio not current');
+      expect(step('true').status).toBe(4);
+    });
+
+    it('a missing artifact is red even when not strict', () => {
+      place({ memory: null, post: null });
+      expect(step('false').status).toBe(4);
+    });
+  });
+});

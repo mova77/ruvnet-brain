@@ -220,10 +220,10 @@ function currency(artifact, repo, maxAgeDays) {
     const changed = diff.status === 0
       ? diff.stdout.split('\n').map((value) => value.trim()).filter(Boolean)
       : [];
-    if (changed.length) return { ok: false, why: `load-bearing files changed: ${changed.join(', ')}` };
+    if (changed.length) return { ok: false, stale: true, why: `load-bearing files changed: ${changed.join(', ')}` };
   }
   const age = artifact.at ? (Date.now() - Date.parse(artifact.at)) / 86_400_000 : Infinity;
-  if (!(age <= maxAgeDays)) return { ok: false, why: `artifact is older than ${maxAgeDays} days` };
+  if (!(age <= maxAgeDays)) return { ok: false, stale: true, why: `artifact is older than ${maxAgeDays} days` };
   return { ok: true };
 }
 
@@ -236,7 +236,8 @@ export function checkArtifact({ file = RESULT_FILE, repo = ROOT, maxAgeDays = 14
   const source = checkSourceIdentity({ repo });
   if (!source.clean) return { status: VERDICT.UNKNOWN, why: source.why, artifact };
   const current = currency(artifact, repo, maxAgeDays);
-  if (!current.ok) return { status: VERDICT.UNKNOWN, why: current.why, artifact };
+  // `stale`: the one UNKNOWN a re-measurement fixes; --tolerate-stale softens nothing else (CLI).
+  if (!current.ok) return { status: VERDICT.UNKNOWN, why: current.why, ...(current.stale ? { stale: true } : {}), artifact };
   const evidence = verifyRuns(artifact, repo);
   if (!evidence.ok) return { status: VERDICT.UNKNOWN, why: evidence.why, artifact };
   const recomputed = aggregate(evidence.inputs);
