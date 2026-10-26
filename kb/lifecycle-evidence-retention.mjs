@@ -298,6 +298,7 @@ function compactTerminalPhases(row) {
   return compacted;
 }
 
+export const MAX_VANISHED_RETRIES = 64;
 export function pruneLifecycleEvidence(options = {}) {
   const policy = options.policy || LIFECYCLE_EVIDENCE_RETENTION_POLICY;
   const removeEntry = options.removeEntry || ((entry) => fs.rmSync(entry, { recursive: true, force: true }));
@@ -326,6 +327,10 @@ export function pruneLifecycleEvidence(options = {}) {
       compacted.push(...compactTerminalPhases(row));
     }
   }
+  // Review r2 (4.7.21): an entry that "vanishes" on every rename (a filesystem that keeps listing it, a writer that
+  // keeps recreating it) must not spin this loop forever. Bounded; when the bound trips, pruning stops (fails closed:
+  // nothing more is removed) and the reason is returned.
+  let vanishedRetries = 0; let stopped = null;
   for (;;) {
     const state = snapshot(options);
     if (isWithin(state, policy)) break;
@@ -339,10 +344,17 @@ export function pruneLifecycleEvidence(options = {}) {
         : [...refreshCandidates, ...transactionCandidates].sort((a, b) => a.timestamp - b.timestamp)[0];
     if (!candidate) break;
     const root = candidate.kind === 'refresh' ? state.roots.refresh : state.roots.transactions;
-    if (!quarantineAndRemove(candidate.path, root, removeEntry, options.afterQuarantine)) continue; // gone: re-snapshot
+    if (!quarantineAndRemove(candidate.path, root, removeEntry, options.afterQuarantine)) { // gone: re-snapshot
+      vanishedRetries += 1;
+      if (vanishedRetries > MAX_VANISHED_RETRIES) {
+        stopped = `pruning stopped: lifecycle evidence vanished ${vanishedRetries} times while being removed (last: ${candidate.path}); nothing further was removed`;
+        break;
+      }
+      continue;
+    }
     removed[candidate.kind === 'refresh' ? 'refresh' : 'transactions'].push(candidate.path);
   }
   const final = assessLifecycleEvidence({ ...options, policy });
   return { ...final, before: initial.before, removed, reclaimedTemporaries, compacted,
-    after: final.after, withinBudget: final.withinBudget };
+    after: final.after, withinBudget: final.withinBudget, ...(stopped ? { stopped } : {}) };
 }

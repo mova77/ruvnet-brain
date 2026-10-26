@@ -373,3 +373,33 @@ describe('lifecycle evidence retention', () => {
   });
 });
 
+
+// Review r2 (4.7.21): an entry that "vanishes" on every rename while the snapshot keeps listing it must not spin the
+// prune loop forever. The mock stops vanishing after 1000 attempts so the unbounded (pre-fix) loop still terminates.
+describe('the vanished-entry retry loop is bounded', () => {
+  it('stops after MAX_VANISHED_RETRIES, removes nothing further, and says why', async () => {
+    const { MAX_VANISHED_RETRIES } = await import('../../kb/lifecycle-evidence-retention.mjs');
+    const f = fixture();
+    for (const [i, id] of ['1791258423435-aaaaaaaaaaaaaaaa', '1791258423436-bbbbbbbbbbbbbbbb', '1791258423437-cccccccccccccccc'].entries()) {
+      refresh(f, id, { at: `2026-10-1${i}T03:00:00Z` });
+    }
+    const runs = path.join(f.brainHome, 'refresh-runs');
+    const before = fs.readdirSync(runs).sort();
+    const real = fs.renameSync; let attempts = 0;
+    const spy = vi.spyOn(fs, 'renameSync').mockImplementation(function (from, ...rest) {
+      if (path.dirname(String(from)) === runs && attempts < 1000) {
+        attempts += 1;
+        throw Object.assign(new Error(`ENOENT: no such file or directory, rename '${from}'`), { code: 'ENOENT' });
+      }
+      return real.call(this, from, ...rest);
+    });
+    let result;
+    try { result = pruneLifecycleEvidence({ ...f, policy: policy({ maxRefreshReceipts: 1 }) }); } finally { spy.mockRestore(); }
+    expect(MAX_VANISHED_RETRIES).toBeGreaterThan(0);
+    expect(attempts).toBe(MAX_VANISHED_RETRIES + 1);
+    expect(result.stopped).toMatch(/pruning stopped: lifecycle evidence vanished \d+ times/);
+    expect(result.removed).toEqual({ refresh: [], transactions: [] });
+    expect(result.withinBudget).toBe(false);
+    expect(fs.readdirSync(runs).sort()).toEqual(before);
+  });
+});
