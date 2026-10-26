@@ -81,7 +81,9 @@ function runRecord({ trap, passing = true, i = 1, error = null, mutant = null })
     verdict: error ? replay.VERDICT.UNKNOWN : (passing ? replay.VERDICT.PASS : replay.VERDICT.FAIL),
     why: error
       ? `harness could not measure this run: ${error}`
-      : (passing ? 'treated action executed and retrieved' : `treated arm produced "${treatedRecord.class}", not the token`),
+      : (passing
+        ? `treated "${treatedRecord.class}" vs control "${controlRecord.class}"; the produced command executed and returned the required outcome`
+        : `treated arm produced "${treatedRecord.class}", not the token`),
     error,
     treated: { ...treatedRecord, transcript: proofRef({ trap, mutant, run: i, arm: 'treated', record: treatedRecord }) },
     control: { ...controlRecord, transcript: proofRef({ trap, mutant, run: i, arm: 'control', record: controlRecord }) },
@@ -147,19 +149,33 @@ describe('the learning-replay workflow step', () => {
   const files = () => replay.PORTFOLIO_RESULT_FILES;
   const cli = (...args) => spawnSync(process.execPath, [path.join(ROOT, 'scripts/learning-replay.mjs'), '--check-portfolio', ...args],
     { cwd: ROOT, encoding: 'utf8', timeout: 60_000 });
-  function place({ memory, post }) {
+  // A trap the portfolio accepts on its merits (N=3, 3/3 recomputed passes), and all four causal mutants at their
+  // real paths: tolerance re-checks every artifact (Codex 4.7.21 r4 #2), so a stale fixture must be otherwise valid.
+  const passingTrap = (trap, top = {}) => artifact({ trap, top: {
+    n: 3, passes: 3, fails: 0, treatedTokenRuns: 3, rate: 1,
+    executionGate: { treatedSubcommandRuns: 3, treatedExecutedRuns: 3, treatedRetrievedRuns: 3 },
+    runs: [1, 2, 3].map((i) => runRecord({ trap, i })),
+    ...top,
+  } });
+  const mutantPaths = () => Object.entries(replay.MUTANT_RESULT_FILES)
+    .flatMap(([trap, byName]) => Object.entries(byName).map(([mutant, file]) => [trap, mutant, file]));
+  function place({ memory, post, mutants = true }) {
     fs.mkdirSync(path.join(ROOT, 'data'), { recursive: true });
     for (const [trap, value] of [[replay.TRAP.MEMORY_SEARCH, memory], [replay.TRAP.POST_TASK, post]]) {
       if (value === null) fs.rmSync(files()[trap], { force: true });
       else fs.writeFileSync(files()[trap], `${JSON.stringify(value, null, 2)}\n`);
     }
+    for (const [trap, mutant, file] of mutantPaths()) {
+      if (!mutants) fs.rmSync(file, { force: true });
+      else fs.writeFileSync(file, `${JSON.stringify(artifact({ trap, passing: false, mutant }), null, 2)}\n`);
+    }
   }
   const failing = () => ({ memory: artifact({ passing: false }), post: artifact({ trap: replay.TRAP.POST_TASK }) });
   const stale = () => ({
-    memory: artifact({ top: { at: new Date(Date.now() - 30 * 86_400_000).toISOString() } }),
-    post: artifact({ trap: replay.TRAP.POST_TASK }),
+    memory: passingTrap(replay.TRAP.MEMORY_SEARCH, { at: new Date(Date.now() - 30 * 86_400_000).toISOString() }),
+    post: passingTrap(replay.TRAP.POST_TASK),
   });
-  afterEach(() => place({ memory: null, post: null }));
+  afterEach(() => place({ memory: null, post: null, mutants: false }));
 
   describe('the portfolio step as the workflow runs it', () => {
     const YML = path.resolve(import.meta.dirname, '../../.github/workflows/learning-replay.yml');
@@ -204,6 +220,17 @@ describe('the learning-replay workflow step', () => {
 
     it('a missing artifact is red even when not strict', () => {
       place({ memory: null, post: null });
+      expect(step('false').status).toBe(4);
+    });
+
+    it('a stale trap does not hide a missing or failing artifact behind it: red even when not strict', () => {
+      place({ ...stale(), post: null });
+      const missing = step('false');
+      expect(missing.status).toBe(4);
+      expect(missing.out).not.toContain('::warning title=LEARNING-REPLAY portfolio not current');
+      place({ ...stale(), post: artifact({ trap: replay.TRAP.POST_TASK, passing: false }) });
+      expect(step('false').status).toBe(1);
+      place({ ...stale(), mutants: false });
       expect(step('false').status).toBe(4);
     });
   });

@@ -35,8 +35,10 @@ name: learning-replay
 # It NO LONGER CLAIMS on a schedule that a real model changed behaviour on the current code. That model
 # half stays the committed portfolio's job. Out-of-date evidence (load-bearing files changed since it was
 # measured, or past the age limit) is the one result softened: printed in the run summary and annotated,
-# exit 0 (`--tolerate-stale`). A recomputed FAIL, INCONCLUSIVE, a missing/forged artifact or any other
-# UNKNOWN stays red on every trigger. A manual dispatch is green on wire PASS + annotated portfolio; ask
+# exit 0 (`--tolerate-stale`), and only after BOTH traps and all four mutants are verified and recomputed
+# with currency alone waived, so a stale artifact cannot hide a defect in itself or in any artifact after it.
+# A recomputed FAIL, INCONCLUSIVE, a missing/forged artifact or any other UNKNOWN in ANY of the six artifacts
+# stays red on every trigger. A manual dispatch is green on wire PASS + annotated portfolio; ask
 # for a hard currency check with strict_portfolio=true. release-vector/claims-verify read the same
 # evidence, where D4 reads UNKNOWN until someone re-measures. UNKNOWN is still never PASS.
 #

@@ -49,7 +49,8 @@ const usage = () => `Usage:
 
 Exit: 0=PASS, 1=FAIL, 3=INCONCLUSIVE, 4=UNKNOWN. --tolerate-stale exits 0 for an UNKNOWN caused only by
 out-of-date evidence (load-bearing files changed since it was measured, or past the age limit) and prints
-STALE-TOLERATED; every FAIL, INCONCLUSIVE and other UNKNOWN keeps its exit code.`;
+STALE-TOLERATED, and only when every trap and mutant artifact still verifies and recomputes to its expected
+result; every FAIL, INCONCLUSIVE and other UNKNOWN in any artifact keeps its exit code.`;
 
 function parse(argv) {
   const has = (flag) => argv.includes(flag);
@@ -148,10 +149,18 @@ function printed(label, result) {
 
 // The scheduled workflow reports out-of-date model evidence without paging on it (nothing scheduled can
 // re-measure it); a recomputed FAIL, a forged or missing artifact, or any other UNKNOWN stays non-zero.
+// The strict check stops at the first stale artifact, so tolerance re-checks the WHOLE portfolio (both traps
+// and all four mutants, every transcript verified and recomputed) with only staleness waived, and softens
+// nothing unless that passes: staleness never hides a defect behind it (Codex 4.7.21 r4 #2, Opus r2 #3).
 function portfolioExit(result, tolerateStale) {
-  const code = printed(`${INVARIANT}-PORTFOLIO`, result);
-  if (!tolerateStale || result.status !== VERDICT.UNKNOWN || result.stale !== true) return code;
-  console.log('  STALE-TOLERATED: the committed model evidence predates the current code; re-measure to restore a verdict.\n');
+  if (!tolerateStale || result.status !== VERDICT.UNKNOWN || result.stale !== true) {
+    return printed(`${INVARIANT}-PORTFOLIO`, result);
+  }
+  const waived = checkPortfolio({ tolerateStale: true });
+  if (waived.status !== VERDICT.PASS) return printed(`${INVARIANT}-PORTFOLIO`, waived);
+  printed(`${INVARIANT}-PORTFOLIO`, result);
+  console.log('  STALE-TOLERATED: every artifact verified and recomputed, but the committed model evidence predates'
+    + ' the current code; re-measure to restore a verdict.\n');
   return EXIT.PASS;
 }
 
