@@ -106,5 +106,7 @@ jobs:
           esac
           # This workflow is the only sender of arrival pages, so a failed delivery is retried and then fails the run
           # visibly (red in Actions) instead of vanishing (review round 2).
-          curl -sS --fail --retry 3 --retry-all-errors --retry-delay 5 -m 20 \
-            -H "Title: $TITLE" -H "Priority: $PRIO" -H "Tags: $TAGS" -d "$BODY" "https://ntfy.sh/$TOPIC" >/dev/null
+          # --retry (not --retry-all-errors): only transient failures are retried, which keeps the rare duplicate page
+          # (a POST accepted but its reply lost) to a timeout case; a lost page is worse than a duplicate.
+          curl -sS --fail --retry 3 --retry-delay 5 -m 20 \
+            -H "Title: $TITLE" -H "Priority: $PRIO" -H "Tags: $TAGS" --data-raw "$BODY" "https://ntfy.sh/$TOPIC" >/dev/null

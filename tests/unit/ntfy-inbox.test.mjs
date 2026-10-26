@@ -64,6 +64,24 @@ describe('round-2 review fixes', () => {
     open = mod.fold(open, [msg('3', '✅ Recovered: com.x', 1_792_900_050)], { resolver: jobLive });
     expect(open[0].closedBy).not.toBe('recovered notice (confirmed)');
   });
+  it('closed history never pushes out an open alert', () => {
+    const now = Date.parse('2026-10-25T12:00:00Z');
+    const issues = Array.from({ length: 150 }, (_, i) => msg(`i${i}`, `SLA breach: issue #${1000 + i}`, now / 1000 - 1000 - i));
+    const prs = Array.from({ length: 400 }, (_, i) => msg(`p${i}`, `New PR #${5000 + i}`, now / 1000 - i));
+    const out = mod.fold([], [...issues, ...prs], { resolver: (a) => (a.kind === 'pr' ? 'pr merged' : false), now });
+    expect(out.filter((a) => !a.closedAt && a.kind === 'issue')).toHaveLength(150);
+    expect(out.filter((a) => a.closedAt).length).toBeLessThanOrEqual(mod.MAX_CLOSED_KEPT);
+  });
+  it('an alert\'s last-seen time only moves forward', () => {
+    const open = mod.fold([], [msg('1', '🔴 FAILING: com.x', 1_792_900_100), msg('2', '🔴 FAILING: com.x', 1_792_900_000)], { resolver: never });
+    expect(open[0].lastAt).toBe(new Date(1_792_900_100 * 1000).toISOString());
+  });
+  it('live checks stop at the time budget and resume next poll', () => {
+    let t = 0; const calls = [];
+    const many = Array.from({ length: 5 }, (_, i) => msg(`j${i}`, `🔴 FAILING: com.j${i}`));
+    mod.fold([], many, { resolver: (a) => { calls.push(a.key); t += 100; return false; }, budgetMs: 250, clock: () => t });
+    expect(calls.length).toBeLessThan(5);
+  });
   it('the open list is capped so SessionStart can always read it', () => {
     const now = Date.parse('2026-10-25T12:00:00Z');
     const many = Array.from({ length: mod.MAX_OPEN_ALERTS + 50 }, (_, i) => msg(`o${i}`, `odd thing ${i}`, now / 1000 - i));

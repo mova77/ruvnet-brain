@@ -83,20 +83,30 @@ export function surfaceIssuePointer({ stateDir, emit, now, env, home, platform, 
  */
 export function surfaceNtfyAlerts({ stateDir, emit, env, home, platform, cwd, now = Date.now() }) {
   try {
-    const file = path.join(stateDir, 'ntfy-open-alerts.json');
-    let size = 0;
-    try { size = fs.statSync(file).size; } catch { return; }
-    if (size > MAX_STATUS_BYTES) return;
     if (!maintainerIssueEntitlement(env, home, 'stuinfla/ruvnet-brain', platform) || !isMaintainerRepo(cwd)) return;
-    const open = (json(file, []) || []).filter((a) => a && !a.closedAt);
-    if (!open.length) return;
-    // Counts by kind only, never message text: anyone who learns the topic can post to it, so a title here would be
-    // a way to put words into the session (review 2026-10-25). The owner's tool prints the details.
-    const kinds = {};
-    for (const a of open) { const k = ['job', 'ci', 'issue', 'pr'].includes(a.kind) ? a.kind : 'other'; kinds[k] = (kinds[k] || 0) + 1; }
-    const summary = Object.entries(kinds).map(([k, n]) => `${n} ${k}`).join(', ');
+    // The reader writes a few-byte summary (scripts/ntfy-inbox.mjs writeSummary) so a large alert list can never
+    // push this banner past its read limit; the detailed list is only a fallback for an older reader.
+    let total = 0; let kinds = {};
+    const summaryPath = path.join(stateDir, 'ntfy-open-summary.json');
+    const summary = (() => { try { return fs.statSync(summaryPath).size <= 4096 ? json(summaryPath) : null; } catch { return null; } })();
+    if (summary && Number.isInteger(summary.open)) {
+      total = summary.open;
+      for (const [k, n] of Object.entries(summary.kinds || {})) if (['job', 'ci', 'issue', 'pr', 'other'].includes(k) && Number.isInteger(n)) kinds[k] = n;
+    } else {
+      const file = path.join(stateDir, 'ntfy-open-alerts.json');
+      let size = 0;
+      try { size = fs.statSync(file).size; } catch { return; }
+      if (size > MAX_STATUS_BYTES) return;
+      const open = (json(file, []) || []).filter((a) => a && !a.closedAt);
+      total = open.length;
+      // Counts by kind only, never message text: anyone who learns the topic can post to it, so a title here would
+      // be a way to put words into the session (review 2026-10-25). The owner's tool prints the details.
+      for (const a of open) { const k = ['job', 'ci', 'issue', 'pr'].includes(a.kind) ? a.kind : 'other'; kinds[k] = (kinds[k] || 0) + 1; }
+    }
+    if (!total) return;
+    const summaryText = Object.entries(kinds).map(([k, n]) => `${n} ${k}`).join(', ');
     const polled = json(path.join(stateDir, 'ntfy-inbox-state.json'), {})?.polledAt;
     const age = polled ? `, read ${((now - Date.parse(polled)) / 3_600_000).toFixed(1)}h ago` : '';
-    emit(`[RuvNet Brain — NTFY: ${open.length} open alert(s) (${summary})${age}. Details: node scripts/ntfy-inbox.mjs --open]`);
+    emit(`[RuvNet Brain — NTFY: ${total} open alert(s) (${summaryText})${age}. Details: node scripts/ntfy-inbox.mjs --open]`);
   } catch { /* advisory only */ }
 }

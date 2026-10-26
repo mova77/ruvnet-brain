@@ -426,6 +426,19 @@ describe.skipIf(process.platform === 'win32')('host-neutral SessionStart core pa
     expect(result.output).not.toContain('com.x');
   });
 
+  it('reads the small ntfy summary first, so a huge alert list can never silence the banner', () => {
+    const result = parity((f) => {
+      warmed(f);
+      entitledRepo(f);
+      write(path.join(f.cache, 'ntfy-open-summary.json'), { at: new Date().toISOString(), open: 3, kinds: { issue: 2, job: 1 } });
+      write(path.join(f.cache, 'ntfy-open-alerts.json'), 'x'.repeat(300 * 1024));
+      const entitlement = path.join(f.state, 'maintainer-issues.json');
+      write(entitlement, { enabled: true, repos: ['stuinfla/ruvnet-brain'] });
+      fs.chmodSync(entitlement, 0o600);
+    });
+    expect(result.output).toMatch(/NTFY: 3 open alert\(s\) \(2 issue, 1 job\)/);
+  });
+
   it('never shows ntfy alerts to a normal end user', () => {
     const result = parity((f) => {
       warmed(f);

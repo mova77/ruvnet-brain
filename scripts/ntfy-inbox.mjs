@@ -32,6 +32,15 @@ export const OPEN_FILE = () => path.join(STATE_DIR(), 'ntfy-open-alerts.json');
 const STATE_FILE = () => path.join(STATE_DIR(), 'ntfy-inbox-state.json');
 const MAX_INBOX_BYTES = 4 * 1024 * 1024;
 export const MAX_OPEN_ALERTS = 200;
+export const MAX_CLOSED_KEPT = 100;
+// SessionStart reads this small summary, never the detailed list, so a big list can never silence the banner.
+export const SUMMARY_FILE = () => path.join(STATE_DIR(), 'ntfy-open-summary.json');
+export function writeSummary(open, now = Date.now()) {
+  const live = open.filter((a) => !a.closedAt);
+  const kinds = {};
+  for (const a of live) { const k = ['job', 'ci', 'issue', 'pr'].includes(a.kind) ? a.kind : 'other'; kinds[k] = (kinds[k] || 0) + 1; }
+  writeJson(SUMMARY_FILE(), { at: new Date(now).toISOString(), open: live.length, kinds });
+}
 const MAX_SEEN = 1000;
 const MAX_ATTEMPTS = 2;
 
@@ -96,7 +105,9 @@ function ghJson(args) { const r = spawnSync('gh', args, { encoding: 'utf8', time
 function readHeartbeat(label) { return readJson(path.join(os.homedir(), '.cache', 'ruvnet-brain', 'heartbeats', `${label}.json`), null); }
 
 /** Fold new messages into the open list. Idempotent: a message id already folded is skipped. */
-export function fold(open, messages, { now = Date.now(), resolver = resolvedNow } = {}) {
+export const RESOLVE_BUDGET_MS = 4 * 60_000;
+export function fold(open, messages, { now = Date.now(), resolver = resolvedNow, budgetMs = RESOLVE_BUDGET_MS, clock = Date.now } = {}) {
+  const resolveUntil = clock() + budgetMs;
   const byKey = new Map(open.map((a) => [a.key, a]));
   const folded = new Set(open.flatMap((a) => [a.id, ...(a.msgIds || []), a.closedByMsg].filter(Boolean)));
   for (const msg of messages) {
@@ -112,15 +123,19 @@ export function fold(open, messages, { now = Date.now(), resolver = resolvedNow 
     if (!c.actionable) continue;
     const existing = byKey.get(c.key);
     if (existing && !existing.closedAt) {
-      existing.count += 1; existing.lastAt = at; existing.lastTitle = msg.title;
-      existing.msgIds = [...(existing.msgIds || []), msg.id].slice(-50);
+      // lastAt only moves forward: a delayed older message must not make a newer failure look resolved.
+      existing.count += 1;
+      if (Date.parse(at) > Date.parse(existing.lastAt)) { existing.lastAt = at; existing.lastTitle = msg.title; }
+      existing.msgIds = [...(existing.msgIds || []), msg.id].slice(-10);
       continue;
     }
-    byKey.set(c.key, { id: msg.id, ...c, firstAt: at, lastAt: at, count: 1, title: msg.title || '', body: String(msg.message || '').slice(0, 500), msgIds: [msg.id], attempts: 0 });
+    byKey.set(c.key, { id: msg.id, ...c, firstAt: at, lastAt: at, count: 1, title: msg.title || '', body: String(msg.message || '').slice(0, 200), msgIds: [msg.id], attempts: 0 });
   }
   for (const a of byKey.values()) {
     if (a.closedAt) continue;
     if (a.kind === 'other' && now - Date.parse(a.lastAt) > 3 * 86_400_000) { a.closedAt = new Date(now).toISOString(); a.closedBy = 'expired (unrecognised message, 3 days)'; continue; }
+    // Live checks stop at the budget; the rest are checked on the next poll (a poll never outlives its lock).
+    if (clock() > resolveUntil) break;
     const why = resolver(a);
     if (why) { a.closedAt = new Date(now).toISOString(); a.closedBy = typeof why === 'string' ? why : 'cause cleared'; }
   }
@@ -131,7 +146,9 @@ export function fold(open, messages, { now = Date.now(), resolver = resolvedNow 
     .sort((x, y) => (x.kind === 'other') - (y.kind === 'other') || Date.parse(y.lastAt) - Date.parse(x.lastAt));
   const over = new Set(openOnes.slice(MAX_OPEN_ALERTS).map((a) => a.key));
   for (const a of kept) if (over.has(a.key)) { a.closedAt = new Date(now).toISOString(); a.closedBy = `dropped: more than ${MAX_OPEN_ALERTS} open alerts`; }
-  return kept.filter((a) => !a.closedAt || !over.has(a.key)).slice(-(MAX_OPEN_ALERTS * 3));
+  const stillOpen = kept.filter((a) => !a.closedAt);
+  const history = kept.filter((a) => a.closedAt && !over.has(a.key)).sort((x, y) => Date.parse(x.closedAt) - Date.parse(y.closedAt)).slice(-MAX_CLOSED_KEPT);
+  return [...stillOpen, ...history];
 }
 
 // ── LOCK: one writer of the inbox state at a time ──────────────────────────────────────────────────────────────
@@ -208,7 +225,7 @@ async function pollLocked(topic, { fetcher, now, resolver, launcher, known, avai
   state.polledAt = new Date(now).toISOString();
   const open = fold(readJson(OPEN_FILE(), []), messages, { now, ...(resolver ? { resolver } : {}) });
   // Inbox, open list and cursor are on disk before the responder is touched: nothing it does can lose them.
-  writeJson(OPEN_FILE(), open); writeJson(STATE_FILE(), state);
+  writeJson(OPEN_FILE(), open); writeSummary(open, now); writeJson(STATE_FILE(), state);
 
   let responded;
   try {
@@ -218,7 +235,7 @@ async function pollLocked(topic, { fetcher, now, resolver, launcher, known, avai
     responded = { started: false, why: `responder launch failed: ${error.message}` };
     state.responderError = { at: new Date(now).toISOString(), message: String(error.message).slice(0, 500) };
   }
-  writeJson(OPEN_FILE(), open); writeJson(STATE_FILE(), state);
+  writeJson(OPEN_FILE(), open); writeSummary(open, now); writeJson(STATE_FILE(), state);
   return { received: messages.length, open: open.filter((a) => !a.closedAt), responder: responded };
 }
 
@@ -465,7 +482,7 @@ export function ack(idOrAll, note = '', now = Date.now(), { wait = 120_000 } = {
     const open = readJson(OPEN_FILE(), []);
     let n = 0;
     for (const a of open) if (!a.closedAt && (idOrAll === 'all' || a.id === idOrAll || a.key === idOrAll)) { a.closedAt = new Date(now).toISOString(); a.closedBy = note || 'acknowledged by a session'; n += 1; }
-    if (n) writeJson(OPEN_FILE(), open);
+    if (n) { writeJson(OPEN_FILE(), open); writeSummary(open, now); }
     return n;
   } finally { releaseLock(lock); }
 }
