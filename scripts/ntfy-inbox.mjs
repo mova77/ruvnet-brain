@@ -152,8 +152,10 @@ export function fold(open, messages, { now = Date.now(), resolver = resolvedNow,
   for (const a of kept) if (over.has(a.key)) { a.closedAt = new Date(now).toISOString(); a.closedBy = `dropped: more than ${MAX_OPEN_ALERTS} open alerts`; }
   const stillOpen = kept.filter((a) => !a.closedAt);
   // Overflowed alerts stay in the record as "dropped" (not erased) and are counted in the summary and banner.
-  const dropped = kept.filter((a) => over.has(a.key));
-  const history = kept.filter((a) => a.closedAt && !over.has(a.key)).sort((x, y) => Date.parse(x.closedAt) - Date.parse(y.closedAt)).slice(-MAX_CLOSED_KEPT);
+  // Dropped records have their own allowance, so later ordinary closures can never push them out.
+  const isDropped = (a) => over.has(a.key) || /^dropped:/.test(a.closedBy || '');
+  const dropped = kept.filter(isDropped);
+  const history = kept.filter((a) => a.closedAt && !isDropped(a)).sort((x, y) => Date.parse(x.closedAt) - Date.parse(y.closedAt)).slice(-MAX_CLOSED_KEPT);
   return [...stillOpen, ...dropped.slice(-MAX_CLOSED_KEPT), ...history];
 }
 
@@ -497,9 +499,11 @@ export function ack(idOrAll, note = '', now = Date.now(), { wait = 120_000 } = {
 const clean = (s, n) => String(s ?? '').replace(/[\u0000-\u001f\u007f-\u009f‎‏‪-‮⁦-⁩]/g, ' ').slice(0, n);
 export function formatOpen(alerts) {
   const open = alerts.filter((a) => !a.closedAt);
-  if (!open.length) return 'No open ntfy alerts.';
+  const dropped = alerts.filter((a) => /^dropped:/.test(a.closedBy || ''));
+  const tail = dropped.length ? `\n${dropped.length} more dropped past the ${MAX_OPEN_ALERTS}-alert cap: ${dropped.slice(-5).map((a) => clean(a.key, 60)).join(', ')}` : '';
+  if (!open.length) return `No open ntfy alerts.${tail}`;
   return open.map((a) => `${clean(a.id, 64)}  [${clean(a.kind, 20)}]${a.blocked ? ` BLOCKED — the responder tried ${Number(a.attempts) || 0}x; needs a person.` : ''} ${clean(a.title, 200)}`
-    + `${a.count > 1 ? `  (×${a.count}, since ${clean(a.firstAt, 30)})` : ''}\n    ${clean(String(a.body || '').split('\n')[0], 160)}`).join('\n');
+    + `${a.count > 1 ? `  (×${a.count}, since ${clean(a.firstAt, 30)})` : ''}\n    ${clean(String(a.body || '').split('\n')[0], 160)}`).join('\n') + tail;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

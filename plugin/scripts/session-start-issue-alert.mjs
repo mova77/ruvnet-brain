@@ -90,7 +90,8 @@ export function surfaceNtfyAlerts({ stateDir, emit, env, home, platform, cwd, no
     const summaryPath = path.join(stateDir, 'ntfy-open-summary.json');
     const summary = (() => { try { return fs.statSync(summaryPath).size <= 4096 ? json(summaryPath) : null; } catch { return null; } })();
     // The summary is written before the list; if the list is newer anyway (an interrupted write), trust the list.
-    const listNewer = (() => { try { return fs.statSync(path.join(stateDir, 'ntfy-open-alerts.json')).mtimeMs > Date.parse(summary?.at || 0) + 5000; } catch { return false; } })();
+    // Compare the files' own write times (the summary's `at` is when the poll started, which can be minutes earlier).
+    const listNewer = (() => { try { return fs.statSync(path.join(stateDir, 'ntfy-open-alerts.json')).mtimeMs > fs.statSync(summaryPath).mtimeMs + 5000; } catch { return false; } })();
     let dropped = 0;
     if (summary && Number.isInteger(summary.open) && !listNewer) {
       if (Number.isInteger(summary.dropped)) dropped = summary.dropped;
@@ -100,7 +101,8 @@ export function surfaceNtfyAlerts({ stateDir, emit, env, home, platform, cwd, no
       const file = path.join(stateDir, 'ntfy-open-alerts.json');
       let size = 0;
       try { size = fs.statSync(file).size; } catch { return; }
-      if (size > MAX_STATUS_BYTES) return;
+      // Too big to read here is still news: say so rather than staying silent.
+      if (size > MAX_STATUS_BYTES) { emit('[RuvNet Brain — NTFY: open alerts present (list too large to summarise here). Details: node scripts/ntfy-inbox.mjs --open]'); return; }
       const open = (json(file, []) || []).filter((a) => a && !a.closedAt);
       total = open.length;
       // Counts by kind only, never message text: anyone who learns the topic can post to it, so a title here would

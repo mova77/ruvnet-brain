@@ -444,12 +444,27 @@ describe.skipIf(process.platform === 'win32')('host-neutral SessionStart core pa
       warmed(f);
       entitledRepo(f);
       write(path.join(f.cache, 'ntfy-open-summary.json'), { at: new Date(Date.now() - 3_600_000).toISOString(), open: 0, kinds: {} });
+      const old = new Date(Date.now() - 3_600_000);
+      fs.utimesSync(path.join(f.cache, 'ntfy-open-summary.json'), old, old); // the summary write is an hour older
       write(path.join(f.cache, 'ntfy-open-alerts.json'), [{ id: 'a1', kind: 'job', key: 'job:x', title: 't', lastAt: new Date().toISOString() }]);
       const entitlement = path.join(f.state, 'maintainer-issues.json');
       write(entitlement, { enabled: true, repos: ['stuinfla/ruvnet-brain'] });
       fs.chmodSync(entitlement, 0o600);
     });
     expect(result.output).toMatch(/NTFY: 1 open alert\(s\) \(1 job\)/);
+  });
+
+  it('a slow poll (summary written well after it started) still shows its banner, and an unreadable list still warns', () => {
+    const result = parity((f) => {
+      warmed(f);
+      entitledRepo(f);
+      write(path.join(f.cache, 'ntfy-open-alerts.json'), 'x'.repeat(300 * 1024));
+      write(path.join(f.cache, 'ntfy-open-summary.json'), { at: new Date(Date.now() - 600_000).toISOString(), open: 2, kinds: { job: 2 } });
+      const entitlement = path.join(f.state, 'maintainer-issues.json');
+      write(entitlement, { enabled: true, repos: ['stuinfla/ruvnet-brain'] });
+      fs.chmodSync(entitlement, 0o600);
+    });
+    expect(result.output).toMatch(/NTFY: 2 open alert\(s\) \(2 job\)/);
   });
 
   it('never shows ntfy alerts to a normal end user', () => {
