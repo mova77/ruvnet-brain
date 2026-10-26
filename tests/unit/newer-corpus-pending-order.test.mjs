@@ -14,7 +14,7 @@ describe('#401 newerCorpusPending orders semver tags and drops superseded eviden
     expect(compareReleaseTags('v4.5.9', 'v4.5.7')).toBe(1);
     expect(compareReleaseTags('v4.5.12', 'v4.6.2')).toBe(-1);
     expect(compareReleaseTags('v4.5.10', 'v4.5.9')).toBe(1);
-    expect(compareReleaseTags('v4.5.9', 'v4.5.9-dev')).toBe(1);
+    expect(compareReleaseTags('v4.5.9', 'v4.5.9-rc.1')).toBe(1);
     expect(compareReleaseTags('v4.5.9', 'v4.5.9')).toBe(0);
     expect(compareReleaseTags(OPAQUE_A, 'v4.5.9')).toBeNull();
   });
