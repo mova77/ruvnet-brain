@@ -136,8 +136,13 @@ export function currentTurnRecords(lines) {
   return { boundaryFound: start >= 0, prompt: start >= 0 ? textOf(recs[start].message?.content) : '', recs: recs.slice(start + 1) };
 }
 
-// Codex tools that neither change state nor run a check; every other unrecognised tool is a change.
-const CODEX_NEUTRAL = /^(?:update_plan|view_image|sleep|list_agents|request_user_input(?:_async)?)$/;
+// Codex tools that neither change state nor run a check; every other unrecognised tool is a change (fail
+// toward asking). Grounded in codex-cli 0.164.0's tool handlers (plan, view_image, tool_search,
+// mcp_resource/{list_mcp_resources,list_mcp_resource_templates,read_mcp_resource}, current_time,
+// get_context_remaining, wait_for_environment, multi_agents/wait, sleep, request_user_input[_async]) and real
+// rollouts (code-mode `wait` on a cell, `wait_agent`/`list_agents`). web_search is a hosted search, read-only.
+// Acting tools stay changes: spawn_agent, send_message, followup_task, interrupt_agent, js, exec, update_goal.
+const CODEX_NEUTRAL = /^(?:update_plan|view_image|sleep|list_agents|wait_agent|wait|request_user_input(?:_async)?|tool_search|web_search|list_mcp_resources|list_mcp_resource_templates|read_mcp_resource|current_time|get_context_remaining|wait_for_environment)$/;
 
 /** Ordered events for the current turn of a Claude JSONL (or normalized Codex) transcript. */
 export function claudeTurnEvents(lines, { host = 'claude' } = {}) {
@@ -297,6 +302,7 @@ const unquoted = (value) => String(value).replace(/"([^"\n]{0,300})"|“([^”\n
  * sentence must be a recognised claim outside its quotes, so quoting alone never makes a claim (#369).
  */
 export function promiseClosingClaim(completion, answer, promiseText) {
+  // DORMANT: auditCompletionClaims no longer returns PASS (only OBSERVED_CHECK/UNKNOWN/FAIL/NONE), so this never closes a promise today.
   if (completion?.verdict !== 'PASS') return null;
   const direct = completion.claims.find((c) => claimClosesPromise(c.text, promiseText));
   if (direct) return direct;

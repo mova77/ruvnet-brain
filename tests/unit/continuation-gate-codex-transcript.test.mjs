@@ -79,3 +79,28 @@ describe('Codex completion audit reads the native rollout (#423)', () => {
     expect(fire(repo(), SCOPED, t, 'claude')).toBe('');
   });
 });
+
+// Review fix (4.7.21): a Codex read-only/observation tool after the check is not a change. Names grounded in
+// codex-cli 0.164.0 (its tool handlers: view_image, plan/update_plan, tool_search, mcp_resource/*, current_time,
+// get_context_remaining, wait_for_environment, multi_agents/wait) and in real rollouts on the owner's Mac
+// (`wait` with a cell_id, `wait_agent`/`list_agents` under the `collaboration` namespace).
+describe('Codex read-only tools are not change boundaries', () => {
+  const call = (name, args = {}, namespace) => ri({ type: 'function_call', name, ...(namespace ? { namespace } : {}), call_id: `ro-${name}`, arguments: JSON.stringify(args) });
+  const verdictAfter = (...extra) => auditCompletionClaims(SCOPED, { turn: readClaudeTurn(rollout(user, patch(100, 110), run(200, 300), ...extra), { host: 'codex' }), host: 'codex' }).verdict;
+  it.each([
+    ['view_image', { path: '/tmp/a.png' }], ['update_plan', { plan: [] }], ['tool_search', { query: 'x' }],
+    ['list_mcp_resources', {}], ['list_mcp_resource_templates', {}], ['read_mcp_resource', { server: 's', uri: 'u' }],
+    ['web_search', { query: 'x' }], ['current_time', {}], ['get_context_remaining', {}], ['wait_for_environment', {}],
+    ['wait', { cell_id: '32', yield_time_ms: 1000 }], ['wait_agent', { timeout_ms: 60000 }, 'collaboration'],
+  ])('%s after the check keeps the observed check', (name, args, ns) => {
+    expect(verdictAfter(call(name, args, ns))).toBe('OBSERVED_CHECK');
+  });
+  it('an unknown or acting tool after the check is still a change (fail toward asking)', () => {
+    for (const [name, ns] of [['js', 'mcp__cua_repl'], ['send_message', 'collaboration'], ['some_future_tool', undefined]]) {
+      expect(verdictAfter(call(name, {}, ns))).not.toBe('OBSERVED_CHECK');
+    }
+  });
+  it('through the real gate: a tool search and an agent wait after the check raise no correction', () => {
+    expect(fire(repo(), SCOPED, rollout(user, patch(100, 110), run(200, 300), call('tool_search', { query: 'x' }), call('wait_agent', { timeout_ms: 1 }, 'collaboration')))).toBe('');
+  });
+});
