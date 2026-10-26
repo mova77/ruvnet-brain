@@ -67,6 +67,27 @@ describe('refreshSharedCodexAppServer — reload a running Codex host without ch
     expect(await refreshSharedCodexAppServer({ codexHome })).toEqual({ state: 'no-shared-server', changed: false });
     expect(fs.existsSync(path.join(codexHome, 'app-server-control'))).toBe(false);
   });
+  // Cross-vendor review F (4.7.21): the deadline started only after the WebSocket opened, so a socket that accepts
+  // but never completes the handshake hung the installer forever.
+  it('a socket that never completes the WebSocket handshake fails within the deadline and is torn down', async () => {
+    const net = await import('node:net');
+    const codexHome = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cxh-')));
+    const sockDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cs-')));
+    const sockets = new Set(); let closed = 0;
+    const server = net.createServer((s) => { sockets.add(s); s.resume(); s.on('close', () => { closed += 1; }); }); // accepts, never answers
+    await new Promise((resolve) => server.listen(path.join(sockDir, 's'), resolve));
+    fs.mkdirSync(path.join(codexHome, 'app-server-control'));
+    fs.symlinkSync(path.join(sockDir, 's'), path.join(codexHome, 'app-server-control', 'app-server-control.sock'));
+    cleanups.push(async () => { for (const s of sockets) s.destroy(); await new Promise((r) => server.close(() => r())); fs.rmSync(codexHome, { recursive: true, force: true }); fs.rmSync(sockDir, { recursive: true, force: true }); });
+    const started = Date.now();
+    const outcome = await Promise.race([refreshSharedCodexAppServer({ codexHome, timeoutMs: 300 }),
+      new Promise((resolve) => setTimeout(() => resolve({ state: 'HUNG' }), 3000))]);
+    expect(outcome).toMatchObject({ state: 'failed', reason: expect.stringMatching(/timed out/) });
+    expect(Date.now() - started).toBeLessThan(2500);
+    for (let i = 0; i < 40 && closed < sockets.size; i += 1) await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(sockets.size).toBe(1);
+    expect(closed).toBe(1); // the half-open connection was terminated, not left dangling
+  });
   it('reports a refused reload as failed without echoing the native error text', async () => {
     const { codexHome } = await sharedServer({ rejectWrite: true });
     const result = await refreshSharedCodexAppServer({ codexHome });
