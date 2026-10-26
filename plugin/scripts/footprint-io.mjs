@@ -182,6 +182,10 @@ export function rescueOperationalFiles(copyDir, rescue, brainHome, name = path.b
     if (!lstat(to)) fs.copyFileSync(from, to, fs.constants.COPYFILE_EXCL);
     if (!regular(to) || sha256Of(to) !== sha256) throw new Error(`could not rescue ${file} to ${to} (a different file is there); the copy is kept`);
   }
+  // A reused rescue folder (an earlier sweep rescued, then could not release, this copy) holds the only copy of these
+  // logs once the copy goes: make it the newest, so retention keeps it among the newest five (review r2). A failure
+  // throws, and the caller keeps the copy.
+  const touched = new Date(); fs.utimesSync(dest, touched, touched);
   return dest;
 }
 

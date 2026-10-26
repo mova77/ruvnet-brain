@@ -1196,6 +1196,24 @@ describe('operational files (logs, ruflo scratch) never pin a copy; they are res
     expect(fs.existsSync(copy)).toBe(false);
     for (const [file, body] of Object.entries(OPERATIONAL)) expect(fs.readFileSync(rescuedAt(m, path.basename(copy), file), 'utf8')).toBe(body);
   });
+  it('a reused rescue folder is made the newest, so the next sweep\'s retention keeps it (review r2)', () => {
+    const m = machine(); live(m); const copy = litterCopy(m);
+    const reused = path.join(m.brainHome, 'kb-copy-rescued', path.basename(copy));
+    for (const [file, body] of Object.entries(OPERATIONAL)) write(rescuedAt(m, path.basename(copy), file), body);
+    old(reused, 20);
+    for (let i = 0; i < 5; i += 1) {
+      const dir = path.join(m.brainHome, 'kb-copy-rescued', `kb.install-preserved-newer-${i}`);
+      write(path.join(dir, 'update.log'), `run ${i}`); old(dir, 10 - i);
+    }
+    sweepFootprint(opts(m, { apply: true }));
+    expect(fs.existsSync(copy)).toBe(false);
+    expect(fs.statSync(reused).mtimeMs).toBeGreaterThan(Date.now() - 60_000);
+    // The next sweep: the only copy of those logs is kept among the newest five.
+    const later = inventoryFootprint(opts(m, { now: Date.now() + 1000 })).items.find((i) => i.path === reused);
+    expect(later).toMatchObject({ kind: 'rescued-kb-logs', action: 'keep' });
+    sweepFootprint(opts(m, { apply: true, now: Date.now() + 1000 }));
+    for (const [file, body] of Object.entries(OPERATIONAL)) expect(fs.readFileSync(rescuedAt(m, path.basename(copy), file), 'utf8')).toBe(body);
+  });
   it('rescued directories are bounded: the newest five are kept, older ones are removed', () => {
     const m = machine(); live(m);
     for (let i = 0; i < 7; i += 1) {
