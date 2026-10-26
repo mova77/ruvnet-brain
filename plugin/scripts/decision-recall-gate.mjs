@@ -16,7 +16,8 @@
  * AT MOST ONE REFUSAL PER PATH PER SESSION (the duplicate-gate shape): the retry is allowed and
  * recorded. Only in an adopted project (canonical `.swarm/memory.db` exists). Opt-outs win
  * (ADR-105 §7): RUVNET_DECISION_RECALL_GATE=off, RUVNET_AGENTDB_FIRST=off, the brain-off sentinel.
- * Fails open on its own errors.
+ * Fails open on its own errors, except a Git identity timeout, which exits 3 (skipped, with the reason) so the
+ * gate's ledger records that this ADR decision was not checked (D8, 4.7.21).
  */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -29,6 +30,9 @@ import { isDirectInvocation } from './entrypoint.mjs';
 
 const ALLOW = 0;
 const REFUSE = 2;
+/** decision-gate.mjs's code for "this policy could not decide, and says why on stderr". */
+const SKIPPED_SELF = 3;
+const GIT_TIMEOUT_MS = 400;
 const STATUS_LINE = /^\s*(?:status:\s*\S.*|\*\*Status\*\*\s*:.*)$/im;
 /** The document's status line, ignoring fenced code (a YAML example is not the ADR's status). */
 const STATUS_LINES = new RegExp(STATUS_LINE.source, 'gim');
@@ -118,7 +122,14 @@ export function evaluate(payload, { env = process.env, now = Date.now() } = {}) 
   const decision = adrDecisionIn(payload);
   if (!decision) return { code: ALLOW };
   let resolution;
-  try { resolution = resolveProjectStore({ projectDir: payload.cwd || process.cwd(), gitTimeoutMs: 400 }); } catch { return { code: ALLOW }; }
+  try { resolution = resolveProjectStore({ projectDir: payload.cwd || process.cwd(), gitTimeoutMs: GIT_TIMEOUT_MS }); } catch (error) {
+    // D8 (4.7.21): a Git timeout is not a verdict. Exit SKIPPED_SELF with the reason, so decision-gate records a
+    // `policy-skipped` ledger row for this ADR decision instead of the silent allow it used to be.
+    if (/timed out/i.test(String(error?.message))) {
+      return { code: SKIPPED_SELF, stderr: `decision-recall: Git project identity timed out after ${GIT_TIMEOUT_MS}ms; the ${decision.kind} ${decision.path} was not checked for an AgentDB consult.` };
+    }
+    return { code: ALLOW };
+  }
   try { if (!fs.statSync(resolution.canonicalAgentDbPath).isFile()) return { code: ALLOW }; } catch { return { code: ALLOW }; }
   const brainHome = brainHomeOf(env);
   const receipt = freshConsultReceipt({ projectRoot: resolution.projectRoot, brainHome, now });
