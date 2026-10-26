@@ -19,6 +19,17 @@ describe('#401 newerCorpusPending orders semver tags and drops superseded eviden
     expect(compareReleaseTags(OPAQUE_A, 'v4.5.9')).toBeNull();
   });
 
+  it('prerelease identifiers compare per semver §11: numeric parts numerically, numeric below alphanumeric, longer set wins', () => {
+    expect(compareReleaseTags('v4.7.21-alpha.10', 'v4.7.21-alpha.9')).toBe(1);
+    expect(compareReleaseTags('v4.7.21-alpha.9', 'v4.7.21-alpha.10')).toBe(-1);
+    expect(compareReleaseTags('v4.7.21-rc.2', 'v4.7.21-rc.11')).toBe(-1);
+    expect(compareReleaseTags('v4.7.21-alpha.1', 'v4.7.21-alpha')).toBe(1);
+    expect(compareReleaseTags('v4.7.21-alpha.beta', 'v4.7.21-alpha.1')).toBe(1);
+    expect(compareReleaseTags('v4.7.21-beta', 'v4.7.21-alpha.10')).toBe(1);
+    expect(compareReleaseTags('v4.7.21-alpha.01', 'v4.7.21-alpha.1')).toBe(0);
+    expect(newerCorpusPending({ source: { releaseTag: 'v4.7.21-alpha.10' }, corpusCheck: check('v4.7.21-alpha.9') })).toBeNull();
+  });
+
   it.each([
     ['v4.5.9', 'v4.5.7'],
     ['v4.6.2', 'v4.6.0'],
