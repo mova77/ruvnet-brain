@@ -1182,6 +1182,20 @@ describe('operational files (logs, ruflo scratch) never pin a copy; they are res
     expect(fs.existsSync(copy)).toBe(false);
     expect(fs.existsSync(rescuedAt(m, path.basename(copy), 'update.log'))).toBe(true);
   });
+  it('a retry never deletes the rescue it just relied on, even when five newer rescues aged it out (review C)', () => {
+    const m = machine(); live(m); const copy = litterCopy(m);
+    // An earlier sweep rescued this copy's logs but could not delete the copy; five newer rescues followed.
+    for (const [file, body] of Object.entries(OPERATIONAL)) write(rescuedAt(m, path.basename(copy), file), body);
+    old(path.join(m.brainHome, 'kb-copy-rescued', path.basename(copy)), 20);
+    for (let i = 0; i < 5; i += 1) {
+      const dir = path.join(m.brainHome, 'kb-copy-rescued', `kb.install-preserved-newer-${i}`);
+      write(path.join(dir, 'update.log'), `run ${i}`); old(dir, 10 - i);
+    }
+    expect(inventoryFootprint(opts(m)).items.find((i) => i.path === path.join(m.brainHome, 'kb-copy-rescued', path.basename(copy))).action).toBe('remove');
+    sweepFootprint(opts(m, { apply: true }));
+    expect(fs.existsSync(copy)).toBe(false);
+    for (const [file, body] of Object.entries(OPERATIONAL)) expect(fs.readFileSync(rescuedAt(m, path.basename(copy), file), 'utf8')).toBe(body);
+  });
   it('rescued directories are bounded: the newest five are kept, older ones are removed', () => {
     const m = machine(); live(m);
     for (let i = 0; i < 7; i += 1) {
@@ -1208,7 +1222,7 @@ describe('BREAK IT: the rescue is what makes releasing a log-holding copy safe',
     expect(treeBytes(path.join(m.brainHome, 'kb-copy-rescued'))).toBeGreaterThan(16 * 1024 * 1024); // ...and the rescue is unbounded
   });
   it('rescue skipped -> the copy is deleted and its only nightly log is lost', async () => {
-    const mod = await mutant([['brain-footprint.mjs', 'if (apply) rescueOperationalFiles(item.path, proof.rescue, roots.brainHome);', 'if (false) void 0;']]);
+    const mod = await mutant([['brain-footprint.mjs', 'if (apply) rescue(item.path, proof.rescue, roots.brainHome);', 'if (false) void 0;']]);
     const real = machine(); live(real); const keptLog = litterCopy(real);
     sweepFootprint(opts(real, { apply: true }));
     expect(fs.readFileSync(rescuedAt(real, path.basename(keptLog), 'update.log'), 'utf8')).toBe(OPERATIONAL['update.log']); // real: rescued
