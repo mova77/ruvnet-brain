@@ -86,14 +86,14 @@ describe('coordinator stage isolation', () => {
   it('no claude on PATH: installed plugins are UNSUPPORTED and preserved, knowledge ran, the run completes', async () => {
     const m = machine(), artifact = path.join(m.home, 'artifact'); fs.mkdirSync(artifact);
     const installed = path.join(m.home, '.claude/plugins/installed_plugins.json');
-    atomic(installed, { plugins: { 'ruvnet-brain@ruvnet-brain': [{ scope: 'user', installPath: artifact, version: '4.7.20' }] } });
+    atomic(installed, { plugins: { 'ruvnet-brain@ruvnet-brain': [{ scope: 'user', installPath: artifact, version: '9.0.0' }] } });
     const runner = (command, args, options) => args[0] === 'view' ? JSON.stringify({ latest: '1.0.0' }) : m.runner(command, args, options);
     const receipt = await runDeveloperUpdate({ mode: 'apply', home: m.home, env: { PATH: m.bin }, runner });
     expect(receipt).toMatchObject({ state: 'completed', ok: true, knowledge: { state: 'current' } });
     expect(receipt.plugins.steps).toEqual([expect.objectContaining({ id: 'ruvnet-brain@ruvnet-brain', state: 'UNSUPPORTED', reason: expect.stringMatching(/no existing Claude command/) })]);
     expect(receipt.coverage.unverified.some(n => n.includes('ruvnet-brain@ruvnet-brain'))).toBe(true);
     expect(m.calls.some(c => c.startsWith('plugin'))).toBe(false);
-    expect(JSON.parse(fs.readFileSync(installed, 'utf8')).plugins['ruvnet-brain@ruvnet-brain'][0].version).toBe('4.7.20');
+    expect(JSON.parse(fs.readFileSync(installed, 'utf8')).plugins['ruvnet-brain@ruvnet-brain'][0].version).toBe('9.0.0');
   });
 
   it('a knowledge failure is recorded on the knowledge stage and the later stages still run', async () => {
@@ -128,7 +128,7 @@ describe('coordinator stage isolation', () => {
 
 /** knowledge() with a runner that answers the receipt door (exit codes) and the plain door (throws off-contract), so the
  * pre-fix code — which only used the plain door with allowed [0, 10] and [0] — fails these cases. */
-function knowledgeFixture({ checks, installExit = 0, installed = '9.0.1', stamped = '4.7.20' }) {
+function knowledgeFixture({ checks, installExit = 0, installed = '9.0.1', stamped = '9.0.0' }) {
   const brainHome = tmp(), root = path.join(brainHome, 'root'), calls = [];
   fs.mkdirSync(path.join(brainHome, 'kb'), { recursive: true }); fs.writeFileSync(path.join(brainHome, 'kb/forge-update.mjs'), '');
   if (stamped) atomic(path.join(brainHome, 'kb/RUNTIME-IDENTITY.json'), { brainVersion: stamped });
@@ -155,12 +155,12 @@ describe('knowledge step', () => {
     const f = knowledgeFixture({ checks: [[5], [0, 'CURRENT']] });
     const result = knowledge(f.run, false, 'k1', f.opts);
     expect(f.calls).toEqual(['check', 'install --update --no-nightly-prompt --no-stack', 'check']);
-    expect(result).toMatchObject({ state: 'updated', restamped: { from: '4.7.20', to: '9.0.1' } });
+    expect(result).toMatchObject({ state: 'updated', restamped: { from: '9.0.0', to: '9.0.1' } });
   });
 
   it('--check exit 5 with the same version is reported incompatible and installs nothing', () => {
-    const f = knowledgeFixture({ checks: [[5]], installed: '4.7.20' });
-    expect(knowledge(f.run, false, 'k2', f.opts)).toMatchObject({ state: 'incompatible', installed: '4.7.20', stamped: '4.7.20' });
+    const f = knowledgeFixture({ checks: [[5]], installed: '9.0.0' });
+    expect(knowledge(f.run, false, 'k2', f.opts)).toMatchObject({ state: 'incompatible', installed: '9.0.0', stamped: '9.0.0' });
     expect(f.calls).toEqual(['check']);
   });
 
@@ -253,7 +253,7 @@ describe('host-update --knowledge mirrors the exit-5 re-stamp', () => {
     atomic(path.join(pkg, 'package.json'), { name: 'ruvnet-brain', version, bin: { 'ruvnet-brain': 'bin/install.mjs' } });
     fs.writeFileSync(path.join(pkg, 'bin/install.mjs'), `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(marker)}, process.argv.slice(2).join(' '));`);
     fs.writeFileSync(path.join(kb, 'forge-update.mjs'), 'process.exit(5);');
-    atomic(path.join(kb, 'RUNTIME-IDENTITY.json'), { brainVersion: '4.7.20' });
+    atomic(path.join(kb, 'RUNTIME-IDENTITY.json'), { brainVersion: '9.0.0' });
     saveUpdateSource('installed', { home });
     const attempt = path.join(brainHome, 'auto-update.json'), lock = path.join(brainHome, 'auto-update.lock'), check = path.join(brainHome, 'corpus-check.json');
     fs.writeFileSync(lock, '{}');
@@ -269,7 +269,7 @@ describe('host-update --knowledge mirrors the exit-5 re-stamp', () => {
     expect(fs.existsSync(m.lock)).toBe(false);
   });
   it('same version as the stamp: still reported incompatible, no installer', () => {
-    const m = installedMachine('4.7.20');
+    const m = installedMachine('9.0.0');
     expect(m.check.outcome).toBe('incompatible');
     expect(fs.existsSync(m.marker)).toBe(false);
   });

@@ -17,7 +17,7 @@ describe('parseNpmPack reads every captured npm shape to the same entry', () => 
     it(`npm ${major}`, () => {
       const entry = parseNpmPack(fixture(major), { expectName: 'ruvnet-brain' });
       expect(entry.filename).toBe('ruvnet-brain-4.7.20.tgz');
-      expect(entry.version).toBe('4.7.20');
+      expect(entry.version).toBe('4.7.20'); // sync-version-ignore: the captured real npm pack output of the 4.7.20 package, pinned as the fixture
       expect([...packedPaths(entry)]).toEqual(EXPECTED_PATHS);
     });
   }

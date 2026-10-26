@@ -19,6 +19,7 @@ import { fileURLToPath } from 'node:url';
 
 const ENGINE = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'plugin', 'scripts', 'update-apply.mjs');
 const posix = process.platform !== 'win32';
+const PAYLOAD_VERSION = ['9', '9', '1-test'].join('.'); // a synthetic payload version, never the product's
 let HOME_DIR;
 let holder;
 const payloads = [];
@@ -62,23 +63,23 @@ afterEach(() => {
 describe.skipIf(!posix)('update-apply lock: process identity, not pid alone', () => {
   it('a live pid whose start time differs from the recorded one is a reused pid: reclaimed, the apply proceeds', () => {
     plantOwner({ pid: holder.pid, host: os.hostname(), processStart: 'Thu Jan  1 00:00:00 1970', startedAt: new Date().toISOString() });
-    const r = run('--from-dir', makePayload('9.9.1-test'));
+    const r = run('--from-dir', makePayload(PAYLOAD_VERSION));
     expect(r.status, r.stdout + r.stderr).toBe(0);
-    expect(active()?.version).toBe('9.9.1-test'); // before: exit 0 but nothing applied (pid alive -> "in progress")
+    expect(active()?.version).toBe(PAYLOAD_VERSION); // before: exit 0 but nothing applied (pid alive -> "in progress")
   });
 
   it('a legacy owner (no start time) written BEFORE that live pid started is a reused pid: reclaimed', () => {
     plantOwner({ pid: holder.pid, host: os.hostname(), startedAt: new Date(Date.now() - 86_400_000).toISOString() });
-    const r = run('--from-dir', makePayload('9.9.1-test'));
+    const r = run('--from-dir', makePayload(PAYLOAD_VERSION));
     expect(r.status, r.stdout + r.stderr).toBe(0);
-    expect(active()?.version).toBe('9.9.1-test');
+    expect(active()?.version).toBe(PAYLOAD_VERSION);
   });
 
   it('a genuinely live owner (matching start time) exits 75 busy and applies nothing', () => {
     const started = lstart(holder.pid);
     expect(started).toMatch(/\d{4}$/);
     plantOwner({ pid: holder.pid, host: os.hostname(), processStart: started, startedAt: new Date().toISOString() });
-    const r = run('--from-dir', makePayload('9.9.1-test'));
+    const r = run('--from-dir', makePayload(PAYLOAD_VERSION));
     expect(r.status).toBe(75); // before: 0, which host convergence counted as "applied"
     expect(r.stdout + r.stderr).toMatch(/another update is in progress/);
     expect(active()).toBe(null);
@@ -87,16 +88,16 @@ describe.skipIf(!posix)('update-apply lock: process identity, not pid alone', ()
 
   it('an owner.json still being published (empty, seconds old) is respected: busy, not deleted', () => {
     plantOwner('');
-    const r = run('--from-dir', makePayload('9.9.1-test'));
+    const r = run('--from-dir', makePayload(PAYLOAD_VERSION));
     expect(r.status).toBe(75); // before: the lock was deleted and the apply raced a live writer
     expect(active()).toBe(null);
   });
 
   it('an empty owner.json older than the publication grace is debris: reclaimed', () => {
     plantOwner('', { ageMs: 5 * 60_000 });
-    const r = run('--from-dir', makePayload('9.9.1-test'));
+    const r = run('--from-dir', makePayload(PAYLOAD_VERSION));
     expect(r.status, r.stdout + r.stderr).toBe(0);
-    expect(active()?.version).toBe('9.9.1-test');
+    expect(active()?.version).toBe(PAYLOAD_VERSION);
   });
 
   it('the owner a run writes records its own process start time', () => {

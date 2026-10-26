@@ -4491,7 +4491,13 @@ async function runUpdate() {
   };
   process.once('SIGTERM', signalGuard);
   process.once('SIGINT', signalGuard);
-  const settleIfSignalled = (child) => { if (['SIGTERM', 'SIGINT'].includes(child?.signal)) signalGuard(child.signal); };
+  // The updater now settles its own SIGTERM/SIGINT (kb/forge-update.mjs exits 143/130 with an `interrupted`
+  // result) instead of dying of the signal, so a group kill shows up here as that exit status too.
+  const settleIfSignalled = (child) => {
+    if (['SIGTERM', 'SIGINT'].includes(child?.signal)) signalGuard(child.signal);
+    else if (child?.status === 143) signalGuard('SIGTERM');
+    else if (child?.status === 130) signalGuard('SIGINT');
+  };
   const detachGuards = () => {
     process.removeListener('exit', exitGuard);
     process.removeListener('SIGTERM', signalGuard);
