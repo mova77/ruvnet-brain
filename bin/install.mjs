@@ -96,6 +96,7 @@ import { runHostCli, waitForHostCli } from '../scripts/host-cli.mjs';
 import {
   writeInstalledRuntimeIdentity, recordCorpusTransportIdentity, isCorpusReleaseTag, rejectedReleasePath,
 } from '../kb/corpus-release-identity.mjs';
+import { isDirectInvocation } from '../plugin/scripts/entrypoint.mjs';
 
 // SEC-0010 #6 — the Ed25519 PUBLIC key is EMBEDDED here (not a separate file) so the installer's
 // trust root travels with the installer code itself: an attacker who swaps the downloaded bundle
@@ -6412,11 +6413,7 @@ the installer reports that boot-level declarations changed.
   // in a unit test ran a real install against the maintainer's HOME. Direct argv identity is the
   // authority boundary. The old IMPORT_ONLY flag may still be present in a long-lived test worker;
   // it must never suppress a genuinely direct CLI execution.
-  const canonical = (value) => {
-    try { return fs.realpathSync(value); } catch { return path.resolve(value); }
-  };
-  const invokedDirectly = Boolean(process.argv[1])
-    && canonical(process.argv[1]) === canonical(fileURLToPath(import.meta.url));
+  const invokedDirectly = isDirectInvocation(import.meta.url);
   if (!invokedDirectly) return;
   if (FLAG_HELP) return showHelp();
   if (NAMED_RELEASE?.error) {

@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 import zlib from 'node:zlib';
 import { codexHookIdentities, codexPluginContentHash } from './codex-hook-trust.mjs';
+import { isDirectInvocation } from '../plugin/scripts/entrypoint.mjs';
 
 /**
  * sha256 of every regular file under package/plugin/ in a verified npm tarball, read in memory (ustar with pax `path`
@@ -336,7 +337,7 @@ export async function reconcileVerifiedCodexHookTrust({ releaseIdentity, install
 }
 
 // Explicit CLI only; importing the helper never starts a process or reads stdin.
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+if (isDirectInvocation(import.meta.url)
   && process.argv[2] === '--reconcile-installed') {
   const started = Date.now(); let emitted = false; let reconcileStarted = false;
   const emit = (receipt) => { if (!emitted) { emitted = true; process.stdout.write(JSON.stringify(receipt) + '\n'); } };

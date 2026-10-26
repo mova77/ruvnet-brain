@@ -2005,7 +2005,9 @@ async function main() {
 // guard merely importing this file would start a live update — a network fetch, a directory swap, and
 // a process.exit() inside whatever imported it. (Found exactly that way: the reclaim test's import
 // began racing a real update against the test run.)
-const invokedDirectly = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+// Ships in the brain bundle, where only kb/ modules exist, so it cannot import
+// plugin/scripts/entrypoint.mjs; this is that helper's comparison, inline: real paths on both sides.
+const invokedDirectly = (() => { try { return Boolean(process.argv[1]) && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url)); } catch { return false; } })();
 if (invokedDirectly && STAGED_RELEASE_FILE) {
   (async () => {
     const input = JSON.parse(fs.readFileSync(STAGED_RELEASE_FILE, 'utf8'));

@@ -660,6 +660,7 @@ describe('hook-shim SessionStart authority selection', () => {
     fs.copyFileSync(path.join(SOURCE_SCRIPTS, 'development-maintenance.mjs'), path.join(scripts, 'development-maintenance.mjs'));
     fs.copyFileSync(path.join(SOURCE_SCRIPTS, 'session-start-budget.mjs'), path.join(scripts, 'session-start-budget.mjs'));
     fs.copyFileSync(path.join(SOURCE_SCRIPTS, 'hook-context-budget.mjs'), path.join(scripts, 'hook-context-budget.mjs'));
+    fs.copyFileSync(path.join(SOURCE_SCRIPTS, 'entrypoint.mjs'), path.join(scripts, 'entrypoint.mjs'));
     write(path.join(root, 'plugin/hooks/hooks.json'), JSON.stringify({ hooks: { SessionStart: [{ hooks: [
       { command: 'node session-start', timeout: 8 },
     ] }] } }));

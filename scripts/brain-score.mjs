@@ -30,6 +30,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isDirectInvocation } from '../plugin/scripts/entrypoint.mjs';
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const DAY = 86_400_000;
@@ -260,7 +261,7 @@ export function composite(dims, kind) {
 }
 
 const isMain = (() => {
-  try { return process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url); }
+  try { return isDirectInvocation(import.meta.url); }
   catch { return false; }
 })();
 

@@ -47,6 +47,7 @@ import os from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { BOT_MARKER, OWNER_LOGIN } from './issue-watch.mjs';
+import { isDirectInvocation } from '../plugin/scripts/entrypoint.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const REPO = 'stuinfla/ruvnet-brain';
@@ -555,4 +556,4 @@ async function main() {
   process.exit(failedAttempt ? 1 : 0);
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) await main();
+if (isDirectInvocation(import.meta.url)) await main();

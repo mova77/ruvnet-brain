@@ -53,6 +53,7 @@ function appendReceipt(file, row) {
 }
 const flagValue = (args, flag) => { const i = args.indexOf(flag); return i >= 0 ? args[i + 1] : undefined; };
 import { contentPathExcludes, pathIsExcluded, privateTurn, maskExcludedPaths, captureFailureReason, firstTurnCaptureNotice } from './turn-capture-privacy.mjs';
+import { isDirectInvocation } from './entrypoint.mjs';
 
 export const TURN_NAMESPACE = 'turns';
 export const MIN_OUTCOME_CHARS = 200;
@@ -494,7 +495,7 @@ export function turnRecordingStatus({ projectDir = process.cwd(), env = process.
     : { state: 'unknown', line: 'turn recording not yet proven — no exact readback receipt' });
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url) && process.argv[2] === '--run-steps') {
+if (isDirectInvocation(import.meta.url) && process.argv[2] === '--run-steps') {
   try { runSteps(JSON.parse(process.argv[3] || '{}')); } catch { /* a detached worker has no one to report to */ }
   process.exit(0);
 }

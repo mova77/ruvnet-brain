@@ -25,6 +25,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { resolveProjectStore } from './project-store-resolver.mjs';
 import { isAdrPath, freshConsultReceipt, brainHomeOf } from './decision-record.mjs';
+import { isDirectInvocation } from './entrypoint.mjs';
 
 const ALLOW = 0;
 const REFUSE = 2;
@@ -150,7 +151,7 @@ export function evaluate(payload, { env = process.env, now = Date.now() } = {}) 
 }
 
 function isMain() {
-  try { return Boolean(process.argv[1]) && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url)); } catch { return false; }
+  try { return isDirectInvocation(import.meta.url); } catch { return false; }
 }
 if (isMain()) {
   let verdict = { code: ALLOW };

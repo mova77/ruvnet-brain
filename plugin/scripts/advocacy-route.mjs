@@ -61,6 +61,7 @@ import {
   ACTIONS, record, shouldStillOffer, stateHashOf, precision, pendingOffers, reconcileIgnored, loadOutcomes,
 } from './advocacy-outcomes.mjs';
 import { packageRecommenderEnabled, offerNames } from './package-recommender-flag.mjs';
+import { isDirectInvocation } from './entrypoint.mjs';
 // Matcher + socket client load only when the flag is on at process start: default-off pays nothing.
 const PKG = packageRecommenderEnabled() ? { ...(await import('./package-recommender.mjs')), ...(await import('./package-recommender-client.mjs')) } : null;
 
@@ -429,7 +430,7 @@ export function decide({ prompt, sessionId, file, state, now = Date.now(), start
 }
 
 // ── CLI ───────────────────────────────────────────────────────────────────────────────────────────
-const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+const isMain = isDirectInvocation(import.meta.url);
 
 async function main() {
   const startedAt = Date.now();

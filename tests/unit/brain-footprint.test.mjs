@@ -885,7 +885,7 @@ describe('SessionStart footprint line', () => {
 async function mutant(replacements) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'footprint-mutant-'));
   dirs.push(dir);
-  for (const f of ['brain-footprint.mjs', 'kb-copy-proof.mjs', 'brain-confirmation.mjs', 'mcp-readiness.mjs', 'brain-location.mjs', 'footprint-io.mjs', 'ruflo-bin.mjs']) {
+  for (const f of ['brain-footprint.mjs', 'kb-copy-proof.mjs', 'brain-confirmation.mjs', 'mcp-readiness.mjs', 'brain-location.mjs', 'footprint-io.mjs', 'ruflo-bin.mjs', 'entrypoint.mjs']) {
     let src = fs.readFileSync(path.join(ROOT, 'plugin', 'scripts', f), 'utf8');
     for (const [file, from, to] of replacements) if (file === f) {
       expect(src.includes(from), `mutation anchor missing in ${f}: ${from}`).toBe(true);

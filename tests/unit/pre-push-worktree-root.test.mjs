@@ -25,6 +25,8 @@ describe('pre-push gate worktree routing', () => {
     fs.chmodSync(foreignHook, 0o755);
     fs.mkdirSync(path.join(repo, 'scripts'), { recursive: true });
     fs.copyFileSync(path.join(ROOT, 'scripts', 'development-push-check.mjs'), path.join(repo, 'scripts', 'development-push-check.mjs'));
+    fs.mkdirSync(path.join(repo, 'plugin', 'scripts'), { recursive: true });
+    fs.copyFileSync(path.join(ROOT, 'plugin', 'scripts', 'entrypoint.mjs'), path.join(repo, 'plugin', 'scripts', 'entrypoint.mjs'));
 
     expect(spawnSync('git', ['init', '-q'], { cwd: repo }).status).toBe(0);
     fs.writeFileSync(path.join(repo, 'tracked.txt'), 'fixture\n');

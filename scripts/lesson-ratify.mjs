@@ -40,6 +40,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { loadLessons, updateLessons, ratify, demote, weightOf, pending, ENFORCEMENT, STATUS, ORIGIN, SOURCE_CLASS, TRIGGERS } from './lesson-store.mjs';
+import { isDirectInvocation } from '../plugin/scripts/entrypoint.mjs';
 
 const FORCE = { block: '⛔ BLOCKS', checklist: '☑ checklist', inject: '· context', review: '👁 review only' };
 
@@ -117,9 +118,7 @@ function printResult(result, id, verb) {
 
 /** am I the entrypoint? — `fileURLToPath`, never `.pathname` (Windows); `realpathSync` guarded (vitest). */
 function isEntrypoint() {
-  if (!process.argv[1]) return false;
-  try { return fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url)); }
-  catch { return false; }
+  return isDirectInvocation(import.meta.url);
 }
 
 if (isEntrypoint()) {

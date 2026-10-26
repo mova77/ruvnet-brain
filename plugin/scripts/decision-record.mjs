@@ -31,6 +31,7 @@ import { resolveRuflo, rufloInvocation } from './ruflo-bin.mjs';
 import { rufloRunDir } from './ruflo-bin.mjs';
 import { currentTurnRecords } from './completion-claim-evidence.mjs';
 import { recordHookFailure } from './hook-failures.mjs';
+import { isDirectInvocation } from './entrypoint.mjs';
 
 export const DECISION_SCHEMA = 'ruvnet-brain.decision-record';
 export const STATUSES = Object.freeze(['ratified', 'detected-unconfirmed']);
@@ -319,6 +320,6 @@ export async function main(argv = process.argv.slice(2), { env = process.env, ou
 }
 
 function isMain() {
-  try { return Boolean(process.argv[1]) && fs.realpathSync(process.argv[1]) === fs.realpathSync(SCRIPT); } catch { return false; }
+  try { return isDirectInvocation(import.meta.url); } catch { return false; }
 }
 if (isMain()) main().then((code) => { process.exitCode = code; }, (e) => { process.stderr.write(`decision-record: ${e.message}\n`); process.exitCode = 1; });

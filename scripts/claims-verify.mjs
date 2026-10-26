@@ -26,6 +26,7 @@ import { storeRoot } from '../kb/store-root.mjs';
 import { validateCoverageDirectory, sha256File } from './coverage-integrity.mjs';
 import { verifyPayload, verifyPayloadMembers, payloadIdFor } from './release-payload.mjs';
 import { extractZip } from '../kb/zip-extract.mjs';
+import { isDirectInvocation } from '../plugin/scripts/entrypoint.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -903,6 +904,6 @@ async function main() {
   if (verdict === 'UNKNOWN' && process.argv.includes('--strict')) process.exitCode = 4;
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (isDirectInvocation(import.meta.url)) {
   await main();
 }
