@@ -26,6 +26,7 @@ import { searchOnce, nativeRead, exactReads, searchJsonResult } from './agentdb-
 import { makeLesson } from './lesson-store.mjs';
 import { supersededKeys, tombstonedKeys } from './decision-record.mjs';
 import { checkpointMs, checkpointNamespaces, newestCheckpoint } from './checkpoint-keys.mjs';
+import { isDirectInvocation } from './entrypoint.mjs';
 export const STORE_FILES = Object.freeze(['memory.db']);
 export const DEFAULT_DEADLINE_MS = 1900;
 export const BLOCK_MAX_BYTES = 600;
@@ -479,7 +480,7 @@ async function main() {
 }
 
 function isMain() {
-  try { return Boolean(process.argv[1]) && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url)); }
+  try { return isDirectInvocation(import.meta.url); }
   catch { return false; }
 }
 if (isMain()) main().catch(() => process.exit(0));

@@ -8,6 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { buildWeeklyAssessment } from './model-weekly-assessment.mjs';
 import { fileURLToPath } from 'node:url';
 import { WEEK_MS, digest, parseInventory, parseArtificialAnalysis, parseCodingAgentEvidence, currencyStatus } from './model-currency-evidence.mjs';
+import { isDirectInvocation } from '../plugin/scripts/entrypoint.mjs';
 
 export const DEFAULT_ROUTER_DIR = path.join(os.homedir(), '.claude', 'model-router');
 export const AA_URLS = [
@@ -218,7 +219,7 @@ export async function refreshModelCurrency({ routerDir = DEFAULT_ROUTER_DIR, now
   } finally { release(routerDir, lock); }
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === SELF) {
+if (isDirectInvocation(import.meta.url)) {
   const dirIndex = process.argv.indexOf('--router-dir');
   const routerDir = dirIndex >= 0 ? process.argv[dirIndex + 1] : DEFAULT_ROUTER_DIR;
   if (!routerDir || !path.isAbsolute(routerDir)) throw new Error('--router-dir must be absolute');

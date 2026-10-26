@@ -11,6 +11,7 @@ import { acquireDeveloperLock, sharedLockStatus } from './developer-update-lock.
 import { maintenance } from './developer-update-maintenance.mjs';
 import { cleanupNpxDuplicates } from './developer-update-cleanup.mjs';
 import { pinnedClaudeTarget, verifyClaudeArtifact } from './plugin-artifact-proof.mjs';
+import { isDirectInvocation } from './entrypoint.mjs';
 export { compare, selectTag, sharedLockStatus };
 const HOME = os.homedir();
 const PREFIX = path.join(HOME, '.npm-global');
@@ -477,4 +478,4 @@ export async function developerUpdateCli(args = process.argv.slice(2)) {
   console.log(JSON.stringify(result));
   return result;
 }
-if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) developerUpdateCli().catch(error => { console.error(error.message); process.exitCode = 1; });
+if (isDirectInvocation(import.meta.url)) developerUpdateCli().catch(error => { console.error(error.message); process.exitCode = 1; });

@@ -28,6 +28,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isKbTree, kbCopyProof } from './kb-copy-proof.mjs';
 import { brainLocation } from './brain-location.mjs';
 import { RUFLO_CWD_ARTIFACTS } from './ruflo-bin.mjs';
+import { isDirectInvocation } from './entrypoint.mjs';
 import { RESCUE_DIR, archiveRoots, archiveUniqueFiles, assessMoveLeftovers, cachedKept, cmpVersion, isVolumeMetadata,
   keptCopyFix, physical, pidAlive, readProofCache, rememberKept, removeWithin, rescueOperationalFiles, rotate,
   treeBytes, truncateToTail } from './footprint-io.mjs';
@@ -533,7 +534,7 @@ export async function loadKbReaders(kbDir) {
 }
 
 // CLI: the detached SessionStart sweep. `node brain-footprint.mjs --sweep [--apply] [--json]`.
-if (process.argv[1] && pathToFileURL(physical(process.argv[1])).href === pathToFileURL(physical(fileURLToPath(import.meta.url))).href) {
+if (isDirectInvocation(import.meta.url)) {
   const argv = process.argv.slice(2);
   const roots = footprintRoots();
   const readers = await loadKbReaders(roots.kbDir);

@@ -30,6 +30,7 @@ import { append as appendOutcome, actionKey, recordRefusal, resolve as resolveOu
 // shape. Normalised ONCE here, so the policies (four of them bash, matching tool_name textually) never
 // see a host-native spelling — the 4.4 measurement was a Grok write silently allowed. hook-input.mjs.
 import { normalizePayloadText } from './hook-input.mjs';
+import { isDirectInvocation } from './entrypoint.mjs';
 
 const QUIET_FULL = String(process.env.RUVNET_STOP_NUDGES || '').toLowerCase() === 'full';
 
@@ -497,7 +498,6 @@ function readPayload() {
 /** Never able to crash a caller that merely imported this (see tests/unit/entrypoint-guard-safety). */
 function isMain() {
   try {
-    if (!process.argv[1]) return false;
-    return fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));
+    return isDirectInvocation(import.meta.url);
   } catch { return false; }
 }
