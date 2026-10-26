@@ -58,15 +58,19 @@ function sameExecutable(left, right) {
   try { return fs.realpathSync(left) === fs.realpathSync(right); } catch { return path.resolve(left || '') === path.resolve(right || ''); }
 }
 
-function ownerState(owner, { hostname, inspectProcess, isAlive }) {
-  if (!owner || owner.host !== hostname || !owner.processStart || !owner.executable) return 'unknown';
-  const observed = inspectProcess
+function observeOwnerProcess(owner, { inspectProcess, isAlive }) {
+  return inspectProcess
     ? inspectProcess(owner.pid)
     : (isAlive && isAlive !== alive)
         ? (isAlive(owner.pid)
             ? { state: 'live', processStart: owner.processStart, executable: owner.executable }
             : { state: 'dead' })
         : observedProcessIdentity(owner.pid);
+}
+
+function ownerState(owner, { hostname, inspectProcess, isAlive }) {
+  if (!owner || owner.host !== hostname || !owner.processStart || !owner.executable) return 'unknown';
+  const observed = observeOwnerProcess(owner, { inspectProcess, isAlive });
   if (observed?.state !== 'live') return observed?.state === 'dead' ? 'dead' : 'unknown';
   return observed.processStart === owner.processStart && sameExecutable(observed.executable, owner.executable)
     ? 'live'
@@ -80,7 +84,7 @@ export function inspectRefreshOwner(owner, { hostname = os.hostname(), inspectPr
 
 // A lock nobody can prove alive must not wedge every later run (4.7.21, audit C). Liveness cannot be proven
 // across hosts (and on macOS os.hostname() follows the network, so "another host" is often this Mac on
-// another Wi-Fi), but a refresh run cannot outlive the updater's own deadlines. An owner.json that cannot be
+// another Wi-Fi: ownerVerdict checks the pid here first), but a refresh run cannot outlive the updater's own deadlines. An owner.json that cannot be
 // read or lacks its identity is debris once no writer could still be publishing it.
 export const REMOTE_OWNER_DEAD_MS = 3 * 3600_000;
 export const INCOMPLETE_OWNER_RECLAIM_MS = 3600_000;
@@ -96,14 +100,102 @@ function newestMtimeMs(...files) {
   return newest;
 }
 
-/** 'dead' also for a remote owner past REMOTE_OWNER_DEAD_MS; every other answer is ownerState's. */
+/**
+ * 'dead' also for a remote owner past REMOTE_OWNER_DEAD_MS; every other answer is ownerState's.
+ * 4.7.21 review (Opus updater #2, reproduced): on macOS the hostname follows the network, so an owner recorded
+ * under "another host" is often THIS Mac, asleep mid-update on the old Wi-Fi. Its pid is inspected here first: the
+ * same pid alive with the same process start and executable IS the owner, whatever the hostname says. Only an
+ * absent or different local process may be aged out.
+ */
 function ownerVerdict(owner, { hostname, inspectProcess, isAlive, nowMs }) {
   const state = ownerState(owner, { hostname, inspectProcess, isAlive });
   if (state !== 'unknown' || !ownerComplete(owner) || owner.host === hostname) return { state, reason: 'exact-dead-owner' };
+  if (owner.processStart && owner.executable) {
+    const local = observeOwnerProcess(owner, { inspectProcess, isAlive });
+    if (local?.state === 'live' && local.processStart === owner.processStart
+      && sameExecutable(local.executable, owner.executable)) return { state: 'live', reason: 'same-process-other-hostname' };
+  }
   const startedMs = Date.parse(owner.startedAt || '');
   return Number.isFinite(startedMs) && nowMs - startedMs > REMOTE_OWNER_DEAD_MS
     ? { state: 'dead', reason: 'stale-remote-owner' }
     : { state, reason: null };
+}
+
+// ── takeover is serialized (4.7.21 review, Codex #1) ─────────────────────────────────────────────
+// Two contenders can judge the same abandoned lock. Without a claim, A reclaims and acquires, then B removes
+// A's FRESH lock on its stale judgement and both run. A takeover now (1) creates an exclusive claim file
+// inside the judged lock directory ('wx': one winner per directory instance), (2) re-checks, while holding
+// the claim, that the directory is the same one (dev/ino) and owner.json is byte-identical to what was
+// judged, and only then (3) moves it aside. A claim left by a crashed reclaimer is superseded by the next
+// numbered claim once CLAIM_STALE_MS old, so a crash mid-takeover cannot wedge the lock either.
+export const CLAIM_STALE_MS = 5 * 60_000;
+const CLAIM_FILE = /^takeover(?:-(\d+))?\.json$/;
+function dirIdentity(dir) {
+  const stat = fs.lstatSync(dir, { bigint: true });
+  if (!stat.isDirectory()) throw Object.assign(new Error(`${dir} is not a lock directory`), { code: 'ENOTDIR' });
+  return `${stat.dev}:${stat.ino}`;
+}
+function readRaw(file) {
+  try { return fs.readFileSync(file, 'utf8'); } catch (error) { if (error?.code === 'ENOENT') return null; throw error; }
+}
+function claimTakeover(lockPath, hostname) {
+  let highest = -1;
+  let highestName = null;
+  for (const name of fs.readdirSync(lockPath)) {
+    const match = CLAIM_FILE.exec(name);
+    if (!match) continue;
+    const level = match[1] ? Number(match[1]) : 0;
+    if (level > highest) { highest = level; highestName = name; }
+  }
+  if (highestName) {
+    let ageMs = 0;
+    try { ageMs = Date.now() - fs.lstatSync(path.join(lockPath, highestName)).mtimeMs; } catch { return null; }
+    if (!(ageMs > CLAIM_STALE_MS)) return null; // another reclaimer is mid-takeover
+  }
+  const level = highest + 1;
+  const file = path.join(lockPath, level ? `takeover-${level}.json` : 'takeover.json');
+  const claim = { schemaVersion: 1, token: crypto.randomBytes(24).toString('hex'), host: hostname,
+    pid: process.pid, claimedAt: new Date().toISOString(), file };
+  let fd;
+  try { fd = fs.openSync(file, 'wx', 0o600); } catch (error) {
+    if (['EEXIST', 'ENOENT'].includes(error?.code)) return null;
+    throw error;
+  }
+  try { fs.writeFileSync(fd, `${JSON.stringify({ ...claim, file: undefined }, null, 2)}\n`); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  return claim;
+}
+function dropClaim(claim) {
+  try { if (readRaw(claim.file)?.includes(claim.token)) fs.unlinkSync(claim.file); } catch { /* gone with its directory */ }
+}
+/**
+ * Remove the lock directory at `lockPath` only if it is still exactly the one observed. Returns 'removed',
+ * 'changed' (it is not the judged directory any more: re-judge it) or 'busy' (another reclaimer holds the claim).
+ */
+function removeObservedLock(lockPath, observed, { hostname, beforeRemove = null, afterClaim = null } = {}) {
+  const claim = claimTakeover(lockPath, hostname);
+  if (!claim) return 'busy';
+  afterClaim?.({ lockPath, claim });
+  let same = false;
+  try {
+    same = dirIdentity(lockPath) === observed.identity
+      && readRaw(path.join(lockPath, 'owner.json')) === observed.raw
+      && Boolean(readRaw(claim.file)?.includes(claim.token));
+  } catch { same = false; }
+  if (!same) { dropClaim(claim); return 'changed'; }
+  try { beforeRemove?.(claim); } catch (error) { dropClaim(claim); throw error; }
+  const tomb = `${lockPath}.stale-${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
+  try { fs.renameSync(lockPath, tomb); } catch (error) {
+    if (error?.code === 'ENOENT') return 'changed';
+    dropClaim(claim);
+    throw error;
+  }
+  // Only the claim holder can move the judged directory, so the moved directory must carry this claim.
+  if (!readRaw(path.join(tomb, path.basename(claim.file)))?.includes(claim.token)) {
+    try { if (!fs.existsSync(lockPath)) fs.renameSync(tomb, lockPath); } catch { /* keep it as evidence */ }
+    throw new Error(`refresh lock takeover moved a directory it did not claim (${lockPath}); refusing`);
+  }
+  fs.rmSync(tomb, { recursive: true, force: true });
+  return 'removed';
 }
 
 /**
@@ -131,12 +223,8 @@ export function refreshReceiptPath(brainHome, runId) {
   return file;
 }
 
-function abandonDeadOwner({ lockPath, owner, hostname, inspectProcess, isAlive, now }) {
-  const claimFile = path.join(lockPath, 'takeover.json');
-  const claim = { schemaVersion: 1, token: crypto.randomBytes(24).toString('hex'), host: hostname,
-    pid: process.pid, claimedAt: now() };
-  const fd = fs.openSync(claimFile, 'wx', 0o600);
-  try { fs.writeFileSync(fd, `${JSON.stringify(claim, null, 2)}\n`); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+/** Records the dead owner's run ABANDONED. Runs only while this process holds the takeover claim on its lock. */
+function abandonDeadOwner({ lockPath, owner, hostname, inspectProcess, isAlive, now, claim }) {
   const observed = JSON.parse(fs.readFileSync(path.join(lockPath, 'owner.json'), 'utf8'));
   const verdict = ownerVerdict(observed, { hostname, inspectProcess, isAlive, nowMs: Date.parse(now()) });
   if (observed.schemaVersion !== 3 || observed.runId !== owner.runId || observed.token !== owner.token
@@ -192,6 +280,7 @@ export function acquireRefreshLock({
   processStart = null,
   inspectProcess = null,
   afterStage = null,
+  afterTakeoverClaim = null,
 } = {}) {
   const root = path.resolve(kbDir || '');
   const lockPath = refreshLockPath(root);
@@ -233,9 +322,14 @@ export function acquireRefreshLock({
       // Windows refuses rename-over-existing with EPERM/EACCES rather than EEXIST. Treat those
       // codes as contention, then inspect the owner through the same liveness fence.
       if (!['EEXIST', 'ENOTEMPTY', 'EPERM', 'EACCES'].includes(error?.code)) throw error;
+      // Judge one exact directory: its identity and owner.json bytes are what the takeover re-checks later.
+      let observed;
+      try { observed = { identity: dirIdentity(lockPath), raw: readRaw(path.join(lockPath, 'owner.json')) }; }
+      catch (observeError) { if (['ENOENT', 'ENOTDIR'].includes(observeError?.code)) continue; throw observeError; }
       let owner = null;
-      try { owner = JSON.parse(fs.readFileSync(path.join(lockPath, 'owner.json'), 'utf8')); } catch { /* judged below */ }
+      try { owner = JSON.parse(observed.raw); } catch { /* judged below */ }
       const nowMs = Date.parse(now());
+      let beforeRemove = null;
       if (!ownerComplete(owner)) {
         const ageMs = nowMs - newestMtimeMs(lockPath, path.join(lockPath, 'owner.json'));
         if (!(ageMs > INCOMPLETE_OWNER_RECLAIM_MS)) {
@@ -249,15 +343,13 @@ export function acquireRefreshLock({
             + `(pid ${owner.pid || '?'} on ${owner.host || '?'}, started ${owner.startedAt || '?'}, lock ${lockPath}). `
             + `If no update is running${owner.host && owner.host !== hostname ? ` on ${owner.host}` : ''}, remove it:  ${removalCommand(lockPath)}`);
         }
-        abandonDeadOwner({ lockPath, owner, hostname, inspectProcess, isAlive, now });
+        beforeRemove = (claim) => abandonDeadOwner({ lockPath, owner, hostname, inspectProcess, isAlive, now, claim });
       }
-      const stale = `${lockPath}.stale-${pid}-${Date.now()}`;
-      try {
-        fs.renameSync(lockPath, stale);
-        fs.rmSync(stale, { recursive: true, force: true });
-      } catch (renameError) {
-        if (renameError?.code !== 'ENOENT') throw renameError;
+      const outcome = removeObservedLock(lockPath, observed, { hostname, beforeRemove, afterClaim: afterTakeoverClaim });
+      if (outcome === 'busy') {
+        throw new Error(`another process is taking over the refresh lock ${lockPath}; refusing to race it (retry shortly)`);
       }
+      // 'removed' or 'changed': acquire again; a changed lock is judged afresh.
     }
   }
   throw new Error(`could not acquire refresh lock ${lockPath}`);

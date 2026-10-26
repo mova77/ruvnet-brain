@@ -117,45 +117,119 @@ function lockAgeMs() {
   for (const p of [LOCK, path.join(LOCK, 'owner.json')]) { try { newest = Math.max(newest, fs.lstatSync(p).mtimeMs); } catch { /* absent */ } }
   return Date.now() - newest;
 }
-function acquireLock(target) {
+// 4.7.21 review (Codex #1, the quarantine path): judging an owner and then moving LOCK aside are two steps, so a
+// contender could move a lock that had changed since it was judged. Moving it back on a mismatch left a window in which
+// a third run's fresh lock blocked the restore; and an owner-less lock (raw null) was indistinguishable from another
+// run's directory between its mkdir and its owner write, so the restore never ran and both runs applied. A takeover now
+// holds an exclusive claim file inside the judged directory and re-checks it (dev/ino + owner bytes) before moving it;
+// owner.json is published with an exclusive link, and a run releases only the lock that carries its own token.
+const CLAIM_STALE_MS = 5 * 60_000;
+const CLAIM_FILE = /^takeover(?:-(\d+))?\.json$/;
+function observeLock() {
+  const stat = fs.lstatSync(LOCK, { bigint: true });
+  if (!stat.isDirectory()) throw Object.assign(new Error('the update lock is not a directory'), { code: 'ENOTDIR' });
+  let raw = null;
+  try { raw = fs.readFileSync(path.join(LOCK, 'owner.json'), 'utf8'); } catch (error) { if (error?.code !== 'ENOENT') throw error; }
+  return { identity: `${stat.dev}:${stat.ino}`, raw };
+}
+const readRaw = (file) => { try { return fs.readFileSync(file, 'utf8'); } catch { return null; } };
+function claimTakeover() {
+  let highest = -1; let highestName = null;
+  for (const name of fs.readdirSync(LOCK)) {
+    const match = CLAIM_FILE.exec(name);
+    const level = match ? (match[1] ? Number(match[1]) : 0) : -1;
+    if (level > highest) { highest = level; highestName = name; }
+  }
+  if (highestName) {
+    let ageMs = 0;
+    try { ageMs = Date.now() - fs.lstatSync(path.join(LOCK, highestName)).mtimeMs; } catch { return null; }
+    if (!(ageMs > CLAIM_STALE_MS)) return null; // another run is mid-takeover
+  }
+  const level = highest + 1;
+  const file = path.join(LOCK, level ? `takeover-${level}.json` : 'takeover.json');
+  const token = crypto.randomBytes(16).toString('hex');
+  try { fs.writeFileSync(file, JSON.stringify({ token, pid: process.pid, claimedAt: new Date().toISOString() }), { flag: 'wx' }); }
+  catch (error) { if (error?.code === 'EEXIST' || error?.code === 'ENOENT') return null; throw error; }
+  return { file, token };
+}
+const dropClaim = (claim) => { try { if (readRaw(claim.file)?.includes(claim.token)) fs.unlinkSync(claim.file); } catch { /* gone with its directory */ } };
+function removeObservedLock(observed) {
+  const claim = claimTakeover();
+  if (!claim) return 'busy';
+  let same = false;
+  try {
+    const now = observeLock();
+    same = now.identity === observed.identity && now.raw === observed.raw && Boolean(readRaw(claim.file)?.includes(claim.token));
+  } catch { same = false; }
+  if (!same) { dropClaim(claim); return 'changed'; }
+  const quarantine = `${LOCK}.stale-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
+  try { fs.renameSync(LOCK, quarantine); } catch (error) { if (error?.code === 'ENOENT') return 'changed'; dropClaim(claim); throw error; }
+  if (!readRaw(path.join(quarantine, path.basename(claim.file)))?.includes(claim.token)) {
+    try { if (!fs.existsSync(LOCK)) fs.renameSync(quarantine, LOCK); } catch { /* keep as evidence */ }
+    return 'changed';
+  }
+  try { fs.rmSync(quarantine, { recursive: true, force: true }); } catch { /* best effort */ }
+  return 'removed';
+}
+/** Complete-or-absent AND exclusive: the hard link fails with EEXIST when another run's owner got there first. */
+function publishOwner(file, content) {
+  const tmp = `${file}.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
+  fs.writeFileSync(tmp, content, { flag: 'wx' });
+  try {
+    try { fs.linkSync(tmp, file); } catch (error) {
+      if (!['EPERM', 'ENOTSUP', 'ENOSYS', 'EXDEV'].includes(error?.code)) throw error;
+      fs.writeFileSync(file, content, { flag: 'wx' }); // no hard links on this filesystem: still exclusive
+    }
+  } finally { try { fs.unlinkSync(tmp); } catch { /* already gone */ } }
+}
+export function acquireLock(target) {
   fs.mkdirSync(BRAIN_HOME, { recursive: true });
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
       fs.mkdirSync(LOCK); // atomic: exists → EEXIST
     } catch (error) {
       if (error?.code !== 'EEXIST') throw error;
-      const raw = (() => { try { return fs.readFileSync(path.join(LOCK, 'owner.json'), 'utf8'); } catch { return null; } })();
+      let observed;
+      try { observed = observeLock(); } catch (observeError) { if (observeError?.code === 'ENOENT') continue; throw observeError; }
       let owner = null;
-      try { owner = raw === null ? null : JSON.parse(raw); } catch { /* incomplete */ }
+      try { owner = observed.raw === null ? null : JSON.parse(observed.raw); } catch { /* incomplete */ }
       const state = lockOwnerState(owner);
       if (state === 'live') return { acquired: false, owner };
       if (state === 'incomplete' && lockAgeMs() < OWNER_PUBLISH_GRACE_MS) return { acquired: false, owner: null };
-      // Quarantine, then confirm the quarantined owner is the one judged: a contender that reclaimed and
-      // re-acquired first must not lose its fresh lock to this run's stale judgement.
-      const quarantine = `${LOCK}.stale-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
-      try { fs.renameSync(LOCK, quarantine); } catch { continue; }
-      let moved = null;
-      try { moved = fs.readFileSync(path.join(quarantine, 'owner.json'), 'utf8'); } catch { /* none */ }
-      if (moved !== raw) {
-        try { if (!fs.existsSync(LOCK)) fs.renameSync(quarantine, LOCK); } catch { /* keep as evidence */ }
-        continue;
+      const outcome = removeObservedLock(observed);
+      if (outcome === 'busy') return { acquired: false, owner: null };
+      if (outcome === 'removed') {
+        receipt('StaleLockReclaimed', { owner: owner ? { pid: owner.pid, host: owner.host, startedAt: owner.startedAt } : null, state });
       }
-      receipt('StaleLockReclaimed', { owner: owner ? { pid: owner.pid, host: owner.host, startedAt: owner.startedAt } : null, state });
-      try { fs.rmSync(quarantine, { recursive: true, force: true }); } catch { /* best effort */ }
-      continue;
+      continue; // 'changed': judge the directory that is there now
     }
+    const token = crypto.randomBytes(16).toString('hex');
     try {
-      writeAtomic(path.join(LOCK, 'owner.json'), JSON.stringify({ pid: process.pid, host: os.hostname(), target,
+      publishOwner(path.join(LOCK, 'owner.json'), JSON.stringify({ pid: process.pid, host: os.hostname(), target, token,
         processStart: processStartOf(process.pid), startedAt: new Date().toISOString() }));
     } catch (error) {
-      try { fs.rmSync(LOCK, { recursive: true, force: true }); } catch { /* leave it to the publication grace */ }
+      if (error?.code === 'EEXIST') return { acquired: false, owner: null }; // another run owns this directory
+      try { fs.rmdirSync(LOCK); } catch { /* not empty: no longer only ours; leave it to the publication grace */ }
       throw error;
     }
-    return { acquired: true };
+    return { acquired: true, token };
   }
   return { acquired: false, owner: null };
 }
-function releaseLock() { try { fs.rmSync(LOCK, { recursive: true, force: true }); } catch { /* gone */ } }
+/** Releases LOCK only while it still carries this run's token: never another run's lock. */
+export function releaseLock(lock) {
+  if (!lock?.acquired || !lock.token) return false;
+  if (!readRaw(path.join(LOCK, 'owner.json'))?.includes(`"token":"${lock.token}"`)) return false;
+  const released = `${LOCK}.released-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
+  try { fs.renameSync(LOCK, released); } catch { return false; }
+  const moved = readRaw(path.join(released, 'owner.json'));
+  if (!moved?.includes(`"token":"${lock.token}"`)) {
+    try { if (!fs.existsSync(LOCK)) fs.renameSync(released, LOCK); } catch { /* keep as evidence */ }
+    return false;
+  }
+  try { fs.rmSync(released, { recursive: true, force: true }); } catch { /* gone */ }
+  return true;
+}
 
 // ── crash recovery (finding 21): resolve any incomplete transaction BEFORE new work ─────────────
 function recoverTxn() {
@@ -516,7 +590,7 @@ function main() {
     receipt('UpdateChecked', { active: active?.version ?? null, staged: stagedVersion });
     return applyFromDir(staged.dir, stagedVersion, active ? 'auto-update' : 'auto-seed') ? 0 : 1;
   } finally {
-    releaseLock();
+    releaseLock(lock);
     if (has('--gc') || !has('--no-gc')) { try { gc(); } catch { /* GC never fails the run */ } }
   }
 }
