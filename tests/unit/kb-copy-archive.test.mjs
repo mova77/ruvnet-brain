@@ -211,6 +211,51 @@ describe('#335 (b): --clean --archive keeps only the unique files, then releases
     expect(archiveEntries(m)).toEqual([]);
   });
 
+  // Review fix (4.7.21 r2): between archive and re-proof a concurrent updater (reclaimBackups counts the archive as
+  // evidence) may delete the copy. The re-proof of a missing directory says "keep"; discarding the archive then would
+  // lose the bytes in both places. The archive is discarded only while the copy still holds every archived byte.
+  it('a copy deleted between archive and re-proof: the archive survives with every byte', () => {
+    const m = machine();
+    const a = preserved(m, 'kb.install-preserved-AAAAAA');
+    const before = files(a).map((rel) => sha(path.join(a, rel)));
+    let calls = 0;
+    const proveCopy = (args) => {
+      calls += 1;
+      if (calls === 2) fs.rmSync(args.copyDir, { recursive: true, force: true }); // the concurrent reclaim
+      return kbCopyProof(args);
+    };
+    const swept = sweepFootprint(opts(m, { apply: true, archive: true, proveCopy }));
+    expect(calls).toBe(2);
+    expect(fs.existsSync(a)).toBe(false);
+    const roots = archiveRoots(path.join(m.brainHome, 'kb.archive'));
+    expect(roots).toHaveLength(1);
+    const receipt = JSON.parse(fs.readFileSync(`${roots[0]}.json`, 'utf8'));
+    expect(receipt.files.map((f) => f.file).sort()).toEqual(['SOURCE.json', 'concepts.big.rvf', path.join('notes', 'user.txt')]);
+    for (const f of receipt.files) expect(sha(path.join(roots[0], f.file))).toBe(f.sha256);
+    // Every byte the copy held is still on disk: its unique files in the archive, the rest in the live brain.
+    const surviving = hashesUnder(m.brainHome);
+    for (const h of before) expect(surviving.has(h)).toBe(true);
+    expect(swept.kept.find((k) => k.path === a).reason).toMatch(/archive at .* is kept: .* no longer a real directory/);
+  });
+
+  it('a copy changed between archive and re-proof: the archive is kept', () => {
+    const m = machine();
+    const a = preserved(m, 'kb.install-preserved-AAAAAA');
+    const note = sha(path.join(a, 'notes', 'user.txt'));
+    let calls = 0;
+    const proveCopy = (args) => {
+      calls += 1;
+      if (calls === 1) return kbCopyProof(args);
+      fs.writeFileSync(path.join(args.copyDir, 'notes', 'user.txt'), 'edited since');
+      return { disposable: false, unique: [], reason: 'kept on re-proof' };
+    };
+    const swept = sweepFootprint(opts(m, { apply: true, archive: true, proveCopy }));
+    const [root] = archiveRoots(path.join(m.brainHome, 'kb.archive'));
+    expect(root).toBeTruthy();
+    expect(sha(path.join(root, 'notes', 'user.txt'))).toBe(note);
+    expect(swept.kept.find((k) => k.path === a).reason).toMatch(/is no longer identical in/);
+  });
+
   it('a half-written (dot-named) archive a killed sweep left is never a reference', () => {
     const m = machine();
     const a = preserved(m, 'kb.install-preserved-AAAAAA');

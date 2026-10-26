@@ -29,7 +29,7 @@ import { isKbTree, kbCopyProof } from './kb-copy-proof.mjs';
 import { brainLocation } from './brain-location.mjs';
 import { RUFLO_CWD_ARTIFACTS } from './ruflo-bin.mjs';
 import { isDirectInvocation } from './entrypoint.mjs';
-import { RESCUE_DIR, archiveRoots, archiveUniqueFiles, assessMoveLeftovers, discardArchive, cachedKept, cmpVersion, isVolumeMetadata,
+import { RESCUE_DIR, archiveRoots, archiveUniqueFiles, assessMoveLeftovers, discardArchiveIfMirrored, cachedKept, cmpVersion, isVolumeMetadata,
   keptCopyFix, physical, pidAlive, readProofCache, rememberKept, removeWithin, rescueOperationalFiles, rotate,
   treeBytes, truncateToTail } from './footprint-io.mjs';
 
@@ -470,9 +470,12 @@ export function sweepFootprint({ apply = false, archive = false, collectPluginGe
         refs.push(archived.root);
         const again = proveCopy({ copyDir, liveDir: roots.kbDir, keptSiblings: [...refs] });
         if (again.disposable) proof = { ...again, reason: `archived ${archived.files.length} unique file(s) to ${archived.root}; ${again.reason}` };
-        else { // the copy is kept (e.g. unreadable metadata on the re-proof): it still holds every byte, so no archive is left behind
-          refs.pop(); discardArchive(archived.root);
-          proof = { ...again, reason: `${again.reason}; not archived: the copy is kept, so its archive was removed` };
+        else { // the copy is kept (e.g. unreadable metadata on the re-proof): if it still holds every archived byte, no archive is left behind
+          const discard = discardArchiveIfMirrored({ root: archived.root, copyDir, files: archived.files });
+          if (discard.discarded) {
+            refs.pop();
+            proof = { ...again, reason: `${again.reason}; not archived: the copy is kept, so its archive was removed` };
+          } else proof = { ...again, reason: `${again.reason}; the archive at ${archived.root} is kept: ${discard.reason}` };
         }
       } else proof = { ...proof, reason: `${proof.reason}; not archived: ${archived.reason}` };
     }

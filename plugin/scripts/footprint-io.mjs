@@ -246,6 +246,26 @@ export function discardArchive(root) {
 }
 
 /**
+ * Discard an archive ONLY while the copy it came from still holds every archived byte (review 4.7.21 r2). Between
+ * the archive and the re-proof another process (an updater's reclaimBackups, which counts this archive as
+ * evidence) may have removed the copy; a re-proof of a missing directory still says "keep", so an unconditional
+ * discard would lose the bytes in both places. The copy must still be a real directory and each archived file a
+ * regular file there with the same SHA-256; otherwise the archive is kept and the reason is returned.
+ */
+export function discardArchiveIfMirrored({ root, copyDir, files }) {
+  const dir = lstat(copyDir);
+  if (!dir || dir.isSymbolicLink() || !dir.isDirectory()) return { discarded: false, reason: `${copyDir} is no longer a real directory` };
+  for (const { file, sha256 } of files || []) {
+    const held = path.join(copyDir, file);
+    let same = false;
+    try { same = regular(held) && sha256File(held) === sha256; } catch { same = false; }
+    if (!same) return { discarded: false, reason: `${file} is no longer identical in ${copyDir}` };
+  }
+  discardArchive(root);
+  return { discarded: true };
+}
+
+/**
  * #335 `--clean --archive` (explicit, never automatic): COPY exactly the files a KEPT proof named unique into
  * `<stampDir>/<label>/<same relative path>`, verify each byte-for-byte, and write `<stampDir>/<label>.json`.
  * Moves and deletes nothing: the caller re-proves the copy against this archive before releasing it. A link,
