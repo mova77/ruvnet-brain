@@ -155,7 +155,7 @@ describe('issue #377 — the user learner store is a fixed path, validated direc
     const { learningTarget } = await import('../../plugin/scripts/learning-store.mjs');
     const home = fresh();
     try {
-      expect(() => learningTarget(userContext(home), { env: { HOME: home }, explicitLegacyApply: true })).toThrow(/^user store not adopted \(no .*global-memory\/\.swarm\/memory\.db\)$/);
+      expect(() => learningTarget(userContext(home), { env: { HOME: home }, explicitLegacyApply: true })).toThrow(/^user store not adopted \(no .*global-memory[\\/]\.swarm[\\/]memory\.db\)$/);
       fs.mkdirSync(path.join(home, '.claude', 'global-memory'), { recursive: true });
       expect(() => learningTarget(userContext(home), { env: { HOME: home }, explicitLegacyApply: true })).toThrow(/^user store not adopted/);
     } finally { fs.rmSync(home, { recursive: true, force: true }); }

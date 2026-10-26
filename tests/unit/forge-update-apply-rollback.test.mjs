@@ -648,7 +648,8 @@ describe('forge-update --apply: retention is advisory; a signal settles the run'
     expect(served.hits.zip).toBe(0);
   });
 
-  it('SIGTERM during the bundle download records "interrupted", exits 143, and releases the lock and the temp stage', async () => {
+  // POSIX only: Windows has no SIGTERM delivery to a handler (process.kill terminates outright), so there is nothing to settle.
+  it.skipIf(process.platform === 'win32')('SIGTERM during the bundle download records "interrupted", exits 143, and releases the lock and the temp stage', async () => {
     const current = sourceJson({ releaseTag: 'v4.0.7', brainVersion: '4.0.7', builtUtc: '2026-07-31T04:39:28.414Z', stores: [STORE_A] });
     layDown(kbDir, current);
     publish(sourceJson({ releaseTag: 'v4.0.8', brainVersion: '4.0.8', builtUtc: '2026-08-02T12:00:00.000Z', stores: [STORE_A] }), 'v4.0.8');

@@ -283,7 +283,9 @@ function requireRecallFitsCap(ruflo, db, env) {
   const inv = rufloInvocationOrPlain(ruflo, ['memory', 'list', '--namespace', 'boot-probe', '--limit', '1', '--format', 'json', '--path', db], { env });
   const boot = () => {
     const t0 = performance.now();
-    const r = spawnSync(inv.executable, inv.args, { env: { ...env, RUFLO_DAEMON_AUTOSTART: '0', CLAUDE_FLOW_AUTO_UPDATE: 'false' }, encoding: 'utf8', timeout: 60_000 });
+    // cwd = the fixture project (db is <project>/.swarm/memory.db): ruflo writes agentdb.rvf.idmap.json into its cwd, and an
+    // inherited cwd is the checkout, which release qualification requires to stay clean.
+    const r = spawnSync(inv.executable, inv.args, { cwd: path.dirname(path.dirname(db)), env: { ...env, RUFLO_DAEMON_AUTOSTART: '0', CLAUDE_FLOW_AUTO_UPDATE: 'false' }, encoding: 'utf8', timeout: 60_000 });
     if (r.status !== 0) throw new Error(`ruflo boot probe failed (exit ${r.status}): ${String(r.stderr || r.error || '').slice(0, 300)}`);
     return Math.round(performance.now() - t0);
   };
