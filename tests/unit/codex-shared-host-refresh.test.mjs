@@ -154,3 +154,82 @@ describe('--update reloads the running Codex app-server through the shared host-
     expect(body.match(/await convergeHostsAfterUpdate\(kbDir\)/g)).toHaveLength(2);
   });
 });
+
+// Review r2 (4.7.21), owner decision: the unattended nightly (RUVNET_NIGHTLY=1, set by bin/nightly-refresh.mjs) must not
+// reload the shared Codex app-server; it records a notice the next SessionStart shows once. Interactive --update reloads.
+describe('the unattended nightly defers the Codex reload to a once-only SessionStart notice', () => {
+  const ROOT = path.resolve(import.meta.dirname, '../..');
+  const VERSION = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version;
+  const converge = async (home, extra) => {
+    const kb = path.join(home, 'kb'); fs.mkdirSync(kb, { recursive: true });
+    const calls = [];
+    const result = await installer.convergeHostsAfterUpdate(kb, {
+      sourceRoot: ROOT, brainHome: path.join(home, 'brain'),
+      wireClaude: () => ({ host: true, wired: true, version: VERSION }),
+      wireCodexHost: () => ({ host: true, wired: true, action: 'unchanged' }),
+      wireCodexPlugin: () => ({ action: 'updated', installed: true, enabled: true, version: VERSION }),
+      runStableSpine: () => ({ status: 0, error: undefined }),
+      refreshHost: async (codexPlugin) => { calls.push(codexPlugin.action); return { state: 'refreshed', changed: false, approvalsGranted: 0 }; },
+      noticeHome: () => path.join(home, 'brain'),
+      ...extra,
+    });
+    return { result, calls };
+  };
+  const tmpHome = () => { const h = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cxn-'))); cleanups.push(() => fs.rmSync(h, { recursive: true, force: true })); return h; };
+
+  it('nightly: no reload; a notice is recorded and the next SessionStart shows it exactly once', async () => {
+    const home = tmpHome();
+    const { result, calls } = await converge(home, { unattended: true });
+    expect(calls).toEqual([]);
+    expect(result.ok).toBe(true);
+    expect(result.hostRefresh).toMatchObject({ state: 'deferred-unattended', noticeRecorded: true });
+    const { stableSpine } = await import('../../plugin/scripts/session-start-update-plane.mjs');
+    const brain = path.join(home, 'brain');
+    fs.writeFileSync(path.join(brain, 'active.json'), JSON.stringify({ version: VERSION }));
+    const say = () => { const out = []; stableSpine({ env: {}, hookDir: '/nonexistent', stateDir: brain, home, pluginVersion: VERSION, emit: (l) => out.push(l), now: Date.now() }); return out; };
+    expect(say()).toEqual(['[RuvNet Brain — CODEX HOOKS CHANGED OVERNIGHT] Codex hooks changed overnight; open Codex sessions will pick them up on restart or after /hooks review.']);
+    expect(say()).toEqual([]);
+  });
+
+  it('nightly with nothing changed for Codex: no reload and no notice', async () => {
+    const home = tmpHome();
+    const { result, calls } = await converge(home, { unattended: true,
+      wireCodexPlugin: () => ({ action: 'unchanged', installed: true, enabled: true, version: VERSION, hookTrust: { state: 'unchanged', changed: false } }) });
+    expect(calls).toEqual([]);
+    expect(result.hostRefresh).toEqual({ state: 'not-needed', changed: false });
+    expect(fs.existsSync(path.join(home, 'brain', 'codex-hooks-overnight-notice.json'))).toBe(false);
+  });
+
+  it('interactive --update still reloads and records no notice', async () => {
+    const home = tmpHome();
+    const { result, calls } = await converge(home, { unattended: false });
+    expect(calls).toEqual(['updated']);
+    expect(result.hostRefresh).toMatchObject({ state: 'refreshed' });
+    expect(fs.existsSync(path.join(home, 'brain', 'codex-hooks-overnight-notice.json'))).toBe(false);
+  });
+
+  it('the nightly marker is the env the scheduled runner sets (RUVNET_NIGHTLY=1), and it is the default', () => {
+    const runner = fs.readFileSync(path.join(ROOT, 'bin', 'nightly-refresh.mjs'), 'utf8');
+    expect(runner).toMatch(/RUVNET_NIGHTLY: '1'/);
+    const src = fs.readFileSync(path.join(ROOT, 'bin', 'install.mjs'), 'utf8');
+    expect(src).toMatch(/unattended = process\.env\.RUVNET_NIGHTLY === '1'/);
+  });
+});
+
+// Review r2 (4.7.21): the reload notice must not say hooks pause when the authorized reconciliation already re-trusted them.
+describe('the reload notice says whether trust was re-established', () => {
+  it('re-trusted (registry-verified or nothing pending): hooks keep running, no /hooks review asked', () => {
+    for (const state of ['registry-verified', 'unchanged']) {
+      const note = installer.codexHostRefreshMessage({ state: 'refreshed' }, { action: 'updated', hookTrust: { state } });
+      expect(note.text).toMatch(/already re-trusted/);
+      expect(note.text).not.toMatch(/re-review them in \/hooks/);
+    }
+  });
+  it('not re-trusted (blocked, degraded, or no reconciliation): hooks need review in /hooks', () => {
+    for (const plugin of [{ hookTrust: { state: 'blocked' } }, { hookTrust: { state: 'degraded' } }, { action: 'updated' }, null]) {
+      const note = installer.codexHostRefreshMessage({ state: 'refreshed' }, plugin);
+      expect(note.text).toMatch(/Brain hooks pause in them until you re-review them in \/hooks/);
+      expect(note.text).not.toMatch(/already re-trusted/);
+    }
+  });
+});

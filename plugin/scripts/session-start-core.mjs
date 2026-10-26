@@ -36,6 +36,7 @@ import { surfaceSignals } from './session-start-signals.mjs';
 import { failureLine, FAILURE_LINE_PREFIX } from './hook-failures.mjs';
 import { brainState, health, knowledgeCurrency, mcpReadiness, KNOWLEDGE_LINE_PREFIX } from './session-start-health.mjs';
 import { stableSpine, heartbeat, knowledgeAutoUpdate, footprintCheck } from './session-start-update-plane.mjs';
+import { CODEX_OVERNIGHT_PREFIX } from './codex-overnight-notice.mjs';
 import { FOOTPRINT_LINE_PREFIX } from './brain-confirmation.mjs';
 import { describeLifecycleHooks, readHookContracts } from './session-start-hook-description.mjs';
 import { createStageTracer } from './session-start-trace.mjs';
@@ -118,6 +119,7 @@ export async function runSessionStart({
       || s.startsWith('[RuvNet Brain — OPEN ISSUES')
       || s.startsWith('[RuvNet Brain — NTFY:')
       || s.startsWith('[RuvNet Brain — TURN CAPTURE]')
+      || s.startsWith(CODEX_OVERNIGHT_PREFIX)
       || /\bopen issue\(s\)/i.test(s)
       || /^\[RuvNet Brain — external signal/i.test(s)
       || (s.startsWith('Workflow ') && !/\b(Say it plainly|offer to look|ask only|run:|invoke)\b/i.test(s))

@@ -11,6 +11,7 @@ import { read, write, exists, json, firstVersion, dispatchDetached, mtimeMs } fr
 import { KNOWLEDGE_LINE_PREFIX, AUTO_UPDATE_LOCK_STALE_MS, autoUpdateOptOut, knowledgeFacts } from './session-start-health.mjs';
 import { inventoryFootprint } from './brain-footprint.mjs';
 import { confirm, footprintAlarm } from './brain-confirmation.mjs';
+import { claimCodexOvernightNotice } from './codex-overnight-notice.mjs';
 
 /**
  * KNOWLEDGE SELF-HEAL (owner invariant 2026-09-30: no brain may ever be more than 48h old) AND
@@ -159,6 +160,8 @@ export const compareVersions = (a, b) => {
 };
 
 export const stableSpine = ({ env, hookDir, stateDir, home, pluginVersion, emit, now }) => {
+  const overnight = claimCodexOvernightNotice(stateDir); // the unattended nightly's deferred Codex reload, said once
+  if (overnight) emit(overnight);
   const activeFile = path.join(stateDir, 'active.json');
   const stamp = path.join(stateDir, '.last-update-check');
   let seedDispatched = false;

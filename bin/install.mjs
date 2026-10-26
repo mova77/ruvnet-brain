@@ -86,6 +86,7 @@ import { shellDiff as pluginShellDiff } from '../plugin/scripts/host-shell-bound
 import { codexPluginContentChanged, codexTrustChanges, codexUsesContentTrust, CODEX_TRUST_ACTION } from '../scripts/codex-hook-trust.mjs';
 import { probeFreshCodexDeclarations } from '../scripts/codex-fresh-host-proof.mjs';
 import { refreshSharedCodexAppServer } from '../scripts/codex-hook-trust-reconcile.mjs';
+import { recordCodexOvernightNotice } from '../plugin/scripts/codex-overnight-notice.mjs';
 import { repairSecurityGuidance } from '../scripts/security-guidance-codex-compat.mjs';
 import { installNativeLaunchers, installRoutingRuntime, runtimeSnapshot } from '../scripts/model-routing-launchers.mjs';
 import { installTerminalLaunchers } from '../scripts/model-terminal-launchers.mjs';
@@ -2330,10 +2331,10 @@ export function wireCodexPlugin({
  * already-running shared Codex app-server to reload, so its open sessions stop reporting the previous hooks (#492).
  * Never starts, stops or restarts a server, and never grants an approval (scripts/codex-hook-trust-reconcile.mjs).
  */
+export const codexHostViewChanged = (codexPlugin) => ['installed', 'updated'].includes(codexPlugin?.action)
+  || codexPlugin?.hookTrust?.changed === true || codexPlugin?.hookTrust?.changed === 'unknown';
 export async function refreshCodexSharedHost(codexPlugin, { codexHome = codexHomeDir(), refresh = refreshSharedCodexAppServer } = {}) {
-  const pluginChanged = ['installed', 'updated'].includes(codexPlugin?.action);
-  const trustChanged = codexPlugin?.hookTrust?.changed === true || codexPlugin?.hookTrust?.changed === 'unknown';
-  if (!pluginChanged && !trustChanged) return { state: 'not-needed', changed: false };
+  if (!codexHostViewChanged(codexPlugin)) return { state: 'not-needed', changed: false };
   return refresh({ codexHome });
 }
 
@@ -2342,10 +2343,14 @@ export async function refreshCodexSharedHost(codexPlugin, { codexHome = codexHom
  * changed Brain hook definitions are pending until reviewed, so those sessions stop running Brain hooks until the
  * owner re-reviews them in /hooks. Said plainly, so a pause in a session he had open is never a surprise (#492).
  */
-export function codexHostRefreshMessage(hostRefresh) {
+export function codexHostRefreshMessage(hostRefresh, codexPlugin = null) {
   if (hostRefresh?.state === 'refreshed') {
-    return { level: 'info', text: '  Running Codex app-server reloaded: Codex sessions that are already open pick up the change immediately, '
-      + 'so Brain hooks pause in them until you re-review them in /hooks (no approval granted, nothing restarted).' };
+    // Review r2 (4.7.21): the authorized trust reconciliation may already have re-trusted the released hooks
+    // (registry-verified, or nothing pending); then nothing pauses and saying so would be false.
+    const retrusted = ['registry-verified', 'unchanged'].includes(codexPlugin?.hookTrust?.state);
+    return { level: 'info', text: '  Running Codex app-server reloaded: Codex sessions that are already open pick up the change immediately; '
+      + (retrusted ? 'Brain hooks were already re-trusted, so they keep running there (nothing restarted).'
+        : 'Brain hooks pause in them until you re-review them in /hooks (no approval granted, nothing restarted).') };
   }
   if (hostRefresh?.state === 'failed') {
     return { level: 'warn', text: `Running Codex app-server not reloaded (${hostRefresh.reason}); its open sessions may report the previous Brain hooks until Codex restarts.` };
@@ -4193,13 +4198,23 @@ export function syncHostsAfterUpdate(cacheDir = resolvedKbDir(), {
  * main flow; before this, every existing user's `--update` skipped it — cross-vendor review E). The reload never
  * grants an approval and never starts, stops or restarts a server (refreshSharedCodexAppServer).
  */
-export async function convergeHostsAfterUpdate(cacheDir = resolvedKbDir(), { refreshHost = refreshCodexSharedHost, ...options } = {}) {
+export async function convergeHostsAfterUpdate(cacheDir = resolvedKbDir(), { refreshHost = refreshCodexSharedHost,
+  unattended = process.env.RUVNET_NIGHTLY === '1', recordNotice = recordCodexOvernightNotice,
+  noticeHome = () => footprintRoots().brainHome, ...options } = {}) {
   const convergence = syncHostsAfterUpdate(cacheDir, options);
   if (!convergence.results?.codex) return convergence;
+  // Owner decision (4.7.21 review r2): the unattended nightly never reloads the shared Codex app-server; a reload
+  // pauses Brain hooks in sessions already open until someone re-reviews them in /hooks. It leaves a notice the next
+  // SessionStart shows once instead. An interactive --update still reloads.
+  if (unattended) {
+    if (!codexHostViewChanged(convergence.results.codex)) return { ...convergence, hostRefresh: { state: 'not-needed', changed: false } };
+    const recorded = recordNotice(noticeHome());
+    return { ...convergence, hostRefresh: { state: 'deferred-unattended', changed: false, noticeRecorded: recorded } };
+  }
   let hostRefresh;
   try { hostRefresh = await refreshHost(convergence.results.codex); }
   catch (error) { hostRefresh = { state: 'failed', changed: false, reason: error?.message || String(error) }; }
-  const note = codexHostRefreshMessage(hostRefresh);
+  const note = codexHostRefreshMessage(hostRefresh, convergence.results.codex);
   if (note) (note.level === 'warn' ? warn : info)(note.text);
   return { ...convergence, hostRefresh };
 }
@@ -6869,7 +6884,7 @@ the installer reports that boot-level declarations changed.
     if (codexHost.host) {
       codexPlugin = wireCodexPlugin();
       const hostRefresh = await refreshCodexSharedHost(codexPlugin);
-      const refreshNote = codexHostRefreshMessage(hostRefresh);
+      const refreshNote = codexHostRefreshMessage(hostRefresh, codexPlugin);
       if (refreshNote) (refreshNote.level === 'warn' ? warn : info)(refreshNote.text);
       if (codexPlugin.available) printCodexLifecycle(await codexLifecycleStatus());
     }
