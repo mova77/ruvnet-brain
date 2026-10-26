@@ -128,7 +128,7 @@ describe('coordinator stage isolation', () => {
 
 /** knowledge() with a runner that answers the receipt door (exit codes) and the plain door (throws off-contract), so the
  * pre-fix code — which only used the plain door with allowed [0, 10] and [0] — fails these cases. */
-function knowledgeFixture({ checks, installExit = 0, installed = '4.7.21', stamped = '4.7.20' }) {
+function knowledgeFixture({ checks, installExit = 0, installed = '9.0.1', stamped = '4.7.20' }) {
   const brainHome = tmp(), root = path.join(brainHome, 'root'), calls = [];
   fs.mkdirSync(path.join(brainHome, 'kb'), { recursive: true }); fs.writeFileSync(path.join(brainHome, 'kb/forge-update.mjs'), '');
   if (stamped) atomic(path.join(brainHome, 'kb/RUNTIME-IDENTITY.json'), { brainVersion: stamped });
@@ -155,7 +155,7 @@ describe('knowledge step', () => {
     const f = knowledgeFixture({ checks: [[5], [0, 'CURRENT']] });
     const result = knowledge(f.run, false, 'k1', f.opts);
     expect(f.calls).toEqual(['check', 'install --update --no-nightly-prompt --no-stack', 'check']);
-    expect(result).toMatchObject({ state: 'updated', restamped: { from: '4.7.20', to: '4.7.21' } });
+    expect(result).toMatchObject({ state: 'updated', restamped: { from: '4.7.20', to: '9.0.1' } });
   });
 
   it('--check exit 5 with the same version is reported incompatible and installs nothing', () => {
@@ -237,7 +237,7 @@ describe('SessionStart scope and time limits', () => {
       fs.writeFileSync(path.join(stateDir, '.auto-update-pref'), 'yes\n');
       const stamp = path.join(stateDir, '.last-update-check'); fs.writeFileSync(stamp, '1\n');
       const lines = [];
-      heartbeat({ env: { HOME: home }, hookDir, stateDir, home, running: '4.7.21', seedDispatched: false, stamp, emit: l => lines.push(l), now: Date.now() });
+      heartbeat({ env: { HOME: home }, hookDir, stateDir, home, running: '9.0.1', seedDispatched: false, stamp, emit: l => lines.push(l), now: Date.now() });
       const text = lines.join('\n');
       if (coordinated) { expect(text).toMatch(/v9\.9\.9 is published; this machine's coordinated nightly update installs it/); expect(text).not.toMatch(/downloading/); }
       else expect(text).toMatch(/v9\.9\.9 is downloading/);
@@ -261,8 +261,8 @@ describe('host-update --knowledge mirrors the exit-5 re-stamp', () => {
       { encoding: 'utf8', timeout: 60_000, env: { HOME: home, USERPROFILE: home, RUVNET_BRAIN_HOME: brainHome, PATH: path.dirname(process.execPath) } });
     return { r, marker, check: JSON.parse(fs.readFileSync(check, 'utf8')), lock };
   }
-  it('installed package 4.7.21 over a 4.7.20 stamp: the installer runs --update', () => {
-    const m = installedMachine('4.7.21');
+  it('installed package 9.0.1 over a 4.7.20 stamp: the installer runs --update', () => {
+    const m = installedMachine('9.0.1');
     expect(m.r.status).toBe(0);
     expect(m.check.outcome).toBe('updating');
     expect(fs.readFileSync(m.marker, 'utf8')).toMatch(/^--update --no-nightly-prompt/);

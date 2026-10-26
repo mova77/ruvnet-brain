@@ -26,7 +26,9 @@
 // updatedAt}` — after every completed batch, tied to COMPLETED WORK rather than log/output activity
 // (which can lag behind, or misleadingly survive, a real stall). `shard-all` is the supervising
 // "parent embed process": it spawns all N `embed` children itself and polls their progress files;
-// if any shard's `completed` count has not advanced within `--stall-minutes` (default 15), it logs
+// if any shard's `completed` count has not advanced within its budget — `--stall-minutes` (default 15)
+// as a floor, stretched to 4x the slowest batch seen, clock started at the shard's first progress
+// write (see createStallWatcher in shard-progress.mjs) — it logs
 // which shard stalled, SIGTERMs (then SIGKILLs) every shard, and exits non-zero — refusing to let a
 // hung shard silently hold the corpus rebuild open. `scripts/nightly-watchdog.mjs` can also read the
 // same progress files directly (see its `readJobProgress`) to report STALLED for a job whose
@@ -288,6 +290,12 @@ async function embedShard(shardIdx, nShards) {
   const outFile = vecShardPath(shardIdx, nShards);
   console.log(`[embed ${shardIdx}/${nShards}] ${mine.length} of ${rows.length} passages -> ${path.basename(outFile)}`);
   const fd = fs.openSync(outFile + '.tmp', 'w');
+  if (mine.length > 0) {
+    // Load the model first, then write completed=0: shard-all's stall watcher starts this shard's batch
+    // clock at its first progress write, so model load (8 shards loading bge at once) has its own budget.
+    await getEmbedder();
+    writeShardProgress(DIR, NAME, shardIdx, nShards, 0, mine.length);
+  }
   const BATCH = 32; const t0 = Date.now(); let done = 0;
   for (let i = 0; i < mine.length; i += BATCH) {
     const batch = mine.slice(i, i + BATCH);
@@ -337,7 +345,8 @@ async function shardAll(nShards, { stallMinutes, pollSeconds } = {}) {
     dir: DIR, name: NAME, of: nShards, stallMs: stallMinutes * 60_000, pollMs: pollSeconds * 1000,
     onStall: (i, info) => {
       stalledOut = true;
-      console.error(`[shard-all] STALL: shard ${i}/${nShards} has not advanced past ${info.lastCompleted} passages in ${(info.staleMs / 60_000).toFixed(1)}m (stall budget ${stallMinutes}m) — terminating all shards`);
+      const phase = info.started ? 'has not advanced past' : 'never wrote progress (model load?) — still at';
+      console.error(`[shard-all] STALL: shard ${i}/${nShards} ${phase} ${info.lastCompleted} passages in ${(info.staleMs / 60_000).toFixed(1)}m (stall budget ${(info.budgetMs / 60_000).toFixed(1)}m, floor ${stallMinutes}m) — terminating all shards`);
       killAll();
     },
   });

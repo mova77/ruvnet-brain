@@ -172,8 +172,8 @@ const STANDALONE = [
   // plist's own ProgramArguments on 2026-07-23, not assumed from the header comment alone:
   ['clear-claude-tmp', 'launchd, every 3h (out-of-repo scheduler) — confirmed live: '
     + 'com.stuartkerr.clear-claude-tmp.plist is loaded and its ProgramArguments invoke this exact file'],
-  ['nightly-gists', 'launchd nightly 21:47 (out-of-repo scheduler) — confirmed live: '
-    + 'com.ruvnet.brain-gists.plist is loaded and its ProgramArguments invoke this exact file'],
+  ['nightly-gists', 'manual re-embed of the developer checkout gists store (the launchd job '
+    + 'com.ruvnet.brain-gists was retired 2026-10-26: no installed brain reads that store)'],
   ['nightly-wrapper', 'author-run maintenance harness, deliberately unscheduled; refuses primary, nested, and dirty worktrees'],
   ['routing-flywheel', 'launchd nightly 04:45 --dry-run (out-of-repo scheduler) — confirmed live: '
     + 'com.ruvnet.routing-flywheel.plist is loaded and its ProgramArguments invoke this exact file'],
