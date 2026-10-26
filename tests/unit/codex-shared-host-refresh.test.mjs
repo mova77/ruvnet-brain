@@ -12,7 +12,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { WebSocketServer } from 'ws';
 import { refreshSharedCodexAppServer } from '../../scripts/codex-hook-trust-reconcile.mjs';
-import { refreshCodexSharedHost } from '../../bin/install.mjs';
+import * as installer from '../../bin/install.mjs';
+
+const { refreshCodexSharedHost } = installer;
 
 const cleanups = [];
 afterEach(async () => { for (const fn of cleanups.splice(0).reverse()) await fn(); });
@@ -82,5 +84,20 @@ describe('refreshCodexSharedHost — the installer reloads the host only after i
     expect(await refreshCodexSharedHost({ action: 'unchanged', hookTrust: { state: 'unchanged', changed: false } }, { codexHome: '/x', refresh })).toEqual({ state: 'not-needed', changed: false });
     expect(await refreshCodexSharedHost({ action: 'disabled' }, { codexHome: '/x', refresh })).toEqual({ state: 'not-needed', changed: false });
     expect(calls).toEqual([{ codexHome: '/x' }, { codexHome: '/x' }, { codexHome: '/x' }]);
+  });
+});
+
+describe('the installer says plainly what the reload does to sessions already open (#492 review)', () => {
+  it('a reload tells the owner open sessions change now and Brain hooks pause there until re-reviewed in /hooks', () => {
+    expect(typeof installer.codexHostRefreshMessage).toBe('function');
+    const note = installer.codexHostRefreshMessage({ state: 'refreshed', changed: false, approvalsGranted: 0 });
+    expect(note.level).toBe('info');
+    expect(note.text).toMatch(/already open pick up the change immediately/);
+    expect(note.text).toMatch(/Brain hooks pause in them until you re-review them in \/hooks/);
+    expect(note.text).toMatch(/no approval granted, nothing restarted/);
+  });
+  it('a failed reload warns; no server or nothing to do says nothing', () => {
+    expect(installer.codexHostRefreshMessage({ state: 'failed', reason: 'timed out' })).toMatchObject({ level: 'warn', text: expect.stringMatching(/not reloaded \(timed out\)/) });
+    for (const state of ['no-shared-server', 'not-needed', 'blocked']) expect(installer.codexHostRefreshMessage({ state })).toBeNull();
   });
 });

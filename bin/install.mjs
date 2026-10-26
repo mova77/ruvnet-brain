@@ -2337,6 +2337,22 @@ export async function refreshCodexSharedHost(codexPlugin, { codexHome = codexHom
   return refresh({ codexHome });
 }
 
+/**
+ * What the owner is told after refreshCodexSharedHost. The reload reaches ALREADY-OPEN Codex sessions at once, and
+ * changed Brain hook definitions are pending until reviewed, so those sessions stop running Brain hooks until the
+ * owner re-reviews them in /hooks. Said plainly, so a pause in a session he had open is never a surprise (#492).
+ */
+export function codexHostRefreshMessage(hostRefresh) {
+  if (hostRefresh?.state === 'refreshed') {
+    return { level: 'info', text: '  Running Codex app-server reloaded: Codex sessions that are already open pick up the change immediately, '
+      + 'so Brain hooks pause in them until you re-review them in /hooks (no approval granted, nothing restarted).' };
+  }
+  if (hostRefresh?.state === 'failed') {
+    return { level: 'warn', text: `Running Codex app-server not reloaded (${hostRefresh.reason}); its open sessions may report the previous Brain hooks until Codex restarts.` };
+  }
+  return null;
+}
+
 export function codexSessionSafety(status) {
   if (status?.restartRequired === true) return status;
   return {
@@ -6836,8 +6852,8 @@ the installer reports that boot-level declarations changed.
     if (codexHost.host) {
       codexPlugin = wireCodexPlugin();
       const hostRefresh = await refreshCodexSharedHost(codexPlugin);
-      if (hostRefresh.state === 'refreshed') info('  Running Codex app-server reloaded: its open sessions now see the installed Brain plugin (no approval granted, nothing restarted).');
-      else if (hostRefresh.state === 'failed') warn(`Running Codex app-server not reloaded (${hostRefresh.reason}); its open sessions may report the previous Brain hooks until Codex restarts.`);
+      const refreshNote = codexHostRefreshMessage(hostRefresh);
+      if (refreshNote) (refreshNote.level === 'warn' ? warn : info)(refreshNote.text);
       if (codexPlugin.available) printCodexLifecycle(await codexLifecycleStatus());
     }
   } catch (e) {
