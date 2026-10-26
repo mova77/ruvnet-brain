@@ -28,10 +28,10 @@ export const RELEASE_REQUIREMENTS = Object.freeze({
     {
       "id": "owner-alerting-volume-and-trust",
       "reason": "Alerts page on change, not repeat; an undelivered page is retried; overrunning jobs and their whole process tree stop; people's issues page once at SLA with one daily summary; the ntfy inbox never turns message text into instructions",
-      "files": ["tests/unit/issue-watch-paging.test.mjs", "tests/unit/ntfy-inbox.test.mjs"],
+      "files": ["tests/unit/issue-watch-paging.test.mjs"],
       "platformFiles": {
-        "linux": ["tests/unit/job-heartbeat-alerting.test.mjs"],
-        "macos": ["tests/unit/job-heartbeat-alerting.test.mjs"]
+        "linux": ["tests/unit/job-heartbeat-alerting.test.mjs", "tests/unit/ntfy-inbox.test.mjs"],
+        "macos": ["tests/unit/job-heartbeat-alerting.test.mjs", "tests/unit/ntfy-inbox.test.mjs"]
       }
     },
     {
