@@ -121,3 +121,27 @@ describe('a Codex MCP tool failure is a failure even when the call completed', (
     expect(audit(mcp(200, 300, { content: [{ type: 'text', text: '5 passed' }], isError: false })).verdict).toBe('OBSERVED_CHECK');
   });
 });
+
+// Review r2 (4.7.21, GPT-6.1): one itemized tool anywhere used to make EVERY code-mode `exec` wrapper vanish, so an
+// opaque acting exec after the check kept OBSERVED_CHECK. Only an exec whose call/output bracket holds native items
+// (the shape Codex writes) is dropped; any other exec after the check is a possible change.
+describe('opaque Codex exec wrappers after the check are changes', () => {
+  const execCall = (id, script = 'await tools.apply_patch({input: "..."})') => ri({ type: 'custom_tool_call', status: 'completed', call_id: id, name: 'exec', input: script });
+  const execOut = (id) => ri({ type: 'custom_tool_call_output', call_id: id, output: [{ type: 'input_text', text: 'Script completed\nOutput:\n' }] });
+  const verdict = (...lines) => auditCompletionClaims(SCOPED, { turn: readClaudeTurn(rollout(user, ...lines), { host: 'codex' }), host: 'codex' }).verdict;
+  it('an exec with no native item inside its bracket, after the check, is a change', () => {
+    expect(verdict(patch(100, 110), run(200, 300), execCall('x1'), execOut('x1'))).not.toBe('OBSERVED_CHECK');
+  });
+  it('an exec still running (no output yet) after the check is a change', () => {
+    expect(verdict(patch(100, 110), run(200, 300), execCall('x2'))).not.toBe('OBSERVED_CHECK');
+  });
+  it('an exec whose bracket holds the native check item keeps the observed check', () => {
+    expect(verdict(patch(100, 110), execCall('x3', 'await tools.exec_command({cmd: "npx vitest run"})'), run(200, 300), execOut('x3'))).toBe('OBSERVED_CHECK');
+  });
+  it('a paired exec that patched after the check is judged by its native items: a change', () => {
+    expect(verdict(patch(100, 110), run(200, 300), execCall('x4'), patch(400, 410), execOut('x4'))).not.toBe('OBSERVED_CHECK');
+  });
+  it('through the real gate: an opaque exec after the check is corrected', () => {
+    expect(fire(repo(), SCOPED, rollout(user, patch(100, 110), run(200, 300), execCall('x5'), execOut('x5')))).toContain('no end-to-end check');
+  });
+});

@@ -53,6 +53,23 @@ function toolItemLines(record, uncertain) {
       content: typeof item.aggregated_output === 'string' ? item.aggregated_output : '' }])];
 }
 
+/**
+ * Code-mode `exec` calls whose call record and output record bracket at least one native tool item: Codex records
+ * the items an exec script runs between that exec's call and its output (rollouts on the owner's Mac, codex-cli
+ * 0.164). An item carries no call id, so the bracket is the only pairing there is; anything else is opaque.
+ */
+function pairedExecCalls(ordered) {
+  const paired = new Set();
+  ordered.forEach((record, i) => {
+    const p = record?.payload;
+    if (record?.type !== 'response_item' || p?.type !== 'custom_tool_call' || p.name !== 'exec' || typeof p.call_id !== 'string') return;
+    const end = ordered.findIndex((r, j) => j > i && r?.type === 'response_item' && r.payload?.type === 'custom_tool_call_output'
+      && r.payload.call_id === p.call_id);
+    if (end > i && ordered.slice(i + 1, end).some(toolItem)) paired.add(p.call_id);
+  });
+  return paired;
+}
+
 /** Keep call IDs intact; torn/unknown records cannot manufacture successful tool evidence. */
 export function nativeTurnLines(lines, host) {
   if (host !== 'codex') return lines;
@@ -64,6 +81,7 @@ export function nativeTurnLines(lines, host) {
   }
   records.reverse();
   const { ordered, uncertain, itemized } = orderToolItems(records);
+  const paired = pairedExecCalls(ordered);
   const out = []; const sessions = new Map(); const calls = new Map();
   // Codex writes the same answer up to three times (response_item, item_completed AgentMessage,
   // task_complete.last_agent_message); any one of them may be the only copy that survived.
@@ -97,8 +115,10 @@ export function nativeTurnLines(lines, host) {
     if (p.type === 'message' && ['user', 'assistant'].includes(p.role)) {
       say(p.role, text(p.content)); continue;
     }
-    // A code-mode `exec` script acts only through tools whose native items are mapped above.
-    if (itemized && p.name === 'exec' && ['custom_tool_call', 'custom_tool_call_output'].includes(p.type)) continue;
+    // A code-mode `exec` script's actions are the native items mapped above, but only an exec PROVABLY paired with
+    // them (review r2, 4.7.21) is dropped; an opaque one (no item inside its call/output bracket, or no output yet)
+    // stays a tool call named `exec`, which the audit counts as a possible change (fail toward asking).
+    if (itemized && paired.has(p.call_id) && ['custom_tool_call', 'custom_tool_call_output'].includes(p.type)) continue;
     if (itemized && p.type === 'custom_tool_call_output' && !calls.has(p.call_id)) continue;
     if (['function_call', 'custom_tool_call'].includes(p.type) && typeof p.call_id === 'string') {
       const args = typeof p.arguments === 'string' ? parse(p.arguments) : p.arguments;
