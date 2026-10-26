@@ -138,10 +138,21 @@ function dirIdentity(dir) {
 function readRaw(file) {
   try { return fs.readFileSync(file, 'utf8'); } catch (error) { if (error?.code === 'ENOENT') return null; throw error; }
 }
+// A claim file must not restart the age an incomplete owner is judged by (Opus r2 #6): writing or removing one bumps
+// the lock directory's mtime, which newestMtimeMs reads, so the directory's own times are put back.
+function keepDirectoryTimes(dir, change) {
+  let before = null;
+  try { before = fs.lstatSync(dir); } catch { /* judged below */ }
+  try { return change(); } finally { if (before) try { fs.lutimesSync(dir, before.atime, before.mtime); } catch { /* gone */ } }
+}
+const GONE = Symbol('judged lock vanished');
 function claimTakeover(lockPath, hostname) {
   let highest = -1;
   let highestName = null;
-  for (const name of fs.readdirSync(lockPath)) {
+  let names;
+  // The judged lock vanished (another reclaimer moved it): re-judge rather than throw (Fable r2 P3-1).
+  try { names = fs.readdirSync(lockPath); } catch (error) { if (['ENOENT', 'ENOTDIR'].includes(error?.code)) return GONE; throw error; }
+  for (const name of names) {
     const match = CLAIM_FILE.exec(name);
     if (!match) continue;
     const level = match[1] ? Number(match[1]) : 0;
@@ -157,15 +168,16 @@ function claimTakeover(lockPath, hostname) {
   const claim = { schemaVersion: 1, token: crypto.randomBytes(24).toString('hex'), host: hostname,
     pid: process.pid, claimedAt: new Date().toISOString(), file };
   let fd;
-  try { fd = fs.openSync(file, 'wx', 0o600); } catch (error) {
-    if (['EEXIST', 'ENOENT'].includes(error?.code)) return null;
+  try { fd = keepDirectoryTimes(lockPath, () => fs.openSync(file, 'wx', 0o600)); } catch (error) {
+    if (error?.code === 'EEXIST') return null;
+    if (error?.code === 'ENOENT') return GONE;
     throw error;
   }
   try { fs.writeFileSync(fd, `${JSON.stringify({ ...claim, file: undefined }, null, 2)}\n`); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
   return claim;
 }
 function dropClaim(claim) {
-  try { if (readRaw(claim.file)?.includes(claim.token)) fs.unlinkSync(claim.file); } catch { /* gone with its directory */ }
+  try { if (readRaw(claim.file)?.includes(claim.token)) keepDirectoryTimes(path.dirname(claim.file), () => fs.unlinkSync(claim.file)); } catch { /* gone with its directory */ }
 }
 /**
  * Remove the lock directory at `lockPath` only if it is still exactly the one observed. Returns 'removed',
@@ -173,6 +185,7 @@ function dropClaim(claim) {
  */
 function removeObservedLock(lockPath, observed, { hostname, beforeRemove = null, afterClaim = null } = {}) {
   const claim = claimTakeover(lockPath, hostname);
+  if (claim === GONE) return 'changed';
   if (!claim) return 'busy';
   afterClaim?.({ lockPath, claim });
   let same = false;

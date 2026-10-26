@@ -135,6 +135,44 @@ describe('concurrent reclaimers of one abandoned lock (Codex #1)', () => {
     expect(releaseRefreshLock(a)).toBe(true);
   });
 
+  it('a reclaimer that dies holding its claim does not restart an incomplete lock\'s age (Opus r2 #6)', () => {
+    const { kbDir, lockPath } = fixture();
+    fs.mkdirSync(lockPath);
+    fs.writeFileSync(path.join(lockPath, 'owner.json'), '');
+    const t = new Date(Date.now() - 1.5 * 3600_000);
+    fs.utimesSync(path.join(lockPath, 'owner.json'), t, t);
+    fs.utimesSync(lockPath, t, t);
+    const crashed = errorOf(() => acquireRefreshLock({ kbDir, ...as(101, { afterTakeoverClaim: () => { throw new Error('killed after claiming'); } }) }));
+    expect(crashed?.message).toBe('killed after claiming');
+    expect(fs.readdirSync(lockPath).sort()).toEqual(['owner.json', 'takeover.json']);
+    const ageMs = Date.now() - fs.lstatSync(lockPath).mtimeMs;
+    expect(ageMs).toBeGreaterThan(1.4 * 3600_000); // before: ~0, so the next takeover waited another hour
+    expect(ageMs).toBeLessThan(1.6 * 3600_000);
+    const old = new Date(Date.now() - CLAIM_STALE_MS - 60_000);
+    fs.utimesSync(path.join(lockPath, 'takeover.json'), old, old);
+    const a = acquireRefreshLock({ kbDir, ...as(202) }); // before: "incomplete or unreadable; refusing takeover until it is 1 h old"
+    expect(ownerToken(lockPath)).toBe(a.token);
+    expect(releaseRefreshLock(a)).toBe(true);
+  });
+
+  it('the judged lock vanishing before the claim is re-judged, not thrown (Fable r2 P3-1)', () => {
+    const { kbDir, lockPath } = fixture();
+    acquireRefreshLock({ kbDir, ...as(DEAD_PID) });
+    const realReaddir = fs.readdirSync;
+    let fired = false;
+    const spy = vi.spyOn(fs, 'readdirSync').mockImplementation((target, ...rest) => {
+      if (!fired && target === lockPath) { fired = true; fs.rmSync(lockPath, { recursive: true }); } // another reclaimer moved it
+      return realReaddir(target, ...rest);
+    });
+    let lock = null;
+    let error = null;
+    try { lock = acquireRefreshLock({ kbDir, ...as(101) }); } catch (e) { error = e; } finally { spy.mockRestore(); }
+    expect(fired).toBe(true);
+    expect(error?.message).toBeUndefined(); // before: ENOENT: no such file or directory, scandir
+    expect(ownerToken(lockPath)).toBe(lock.token);
+    expect(releaseRefreshLock(lock)).toBe(true);
+  });
+
   it('six processes released together on one dead lock: exactly one owns it', async () => {
     const { kbDir, lockPath } = fixture();
     acquireRefreshLock({ kbDir, ...as(DEAD_PID) });

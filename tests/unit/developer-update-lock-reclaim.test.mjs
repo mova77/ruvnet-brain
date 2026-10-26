@@ -7,7 +7,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { Worker } from 'node:worker_threads';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { acquireDeveloperLock, sharedLockStatus, processStartOf, STALE_RECLAIM_MS, CLAIM_STALE_MS } from '../../plugin/scripts/developer-update-lock.mjs';
 
 const roots = [];
@@ -143,19 +144,42 @@ describe('developer update lock: concurrent reclaimers', () => {
     owners[0].release();
   });
 
-  it('an owner published into the directory between mkdir and this process\'s own write wins: no overwrite', () => {
+  it('an owner that publishes after this process judged the lock free wins: the publication rename refuses, no overwrite', () => {
     const brainHome = brain(), dir = lockDir(brainHome);
     const foreign = { pid: process.pid, token: 'f'.repeat(32), startedAt: new Date().toISOString(), processStart: processStartOf(process.pid) };
-    const realMkdir = fs.mkdirSync;
-    const spy = vi.spyOn(fs, 'mkdirSync').mockImplementation((target, options) => {
-      const result = realMkdir(target, options);
-      if (target === dir) fs.writeFileSync(path.join(dir, 'owner.json'), JSON.stringify(foreign));
-      return result;
+    const realRename = fs.renameSync;
+    let fired = false;
+    const spy = vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      if (!fired && to === dir) { fired = true; fs.mkdirSync(dir); fs.writeFileSync(path.join(dir, 'owner.json'), JSON.stringify(foreign)); }
+      return realRename(from, to);
     });
     let error = null;
     try { acquireDeveloperLock({ brainHome }); } catch (e) { error = e; } finally { spy.mockRestore(); }
+    expect(fired).toBe(true);
     expect(error?.message).toMatch(/^developer update lock running; /); // before: the foreign owner was overwritten
     expect(ownerOf(brainHome).token).toBe(foreign.token);
+    expect(fs.readdirSync(brainHome).filter(name => name !== 'developer-update.lock')).toEqual([]); // staging removed
+  });
+
+  it.skipIf(process.platform === 'win32')('a mkdir-then-write owner (agentic-kit) caught between its two steps cannot also own the lock', () => {
+    const brainHome = brain(), dir = lockDir(brainHome);
+    const realRename = fs.renameSync;
+    let kitError = null, fired = false;
+    const spy = vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      if (fired || to !== dir) return realRename(from, to);
+      fired = true;
+      fs.mkdirSync(dir); // Kit's atomic mkdir succeeded; its owner write has not happened yet
+      const result = realRename(from, to); // POSIX replaces an EMPTY directory
+      try { fs.writeFileSync(path.join(dir, 'owner.json'), JSON.stringify({ pid: 1, token: 'k'.repeat(32) }), { flag: 'wx' }); }
+      catch (error) { kitError = error; }
+      return result;
+    });
+    let lock;
+    try { lock = acquireDeveloperLock({ brainHome }); } finally { spy.mockRestore(); }
+    expect(fired).toBe(true);
+    expect(kitError?.code).toBe('EEXIST'); // Kit's exclusive owner write refuses: one owner
+    expect(ownerOf(brainHome).token).toBe(lock.token);
+    lock.release();
   });
 
   it('while one reclaimer holds the claim, a second one refuses instead of racing it', () => {
@@ -178,6 +202,39 @@ describe('developer update lock: concurrent reclaimers', () => {
     const old = (Date.now() - CLAIM_STALE_MS - 60_000) / 1000;
     fs.utimesSync(claim, old, old);
     const lock = acquireDeveloperLock({ brainHome, alive: notDead });
+    expect(ownerOf(brainHome).token).toBe(lock.token);
+    lock.release();
+  });
+
+  it('a reclaimer that dies holding its claim does not restart the owner-less lock\'s age (Opus r2 #6)', () => {
+    const brainHome = brain(), dir = lockDir(brainHome);
+    fs.mkdirSync(dir); ageDir(dir, 11 * 60_000);
+    const crashed = errorOf(() => acquireDeveloperLock({ brainHome, afterTakeoverClaim: () => { throw Error('killed after claiming'); } }));
+    expect(crashed?.message).toBe('killed after claiming');
+    expect(fs.readdirSync(dir)).toEqual(['takeover.json']);
+    const ageMs = Date.now() - fs.lstatSync(dir).mtimeMs;
+    expect(ageMs).toBeGreaterThan(10 * 60_000); // before: ~0, the claim write had reset it
+    expect(ageMs).toBeLessThan(12 * 60_000);
+    const old = (Date.now() - CLAIM_STALE_MS - 60_000) / 1000;
+    fs.utimesSync(path.join(dir, 'takeover.json'), old, old);
+    const lock = acquireDeveloperLock({ brainHome }); // before: refused "lock unknown" for another ten minutes
+    expect(ownerOf(brainHome).token).toBe(lock.token);
+    lock.release();
+  });
+
+  it('the judged lock vanishing before the claim is re-judged, not thrown (Fable r2 P3-1)', () => {
+    const brainHome = brain(), dir = lockDir(brainHome);
+    plantDead(brainHome);
+    const realReaddir = fs.readdirSync;
+    let fired = false;
+    const spy = vi.spyOn(fs, 'readdirSync').mockImplementation((target, ...rest) => {
+      if (!fired && target === dir) { fired = true; fs.renameSync(dir, `${dir}.stale-other`); fs.rmSync(`${dir}.stale-other`, { recursive: true }); }
+      return realReaddir(target, ...rest);
+    });
+    let lock = null, error = null;
+    try { lock = acquireDeveloperLock({ brainHome, alive: notDead }); } catch (e) { error = e; } finally { spy.mockRestore(); }
+    expect(fired).toBe(true);
+    expect(error?.message).toBeUndefined(); // before: ENOENT: no such file or directory, scandir
     expect(ownerOf(brainHome).token).toBe(lock.token);
     lock.release();
   });
@@ -209,4 +266,78 @@ describe('developer update lock: concurrent reclaimers', () => {
     expect(results.filter(line => line.startsWith('REFUSED ')), results.join('\n')).toHaveLength(5);
     expect(ownerOf(brainHome).token).toBe(owned[0].slice('OWNED '.length));
   }, 30_000);
+});
+
+// 4.7.21 review round 4 (Codex #1): a lock directory that existed before its owner record could be judged owner-less
+// and old by a reclaimer, claimed and re-checked (still owner-less: the same), and then moved aside together with the
+// owner the first process published in between. Both ran. Two worker threads drive that interleaving through
+// barriers: A stops at its publication step, B (whose clock is 11 minutes ahead) stops just before moving the lock
+// aside. The lock is now published fully populated by one rename, so no owner-less moment exists to be judged.
+describe('developer update lock: publication cannot be split by a takeover', () => {
+  const MODULE = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'plugin', 'scripts', 'developer-update-lock.mjs');
+  const ownerOf = brainHome => JSON.parse(fs.readFileSync(path.join(lockDir(brainHome), 'owner.json'), 'utf8'));
+  // Slots: 0 = B reached its move-aside, 1 = release B, 2 = A reached its publication, 3 = release A.
+  const WORKER = `
+    const { workerData, parentPort } = require('node:worker_threads');
+    const fs = require('node:fs'); const path = require('node:path');
+    const flags = new Int32Array(workerData.sab); const dir = workerData.dir;
+    const pause = (reached, release) => { Atomics.store(flags, reached, 1); Atomics.notify(flags, reached); Atomics.wait(flags, release, 0, 15000); };
+    let fired = false;
+    if (workerData.role === 'B') {
+      const real = fs.renameSync;
+      fs.renameSync = function (from, to) {
+        if (!fired && from === dir && String(to).startsWith(dir + '.stale-')) { fired = true; pause(0, 1); }
+        return real.apply(this, arguments);
+      };
+    } else {
+      // A's publication step: the owner write into the lock (mkdir-then-write) or the rename that publishes it.
+      const realWrite = fs.writeFileSync, realRename = fs.renameSync;
+      fs.writeFileSync = function (file) {
+        if (!fired && String(file).startsWith(dir + path.sep + 'owner.json')) { fired = true; pause(2, 3); }
+        return realWrite.apply(this, arguments);
+      };
+      fs.renameSync = function (from, to) {
+        if (!fired && to === dir) { fired = true; pause(2, 3); }
+        return realRename.apply(this, arguments);
+      };
+    }
+    import(workerData.module).then((m) => {
+      try {
+        const lock = m.acquireDeveloperLock({ brainHome: workerData.brainHome, now: Date.now() + workerData.skewMs, startOf: () => 'same-process' });
+        parentPort.postMessage({ token: lock.token });
+      } catch (error) { parentPort.postMessage({ refused: error.message }); }
+    }, (error) => parentPort.postMessage({ error: String(error && error.stack || error) }));`;
+  const waitFor = async (predicate, ms = 15_000) => {
+    const deadline = Date.now() + ms;
+    while (!predicate()) {
+      if (Date.now() > deadline) throw Error('timed out waiting for the interleaving');
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+  };
+
+  it('A is mid-publication when B judges the lock owner-less and old: exactly one owns it, and it is the recorded owner', async () => {
+    const brainHome = brain(), dir = lockDir(brainHome);
+    const sab = new SharedArrayBuffer(16), flags = new Int32Array(sab);
+    const start = (role, skewMs) => {
+      const worker = new Worker(WORKER, { eval: true, workerData: { role, sab, dir, brainHome, skewMs, module: pathToFileURL(MODULE).href } });
+      const result = { done: false, value: null };
+      worker.once('message', value => { result.value = value; result.done = true; });
+      worker.once('error', error => { result.value = { error: String(error) }; result.done = true; });
+      return result;
+    };
+    const a = start('A', 0);
+    await waitFor(() => Atomics.load(flags, 2) === 1 || a.done);
+    const b = start('B', 11 * 60_000);
+    await waitFor(() => Atomics.load(flags, 0) === 1 || b.done);
+    Atomics.store(flags, 3, 1); Atomics.notify(flags, 3);
+    await waitFor(() => a.done);
+    Atomics.store(flags, 1, 1); Atomics.notify(flags, 1);
+    await waitFor(() => b.done);
+    expect(a.value.error, a.value.error).toBeUndefined();
+    expect(b.value.error, b.value.error).toBeUndefined();
+    const owners = [a.value, b.value].filter(value => value.token);
+    expect(owners, JSON.stringify({ a: a.value, b: b.value })).toHaveLength(1); // before: both A and B held tokens
+    expect(ownerOf(brainHome).token).toBe(owners[0].token);
+    expect(fs.readdirSync(brainHome).filter(name => name !== 'developer-update.lock')).toEqual([]); // no staging or tomb litter
+  }, 40_000);
 });
