@@ -128,10 +128,16 @@ const MAX_BUFFER = 1 << 20;
 
 const VALID_CHANNELS = new Set(['advocacy', 'promotion', 'lesson', 'alarm']);
 const VALID_EFFECTS = new Set(['advisory', 'block']);
-// The shim's quiet default (RUVNET_STOP_NUDGES unset) narrows this run to lesson + alarm: lesson
-// producers still run and deliver, advocacy/promotion producers are never spawned. Unset → every channel.
-const ALLOWED_CHANNELS = process.env.RUVNET_UNPROMPTED_CHANNELS
-  ? new Set(process.env.RUVNET_UNPROMPTED_CHANNELS.split(',').map((c) => c.trim()).filter((c) => VALID_CHANNELS.has(c)))
+// QUIET BY DEFAULT, ENFORCED HERE (4.7.21 review F1). Unless RUVNET_STOP_NUDGES=full, this run is narrowed
+// to lesson + alarm: lesson producers still run and deliver, advocacy/promotion producers are never spawned.
+// The shim also exports RUVNET_UNPROMPTED_CHANNELS, but the shim is boot-frozen and this body is hot-updated,
+// so the quiet promise must not depend on which shim generation happens to dispatch it. An explicit
+// RUVNET_UNPROMPTED_CHANNELS still wins (the shim's own narrowing, or a caller that names channels).
+const QUIET_DEFAULT_CHANNELS = 'lesson,alarm';
+const NUDGES_FULL = String(process.env.RUVNET_STOP_NUDGES || '').toLowerCase() === 'full';
+const CHANNEL_LIST = process.env.RUVNET_UNPROMPTED_CHANNELS || (NUDGES_FULL ? '' : QUIET_DEFAULT_CHANNELS);
+const ALLOWED_CHANNELS = CHANNEL_LIST
+  ? new Set(CHANNEL_LIST.split(',').map((c) => c.trim()).filter((c) => VALID_CHANNELS.has(c)))
   : VALID_CHANNELS;
 
 /** Exit 0 with byte-empty stdout — the fail-safe and the "nothing to say" path. */

@@ -375,6 +375,7 @@ function registeredTimeoutMs(extraArgs) {
 // chosen from the typed table — never from input.
 function runHook(file, activeVersion = '') {
   if (!fs.existsSync(file)) return 0; // nothing to run — never invent a failure
+  try { if (QUIET_SPEECH_CHANNELS && !fs.readFileSync(file, 'utf8').includes('RUVNET_UNPROMPTED_CHANNELS')) return 0; } catch { return 0; } // quiet + a <=4.7.20 spine body that ignores the narrowing (it would speak advocacy) → the old whole-hook quiet exit
   let cmd;
   if (entry.interpreter === 'node') {
     cmd = process.execPath;

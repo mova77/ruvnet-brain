@@ -40,14 +40,16 @@ import { GPT_5_6_SOL_ID } from './review-model-defaults.mjs';
 const usage = () => `Usage:
   node scripts/learning-replay.mjs [--trap ${TRAP.MEMORY_SEARCH}|${TRAP.POST_TASK}] [--n N] [--host codex|claude-code] [--model MODEL]
   node scripts/learning-replay.mjs --check
-  node scripts/learning-replay.mjs --check-portfolio
+  node scripts/learning-replay.mjs --check-portfolio [--tolerate-stale]
   node scripts/learning-replay.mjs --measure-portfolio --host codex --model MODEL
   node scripts/learning-replay.mjs --check-mutants
   node scripts/learning-replay.mjs --check-wire      (token-free; needs the global ruflo)
   node scripts/learning-replay.mjs --dry-run
   node scripts/learning-replay.mjs --mutant <${Object.keys(MUTANTS).join('|')}>
 
-Exit: 0=PASS, 1=FAIL, 3=INCONCLUSIVE, 4=UNKNOWN.`;
+Exit: 0=PASS, 1=FAIL, 3=INCONCLUSIVE, 4=UNKNOWN. --tolerate-stale exits 0 for an UNKNOWN caused only by
+out-of-date evidence (load-bearing files changed since it was measured, or past the age limit) and prints
+STALE-TOLERATED; every FAIL, INCONCLUSIVE and other UNKNOWN keeps its exit code.`;
 
 function parse(argv) {
   const has = (flag) => argv.includes(flag);
@@ -144,6 +146,15 @@ function printed(label, result) {
   return EXIT[result.status] ?? EXIT.UNKNOWN;
 }
 
+// The scheduled workflow reports out-of-date model evidence without paging on it (nothing scheduled can
+// re-measure it); a recomputed FAIL, a forged or missing artifact, or any other UNKNOWN stays non-zero.
+function portfolioExit(result, tolerateStale) {
+  const code = printed(`${INVARIANT}-PORTFOLIO`, result);
+  if (!tolerateStale || result.status !== VERDICT.UNKNOWN || result.stale !== true) return code;
+  console.log('  STALE-TOLERATED: the committed model evidence predates the current code; re-measure to restore a verdict.\n');
+  return EXIT.PASS;
+}
+
 // A portfolio includes both positive traps AND all four causal mutants. Run every scenario even
 // after a failure, then let the unchanged evidence checker decide the result; child exit 1 is the
 // expected outcome of a causal mutant, and is never by itself a successful portfolio measurement.
@@ -182,7 +193,7 @@ export async function main(argv = process.argv.slice(2)) {
   if (has('--check')) {
     return printed(INVARIANT, checkArtifact({ file: PORTFOLIO_RESULT_FILES[trap] }));
   }
-  if (has('--check-portfolio')) return printed(`${INVARIANT}-PORTFOLIO`, checkPortfolio());
+  if (has('--check-portfolio')) return portfolioExit(checkPortfolio(), has('--tolerate-stale'));
   if (has('--check-mutants')) return printed(`${INVARIANT}-MUTANTS`, checkMutantArtifacts());
   if (has('--check-wire')) return printed(`${INVARIANT}-WIRE`, checkWire());
   if (has('--measure-portfolio')) return measurePortfolio({ host, model });

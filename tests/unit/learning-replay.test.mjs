@@ -90,9 +90,10 @@ describe('the scheduled wire gate measures HEAD and never passes on a guess', ()
     const yml = fs.readFileSync(path.resolve('.github/workflows/learning-replay.yml'), 'utf8');
     expect(yml).toMatch(/run: npm run learning:replay:wire/);
     expect(yml).not.toMatch(/continue-on-error/);
-    // Portfolio currency stays a hard failure when someone explicitly asks for it.
-    expect(yml).toMatch(/HARD: \$\{\{ github\.event_name == 'workflow_dispatch' \}\}/);
-    expect(yml).toMatch(/if \[ "\$HARD" = "true" \]; then exit "\$rc"; fi/);
+    // Portfolio currency is hard only when a manual dispatch asks for it (strict_portfolio); every other
+    // non-zero portfolio result propagates. The behaviour is executed in learning-replay-proof.test.mjs.
+    expect(yml).toMatch(/strict_portfolio:/);
+    expect(yml).not.toMatch(/\$HARD/);
   });
 });
 

@@ -33,9 +33,12 @@ name: learning-replay
 #      the brain-off control never receives it, and deleting the lesson removes it. No model, no tokens.
 # Both are hard gates: a broken learning loop turns this red (the 10-15 regression fails step 2).
 # It NO LONGER CLAIMS on a schedule that a real model changed behaviour on the current code. That model
-# half stays the committed portfolio's job; its currency is printed in the run summary and annotated
-# every night, is a hard failure on workflow_dispatch, and is read by release-vector/claims-verify,
-# where D4 reads UNKNOWN until someone re-measures. UNKNOWN is still never PASS.
+# half stays the committed portfolio's job. Out-of-date evidence (load-bearing files changed since it was
+# measured, or past the age limit) is the one result softened: printed in the run summary and annotated,
+# exit 0 (`--tolerate-stale`). A recomputed FAIL, INCONCLUSIVE, a missing/forged artifact or any other
+# UNKNOWN stays red on every trigger. A manual dispatch is green on wire PASS + annotated portfolio; ask
+# for a hard currency check with strict_portfolio=true. release-vector/claims-verify read the same
+# evidence, where D4 reads UNKNOWN until someone re-measures. UNKNOWN is still never PASS.
 #
 # The token-burning path exists here too and is one click away (`workflow_dispatch` with
 # run_replay=true), gated on an ANTHROPIC_API_KEY secret being present. If the secret is absent the
@@ -69,6 +72,10 @@ on:
         description: 'Spend real tokens and re-measure (needs the ANTHROPIC_API_KEY secret)'
         type: boolean
         default: false
+      strict_portfolio:
+        description: 'Fail this run when the committed model portfolio is out of date (not only when it fails)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -100,22 +107,26 @@ jobs:
       - name: LEARNING-REPLAY-WIRE — the lesson reaches project B on HEAD (hard gate)
         # Exit 0 only on PASS. 1 FAIL, 3 INCONCLUSIVE, 4 UNKNOWN — none of which is a pass.
         run: npm run learning:replay:wire
-      - name: LEARNING-REPLAY-PORTFOLIO — model evidence currency (reported; hard on manual dispatch)
+      - name: LEARNING-REPLAY-PORTFOLIO — model evidence (FAIL is red; out-of-date is annotated unless strict)
         env:
-          HARD: ${{ github.event_name == 'workflow_dispatch' }}
+          STRICT: ${{ github.event_name == 'workflow_dispatch' && inputs.strict_portfolio == true }}
         run: |
           set +e
-          out="$(npm run --silent learning:replay:check 2>&1)"; rc=$?
+          if [ "$STRICT" = "true" ]; then tolerate=""; else tolerate="--tolerate-stale"; fi
+          out="$(npm run --silent learning:replay:check -- $tolerate 2>&1)"; rc=$?
           set -e
           printf '%s\n' "$out"
           {
-            echo "### Model-measured D4 portfolio (exit $rc; 0 = PASS)"
+            echo "### Model-measured D4 portfolio (exit $rc; 0 = PASS, or out-of-date evidence tolerated)"
             echo '```'; printf '%s\n' "$out"; echo '```'
             echo "Re-measure on an owner seat: \`node scripts/learning-replay.mjs --measure-portfolio --host codex --model gpt-6.1-sol\`, then land the evidence through a release branch."
           } >> "$GITHUB_STEP_SUMMARY"
+          case "$out" in *STALE-TOLERATED*)
+            echo "::warning title=LEARNING-REPLAY portfolio not current::$(printf '%s' "$out" | tr '\n' ' ')" ;;
+          esac
           if [ "$rc" -ne 0 ]; then
-            echo "::warning title=LEARNING-REPLAY portfolio not current::$(printf '%s' "$out" | tr '\n' ' ')"
-            if [ "$HARD" = "true" ]; then exit "$rc"; fi
+            echo "::error title=LEARNING-REPLAY portfolio::$(printf '%s' "$out" | tr '\n' ' ')"
+            exit "$rc"
           fi
 
   replay:
