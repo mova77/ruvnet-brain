@@ -98,7 +98,10 @@ export function automaticInvocation(args, { source, home = os.homedir(), nodePat
     const coordinator = developerCoordinatorOwner({ home });
     if (coordinator.active) {
       if (!coordinator.ready) throw new Error(`coordinated updater is not ready: ${coordinator.reason}`);
-      return { executable: nodePath, args: [coordinator.entry, '--apply'], source: 'developer-suite', coordinator };
+      // Hooks and timers get knowledge only, never the whole suite (brew, cargo, every npm install) under a session TTL
+      // that kills it mid-install (AuditC #10). The full suite runs only from the scheduled runner, which calls the
+      // coordinator directly, not through here.
+      return { executable: nodePath, args: [coordinator.entry, '--apply', '--knowledge-only'], source: 'developer-suite', coordinator };
     }
   }
   source ??= updateSource({ home });
