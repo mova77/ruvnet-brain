@@ -23,8 +23,11 @@ const removal = directory => process.platform === 'win32' ? `Remove-Item -Recurs
 // aside on its stale judgement and both ran. A takeover now (1) creates an exclusive claim file inside the judged
 // directory ('wx': one winner per directory instance), (2) re-checks, while holding the claim, that it is the same
 // directory (dev/ino) with byte-identical owner.json, and only then (3) moves it aside. A claim left by a crashed
-// reclaimer is superseded by the next numbered claim once CLAIM_STALE_MS old. The owner record is published with an
-// exclusive link, so two processes that both believe they created the directory cannot both become its owner.
+// reclaimer is superseded by the next numbered claim once CLAIM_STALE_MS old.
+// Round 4 (Codex #1): a lock that existed before its owner record (mkdir, then write) could be judged owner-less and old,
+// claimed, re-checked (still owner-less, so "the same") and moved aside together with the owner published in between:
+// two owners. The lock is now built complete in a staging sibling and published by ONE rename, so it never exists
+// without its owner; a rename onto an existing lock fails (ENOTEMPTY/EEXIST, EPERM/EACCES on Windows) and is re-judged.
 export const CLAIM_STALE_MS = 5 * 60 * 1000;
 const CLAIM_FILE = /^takeover(?:-(\d+))?\.json$/;
 function observeDirectory(directory) {
@@ -35,9 +38,19 @@ function observeDirectory(directory) {
   return { identity: `${stat.dev}:${stat.ino}`, raw };
 }
 const readRaw = file => { try { return fs.readFileSync(file, 'utf8'); } catch { return null; } };
+// A claim file must not restart the age an owner-less lock is judged by (Opus r2 #6): writing or removing one bumps the
+// directory's mtime, so the directory's own times are put back.
+function keepDirectoryTimes(directory, change) {
+  let before = null;
+  try { before = fs.lstatSync(directory); } catch { /* judged below */ }
+  try { return change(); } finally { if (before) try { fs.lutimesSync(directory, before.atime, before.mtime); } catch { /* gone */ } }
+}
+const GONE = Symbol('judged lock vanished');
 function claimTakeover(directory) {
-  let highest = -1, highestName = null;
-  for (const name of fs.readdirSync(directory)) {
+  let highest = -1, highestName = null, names;
+  // The judged lock vanished (another reclaimer moved it): re-judge rather than throw (Fable r2 P3-1).
+  try { names = fs.readdirSync(directory); } catch (error) { if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return GONE; throw error; }
+  for (const name of names) {
     const match = CLAIM_FILE.exec(name);
     if (match && (match[1] ? Number(match[1]) : 0) > highest) { highest = match[1] ? Number(match[1]) : 0; highestName = name; }
   }
@@ -49,14 +62,15 @@ function claimTakeover(directory) {
   const level = highest + 1;
   const file = path.join(directory, level ? `takeover-${level}.json` : 'takeover.json');
   const token = crypto.randomUUID();
-  try { fs.writeFileSync(file, JSON.stringify({ token, pid: process.pid, claimedAt: new Date().toISOString() }), { flag: 'wx', mode: 0o600 }); }
-  catch (error) { if (error.code === 'EEXIST' || error.code === 'ENOENT') return null; throw error; }
+  try { keepDirectoryTimes(directory, () => fs.writeFileSync(file, JSON.stringify({ token, pid: process.pid, claimedAt: new Date().toISOString() }), { flag: 'wx', mode: 0o600 })); }
+  catch (error) { if (error.code === 'EEXIST') return null; if (error.code === 'ENOENT') return GONE; throw error; }
   return { file, token };
 }
-const dropClaim = claim => { try { if (readRaw(claim.file)?.includes(claim.token)) fs.unlinkSync(claim.file); } catch { /* gone with its directory */ } };
+const dropClaim = claim => { try { if (readRaw(claim.file)?.includes(claim.token)) keepDirectoryTimes(path.dirname(claim.file), () => fs.unlinkSync(claim.file)); } catch { /* gone with its directory */ } };
 /** Move `directory` aside only if it is still exactly the one observed: 'removed' | 'changed' | 'busy'. */
 function removeObservedLock(directory, observed, { afterClaim = null } = {}) {
   const claim = claimTakeover(directory);
+  if (claim === GONE) return 'changed';
   if (!claim) return 'busy';
   afterClaim?.({ directory, claim });
   let same = false;
@@ -74,17 +88,20 @@ function removeObservedLock(directory, observed, { afterClaim = null } = {}) {
   fs.rmSync(tomb, { recursive: true, force: true });
   return 'removed';
 }
-/** Publish owner.json complete-or-absent AND exclusively: a hard link fails with EEXIST when another owner got there first. */
-function publishOwner(file, content) {
-  const tmp = `${file}.tmp-${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
-  fs.writeFileSync(tmp, content, { flag: 'wx', mode: 0o600 });
+/** Publish the lock with its owner already inside: one rename, which fails when any populated lock is there. */
+const CONTENDED = new Set(['EEXIST', 'ENOTEMPTY', 'EPERM', 'EACCES']);
+function publishLock(directory, content) {
+  const staged = `${directory}.acquire-${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
   try {
-    try { fs.linkSync(tmp, file); }
-    catch (error) {
-      if (!['EPERM', 'ENOTSUP', 'ENOSYS', 'EXDEV'].includes(error.code)) throw error;
-      fs.writeFileSync(file, content, { flag: 'wx', mode: 0o600 }); // a filesystem without hard links: still exclusive
-    }
-  } finally { try { fs.unlinkSync(tmp); } catch { /* already gone */ } }
+    fs.mkdirSync(staged, { mode: 0o700 });
+    fs.writeFileSync(path.join(staged, 'owner.json'), content, { flag: 'wx', mode: 0o600 });
+    fs.renameSync(staged, directory);
+    return true;
+  } catch (error) {
+    try { fs.rmSync(staged, { recursive: true, force: true }); } catch { /* best effort */ }
+    if (CONTENDED.has(error.code) && fs.existsSync(directory)) return false; // another owner got there first: re-judge
+    throw error;
+  }
 }
 export function sharedLockStatus({ brainHome, alive = pidAlive, startOf = processStartOf } = {}) {
   const directory = path.join(brainRoot(brainHome), 'developer-update.lock');
@@ -123,26 +140,20 @@ export function acquireDeveloperLock({ brainHome, token = process.env.RUVNET_DEV
       continue; // 'removed' or 'changed': judge the directory afresh
     } else if (status.state !== 'idle') throw refuse(status.state);
     fs.mkdirSync(path.dirname(status.directory), { recursive: true });
-    try { fs.mkdirSync(status.directory, { mode: 0o700 }); } // atomic claim; racing owners get EEXIST
-    catch (error) { if (error.code === 'EEXIST') continue; throw error; }
     const owner = { pid, token: crypto.randomUUID(), startedAt: new Date().toISOString(), processStart: startOf(pid) };
-    const file = path.join(status.directory, 'owner.json');
-    try { publishOwner(file, JSON.stringify(owner)); }
-    catch (error) {
-      if (error.code === 'EEXIST') throw refuse('running'); // another process published into this directory first: it is the owner
-      try { fs.rmdirSync(status.directory); } catch { /* not empty: no longer only ours */ }
-      throw error;
-    }
+    if (!publishLock(status.directory, JSON.stringify(owner))) continue; // judge the lock that won
     return { token: owner.token, ownerPid: pid, inherited: false, release() {
       const current = sharedLockStatus({ brainHome, alive, startOf });
       if (current.owner?.token !== owner.token || current.owner?.pid !== pid) throw Error('developer update lock ownership changed');
-      fs.unlinkSync(file);
-      try { fs.rmdirSync(status.directory); }
-      catch (error) { // a contender's claim file can sit here for an instant; the directory is still this owner's to dispose of
-        if (error.code !== 'ENOTEMPTY' && error.code !== 'EEXIST') throw error;
-        const tomb = `${status.directory}.released-${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
-        fs.renameSync(status.directory, tomb); fs.rmSync(tomb, { recursive: true, force: true });
+      // Move the whole lock aside in one step, then confirm it was this owner's: removing owner.json first left an empty
+      // directory that a contender's publication rename could replace, and the follow-up removal deleted that live lock.
+      const tomb = `${status.directory}.released-${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
+      fs.renameSync(status.directory, tomb);
+      if (!readRaw(path.join(tomb, 'owner.json'))?.includes(owner.token)) {
+        try { if (!fs.existsSync(status.directory)) fs.renameSync(tomb, status.directory); } catch { /* keep it as evidence */ }
+        throw Error('developer update lock ownership changed');
       }
+      fs.rmSync(tomb, { recursive: true, force: true });
     } };
   }
   throw Error(`developer update lock is contended; ${path.join(brainRoot(brainHome), 'developer-update.lock')}. Retry shortly.`);

@@ -122,7 +122,11 @@ function lockAgeMs() {
 // a third run's fresh lock blocked the restore; and an owner-less lock (raw null) was indistinguishable from another
 // run's directory between its mkdir and its owner write, so the restore never ran and both runs applied. A takeover now
 // holds an exclusive claim file inside the judged directory and re-checks it (dev/ino + owner bytes) before moving it;
-// owner.json is published with an exclusive link, and a run releases only the lock that carries its own token.
+// a run releases only the lock that carries its own token.
+// Round 4 (Codex #1): mkdir-then-publish left an owner-less moment; a run paused there past the grace was judged debris,
+// claimed, re-checked (still owner-less: "the same") and moved aside with the owner it published meanwhile: two runs
+// applied. LOCK is now built complete in a staging sibling and published by ONE rename, so it never exists without its
+// owner; a rename onto an existing lock fails (ENOTEMPTY/EEXIST, EPERM/EACCES on Windows) and that lock is judged.
 const CLAIM_STALE_MS = 5 * 60_000;
 const CLAIM_FILE = /^takeover(?:-(\d+))?\.json$/;
 function observeLock() {
@@ -133,9 +137,19 @@ function observeLock() {
   return { identity: `${stat.dev}:${stat.ino}`, raw };
 }
 const readRaw = (file) => { try { return fs.readFileSync(file, 'utf8'); } catch { return null; } };
+// A claim file must not restart the publication grace (Opus r2 #6): writing or removing one bumps LOCK's mtime, which
+// lockAgeMs reads, so LOCK's own times are put back.
+function keepLockTimes(change) {
+  let before = null;
+  try { before = fs.lstatSync(LOCK); } catch { /* judged below */ }
+  try { return change(); } finally { if (before) try { fs.lutimesSync(LOCK, before.atime, before.mtime); } catch { /* gone */ } }
+}
+const GONE = Symbol('judged lock vanished');
 function claimTakeover() {
-  let highest = -1; let highestName = null;
-  for (const name of fs.readdirSync(LOCK)) {
+  let highest = -1; let highestName = null; let names;
+  // The judged lock vanished (another run moved it): re-judge rather than throw out of main (Fable r2 P3-1).
+  try { names = fs.readdirSync(LOCK); } catch (error) { if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return GONE; throw error; }
+  for (const name of names) {
     const match = CLAIM_FILE.exec(name);
     const level = match ? (match[1] ? Number(match[1]) : 0) : -1;
     if (level > highest) { highest = level; highestName = name; }
@@ -148,13 +162,14 @@ function claimTakeover() {
   const level = highest + 1;
   const file = path.join(LOCK, level ? `takeover-${level}.json` : 'takeover.json');
   const token = crypto.randomBytes(16).toString('hex');
-  try { fs.writeFileSync(file, JSON.stringify({ token, pid: process.pid, claimedAt: new Date().toISOString() }), { flag: 'wx' }); }
-  catch (error) { if (error?.code === 'EEXIST' || error?.code === 'ENOENT') return null; throw error; }
+  try { keepLockTimes(() => fs.writeFileSync(file, JSON.stringify({ token, pid: process.pid, claimedAt: new Date().toISOString() }), { flag: 'wx' })); }
+  catch (error) { if (error?.code === 'EEXIST') return null; if (error?.code === 'ENOENT') return GONE; throw error; }
   return { file, token };
 }
-const dropClaim = (claim) => { try { if (readRaw(claim.file)?.includes(claim.token)) fs.unlinkSync(claim.file); } catch { /* gone with its directory */ } };
+const dropClaim = (claim) => { try { if (readRaw(claim.file)?.includes(claim.token)) keepLockTimes(() => fs.unlinkSync(claim.file)); } catch { /* gone with its directory */ } };
 function removeObservedLock(observed) {
   const claim = claimTakeover();
+  if (claim === GONE) return 'changed';
   if (!claim) return 'busy';
   let same = false;
   try {
@@ -171,22 +186,28 @@ function removeObservedLock(observed) {
   try { fs.rmSync(quarantine, { recursive: true, force: true }); } catch { /* best effort */ }
   return 'removed';
 }
-/** Complete-or-absent AND exclusive: the hard link fails with EEXIST when another run's owner got there first. */
-function publishOwner(file, content) {
-  const tmp = `${file}.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
-  fs.writeFileSync(tmp, content, { flag: 'wx' });
+/** LOCK appears with its owner already inside, by one rename that fails when a populated lock is there. */
+const CONTENDED = new Set(['EEXIST', 'ENOTEMPTY', 'EPERM', 'EACCES']);
+function publishLock(content) {
+  const staged = `${LOCK}.acquire-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
   try {
-    try { fs.linkSync(tmp, file); } catch (error) {
-      if (!['EPERM', 'ENOTSUP', 'ENOSYS', 'EXDEV'].includes(error?.code)) throw error;
-      fs.writeFileSync(file, content, { flag: 'wx' }); // no hard links on this filesystem: still exclusive
-    }
-  } finally { try { fs.unlinkSync(tmp); } catch { /* already gone */ } }
+    fs.mkdirSync(staged);
+    fs.writeFileSync(path.join(staged, 'owner.json'), content, { flag: 'wx' });
+    fs.renameSync(staged, LOCK);
+  } catch (error) {
+    try { fs.rmSync(staged, { recursive: true, force: true }); } catch { /* best effort */ }
+    if (CONTENDED.has(error?.code) && fs.existsSync(LOCK)) throw Object.assign(new Error('the update lock is held'), { code: 'EEXIST' });
+    throw error;
+  }
 }
 export function acquireLock(target) {
   fs.mkdirSync(BRAIN_HOME, { recursive: true });
+  const processStart = processStartOf(process.pid);
   for (let attempt = 0; attempt < 3; attempt++) {
+    const token = crypto.randomBytes(16).toString('hex');
     try {
-      fs.mkdirSync(LOCK); // atomic: exists → EEXIST
+      publishLock(JSON.stringify({ pid: process.pid, host: os.hostname(), target, token,
+        processStart, startedAt: new Date().toISOString() }));
     } catch (error) {
       if (error?.code !== 'EEXIST') throw error;
       let observed;
@@ -202,15 +223,6 @@ export function acquireLock(target) {
         receipt('StaleLockReclaimed', { owner: owner ? { pid: owner.pid, host: owner.host, startedAt: owner.startedAt } : null, state });
       }
       continue; // 'changed': judge the directory that is there now
-    }
-    const token = crypto.randomBytes(16).toString('hex');
-    try {
-      publishOwner(path.join(LOCK, 'owner.json'), JSON.stringify({ pid: process.pid, host: os.hostname(), target, token,
-        processStart: processStartOf(process.pid), startedAt: new Date().toISOString() }));
-    } catch (error) {
-      if (error?.code === 'EEXIST') return { acquired: false, owner: null }; // another run owns this directory
-      try { fs.rmdirSync(LOCK); } catch { /* not empty: no longer only ours; leave it to the publication grace */ }
-      throw error;
     }
     return { acquired: true, token };
   }
