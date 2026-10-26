@@ -7,9 +7,11 @@ import { EXECUTION_MODULES, OPTIONAL_EXECUTION_MODULES } from './developer-updat
 const hash = file => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 export function developerCoordinatorOwner({ home = os.homedir(), brainHome = process.env.RUVNET_BRAIN_HOME || path.join(home, '.cache/ruvnet-brain') } = {}) {
   const config = path.join(brainHome, 'developer-update-config.json'), registration = path.join(brainHome, 'scheduler/registration.json');
-  let record;
-  try { record = JSON.parse(fs.readFileSync(registration, 'utf8')); } catch { /* handled below */ }
-  const configured = fs.existsSync(config) || record?.mode === 'developer-suite';
+  let record, registered = true;
+  try { record = JSON.parse(fs.readFileSync(registration, 'utf8')); } catch (error) { registered = error.code !== 'ENOENT'; }
+  // A config left behind by --disable-nightly (no registration at all) owns nothing: refusing every automatic update
+  // as "not ready" forever would wedge the machine (AuditC #11). An unreadable registration still refuses.
+  const configured = (fs.existsSync(config) && registered) || record?.mode === 'developer-suite';
   if (!configured) return { active: false, ready: false };
   const entry = record?.updateModules?.['developer-update.mjs'];
   try {

@@ -14,7 +14,7 @@ import { json, exists, mtimeMs, read } from './session-start-fsutil.mjs';
 import { unmountedNotice } from './brain-location.mjs';
 import { assessMoveLeftovers } from './footprint-io.mjs';
 import {
-  describeFailedRefreshRun, readNightlyRegistration, refreshHistory, updateOwnedByAgenticKit,
+  describeFailedRefreshRun, developerRunHealth, readNightlyRegistration, refreshHistory, updateOwnedByAgenticKit,
 } from './nightly-scheduler.mjs';
 
 export const brainState = (env, home) => {
@@ -93,7 +93,7 @@ export const autoUpdatePaths = (brainHome) => ({
   checkFile: path.join(brainHome, 'corpus-check.json'),
   checkResultFile: path.join(brainHome, '.last-kb-check-result.json'),
 });
-export const AUTO_UPDATE_LOCK_STALE_MS = 35 * 60_000; // detach TTL (30 min) + slack
+export const AUTO_UPDATE_LOCK_STALE_MS = 160 * 60_000; // detach TTL (session-start-update-plane ttlSec, 155 min) + slack
 
 /** The inputs every currency decision reads — one reader, shared by the line and the auto-update. */
 export const knowledgeFacts = ({ env = process.env, home, now = Date.now() } = {}) => {
@@ -210,6 +210,25 @@ export const hostSyncOnlyFailure = (receipt) => {
   return { state, why: why || 'no reason recorded (run npx ruvnet-brain --doctor)' };
 };
 
+/**
+ * A coordinated (developer-suite) nightly reports in nightly-suite-update.json, never in refresh-runs, so a failing or stale
+ * suite stayed silent while the knowledge was current (AuditC #26). One line then; '' when it is healthy, never ran, or absent.
+ */
+const coordinatedSuiteLine = ({ brainHome, now, builtMs, age }) => {
+  let health;
+  try {
+    const registration = readNightlyRegistration({ brainHome });
+    if (!registration.ok || registration.record.mode !== 'developer-suite') return '';
+    health = developerRunHealth({ brainHome, registration: registration.record, now });
+  } catch { return ''; }
+  if (!['failed', 'stale'].includes(health.state)) return '';
+  const what = health.state === 'stale' ? `has not completed in ${Math.round(health.ageHours)}h`
+    : `FAILED${Number.isFinite(health.ageHours) ? ` ${age(now - health.ageHours * 3_600_000)}` : ''}: ${String(health.evidence || 'no reason recorded').split('\n')[0].slice(0, 200)}`;
+  return `${KNOWLEDGE_LINE_PREFIX}CURRENT, NIGHTLY SUITE ${health.state === 'stale' ? 'STALE' : 'FAILING'}] knowledge base built `
+    + `${Number.isFinite(builtMs) ? age(builtMs) : 'at an UNKNOWN time'} and current; the coordinated nightly update ${what}. `
+    + `Details: ${path.join(brainHome, 'scheduler', 'last-suite-attempt.json')} (verify: npx ruvnet-brain --doctor).`;
+};
+
 export const knowledgeCurrency = ({ env = process.env, home, now = Date.now(), windowHours = 48 } = {}) => {
   const facts = knowledgeFacts({ env, home, now });
   const { brainHome, builtMs, history, hours, attempt } = facts;
@@ -248,7 +267,7 @@ export const knowledgeCurrency = ({ env = process.env, home, now = Date.now(), w
       + (restart ? 'Fix: restart Claude Code or Codex (`claude --continue` keeps a Claude conversation), then record it: npx ruvnet-brain@latest --update.'
         : 'Fix: npx ruvnet-brain@latest --update (verify: npx ruvnet-brain --doctor).');
   }
-  if (!failing && fresh) return '';
+  if (!failing && fresh) return coordinatedSuiteLine({ brainHome, now, builtMs, age });
   const kit = agenticKitUpdates({ home, facts });
   const agentKit = kit === 'delivering';
   // An agentic-kit machine must never be told to also --enable-nightly (one owner per machine).
@@ -256,7 +275,7 @@ export const knowledgeCurrency = ({ env = process.env, home, now = Date.now(), w
   const parts = [ageKnown ? `knowledge base built ${day(builtMs)} (${age(builtMs)})`
     : 'knowledge base age UNKNOWN (SOURCE.json missing or unreadable)'];
   if (autoFailed) {
-    const why = autoAbandoned ? 'it never recorded an outcome (killed at its 30-minute limit, or the machine slept)'
+    const why = autoAbandoned ? 'it never recorded an outcome (killed at its time limit, or the machine slept)'
       : `exit ${attempt.code ?? 'unknown'}: ${attempt.reason || 'no reason recorded'}`;
     parts.push(`automatic update launched ${age(launchedMs)} FAILED — ${why}`);
   } else if (hostOnly) {
