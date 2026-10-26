@@ -61,3 +61,82 @@ describe('issue watcher paging frequency', () => {
     expect(pages()).toEqual([]);
   });
 });
+
+// 4.7.21 (RC1.5): 17 "SLA breach" pages landed within 11 s on Oct 25 when the watcher replayed every open breach
+// at once. One run now sends at most ONE combined page, whatever the state file says.
+describe('a burst of breaches is one page', () => {
+  const many = (n) => Array.from({ length: n }, (_, i) => ({ number: 600 + i, title: `person issue ${i}`,
+    createdAt: new Date(START - (10 + i) * HOUR).toISOString(), author: { login: `person${i}` } }));
+  const ackedComments = [{ author: { login: 'stuinfla' }, body: '🤖 Automated acknowledgment — received and opened.' }];
+
+  it('17 breaching issues with an empty state file produce exactly 1 request (before: 17)', async () => {
+    issues = many(17);
+    await run({ now: START });
+    const titles = pages();
+    expect(titles).toHaveLength(1);
+    expect(titles[0]).toMatch(/^SLA breach: issue #\d+ \(\+16 more/);
+    expect(titles[0]).toMatch(/^[\x20-\x7e]+$/);
+    const body = fetcher.mock.calls[0][1].body;
+    expect(body.split('\n').filter((l) => /^#\d+/.test(l)).length).toBeLessThanOrEqual(8); // bounded body
+    await run({ now: START + HOUR });
+    expect(pages()).toHaveLength(1); // every one of them is now recorded as paged
+  });
+
+  it('an unreadable state file baselines silently: one page, and no public re-acknowledgment of acked issues', async () => {
+    fs.writeFileSync(path.join(dir, 'state.json'), '{not json');
+    issues = many(5);
+    vi.mocked(spawnSync).mockImplementation((bin, args) => {
+      if (args[1] === 'list') return { status: 0, stdout: JSON.stringify(issues) };
+      if (args[1] === 'view') return { status: 0, stdout: JSON.stringify({ comments: ackedComments }) };
+      if (args[1] === 'comment') return { status: 0, stdout: '' };
+      throw new Error('unexpected external command');
+    });
+    await run({ now: START });
+    expect(pages()).toHaveLength(1);
+    const commented = vi.mocked(spawnSync).mock.calls.filter((c) => c[1][1] === 'comment');
+    expect(commented).toHaveLength(0); // before: 5 duplicate public comments
+  });
+
+  it('a page that fails is retried next run as the same single combined page', async () => {
+    issues = many(4);
+    fetcher.mockResolvedValueOnce({ ok: false, status: 429 });
+    await run({ now: START });
+    await run({ now: START + HOUR });
+    expect(pages()).toHaveLength(2);
+    await run({ now: START + 2 * HOUR });
+    expect(pages()).toHaveLength(2);
+  });
+
+  it('one issue whose detail lookup fails is skipped, not the whole run', async () => {
+    issues = many(3);
+    vi.mocked(spawnSync).mockImplementation((bin, args) => {
+      if (args[1] === 'list') return { status: 0, stdout: JSON.stringify(issues) };
+      if (args[1] === 'view' && args[2] === '601') return { status: 1, stderr: 'HTTP 404: Not Found' };
+      if (args[1] === 'view') return { status: 0, stdout: JSON.stringify({ comments: [] }) };
+      if (args[1] === 'comment') return { status: 0, stdout: '' };
+      throw new Error('unexpected external command');
+    });
+    const out = await run({ now: START }); // before: threw, so nothing was judged or paged
+    expect(out.results.map((r) => r.number)).toEqual([600, 602]);
+    expect(out.degraded).toEqual([601]);
+    expect(pages()).toHaveLength(1);
+  });
+
+  it('a transient GitHub error is retried with backoff instead of failing the run', async () => {
+    issues = many(1);
+    let lists = 0;
+    vi.mocked(spawnSync).mockImplementation((bin, args) => {
+      if (bin === 'sleep') return { status: 0 };
+      if (args[1] === 'list') { lists += 1; return lists < 3 ? { status: 1, stderr: 'error connecting to api.github.com' } : { status: 0, stdout: JSON.stringify(issues) }; }
+      if (args[1] === 'view') return { status: 0, stdout: JSON.stringify({ comments: [] }) };
+      if (args[1] === 'comment') return { status: 0, stdout: '' };
+      throw new Error('unexpected external command');
+    });
+    const out = await run({ now: START }); // before: "error connecting" was not transient — the run failed
+    expect(lists).toBe(3);
+    expect(out.results).toHaveLength(1);
+    const sleeps = vi.mocked(spawnSync).mock.calls.filter((c) => c[0] === 'sleep').map((c) => Number(c[1][0]));
+    expect(sleeps).toHaveLength(2);
+    expect(sleeps[1]).toBeGreaterThan(sleeps[0]); // backoff, not a fixed wait
+  });
+});

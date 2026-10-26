@@ -62,3 +62,33 @@ describe('watcher channel delivery is independent across consecutive runs', () =
     expect(ackCalls()).toHaveLength(0); expect(read()).toMatchObject(first); expect(read().lastAlertAt).toBeTruthy();
   });
 });
+
+// issue-fix shares the watcher's transient-error rule (4.7.21): a 1 a.m. "error connecting to api.github.com" or an
+// HTTP 502 must not fail the run and page the phone.
+describe('issue-fix retries a transient GitHub failure', () => {
+  it.each(['error connecting to api.github.com', 'HTTP 502: Bad Gateway', 'net/http: TLS handshake timeout'])('%s', async (stderr) => {
+    let lists = 0;
+    vi.mocked(spawnSync).mockReset().mockImplementation((bin, args) => {
+      if (bin === 'sleep') return { status: 0 };
+      if (args[1] === 'list') { lists += 1; return lists === 1 ? { status: 1, stderr } : { status: 0, stdout: '[]' }; }
+      throw new Error('unexpected external command');
+    });
+    vi.resetModules();
+    const fix = await import('../../scripts/issue-fix.mjs');
+    const out = await fix.run({ now: NOW }); // before: threw on the first failure for the first two messages
+    expect(lists).toBe(2);
+    expect(out.results).toEqual([]);
+  });
+  it('a non-transient failure still fails loudly, after one attempt', async () => {
+    let lists = 0;
+    vi.mocked(spawnSync).mockReset().mockImplementation((bin, args) => {
+      if (bin === 'sleep') return { status: 0 };
+      if (args[1] === 'list') { lists += 1; return { status: 1, stderr: 'HTTP 401: Bad credentials' }; }
+      throw new Error('unexpected external command');
+    });
+    vi.resetModules();
+    const fix = await import('../../scripts/issue-fix.mjs');
+    await expect(fix.run({ now: NOW })).rejects.toThrow(/Bad credentials/);
+    expect(lists).toBe(1);
+  });
+});

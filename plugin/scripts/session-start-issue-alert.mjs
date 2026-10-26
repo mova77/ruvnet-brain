@@ -84,6 +84,7 @@ export function surfaceIssuePointer({ stateDir, emit, now, env, home, platform, 
 export function surfaceNtfyAlerts({ stateDir, emit, env, home, platform, cwd, now = Date.now() }) {
   try {
     if (!maintainerIssueEntitlement(env, home, 'stuinfla/ruvnet-brain', platform) || !isMaintainerRepo(cwd)) return;
+    surfaceJobHealth({ stateDir, emit, now });
     // The reader writes a few-byte summary (scripts/ntfy-inbox.mjs writeSummary) so a large alert list can never
     // push this banner past its read limit; the detailed list is only a fallback for an older reader.
     let total = 0; let kinds = {};
@@ -115,5 +116,43 @@ export function surfaceNtfyAlerts({ stateDir, emit, env, home, platform, cwd, no
     const age = polled ? `, read ${((now - Date.parse(polled)) / 3_600_000).toFixed(1)}h ago` : '';
     const over = dropped ? `; ${dropped} more dropped past the cap` : '';
     emit(`[RuvNet Brain — NTFY: ${total} open alert(s) (${summaryText || 'none listed'})${over}${age}. Details: node scripts/ntfy-inbox.mjs --open]`);
+  } catch { /* advisory only */ }
+}
+
+const WATCHDOG_LABEL = 'com.ruvnet.nightly-watchdog';
+const WATCHDOG_MAX_AGE_H = 30;
+const MAX_RECEIPTS = 64;
+const MAX_RECEIPT_BYTES = 64 * 1024;
+
+/**
+ * WHO WATCHES THE WATCHDOG (4.7.21). nightly-watchdog.mjs cannot judge its own run, and a watchdog that stopped
+ * firing would be silent by construction. This reads the local heartbeat receipts (scripts/job-heartbeat.sh) —
+ * no network, bounded file count and size — and says ONE line when any receipt is failed/killed or the
+ * watchdog's own receipt is older than 30 h. Machines without heartbeats (every end user) get nothing.
+ */
+export function surfaceJobHealth({ stateDir, emit, now = Date.now() }) {
+  try {
+    const dir = path.join(stateDir, 'heartbeats');
+    let names;
+    try { names = fs.readdirSync(dir).filter((n) => n.endsWith('.json')).slice(0, MAX_RECEIPTS); } catch { return; }
+    if (!names.length) return;
+    const red = [];
+    let watchdogAt = null;
+    for (const name of names) {
+      const file = path.join(dir, name);
+      try { if (fs.statSync(file).size > MAX_RECEIPT_BYTES) continue; } catch { continue; }
+      const r = json(file);
+      if (!r || typeof r !== 'object') continue;
+      const label = name.slice(0, -'.json'.length);
+      if (r.state === 'failed' || r.state === 'killed') red.push(label);
+      if (label === WATCHDOG_LABEL) watchdogAt = Date.parse(r.ended_at || r.started_at || '');
+    }
+    const parts = [];
+    if (red.length) parts.push(`${red.length} scheduled job(s) failing (${red.slice(0, 3).join(', ')}${red.length > 3 ? ', …' : ''})`);
+    if (watchdogAt !== null) {
+      const ageH = Number.isFinite(watchdogAt) ? (now - watchdogAt) / 3_600_000 : Infinity;
+      if (ageH > WATCHDOG_MAX_AGE_H) parts.push(`the nightly watchdog last ran ${Number.isFinite(ageH) ? `${Math.floor(ageH)}h ago` : 'at an unreadable time'}`);
+    }
+    if (parts.length) emit(`[RuvNet Brain — JOBS: ${parts.join('; ')}. Details: node scripts/nightly-watchdog.mjs --no-push]`);
   } catch { /* advisory only */ }
 }
