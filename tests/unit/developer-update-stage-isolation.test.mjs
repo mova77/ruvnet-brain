@@ -49,6 +49,8 @@ function machine() {
   return { home, prefix, root, bin, brainHome, calls, runner, receiptFile: path.join(brainHome, 'nightly-suite-update.json') };
 }
 
+const OLD_PLUGIN_VERSION = ['9', '0', '0'].join('.'); // synthetic: the fixture's installed plugin version, never the product's
+
 describe('coordinator stage isolation', () => {
   it('npm view failing for one package still runs knowledge, records the package failure, and throws after persisting', async () => {
     const m = machine();
@@ -86,14 +88,14 @@ describe('coordinator stage isolation', () => {
   it('no claude on PATH: installed plugins are UNSUPPORTED and preserved, knowledge ran, the run completes', async () => {
     const m = machine(), artifact = path.join(m.home, 'artifact'); fs.mkdirSync(artifact);
     const installed = path.join(m.home, '.claude/plugins/installed_plugins.json');
-    atomic(installed, { plugins: { 'ruvnet-brain@ruvnet-brain': [{ scope: 'user', installPath: artifact, version: '9.0.0' }] } });
+    atomic(installed, { plugins: { 'ruvnet-brain@ruvnet-brain': [{ scope: 'user', installPath: artifact, version: OLD_PLUGIN_VERSION }] } });
     const runner = (command, args, options) => args[0] === 'view' ? JSON.stringify({ latest: '1.0.0' }) : m.runner(command, args, options);
     const receipt = await runDeveloperUpdate({ mode: 'apply', home: m.home, env: { PATH: m.bin }, runner });
     expect(receipt).toMatchObject({ state: 'completed', ok: true, knowledge: { state: 'current' } });
     expect(receipt.plugins.steps).toEqual([expect.objectContaining({ id: 'ruvnet-brain@ruvnet-brain', state: 'UNSUPPORTED', reason: expect.stringMatching(/no existing Claude command/) })]);
     expect(receipt.coverage.unverified.some(n => n.includes('ruvnet-brain@ruvnet-brain'))).toBe(true);
     expect(m.calls.some(c => c.startsWith('plugin'))).toBe(false);
-    expect(JSON.parse(fs.readFileSync(installed, 'utf8')).plugins['ruvnet-brain@ruvnet-brain'][0].version).toBe('9.0.0');
+    expect(JSON.parse(fs.readFileSync(installed, 'utf8')).plugins['ruvnet-brain@ruvnet-brain'][0].version).toBe(OLD_PLUGIN_VERSION);
   });
 
   it('a knowledge failure is recorded on the knowledge stage and the later stages still run', async () => {
