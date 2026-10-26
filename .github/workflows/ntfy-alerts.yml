@@ -24,6 +24,10 @@ on:
 # one ever to slip through again) still has no credential worth stealing.
 permissions:
   actions: read
+# The run title names the run that triggered it, so a later red can find THIS run's outcome and prove that the
+# page for that red went out (4.7.21 review round 2: delivery evidence must be tied to the previous red itself).
+# Only numeric ids and the workflow name reach the title; issue/PR titles never do.
+run-name: ${{ github.event_name == 'workflow_run' && format('ntfy-alerts for run {0}', github.event.workflow_run.id) || github.workflow }}
 
 # A NOTIFIER MUST NEVER BE ABLE TO STARVE THE THING IT NOTIFIES ABOUT (added 2026-08-06).
 #
@@ -70,7 +74,6 @@ jobs:
           WR_ID: ${{ github.event.workflow_run.id }}
           WR_RUN_NUMBER: ${{ github.event.workflow_run.run_number }}
           WR_WORKFLOW_ID: ${{ github.event.workflow_run.workflow_id }}
-          SELF_RUN_ID: ${{ github.run_id }}
           EVENT: ${{ github.event_name }}
           REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
@@ -112,8 +115,10 @@ jobs:
               # Never deduplicated (review round 4.7.21-fix):
               #  - a workflow_dispatch run: protected-release is always dispatched, for a corpus night AND for a code
               #    release, so "the previous run" may be the other kind; a dispatch is a deliberate act worth one page;
-              #  - a red whose previous red was not provably delivered: this step fails when ntfy refuses the POST, so a
-              #    non-green ntfy-alerts run since the previous red started means that page may never have arrived.
+              #  - a red whose previous red's page is not PROVEN delivered. Proof is affirmative and tied to that red:
+              #    the ntfy-alerts run titled "ntfy-alerts for run <previous red's id>" (run-name above) completed
+              #    green. This step fails when ntfy refuses the POST, so green means the page went out (or that red was
+              #    itself a proven repeat). No such run, one still running, or one that ended any other way: page again.
               # If any lookup fails, page anyway: a lost first red is worse than a repeat.
               NOTE=""
               set -o pipefail
@@ -123,17 +128,17 @@ jobs:
                     | jq -er --argjson id "$WR_ID" --argjson n "$WR_RUN_NUMBER" \
                       '[.workflow_runs[] | select(.id != $id and .run_number < $n and .event != "pull_request")
                         | select(.conclusion != "cancelled" and .conclusion != "skipped")][0]
-                        | if . == null then "none" else "\(.conclusion) \(.run_started_at // .created_at)" end'); then
-                  PREV_CONC="${PREV%% *}"; PREV_AT="${PREV#* }"
+                        | if . == null then "none" else "\(.conclusion) \(.id) \(.run_started_at // .created_at)" end'); then
+                  PREV_CONC="${PREV%% *}"; PREV_REST="${PREV#* }"; PREV_ID="${PREV_REST%% *}"; PREV_AT="${PREV_REST#* }"
                   case "$PREV_CONC" in
                     failure|timed_out|startup_failure)
                       if DELIVERY=$(gh api -X GET "repos/$REPO/actions/workflows/ntfy-alerts.yml/runs" \
                             -f created=">=$PREV_AT" -f per_page=100 2>/dev/null \
-                          | jq -er --argjson self "$SELF_RUN_ID" \
+                          | jq -er --arg title "ntfy-alerts for run $PREV_ID" \
                             'if .total_count > (.workflow_runs | length) then "unknown"
-                             elif any(.workflow_runs[]; .id != $self and .status == "completed"
-                                      and .conclusion != "success" and .conclusion != "skipped") then "undelivered"
-                             else "delivered" end'); then
+                             elif any(.workflow_runs[]; .display_title == $title and .status == "completed"
+                                      and .conclusion == "success") then "delivered"
+                             else "undelivered" end'); then
                         if [ "$DELIVERY" = "delivered" ]; then echo "previous run was also $PREV_CONC and its page went out; already paged"; exit 0; fi
                         NOTE=" (repeat: the previous red's page may not have arrived)"
                       else

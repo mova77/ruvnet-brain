@@ -77,9 +77,13 @@ const isOperational = (relative) => (!relative.includes(path.sep) && OPERATIONAL
   || (relative.split(path.sep)[0] === '.claude-flow' && relative.includes(path.sep));
 // Files the installer/updater writes into a KB that no bundle ships (bin/install.mjs placeUpdater,
 // placeTrustedCoverageValidator, ensureVerifier; the updater's snapshot receipt). Re-created on every install.
-const INSTALLER_WRITTEN = new Set(['coverage-integrity.mjs', 'RUNTIME-IDENTITY.json', '.refresh-snapshot.json',
+// Every bin/install.mjs UPDATER_FILES name must be here (tests/unit/kb-copy-proof-unknown-content.test.mjs holds the
+// two lists together): download-retry.mjs and forge-guard-injection.mjs were placed but missing, so an old copy whose
+// placed version differed from both the live file and its own manifest was kept as "unique" (review round 2, Opus #5).
+export const INSTALLER_WRITTEN = new Set(['coverage-integrity.mjs', 'RUNTIME-IDENTITY.json', '.refresh-snapshot.json',
   'forge-update.mjs', 'zip-extract.mjs', 'brain-profile.mjs', 'refresh-run.mjs', 'update-storage-transaction.mjs',
-  'lifecycle-evidence-retention.mjs', 'corpus-release-identity.mjs', 'verify-citation.mjs', 'package-lock.json', '.DS_Store']);
+  'lifecycle-evidence-retention.mjs', 'corpus-release-identity.mjs', 'download-retry.mjs', 'forge-guard-injection.mjs',
+  'verify-citation.mjs', 'package-lock.json', '.DS_Store']);
 
 /** A directory that is a knowledge-base tree (SOURCE.json plus a store or the search entry point). */
 export const isKbTree = (dir) => Boolean(lstat(path.join(dir, 'SOURCE.json')))
