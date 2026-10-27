@@ -28,6 +28,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { answerFromCards } from '../../kb/card-lane.mjs';
+import { isDirectInvocation } from '../../plugin/scripts/entrypoint.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = path.resolve(HERE, '../..');
@@ -158,5 +159,5 @@ async function main() {
   process.exit(1);
 }
 
-const invokedDirectly = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
+const invokedDirectly = isDirectInvocation(import.meta.url);
 if (invokedDirectly) main();

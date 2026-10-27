@@ -1,0 +1,134 @@
+import { describe, expect, it } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { REQUIRED_CHECKS } from '../../scripts/release-proof.mjs';
+import * as guard from '../../scripts/protected-release-invocation.mjs';
+import { getVersion } from '../../scripts/version.mjs';
+
+const SHA = 'a'.repeat(40);
+const VERSION = getVersion();
+
+function fixture() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'protected-release-'));
+  const evidence = path.join(root, 'release-evidence');
+  fs.mkdirSync(evidence);
+  const artifactPath = path.join(evidence, `ruvnet-brain-${VERSION}.tgz`);
+  fs.writeFileSync(artifactPath, 'sealed candidate bytes');
+  const digest = crypto.createHash('sha256').update(fs.readFileSync(artifactPath)).digest('hex');
+  const receipt = {
+    schemaVersion: 1,
+    phase: 'candidate',
+    sha: SHA,
+    tree: 'b'.repeat(40),
+    dirty: false,
+    version: VERSION,
+    tag: `v${VERSION}`,
+    sourceVersions: { package: VERSION, claudePlugin: VERSION, codexPlugin: VERSION },
+    artifact: {
+      path: `release-evidence/ruvnet-brain-${VERSION}.tgz`,
+      sha256: digest,
+      sourceSha: SHA,
+      version: VERSION,
+      bundle: { brainVersion: VERSION, releaseTag: `v${VERSION}` },
+    },
+    releaseVector: { verdict: 'PASS', sha: SHA, unknown: 0, skipped: 0 },
+    tests: { total: 1, passed: 1, failed: 0, skipped: 0, todo: 0 },
+    coverage: { status: 'PASS', lines: 95, requiredLines: 80 },
+    security: { status: 'PASS', critical: 0, high: 0 },
+    issues: { open: [] },
+    github: {
+      sha: SHA,
+      checks: REQUIRED_CHECKS.map((name) => ({ name, status: 'completed', conclusion: 'success' })),
+    },
+    hosts: {
+      claude: { status: 'PASS', version: VERSION, artifactSha256: digest },
+      codex: { status: 'PASS', version: VERSION, artifactSha256: digest },
+    },
+    brain: {
+      status: 'PASS', selfStore: true, citedSelfSource: true,
+      narrowMs: 100, broadMs: 200, concurrentMs: 150, deadlineMs: 1000,
+    },
+    qe: { status: 'PASS', total: 1, passed: 1, failed: 0, skipped: 0 },
+    graders: [
+      { id: 'grader-a', independent: true, score: 95, sha: SHA, artifactSha256: digest },
+      { id: 'grader-b', independent: true, score: 96, sha: SHA, artifactSha256: digest },
+    ],
+  };
+  const receiptPath = path.join(evidence, 'candidate-receipt.json');
+  fs.writeFileSync(receiptPath, JSON.stringify(receipt));
+  const env = {
+    GITHUB_ACTIONS: 'true',
+    GITHUB_WORKFLOW: 'protected-release',
+    GITHUB_REPOSITORY: 'stuinfla/ruvnet-brain',
+    GITHUB_EVENT_NAME: 'workflow_dispatch',
+    GITHUB_REF_PROTECTED: 'true',
+    RUVNET_CANDIDATE_RECEIPT: 'release-evidence/candidate-receipt.json',
+    RUVNET_EXPECTED_SHA: SHA,
+    RUVNET_EXPECTED_ARTIFACT_SHA256: digest,
+    RUVNET_EXPECTED_VERSION: VERSION,
+    RUVNET_RELEASE_MODE: 'strict',
+  };
+  return { root, env, receipt, digest };
+}
+
+describe('protected publish invocation guard', () => {
+  it('rejects development generations from every publication path', () => {
+    expect(guard.validatePublishableVersion).toBeTypeOf('function');
+    expect(guard.validatePublishableVersion(VERSION)).toEqual([]);
+    expect(guard.validatePublishableVersion(`${VERSION}-dev`)).toContain('development versions cannot be published');
+  });
+
+  it('requires the repository protected workflow-dispatch environment', () => {
+    const f = fixture();
+    expect(guard.validateProtectedPublishEnvironment).toBeTypeOf('function');
+    expect(guard.validateProtectedPublishEnvironment(f.env)).toEqual([]);
+    for (const [key, value] of [
+      ['GITHUB_REPOSITORY', 'attacker/fork'],
+      ['GITHUB_EVENT_NAME', 'push'],
+      ['GITHUB_REF_PROTECTED', 'false'],
+    ]) {
+      expect(guard.validateProtectedPublishEnvironment({ ...f.env, [key]: value })).not.toEqual([]);
+    }
+  });
+
+  it('accepts only the protected workflow carrying a valid exact artifact seal', () => {
+    const f = fixture();
+    expect(guard.validateProtectedPublishInvocation({ root: f.root, env: f.env })).toMatchObject({
+      verdict: 'PASS', sha: SHA, artifactSha256: f.digest, version: VERSION, mode: 'strict',
+    });
+  });
+
+  it('accepts an explicit stabilization seal only in stabilization mode', () => {
+    const f = fixture();
+    Object.assign(f.receipt, {
+      phase: 'stabilization-candidate', mode: 'stabilization', targetScore: 95, scoreClaimed: false,
+    });
+    fs.writeFileSync(path.join(f.root, 'release-evidence/candidate-receipt.json'), JSON.stringify(f.receipt));
+    f.env.RUVNET_RELEASE_MODE = 'stabilization';
+    expect(guard.validateProtectedPublishInvocation({ root: f.root, env: f.env })).toMatchObject({
+      verdict: 'PASS', mode: 'stabilization',
+    });
+  });
+
+  it.each([
+    ['local invocation', (f) => { delete f.env.GITHUB_ACTIONS; }],
+    ['wrong workflow', (f) => { f.env.GITHUB_WORKFLOW = 'ci'; }],
+    ['wrong repository', (f) => { f.env.GITHUB_REPOSITORY = 'attacker/fork'; }],
+    ['non-dispatch event', (f) => { f.env.GITHUB_EVENT_NAME = 'push'; }],
+    ['unprotected ref', (f) => { f.env.GITHUB_REF_PROTECTED = 'false'; }],
+    ['missing receipt', (f) => { f.env.RUVNET_CANDIDATE_RECEIPT = ''; }],
+    ['split SHA', (f) => { f.env.RUVNET_EXPECTED_SHA = 'c'.repeat(40); }],
+    ['split digest', (f) => { f.env.RUVNET_EXPECTED_ARTIFACT_SHA256 = 'd'.repeat(64); }],
+    ['wrong generation', (f) => { f.env.RUVNET_EXPECTED_VERSION = '4.0.3'; }],
+    ['wrong release mode', (f) => { f.env.RUVNET_RELEASE_MODE = 'stabilization'; }],
+    ['tampered artifact', (f) => { fs.appendFileSync(path.join(f.root, f.receipt.artifact.path), '!'); }],
+  ])('fails closed on %s', (_name, mutate) => {
+    const f = fixture();
+    mutate(f);
+    expect(guard.validateProtectedPublishInvocation({ root: f.root, env: f.env }).verdict).toBe('FAIL');
+  });
+
+
+});

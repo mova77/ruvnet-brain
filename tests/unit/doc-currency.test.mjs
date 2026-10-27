@@ -21,7 +21,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
-  evaluateDoc, evaluate, listDocs, parseFrontmatter, normativeBody, resolveGoverned,
+  evaluateDoc, evaluate, findCallers, listDocs, parseFrontmatter, normativeBody, resolveGoverned,
   computeDigest, deriveImpl, deriveDrift, weakest, planFix, applyFix, blockingFindings,
   changedDocumentScope, countReferents, main, IMPL_LADDER,
 } from '../../scripts/doc-currency.mjs';
@@ -45,6 +45,7 @@ function newRepo() {
   sh(dir, 'git', ['config', 'user.email', 'test@example.invalid']);
   sh(dir, 'git', ['config', 'user.name', 'Currency Fixture']);
   sh(dir, 'git', ['config', 'commit.gpgsign', 'false']);
+  sh(dir, 'git', ['config', 'core.hooksPath', '/dev/null']);
   fs.mkdirSync(path.join(dir, 'docs/adr'), { recursive: true });
   fs.mkdirSync(path.join(dir, 'scripts'), { recursive: true });
   return dir;
@@ -563,6 +564,35 @@ describe('ADVERSARIAL: impl takes the WEAKEST governed path, never any', () => {
   });
 });
 
+describe('evaluation-scoped caller lookup cache', () => {
+  it('searches duplicate governed paths once per evaluation and sees edits on the next evaluation', () => {
+    const r = newRepo();
+    write(r, 'scripts/shared.mjs', 'export const shared = true;\n');
+    write(r, 'scripts/caller.mjs', "import './shared.mjs';\n");
+    write(r, 'docs/adr/0001-a.md', adr({ id: 'ADR-001', governs: ['scripts/shared.mjs'] }));
+    write(r, 'docs/adr/0002-b.md', adr({ id: 'ADR-002', governs: ['scripts/shared.mjs'] }));
+    commit(r, 'add shared governed path');
+
+    let calls = 0;
+    const observed = [];
+    const callerLookup = (root, rel) => {
+      calls += 1;
+      const result = findCallers(root, rel);
+      observed.push({ root, rel, result });
+      return result;
+    };
+    const first = evaluate(r, { dirs: ['docs/adr'], callerLookup });
+    expect(calls).toBe(1);
+    expect(observed[0]).toMatchObject({ rel: 'scripts/shared.mjs', result: ['scripts/caller.mjs'] });
+    expect(first.docs.map((doc) => doc.impl)).toEqual(['wired', 'wired']);
+
+    write(r, 'scripts/caller.mjs', 'export const consumer = true;\n');
+    const second = evaluate(r, { dirs: ['docs/adr'], callerLookup });
+    expect(calls).toBe(2);
+    expect(second.docs.map((doc) => doc.impl)).toEqual(['built', 'built']);
+  });
+});
+
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 describe('--fix never invents a date', () => {
   it('backfills created + updated ONLY from git, and labels both as derived', () => {
@@ -750,6 +780,22 @@ describe('CLI contract', () => {
     expect(base).toMatch(/^[0-9a-f]{40}$/);
   });
 
+  it('candidate drift excludes old debt even when the same governed file changes once', () => {
+    const r = newRepo();
+    write(r, 'scripts/thing.mjs', 'export const t = 1;\n');
+    write(r, 'docs/adr/0001-x.md', adr({ governs: ['scripts/thing.mjs'] }));
+    commit(r, 'baseline', '2026-07-01T12:00:00');
+    for (let i = 2; i <= 4; i++) {
+      write(r, 'scripts/thing.mjs', `export const t = ${i};\n`);
+      commit(r, 'old debt', `2026-07-0${i}T12:00:00`);
+    }
+    const base = sh(r, 'git', ['rev-parse', 'HEAD']);
+    write(r, 'scripts/thing.mjs', 'export const t = 5;\n');
+    commit(r, 'candidate', '2026-07-05T12:00:00');
+    expect(quiet(() => main(['--check', '--root', r, '--changed', base, '--json']))).toBe(0);
+    expect(quiet(() => main(['--check', '--root', r, '--changed', 'absent-ref', '--json']))).toBe(1);
+  });
+
   it('--report renders every document and distinguishes absent stamps from inferred ones', () => {
     const r = newRepo();
     write(r, 'docs/adr/0001-x.md', '---\nid: ADR-001\nstatus: Accepted\ndate: 2026-07-01\n---\n\n# body\n');
@@ -818,5 +864,25 @@ describe('against the REAL repository', () => {
     const d = evaluateDoc(REPO_ROOT, 'docs/adr/0013-onboarding-console.md', { checkWiring: false });
     if (d.dirty) return;   // mid-edit; the check is correctly suspended
     expect(codes(d)).not.toContain('stamp-lags-doc');
+  });
+});
+
+
+describe('single shipped evaluator compatibility', () => {
+  it('keeps the root public exports and default repository identical to the shipped implementation', async () => {
+    const wrapper = await import('../../scripts/doc-currency.mjs');
+    const owned = await import('../../plugin/scripts/doc-currency.mjs');
+    expect(Object.keys(wrapper).sort()).toEqual(Object.keys(owned).sort());
+    for (const key of Object.keys(owned)) expect(wrapper[key]).toBe(owned[key]);
+    expect(owned.REPO_ROOT).toBe(REPO_ROOT);
+  });
+  it('both direct entrypoints execute the same check against an explicit repository', () => {
+    const root = newRepo();
+    write(root,'docs/adr/0001-x.md','---\nid: ADR-001\nstatus: Accepted\ndate: 2026-07-01\n---\n\n# body\n');
+    commit(root,'add','2026-07-01T12:00:00');
+    const invoke = (file) => spawnSync(process.execPath,[path.join(REPO_ROOT,file),'--check','--root',root,'--json'],{encoding:'utf8',timeout:5000});
+    const old = invoke('scripts/doc-currency.mjs'), shipped = invoke('plugin/scripts/doc-currency.mjs');
+    expect(old.status).toBe(1);expect(shipped.status).toBe(old.status);
+    expect(JSON.parse(shipped.stdout)).toEqual(JSON.parse(old.stdout));
   });
 });

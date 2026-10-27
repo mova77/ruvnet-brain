@@ -6,10 +6,12 @@ import path from 'node:path';
 
 const ROOT = path.resolve(import.meta.dirname, '../..');
 const GROUND = path.join(ROOT, 'plugin/scripts/ground-ruvnet.sh');
-const SHIM = path.join(ROOT, 'plugin/scripts/hook-shim.mjs');
-const SHIM_BASH = path.join(ROOT, 'plugin/scripts/hook-shim-bash.mjs');
-const ADAPTER = path.join(ROOT, 'plugin/scripts/codex-hook-adapter.mjs');
-const MARKER = '[RuvNet Brain — the self-learning flywheel is available here and switched OFF]';
+// THE BLOCK'S IDENTITY, not its full sentence. This was the entire headline verbatim — a copy of a
+// product string living in a test — so issue #138's rewording ("switched OFF" -> "is NOT running",
+// because a settings entry is not the daemon's environment) made this count 0 and read as "the
+// advisory stopped firing". It had not; only the copy had changed. Anchoring on the stable prefix
+// keeps the CADENCE property under test without pinning the wording it is indifferent to.
+const MARKER = '[RuvNet Brain — the self-learning flywheel';
 const hasBash = spawnSync('bash', ['-c', 'exit 0']).status === 0;
 
 let home;
@@ -57,9 +59,9 @@ function claude(project, extra = {}) {
 function seedCodexGeneration() {
   const root = path.join(home, '.cache', 'ruvnet-brain', 'versions', 'test');
   fs.mkdirSync(path.join(root, 'scripts'), { recursive: true });
-  for (const source of [GROUND, SHIM, SHIM_BASH, ADAPTER]) {
-    fs.copyFileSync(source, path.join(root, 'scripts', path.basename(source)));
-  }
+  // Use the real generation's module closure: a hand-maintained adapter import list
+  // omitted hook-context-budget and tested an unlaunchable installation fixture.
+  fs.cpSync(path.join(ROOT, 'plugin/scripts'), path.join(root, 'scripts'), { recursive: true });
   fs.writeFileSync(path.join(home, '.cache', 'ruvnet-brain', 'active.json'), JSON.stringify({
     generation: 1,
     version: 'test',
@@ -131,11 +133,16 @@ describe.skipIf(!hasBash || process.platform === 'win32')('flywheel advisory cad
   it('uses the same claim through the Codex lifecycle adapter', () => {
     const first = codex(projects[0]);
     const second = codex(projects[0]);
+    const third = codex(projects[0]);
 
-    expect(first.status).toBe(0);
-    expect(second.status).toBe(0);
-    expect(count(first.stdout)).toBe(1);
-    expect(count(second.stdout)).toBe(0);
+    expect(first.status, first.stderr).toBe(0);
+    expect(second.status, second.stderr).toBe(0);
+    expect(third.status, third.stderr).toBe(0);
+    // 4.5: this payload carries a session_id, so the per-prompt injection budget applies, and on the first
+    // prompt the memory offer (higher priority) takes it — the flywheel offer is DEFERRED, unclaimed, to the
+    // next prompt. The property under test is unchanged: exactly once per project and day, via Codex too.
+    expect(count(first.stdout) + count(second.stdout) + count(third.stdout)).toBe(1);
     expect(() => JSON.parse(first.stdout)).not.toThrow();
+    expect(() => JSON.parse(second.stdout)).not.toThrow();
   });
 });

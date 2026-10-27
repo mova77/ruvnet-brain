@@ -1,11 +1,13 @@
 {
-  "brainVersion": "4.0.2",
-  "generated": "2026-07-30T07:24:51.903Z",
-  "generatedHuman": "Thu, 30 Jul 2026 07:24:51 GMT",
+  "brainVersion": "4.7.21",
+  "generated": "2026-08-20T07:16:21.648Z",
+  "generatedHuman": "Thu, 20 Aug 2026 07:16:21 GMT",
   "coverage": {
-    "built": 69,
-    "catalogued": 192,
-    "orgTotalApprox": 248,
+    "built": 77,
+    "catalogued": 200,
+    "orgTotalApprox": 206,
+    "orgTotalSource": "live",
+    "orgTotalAt": "2026-08-20T07:16:22.447Z",
     "pending": 123
   },
   "builtRepos": [
@@ -13,7 +15,7 @@
       "name": "RuView",
       "tier": "T0",
       "stars": 75658,
-      "builtFromSha": "90b29595fbebf5c7b0356fa260332fcc674760ef",
+      "builtFromSha": "a3b6e1d500df784b9ad1846dd39deb07e2c69a34",
       "latestRemoteSha": null,
       "status": "built"
     },
@@ -21,7 +23,7 @@
       "name": "ruflo",
       "tier": "T0",
       "stars": 61698,
-      "builtFromSha": "503b647325f6e0a98bd1d771ae6bca6def331d30",
+      "builtFromSha": "fa13ee4ad60ac2090b1480656eb233521790d640",
       "latestRemoteSha": null,
       "status": "built"
     },
@@ -29,7 +31,7 @@
       "name": "RuVector",
       "tier": "T0",
       "stars": 4296,
-      "builtFromSha": "597be6a753472f0521fe2def097116e717ed4332",
+      "builtFromSha": "7b38d0bdd25ad97f0f8eb05633af3db678b6fd6c",
       "latestRemoteSha": null,
       "status": "built"
     },
@@ -61,7 +63,7 @@
       "name": "metaharness",
       "tier": "T1",
       "stars": 330,
-      "builtFromSha": "87b6c517c7e6bb021762b002bfa54c4f5b4acd65",
+      "builtFromSha": "5453c8c990824b54e05f289774e5a8b2cea0a32e",
       "latestRemoteSha": null,
       "status": "built"
     },
@@ -117,7 +119,7 @@
       "name": "midstream",
       "tier": "T1",
       "stars": 125,
-      "builtFromSha": "92250c20d8aa3d867fcc8cb75aeabbc95eb1a0cc",
+      "builtFromSha": "583b32ef35dfdb60c7d3d5c28c68f1f635b55b21",
       "latestRemoteSha": null,
       "status": "built"
     },
@@ -125,7 +127,7 @@
       "name": "rvm",
       "tier": "T1",
       "stars": 113,
-      "builtFromSha": "af97d18f29d5704f2fbbeecccce192d712bb9a80",
+      "builtFromSha": "1a055716c9c544b35f89162e32e7946e3ac2f8f2",
       "latestRemoteSha": null,
       "status": "built"
     },
@@ -141,7 +143,7 @@
       "name": "sublinear-time-solver",
       "tier": "T1",
       "stars": 82,
-      "builtFromSha": "47804fc5ca495d4fd608866fdb1e0960b34bffbf",
+      "builtFromSha": "6ef45761e9a27029cf968322b3967364499e3b5d",
       "latestRemoteSha": null,
       "status": "built"
     },
@@ -165,7 +167,7 @@
       "name": "ruv-neural",
       "tier": "T1",
       "stars": 20,
-      "builtFromSha": "caaa14144a70829293737b0ca717ebc818fcc523",
+      "builtFromSha": "c600537f9f2c3fe62c11ddc970337a6b8530d4a7",
       "latestRemoteSha": null,
       "status": "built"
     },
@@ -173,7 +175,7 @@
       "name": "rufield",
       "tier": "T1",
       "stars": 17,
-      "builtFromSha": "f3c149296aadaa783f076267c3f781e5560a4c6e",
+      "builtFromSha": "43b1df3dc3c436a21e3fc85dc34475458a1eca9d",
       "latestRemoteSha": null,
       "status": "built"
     },
@@ -181,7 +183,7 @@
       "name": "rvcsi",
       "tier": "T1",
       "stars": 13,
-      "builtFromSha": "77c8b6e051fe8a2a3370715d4c3139311b93c364",
+      "builtFromSha": "2ef4fd1e3a30dad68cb7969135a809a0ef230656",
       "latestRemoteSha": null,
       "status": "built"
     },
@@ -189,7 +191,7 @@
       "name": "RuLake",
       "tier": "T1",
       "stars": 11,
-      "builtFromSha": "8f2c40863788eb38f260edb4fdbee4e07e1631d4",
+      "builtFromSha": "554f0a60b948e0dfe6d4813dd6a096758a46a5d9",
       "latestRemoteSha": null,
       "status": "built"
     },
@@ -213,7 +215,7 @@
       "name": "open-claude-code",
       "tier": "T2",
       "stars": 416,
-      "builtFromSha": "09f4a1e415272f29d35d28b949a87acdfeefb057",
+      "builtFromSha": "9e2e08c03d9b5d009eac14fc10a50d223a73de70",
       "latestRemoteSha": null,
       "status": "built"
     },
@@ -221,7 +223,7 @@
       "name": "ruvnet",
       "tier": "T2",
       "stars": 217,
-      "builtFromSha": "9e31715f15a7cb64154ce669c7db56242a6c60ad",
+      "builtFromSha": "bd5656a9b168d65bb0226eb41efd581b6dab14bf",
       "latestRemoteSha": null,
       "status": "built"
     },
@@ -301,7 +303,7 @@
       "name": "musica",
       "tier": "T2",
       "stars": 17,
-      "builtFromSha": "e6fa3d4190cba6a11a4bea7ad9dbf8280165d9fc",
+      "builtFromSha": "617b61395682b9b3fe6e330206bf3ff41aef9d67",
       "latestRemoteSha": null,
       "status": "built"
     },
@@ -341,7 +343,7 @@
       "name": "worldgraph",
       "tier": "T2",
       "stars": 7,
-      "builtFromSha": "75e29dbf9f631c6a590300e8d5436162f2108e97",
+      "builtFromSha": "360ef48a2536d45033cdbe0c40c0f522b8f75ae7",
       "latestRemoteSha": null,
       "status": "built"
     },
@@ -410,6 +412,20 @@
       "status": "built"
     },
     {
+      "name": "ai-text-watermark",
+      "tier": "fresh",
+      "builtFromSha": "a88fcadeb87e43cdd0fcda3bba75840e4edee9db",
+      "latestRemoteSha": null,
+      "status": "built"
+    },
+    {
+      "name": "autogenous",
+      "tier": "fresh",
+      "builtFromSha": "b5c6e8380a40481d1f7d81e3c777504f487fed9a",
+      "latestRemoteSha": null,
+      "status": "built"
+    },
+    {
       "name": "cognitum-api",
       "tier": "fresh",
       "builtFromSha": "4061b309bd15fc3bd59cc2729ee774e341a3548d",
@@ -448,13 +464,6 @@
       "name": "cognitum-one-sensor-primer",
       "tier": "fresh",
       "builtFromSha": "6bb135edf7bde8518af43afa8542ea79b2e07541",
-      "latestRemoteSha": null,
-      "status": "built"
-    },
-    {
-      "name": "cognitum-open-design",
-      "tier": "fresh",
-      "builtFromSha": "459c90257bcf62be97307bfcee25d9fe6fffee6f",
       "latestRemoteSha": null,
       "status": "built"
     },
@@ -515,9 +524,37 @@
       "status": "built"
     },
     {
+      "name": "dream-machine",
+      "tier": "fresh",
+      "builtFromSha": "8ce385786faa5e63cc0e7105cc6e96f663a51f07",
+      "latestRemoteSha": null,
+      "status": "built"
+    },
+    {
       "name": "hackerone",
       "tier": "fresh",
       "builtFromSha": "1e3bcde8258d472a733abe9d9de9219f8ae06f16",
+      "latestRemoteSha": null,
+      "status": "built"
+    },
+    {
+      "name": "latentmesh",
+      "tier": "fresh",
+      "builtFromSha": "922ea196ddfd653ca47c6e900f9aae58f6f26c9d",
+      "latestRemoteSha": null,
+      "status": "built"
+    },
+    {
+      "name": "llm-stream-reformat",
+      "tier": "fresh",
+      "builtFromSha": "74e1d2cef896afd7f49b4cd891978bb64f67d698",
+      "latestRemoteSha": null,
+      "status": "built"
+    },
+    {
+      "name": "rucelium",
+      "tier": "fresh",
+      "builtFromSha": "813da13eb9a46b6acf78fe7ecc8c220ecf83b386",
       "latestRemoteSha": null,
       "status": "built"
     },
@@ -536,9 +573,30 @@
       "status": "built"
     },
     {
+      "name": "ruvnet-brain",
+      "tier": "fresh",
+      "builtFromSha": "db94e591e99c06899d242c0b34e16c7307fadd78",
+      "latestRemoteSha": null,
+      "status": "built"
+    },
+    {
       "name": "rvface",
       "tier": "fresh",
       "builtFromSha": "612a09e5b16ec9ff7cec1623c2845ff64ca2544b",
+      "latestRemoteSha": null,
+      "status": "built"
+    },
+    {
+      "name": "rvqr",
+      "tier": "fresh",
+      "builtFromSha": "5632240501685d4d37c11565b18767a37c490e4c",
+      "latestRemoteSha": null,
+      "status": "built"
+    },
+    {
+      "name": "wifi-veil",
+      "tier": "fresh",
+      "builtFromSha": "018468b5d2bf41f35c552910f35659830af0eb91",
       "latestRemoteSha": null,
       "status": "built"
     }

@@ -9,7 +9,7 @@
 //
 // Checks:
 //   1. PARITY     — passages.jsonl line count == meta entry count == idmap entry count.
-//   2. TRUNCATION — FAILS if any passage is empty; if > MAX_CAP_FRACTION of passages sit
+//   2. TRUNCATION — FAILS if any passage is empty; if >= MIN_CAP_COUNT and > MAX_CAP_FRACTION of passages sit
 //                   EXACTLY at a legacy preview cap (200/240) ending mid-content (the old bug);
 //                   if a passage is shorter than its own meta preview (impossible unless cut);
 //                   if many passages equal their preview AND sit at a cap.
@@ -28,6 +28,11 @@ import { searchKb } from './forge-ask.mjs';
 const LEGACY_CAPS = [200, 240];
 const CAP_TOLERANCE = 0;
 const MAX_CAP_FRACTION = 0.02;
+// A percentage of a tiny store is a coincidence, not evidence: one passage that happens to be exactly 200
+// or 240 chars long is 2.2% of a 45-passage store. The old bug clipped passages wholesale, so require a
+// minimum absolute count before the fraction rule can fire (measured 2026-09-30: agentic-employment, 1/45,
+// refused an otherwise valid corpus generation in the customer canary).
+const MIN_CAP_COUNT = 3;
 const CLIP_FAIL_COUNT = 25;
 
 function parseArgs() {
@@ -129,13 +134,16 @@ async function checkStore({ dir, name, query, variant }) {
 
   // 2. TRUNCATION
   if (emptyText > 0) fails.push(`TRUNCATION: ${emptyText} passage(s) have empty/invalid text`);
-  if (clippedAtCap >= CLIP_FAIL_COUNT) fails.push(`TRUNCATION: ${clippedAtCap} passages equal their preview AND sit at a 200/240 cap mid-content (the old bug)`);
+  // A tiny store (13 of 199 real stores hold 1-2 passages) can never reach CLIP_FAIL_COUNT or the cap
+  // fraction's minimum count; if EVERY passage is clipped exactly like the old bug, that is the old bug.
+  const allClipped = lineCount > 0 && clippedAtCap === lineCount;
+  if (clippedAtCap >= CLIP_FAIL_COUNT || allClipped) fails.push(`TRUNCATION: ${clippedAtCap} passages equal their preview AND sit at a 200/240 cap mid-content (the old bug)${allClipped ? ' — every passage in the store' : ''}`);
   else if (clippedAtCap > 0) notes.push(`clip scan: ${clippedAtCap} at-cap+equal-preview (< ${CLIP_FAIL_COUNT}, informational)`);
   else notes.push('clip scan: 0 at-cap clipped-preview passages');
   if (shorterThanPreview > 0) fails.push(`TRUNCATION: ${shorterThanPreview} passage(s) shorter than their own preview`);
   const capFraction = lineCount ? capExact / lineCount : 0;
-  if (capFraction > MAX_CAP_FRACTION) fails.push(`TRUNCATION: ${capExact}/${lineCount} (${(capFraction * 100).toFixed(1)}%) passages clipped at a legacy cap (200/240)`);
-  else notes.push(`truncation OK: ${capExact} at-cap (${(capFraction * 100).toFixed(2)}% <= ${MAX_CAP_FRACTION * 100}%), len range ${minLen}..${maxLen}`);
+  if (capExact >= MIN_CAP_COUNT && capFraction > MAX_CAP_FRACTION) fails.push(`TRUNCATION: ${capExact}/${lineCount} (${(capFraction * 100).toFixed(1)}%) passages clipped at a legacy cap (200/240)`);
+  else notes.push(`truncation OK: ${capExact} at-cap (${(capFraction * 100).toFixed(2)}%; fails only at >= ${MIN_CAP_COUNT} AND > ${MAX_CAP_FRACTION * 100}%), len range ${minLen}..${maxLen}`);
 
   // 3. LIVE QUERY
   const q = query || 'what is this repository and how is it organized';

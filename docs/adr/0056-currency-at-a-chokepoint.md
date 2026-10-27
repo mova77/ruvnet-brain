@@ -3,7 +3,10 @@ id: ADR-056
 title: Pay the debt, then wire the gate — document currency without a ratchet
 status: Proposed
 date: 2026-07-27
-updated: 2026-07-30
+updated: 2026-10-01
+updated_source: derived-from-git
+version: 1.2.1
+reviewed_digest: ad0f3db55a59
 impl: wired
 governs:
   - scripts/wired-check.mjs
@@ -19,12 +22,40 @@ relates: [ADR-034, ADR-024, ADR-037, ADR-009, ADR-020]
 # ADR-056: Pay the debt, then wire the gate
 
 **Status**: Proposed
-**Date**: 2026-07-27 · **Last updated**: 2026-07-30 · **Why**: v3 closes a changed-scope escape that
-let governed code move without bringing its ADR into the blocking set; v2 followed an adversarial
-duel in which v1 scored
-scored 33/100 and 52/100 by two independent models and largely rewritten; record in §Duel
+**Date**: 2026-07-27 · **Last updated**: 2026-09-05 · **Why**: shared currency findings and opt-in
+managed stamps now have explicit source-bound behavior; historical design review remains in §Duel.
 **Implementation**: wired (DERIVED, not claimed — §§1, 2, 5, 7 are built, wired and tested; §8's
-session-start notice and §3's opt-in hook widening are NOT) · **Verified in sync**: never
+session-start notice is not established by this review) · **Verified in sync**: never
+
+### Recovery implementation review — 2026-09-05
+
+The same-commit rule below now has a pre-commit counterpart: an explicit `reviewed_digest` and
+source-linked currency-log review row bind the current document and governed working bytes through
+the existing currency digest. This records examination and findings, not normative agreement or
+verification. It clears only missing-review inference; dirty state or a changed date alone clears
+nothing, and subsequent source/body edits expire the binding. Other violations remain blocking.
+There is no automatic review writer and no additional hook. ADR-034's current-boundary section
+names the proposal/implementation differences that this review does not conceal.
+
+For §4, distinguish the sweep's Git-derived dates from the ongoing stamper: normal refresh stamps
+the current edit date, and explicit managed mode can use observed modification time. Neither is a
+claim that Git recorded that edit or that a semantic review occurred.
+
+The existing edit gate now imports `resolveGoverned()` and `blockingFindings()` from the same
+`scripts/doc-currency.mjs` used at push time. Scalar and list declarations, explicit globs, and exact
+paths share one meaning; a directory declaration does not acquire recursive ownership. It refuses
+only already-stale debt in its existing narrow policy, emits the authoritative finding message,
+allows Superseded warnings, and fails open when the currency tooling cannot be read or evaluated.
+This does not turn every warning into a block or install another host hook.
+
+`plugin/scripts/md-stamp.mjs` keeps default refresh-only behavior. Explicit
+`RUVNET_MD_STAMP=ensure` uses `computeManagedStamp()` to maintain creation/update metadata and a
+content digest: repeated unchanged input is idempotent, unknown creation provenance stays unknown,
+existing creation history is preserved, and `updated_pinned: true` prevents changes. YAML metadata
+stays inside the leading frontmatter block; unknown document shapes and generated/excluded trees
+are not stamped. An edit timestamp/content hash is not a semantic `verified_digest`. The canonical
+currency digest separately includes actual governed working bytes and the normative document body.
+No global configuration or automatic host activation is inferred from these functions existing.
 
 ## Context
 
@@ -185,6 +216,16 @@ Scoping only to directly touched ADR filenames is an escape hatch: code can inva
 without the claim ever being evaluated. `--changed` is only safe *because* the debt is zero: a
 touched document, or a document governing touched code, that is red really is your fault.
 
+**CODE DRIFTED, 2026-09-11 (currency review).** `scripts/git-hooks/pre-push` no longer invokes
+`--changed` at all: commit `00526b12` (2026-09-07) reduced the whole file to a 5-line delegator that
+runs only `scripts/development-push-check.mjs` (a credential scan). The `--changed` invocation this
+paragraph describes moved to `scripts/release-vector.mjs --changed <base>` (governed by ADR-058),
+run at release-qualification time rather than at a local `git push`. Commit `2b022100` (2026-09-09)
+extended `scripts/doc-currency.mjs` itself with the actual `--changed` scoping logic §5 describes
+(`changedDocumentCandidates`/`changedDocumentScope`) — that half of the mechanism is real and wired,
+just invoked from a different chokepoint than this section names. The zero-ratchet, no-new-state
+design this section argues for is unaffected; only the calling site moved.
+
 ### 6. `governs:` grows one document at a time — the corpus-wide backfill is CUT
 
 Both models ranked this their #1 cut, independently. Fable measured why the proposed derivation is
@@ -303,9 +344,29 @@ Both models credited exactly one section of v1 as correct and correctly-sized: *
 fix** — which is the one section that was already built.
 
 ## Currency log
+| 2026-10-26 | Review (4.7.21): decision unchanged. `scripts/wired-check.mjs` skips files that do not mention a module name before running its caller regex (result-preserving) and no longer walks `.claude/worktrees`; the brain-gists launchd job was retired, so its STANDALONE reason now says manual run. | `scripts/wired-check.mjs`, `tests/unit/wired-baseline-classification.test.mjs`. |
+| 2026-10-01 | Currency review (4.5, after merging release-integ-4.5 2b2ec6a9): decision unchanged. `scripts/wired-check.mjs` gains only STANDALONE registrations: the ADR-0093 recommendation harnesses and the package-card generator, plus the 4.5 retrieval harnesses. The onboarding-console note now lists the `/rnbc` and `/rnb` aliases. The currency chokepoint is untouched. reviewed_digest ad0f3db55a59. | Reviewed `scripts/wired-check.mjs`. |
+| 2026-10-01 | Currency review (4.5 retrieval): decision unchanged. `scripts/wired-check.mjs` only registers new human-run measurement harnesses as standalone entries (abstain-trace, abstain-threshold-sweep, need-set-split, judge-train, doc2query-generate, doc2query-reach, sona-query-adapter-eval, route-latency-warm, route-index-memory). The currency chokepoint is untouched. reviewed_digest 6d959f6ee19a. | Reviewed `scripts/wired-check.mjs`. |
+| 2026-09-27 | Currency review: decision unchanged. Motion: wired-check hardening (a lesson-migration reclassification, a hook-shim TABLE over-trust fix) and a QE gate consolidation. The chokepoint design is unchanged. | Reviewed `scripts/wired-check.mjs`, `scripts/doc-currency.mjs`, `scripts/git-hooks/pre-push`, `plugin/scripts/md-stamp.mjs` against the commits listed above; reviewed_digest 3fe43538cf2c. |
+
+| 2026-09-19 | Kept the currency verdict unchanged while removing repeated local scan work. Each governed path's caller search is memoized only inside one `evaluate()` call; the next invocation reads current Git/source state. | `scripts/doc-currency.mjs`; `tests/unit/doc-currency.test.mjs` proves one lookup for duplicate ADR declarations and fresh results after an edit. No threshold or finding rule changed. |
+| 2026-09-12 | Currency review at commit b593a92b: decision unchanged, and the gate is stronger — `scripts/wired-check.mjs` now excludes `.claude/worktrees/` from the caller search (`b593a92b`, test-first: two of three assertions red on the old code). The defect it removes is the one this document exists to prevent: with any agent worktree present, the worktree's full repository copy was counted as a caller, so `handoff-asset` read `wired` while invoked by nothing and the entire MANUAL class read 0 — a green gate that was measuring a copy of the repo instead of the repo. `--check` with no worktree present is unchanged (261 wired · 7 manual · 56 exempt · 4 held · 0 UNWIRED), which is the point: the fix changes nothing about the real tree, only stops the pollution. | Reviewed `scripts/wired-check.mjs`; `scripts/doc-currency.mjs`, `scripts/git-hooks/pre-push`, `plugin/scripts/md-stamp.mjs` did not move. reviewed_digest 04d3acc31aa9. |
+| 2026-09-11 | Currency review at commit c7418a77: decision unchanged. `scripts/wired-check.mjs` moved once more after the 7296c984 review: `c7418a77` adds a STANDALONE declaration for `scripts/handoff-asset.mjs` (a human-run client handoff per docs/CLIENT-ASSET-HANDOFF.md, added 32b7b7ca with the TriSmart sub-product). It was the one UNWIRED module the first worktree-free run of the day surfaced — while agent worktrees existed under `.claude/worktrees/`, their `package.json` copies were counted as callers, hiding it and the entire MANUAL class (7 tools). No predicate or search-set change in this commit; the search-set pollution is pre-existing (85f584b2's wired-check reports the same worktree callers on the same tree) and is the next thing this document should govern. `--check`: 261 wired · 7 manual · 56 exempt · 4 held · 0 UNWIRED. | Reviewed `scripts/wired-check.mjs`; `scripts/doc-currency.mjs`, `scripts/git-hooks/pre-push`, `plugin/scripts/md-stamp.mjs` did not move. reviewed_digest 0fb32c7b7ff0. |
+| 2026-09-11 | Currency review at commit 7296c984: decision unchanged. `scripts/wired-check.mjs` moved twice: `32b7b7ca` (pre-session worktree merge — the hooks-plane check derives its expected registration count from `continuityRegistrations(host)` instead of a literal 2) and `8747d2f8` (a STANDALONE declaration for `plugin/scripts/project-progression-checkpoint.mjs`, the body of the `/ruvnet-brain:checkpoint` command, same shape as the existing `onboarding-console` entry). `scripts/doc-currency.mjs`, `scripts/git-hooks/pre-push`, `plugin/scripts/md-stamp.mjs` did not move. `wired-check --check` on main reports 0 UNWIRED in all three tables. | Reviewed `scripts/wired-check.mjs`, `scripts/doc-currency.mjs`. reviewed_digest 1141e195338c. |
+| 2026-09-11 | Currency review at commit 2eef2024: code drifted, corrected in §5 above (not the status). `scripts/git-hooks/pre-push` (`00526b12`) no longer invokes the currency check — reduced to a 5-line credential-scan delegator. The `--changed` scoping mechanism itself (`2b022100`) is real and now lives in `scripts/doc-currency.mjs`, invoked from `scripts/release-vector.mjs` (ADR-058) instead. `scripts/wired-check.mjs` (`56420430`, `8790160b`) was updated to correctly classify the two new constrained continuity hook registrations and reword one STANDALONE entry — the wired/manual/unwired mechanism §7 describes is unchanged, just kept accurate against `codex-hooks.json`'s new state. | Reviewed `scripts/git-hooks/pre-push`, `scripts/doc-currency.mjs`, `scripts/release-vector.mjs`, and both `scripts/wired-check.mjs` diffs directly. reviewed_digest 1728f71b48ec. |
+| 2026-09-05 | Reviewed source a6a774d6cea3; findings recorded, not semantic verification. | `scripts/wired-check.mjs`, `scripts/doc-currency.mjs`, `scripts/git-hooks/pre-push`, and `plugin/scripts/md-stamp.mjs` were fully examined by the assigned audit reviewer. Root checked the source-bound review integration and focused tests. This records examination only; the Proposed decision, unproven session-start notice, and distinct edit-date versus review-date meanings remain explicit. |
+
+| 2026-09-05 | Added a pre-commit exact-byte review boundary without a second gate or automatic semantic approval. | `scripts/doc-currency.mjs` reuses its canonical digest; `tests/unit/doc-currency-review.test.mjs` exercises real Git history, staged/unstaged changes, missing evidence, and independent overclaim refusal. `plugin/scripts/md-stamp.mjs` remains an edit-metadata producer, never the review authority. |
+
+| 2026-09-05 | Re-read the canonical edit/push boundary and managed-stamp implementation without widening stale-debt policy or claiming this Proposed decision Accepted. | `plugin/scripts/adr-currency-gate.mjs` reuses `scripts/doc-currency.mjs` resolution and blocking findings; real-Git parity covers scalar/list/glob ownership and Superseded warnings. `plugin/scripts/md-stamp.mjs` explicitly opts into managed metadata, preserves pins/creation history and frontmatter, and distinguishes unchanged content from an edit. The recovery review establishes source behavior, not universal host activation or the unproven session-start notice. Version 1.0.0 starts explicit revision tracking without rewriting prior history. |
 
 | Date | What changed | Why (with referents) |
 |---|---|---|
+| 2026-08-22 | Re-read the expanded reachability and pre-push chokepoint at convergence tip `ddae606`; the gate now distinguishes real operational callers from exports, self-reference, manual tools, and isolated maintenance entrypoints without weakening fail-closed behavior. | `b1172a7` wires the maintenance entrypoints, `c05f535` audits release-critical operational exports, and `17fe54b` / `bd446d9` make corpus ownership reachable through the production reconcile path. Exact-tip `npm run wired:check` reports 272 modules, zero UNWIRED modules, zero UNWIRED critical exports, and zero UNWIRED hooks. This row reviews currency only; the six manual tools and four held modules remain disclosed rather than rounded up. |
+| 2026-08-30 | Re-read the chokepoint after adding the convergence-manifest check to pre-push; the release identity is now validated before remote publication. | `scripts/git-hooks/pre-push`; `scripts/convergence-manifest.mjs`; exact hosted QA failure on stale generated identity. |
+| 2026-08-22 | Re-read the only moved governed path, `scripts/wired-check.mjs`; the chokepoint remains fail-closed and its reachability model is more exact. | `6336c52` reclassifies the retired nightly/source writers as explicit author-run isolated-worktree commands instead of claiming a deleted LaunchAgent reaches them. `26b0095` makes Check C enumerate both static lesson trigger labels and dynamically appended `ARGS+=(--trigger ...)` paths, with `tests/unit/wired-check.test.mjs` proving the dynamic-only case. `scripts/doc-currency.mjs`, `scripts/git-hooks/pre-push`, and `plugin/scripts/md-stamp.mjs` did not move; this ADR remains Proposed with its wired slice unchanged. |
+| 2026-08-06 | **A version bump no longer counts as governed-code drift** (`scripts/doc-currency.mjs`, `deriveDrift`). | This gate's own credibility problem, found by using it heavily in one day. `scripts/sync-version.mjs` rewrites the plugin manifests, `package.json`, `kb/package.json` and `RVF-GENERATIONS.json` on EVERY release bump, and several ADRs legitimately `govern:` those files — so each bump marked them `presumed-stale` regardless of whether any decision moved. It fired four times in one day (ADR-050/051/057/058), and every single resolution was "re-read, only a version string changed". That is the precise failure mode this ADR exists to prevent: a chokepoint that cries wolf gets satisfied with a date stamp instead of a reading, and this repo has already blanket-stamped 61 ADRs from a bad grep once. It would also have permanently blocked `scripts/release-convergence-watchdog.mjs`, which runs unattended and cannot author a currency row. Drift now counts only commits whose diff inside the governed paths contains at least one non-version line; one substantive line still counts the whole commit. TEETH measured in both directions rather than assumed — the same day's substantive edit to `.github/workflows/protected-release.yml` still registers (`state=lagging, commits=1`) while the codex manifest's version-only churn is exempt (`state=current, commits=0`). Blocking findings 4 → 1. |
+| 2026-08-01 | Classified `scripts/fix-workstream.mjs` as an explicit session-supervised standalone CLI after the clean integration gate correctly rejected it as unreachable. | ADR-050 requires an isolated worktree and integration-owner handoff for non-trivial fixes. `scripts/fix-workstream.mjs` implements that human/agent-invoked boundary and deliberately has no unattended caller; `tests/unit/fix-workstream.test.mjs` proves it cannot merge, push, publish, delete, or clean worktrees. |
 | 2026-07-30 | Closed the `--changed` governed-path escape and corrected the pre-push success message boundary. | `scripts/doc-currency.mjs` previously intersected the diff only with ADR filenames, so changed governed code could print global BLOCK findings yet leave the scoped set empty and return 0. The scope now includes documents whose resolved `governs:` paths intersect the diff; `tests/unit/doc-currency.test.mjs` pins both governed-path failure and unrelated-change pass. `scripts/verify-channels.mjs` now reports only channel-check success before currency runs, while `scripts/git-hooks/pre-push` owns the final whole-gate success. |
 | 2026-07-28 | Removed the obsolete `ground-before-write` and `grounding-stamp` exemptions from `scripts/wired-check.mjs`. | Both hooks are now shipped through `plugin/hooks/hooks.json` and `plugin/hooks/codex-hooks.json`; retaining the inert exemptions made the same report call them both exempt and wired. `npm run wired:check` now reports 0 unwired without that contradiction. |
 | 2026-07-27 | Initial draft (v1) | Owner's three rules. Audit found all three pre-existing and unfired: `md-stamp.mjs:11`, missing `~/.claude/hooks/ascii-svg-auto-sync.sh`, `package.json:35` defined-but-uncalled. ADR-034's `impl: unbuilt` refuted by `scripts/doc-currency.mjs` |

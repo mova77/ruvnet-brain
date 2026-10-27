@@ -1,0 +1,288 @@
+---
+id: ADR-070
+title: One release generation across corpus, package, hosts, and retained state
+status: Accepted
+date: 2026-08-21
+updated: 2026-10-25
+updated_source: derived-from-git
+reviewed_digest: 30ca8452b09f
+version: 1.1.5
+authors: [Stuart Kerr, Codex]
+tags: [release, generation, corpus, update, synchronization, retention, proof]
+supersedes: []
+relates: [ADR-023, ADR-051, ADR-065]
+governs:
+  - .github/workflows/ci.yml
+  - bin/install.mjs
+  - kb/forge-update.mjs
+  - scripts/brain-stamp.mjs
+  - scripts/build-bundle.mjs
+  - scripts/release.mjs
+  - scripts/release-transaction-provider.mjs
+  - scripts/self-update.mjs
+  - scripts/published-surface-probe.mjs
+---
+
+# ADR-070 — One release generation across corpus, package, hosts, and retained state
+
+**Status**: Accepted
+
+> **Reviewed 2026-09-04 (4.3.9 candidate).** The publisher now validates both handoff paths before
+> beginning the remote transaction and materializes the exact identity plus signed channels receipt
+> only after convergence validates, using no-overwrite hard links and synchronous-error rollback.
+> Pairwise crash atomicity is not claimed. npm, GitHub, hosts, and the canonical site remain
+> unproven for 4.3.9 until their live exact-version checks complete.
+
+Fable 5 and GPT-5.6-Sol converged on the corrected design before implementation.
+
+## Context
+
+On 2026-08-21 the public product identified itself as two different generations: GitHub's latest
+release was `v4.2.1-dev`, while npm still served `4.0.90-dev`. A new window therefore loaded the npm /
+plugin generation and correctly displayed 4.0.90 rather than the newer corpus tag. The nightly then
+stamped a local `4.2.2-dev` candidate but failed bundle assembly because many canonical RVF files had
+no matching entry in `RVF-GENERATIONS.json`. No public release advanced.
+
+Two open defects expose the architectural seams:
+
+- #152: CI seeds the next knowledge bundle from the latest release bundle. Locally ingested stores
+  are invisible to that self-seeding loop, so the shipped corpus cannot grow from the authoritative
+  local store root.
+- #153: the installer deletes an outgoing Claude plugin-cache version while already-running sessions
+  still hold that exact directory as `CLAUDE_PLUGIN_ROOT`. The Stable Spine cannot help because the
+  host fails before `hook-shim.mjs` can run.
+
+The same audit measured 29 GB under `~/.cache/ruvnet-brain`, primarily rollback snapshots left from
+repeated update attempts. A release system that converges versions but leaks a full corpus snapshot
+per attempt is not operationally correct.
+
+ADR-023 is Accepted and implemented: it makes the Stable Spine the hot-update boundary. ADR-051 is
+Accepted/Implemented: it requires stable Codex host wiring. This decision extends them; it does not
+replace their stable-path contracts.
+
+## Decision under review
+
+### 1. A release is one aggregate, never parallel version strings
+
+Define `ReleaseGeneration` as one immutable aggregate containing:
+
+1. exact source commit or immutable source snapshot;
+2. npm plugin/package artifact;
+3. signed knowledge bundle;
+4. corpus-source receipt (store identities, source commits, RVF digests, visibility fence);
+5. release transaction and post-publication receipts.
+
+Every member carries the same normalized version. GitHub `latest`, npm `latest`, the plugin manifests,
+the installed Stable Spine, and the installed KB manifest are projections of that aggregate. The
+publisher stages members and promotes public channels before post-publication installed verification,
+as corrected by ADR-072. Channel convergence records `PUBLISHED_NOT_VERIFIED`; only completed
+public verification permits `install-verified`. Moving `latest` is not proof of release completion.
+
+### 2. Replace recursive latest-release seeding with an explicit immutable corpus seed
+
+The corpus input is a separately sealed, immutable asset identified by a committed descriptor:
+
+```json
+{
+  "tag": "corpus-v<generation>",
+  "asset": "ruvnet-brain-corpus.zip",
+  "sha256": "<digest>",
+  "stores": 0,
+  "createdFrom": "<source snapshot>"
+}
+```
+
+CI downloads the exact tag and verifies the committed digest before bundle assembly. It never asks
+for "latest" and never uses the candidate bundle as its own source. Advancing the corpus requires a
+new immutable seed tag plus a reviewable descriptor change; it never rewrites an already-sealed
+release asset. The seed publisher applies the same public/private visibility fence as bundle assembly
+and emits a source-linked store inventory.
+
+### 3. The generation ledger is rebuilt from the assets it governs
+
+Before bundle assembly, the candidate process enumerates every canonical `*.big.rvf` in the selected
+asset root and writes or validates exactly one `RVF-GENERATIONS.json` entry per store. Entries bind the
+actual filename, byte count, SHA-256, embedding metadata, source commit, and build time. Bundle assembly
+then fails closed on any missing, extra, aliased, private, or digest-mismatched entry.
+
+The ledger is not inferred from `data/manifest.json`, and a manifest row is not evidence that an RVF
+generation record exists. The candidate receipt records both counts and requires equality after the
+privacy fence.
+
+### 4. Retire a host generation to a compatibility shell; never dangle a live path
+
+Claude Code owns the versioned plugin-cache path, while the Brain owns the bytes it installed there.
+After the registry advances, the outgoing directory is atomically retired to a tiny compatibility
+shell rather than deleted. The shell retains its plugin manifest and the two Stable-Spine entrypoints
+(`scripts/hook-shim.mjs` and `scripts/hook-shim-bash.mjs`) needed by frozen hook commands. It removes
+skills, commands, hook declarations, and all other discoverable payload so an old generation cannot
+be re-registered as a second active plugin.
+
+A failed retirement leaves the original outgoing directory usable. Compatibility shells are not
+garbage-collected until a trustworthy host-session lease exists; the current plugin registry alone
+does not prove that no running session holds an old `CLAUDE_PLUGIN_ROOT`.
+
+The Brain's own `versions/` remains lease-aware and keeps the active and previous gated generations.
+It may collect only unleased generations according to ADR-023.
+
+### 5. Rollback storage is transaction-scoped and self-reclaiming
+
+One update transaction creates at most one KB rollback snapshot. Every terminal outcome classifies it:
+
+- verified success or verified no-op: reclaim when receipt-backed cleanup proves it safe;
+  failed cleanup remains explicit `cleanup-pending`;
+- damaged/uncertain live KB: retain with a receipt naming the exact reason and recovery command;
+- abandoned but provably redundant historical snapshot: reclaim during the next preflight, before a
+  new snapshot is created.
+
+Reclamation inventories only governed store artifacts, ignores ordinary tooling symlinks, refuses to
+delete a snapshot containing the only copy of a store, and reports bytes freed. Candidate scratch
+directories are removed on both success and failure unless explicitly retained as named recovery
+evidence.
+
+### 6. Publication is a serialized, guarded, resumable transaction
+
+The publisher starts from the observed prior npm and GitHub latest identities. It stages the exact
+package and bundle, verifies their digests and generation identity, then promotes both surfaces with
+compare-and-swap guards. A partial promotion is an incomplete transaction to repair, not a release.
+Because provider reads and writes are separate, this is not claimed to be atomic compare-and-swap. The next run resumes the same transaction or rolls it forward; it never invents a new version merely
+because one surface moved.
+
+### 7. Proof must cross the real user boundary
+
+Release completion requires all of the following against the public bytes:
+
+- exact tag resolves to the release commit;
+- npm exact version and `latest` resolve to the same generation;
+- GitHub `latest` resolves to the same generation and exposes the signed bundle and receipts;
+- a clean temporary install downloads and verifies the public artifacts;
+- Claude Code and Codex host probes load the expected generation;
+- a fresh process/window prints the same single user-facing version;
+- representative `search_ruvnet` queries resolve citations from the installed bundle;
+- disk delta and retained-directory inventory remain within the documented budget;
+- update rerun is idempotent and does not create another full rollback or candidate copy.
+
+Only after those checks may the nightly failure marker be deleted and issues #152/#153 be closed.
+
+## Rejected alternatives
+
+- **Rewrite the latest release bundle in place.** This invalidates the immutable seal and signature.
+- **Keep seeding from GitHub latest.** It preserves the closed loop that caused #152.
+- **Delete N-1 plugin cache after install.** A long-running session can still hold N-1; age and ordinal
+  are not liveness evidence.
+- **Keep every full plugin generation.** Safe but wasteful; the compatibility shell preserves the
+  only cold-session entrypoints while removing duplicate payload and rediscovery surfaces.
+- **Trust the local version stamp.** A stamp proves neither publication nor installability.
+- **Keep every rollback forever.** Safe failure handling still needs bounded, evidence-driven cleanup.
+
+### Installed-update public proof
+
+Before `install-verified`, each public dual-host leaf on Linux, macOS, and Windows must
+include two sequential terminal runs triggered by that platform's native scheduler. The
+proof consumes the exact public npm package and signed bundle, binds their hashes to the
+candidate source, version, and workflow run, and validates the live installed ReleaseCoverage
+projection after each run. Run two must be `noop`, with measured storage deltas, no redundant
+full-corpus copies, bounded retained evidence, and verified removal of the owned proof job.
+Missing raw evidence or failed cleanup blocks acceptance; claimed validation flags do not
+replace raw receipt, signature, executable-identity, and projection validation.
+
+This is explicitly `scope: installed-update`. Update, host convergence, and cleanup carry
+current-run execution evidence. Corpus phases imported from the signed release remain
+`imported-release`, bound to the installed projection and candidate source. Upstream freshness
+remains `UNKNOWN`; these consumer runs do not prove a new corpus build or complete S-4.
+The strict current-run corpus-production validator remains a separate requirement.
+
+## Consequences
+
+- Corpus promotion becomes an explicit, reviewable input rather than an accidental side effect.
+- Publication can resume after partial failure without splitting the public generation.
+- Live Claude sessions retain valid hook roots across updates.
+- The large corpus is stored once as the active KB plus only a genuinely necessary recovery copy.
+- CI needs a corpus-seed descriptor and a seed-publication path; this is deliberate because git does
+  not contain the RVF binaries it must ship.
+
+## Acceptance criteria
+
+1. A test breaks if CI downloads an unpinned latest bundle as corpus input.
+2. A test breaks if any canonical RVF lacks a byte-bound generation entry.
+3. A live-session fixture continues executing UserPromptSubmit and SessionEnd through its retired
+   hook root after an update, while stale skills/commands/hooks are absent.
+4. A release fixture refuses or repairs GitHub/npm generation divergence.
+5. Two consecutive no-op updates produce zero additional full KB backups.
+6. A fresh public install and a fresh host window report the same release generation.
+7. Coverage documentation is generated from the sealed manifest, source ledger, and gist inventory.
+
+## Recovery source review — 2026-09-07
+
+`kb/forge-update.mjs` delegates storage to `runStorageTransaction()`: candidate/live verification,
+receipt-backed rollback, and explicit cleanup-pending state bound storage recovery. Immediate
+reclamation is an intended result, not an unconditional guarantee. Installer activation stages and
+rolls back runtime changes; this is not crash-atomic recovery proof. The Windows public probe uses
+`npx.cmd` through its platform command boundary. Native public verification remains required.
+
+## Artifact and replay qualification correction — 2026-09-07
+
+The final projected assembly now derives its runtime generation ledger from the immutable public
+ledger, binds the current source commit, and validates complete assembled coverage before ZIP creation.
+This fixes the missing runtime source identity caught by hosted census on 1609d077. The first assembly
+still supplies seed bytes to the projection producer. Focused producer and mutation tests pass;
+new hosted and public verification remain required.
+
+## Currency log
+| 2026-10-25 | Review `30ca8452b09f` (4.7.21): decision unchanged; one generation across corpus, package, hosts and retained state. `kb/forge-update.mjs` (#335, review A): `reclaimBackups` also accepts a regular file byte-identical at the same path in a `kb.archive/` tree written by the explicit `--clean --archive`; a reference reached through a link or resolving inside the backup never counts, and anything unproven falls through to the unchanged checks, so section 5's refusal to delete the only copy of a store still holds (the archive is a kept copy). Its inline entry check now compares real paths. `bin/install.mjs`: `--update` and `--host-sync-only` reload a running shared Codex app-server after a plugin or trust change through `convergeHostsAfterUpdate` (#492, review E), and a released prior generation's logs and ruflo scratch are rescued first (#406). `scripts/build-bundle.mjs` and `scripts/published-surface-probe.mjs`: entry-point sweep only. | Reviewed diffs 320b778b..63ca7c0d for `kb/forge-update.mjs`, `bin/install.mjs`, `scripts/build-bundle.mjs` and `scripts/published-surface-probe.mjs`. |
+| 2026-10-24 | Review `41fb7e526438` (4.7.18): decision unchanged. `bin/install.mjs` moved | The 4.7.18 changes to it are Codex snapshot retry/repair during wiring, a recorded reason on every failed host sync, and an early refusal for a stale source checkout running `--update`. Generation convergence is unchanged: a host still converges only to the exact published version, and a failed sync still rolls the Console runtime back; it now also says why. Source: `bin/install.mjs`. |
+| 2026-10-01 | Currency review (4.5 retrieval): decision unchanged. `.github/workflows/ci.yml` adds a read-only capability-battery step on the sealed bundle in release-qe. Generation convergence and the update path are untouched. reviewed_digest e7ef4a215243. | Reviewed `.github/workflows/ci.yml`. |
+| 2026-09-27 | Currency review: decision unchanged. Motion: this session's own install.mjs and release-transaction-provider.mjs fixes (macOS deadline, ENOBUFS), plus corpus-currency consolidation and CI hardening. These fixes strengthen generation convergence; they do not change its design. | Reviewed `.github/workflows/ci.yml`, `bin/install.mjs`, `kb/forge-update.mjs`, `scripts/brain-stamp.mjs`, `scripts/build-bundle.mjs`, `scripts/release.mjs` against the commits listed above; reviewed_digest dca3b4ba9d47. |
+| 2026-09-19 | Reviewed the candidate installer identity diagnostic: package, validator and search SOURCE versions are separate observations. Doctor fails inconsistent identities or weak retrieval evidence; observed search hashes do not authenticate a release. | `bin/install.mjs`, `scripts/installed-brain-health.mjs`, ADR-089. Focused candidate tests passed; public install and update proof remain pending. |
+| 2026-09-13 | Corpus-seed pipeline consolidation, step 5 (remediated on top of `86cbe798`): the one-generation rule's producer side no longer needs two assemblies. The build → `scripts/release-projection.mjs` → rebuild sequence (two archives per release, the first discarded after seeding a ledger the projection could read) is replaced by ONE `assembleBundle` pass (`scripts/build-bundle.mjs`) that derives `SOURCE.json`, the runtime and public generation ledgers, `manifest.json`, and the release projection from one selected-record set and creates exactly one archive (`tests/unit/assemble-bundle.test.mjs`, required proof 5). `release-projection.mjs`'s standalone CLI is retired (exits 1 with a pointer); `createReleaseProjection` is called in-process. `.github/workflows/ci.yml` deliberately still runs the old sequence against the pinned seed until a Step-4-produced seed is published and re-pinned (plan step 11); until then the new path is library + CLI only, and this ADR's 2026-08-21 `ci.yml` wiring rows below still describe what runs in production. | Reviewed `scripts/build-bundle.mjs`, `scripts/release-projection.mjs`, `.github/workflows/ci.yml` (byte-identical to `main`), `scripts/corpus-reconcile.mjs` (`prepareCorpusCandidate` still invokes the same CLI flags). |
+| 2026-09-12 | Currency review at commit 5f919c52: decision unchanged and reinforced. The one release generation now includes the piece that verifies it: `bin/install.mjs` (`5f919c52`) places the package's `plugin/scripts/coverage-integrity.mjs` beside the updater as `coverage-integrity.mjs` — in `unzipInto()` before the staged ReleaseCoverage check, and in `runUpdate()` before the updater child spawns — and `kb/forge-update.mjs` (`5f919c52`) `prepareCandidate` carries the LIVE copy into the candidate, never the bundle's, so the validator's identity stays bound to the signed package across generations and a byte-identical bundle keeps reading as a no-op. Measured 2026-09-12: `loadTrustedCoverageValidator()` had demanded a file no bundle and no installer ever placed (`scripts/build-bundle.mjs` cannot see the dynamic load), so the installed-update path this ADR converges on had never once completed in the field — every 4.3.21 `--update` fell back to a fresh install. Also in the window: `kb/forge-update.mjs` `9fda9e1b` (overlay capture walks the root `{ strict: false }`; `.rvf` symlinks still throw). | Reviewed the `bin/install.mjs` and both `kb/forge-update.mjs` diffs in full; `runStorageTransaction()` boundaries in `kb/update-storage-transaction.mjs` untouched; `scripts/build-bundle.mjs` deliberately NOT changed — the validator must not ship inside the artifact it judges. reviewed_digest c1a3bdcccaa4. |
+| 2026-09-11 | Currency review at commit 7296c984: decision unchanged and reinforced. `scripts/release.mjs` was rewritten (`e3b0f0ba`: `--publish` / `--check` / `--corpus-seed` removed, so `protected-release.yml:349` would have printed USAGE; a parallel `publish-npm.yml` publisher) and restored byte-for-byte to 85f584b2 (`a4b1bf0d`); the tag-fired publish was refused by the pre-existing `prepublishOnly` → `protected-release-invocation.mjs` guard and npm stayed at 4.3.21 — the one-aggregate, one-publisher rule held under attack. `kb/forge-update.mjs` and `bin/install.mjs` `dc18fadc`: §5's reclaim now admits `.install-preserved-*` copies under the same redundancy proof as `.bak-*`, feeds COVERAGE policy exclusions into `intentionallyRemovedStores`, pins any copy holding a PRIVATE-fenced store, and reclaims down to budget instead of dying over budget; the dry run on the owner's machine removes nothing (both copies pin `cognitum-api` plus two eligible stores missing from live). `scripts/release-transaction-provider.mjs`, `scripts/self-update.mjs`, `scripts/published-surface-probe.mjs`, `scripts/build-bundle.mjs`, `scripts/brain-stamp.mjs`, `.github/workflows/ci.yml` did not move. | Reviewed `scripts/release.mjs`, `kb/forge-update.mjs`, `bin/install.mjs`. reviewed_digest 5b990e855ed0. |
+| 2026-09-11 | Currency review at commit 2eef2024: decision unchanged; the one notable change reinforces this ADR rather than contradicting it. `bin/install.mjs`'s `acquireHostConvergenceLock()` (`e917fa25`) was rewritten from a simple mkdir-based lock to a token-owned, stale-detection, rename-quarantine one that survives concurrent installer races — this ADR's text names no specific lock implementation, so nothing here is contradicted, and a race-safe lock only strengthens the "one generation" guarantee. The same commit made `classifyHostConvergence()` treat a host with `restartRequired: true` as NOT yet converged, tightening what "ready" means. `09079037`'s restart-notice refinement (reviewed under ADR-013/049/051) and the legacy-generation-pruning grace-period removal (retained indefinitely rather than a 14-day grace, `e917fa25`) are also unclaimed by this document's text. The other 8 drift commits were already reviewed as decision-unchanged plumbing under ADR-051/053/054/056/062. | Read `e917fa25`'s full diff on `bin/install.mjs`; grepped this document for `acquireHostConvergenceLock`/`classifyHostConvergence`/lock/restart/grace — zero hits, confirming no specific claim is contradicted. |
+| 2026-09-07 | Reviewed source digest 899e9e2380e9: installed-update public proof boundary; producer freshness remains UNKNOWN. | `kb/forge-update.mjs` imports signed corpus evidence; `scripts/public-verification-aggregate.mjs` and `scripts/nightly-two-run-proof.mjs` validate raw native consumer evidence. |
+
+| 2026-09-07 | Reviewed the failed hosted census and corrected producer; source digest 3e4b5167e33f. | `scripts/build-bundle.mjs`; tests in `/tmp/ruvnet-assembled-projection-tests-20260907.log`, no public PASS claimed. |
+
+| 2026-09-07 | Reviewed recovery source and corrected implementation boundaries; source digest d08c8b76c84c. | `kb/forge-update.mjs`; source examination only, no renewed runtime or publication verification. |
+| 2026-09-04 | Reconciled Windows convergence verification with canonical QA: both lanes now regenerate the convergence manifest after checkout, so a pull request's synthetic merge ref is evaluated as the exact candidate rather than against the branch-tip snapshot. The convergence assertion remains enforced. | `.github/workflows/ci.yml`; `tests/unit/convergence-workflow-parity.test.mjs`; issue #241. |
+| 2026-08-31 | Closed the PR merge-ref freshness gap: canonical QA now regenerates the convergence manifest inside the exact checked-out candidate before running the gate, preventing a branch-generated snapshot from becoming stale on GitHub's synthetic merge ref. | `.github/workflows/canonical-qa.yml`; `scripts/convergence-manifest.mjs`; issue #193 release follow-up. |
+| 2026-08-31 | Regenerated the convergence manifest after the portable watchdog correction; the manifest now binds the actual PR tip rather than an earlier rebased commit. | `data/convergence-manifest.json`; PR #211. |
+| 2026-08-31 | Reconciled the watchdog's Windows command boundary after hosted PR evidence showed shell:false cannot assume an `npx` shim; the unit lane now invokes Vitest through Node while retaining the same exact candidate test surface. | `.github/workflows/ci.yml`; `scripts/ci/step-watchdog.mjs`; PR #211. |
+| 2026-08-31 | Reconciled after the 4.3.3 main-branch merge and CI watchdog change; generation identity remains exact-SHA bound and long release stages now fail at named boundaries with receipts. | `scripts/ci/step-watchdog.mjs`; `.github/workflows/ci.yml`; exact-SHA CI run `33358984585`. |
+
+| 2026-08-30 | The two-stage candidate build now validates against the same projection evidence it later packages: seed-compatible gist receipts, class registry, derived receipts, excluded stores, and the projected generation ledger are all present at validation time. | `scripts/release-projection.mjs`, `scripts/build-bundle.mjs`, `plugin/scripts/coverage-integrity.mjs` |
+| 2026-08-30 | The projected validation input now receives the canonical private-store fence from the checkout before inventory validation, closing the remaining seed-versus-policy input mismatch. | `scripts/build-bundle.mjs`; `kb/PRIVATE-STORES.json`; exact-SHA release-QE. |
+| 2026-08-30 | The release projection now derives its totals and enumeration receipt from the seeded row set and carries the source-observation digest as a separate bound evidence identity. | `scripts/release-projection.mjs`; exact-SHA release-QE. |
+| 2026-08-30 | The second-stage builder now stages the projected gist receipt before validation, making the public evidence partition identical before and after archive assembly. | `scripts/build-bundle.mjs`; exact-SHA release-QE. |
+| 2026-08-30 | Replayed the complete two-stage release locally and confirmed identical public inventory partition hashes before and after archive assembly. | `scripts/release-projection.mjs`; `scripts/build-bundle.mjs`; local proof `566fe4f5bb435f11c8a924a8cef9b8c251c508051653121f39e7533536455daf`. |
+| 2026-08-30 | The repository pre-push gate now verifies the generated convergence manifest, making stale source identity a local push failure instead of a hosted QA failure. | `scripts/git-hooks/pre-push`; `scripts/convergence-manifest.mjs`; exact-SHA CI. |
+| 2026-08-30 | The candidate’s full CI contract is now pull-request gated as well as main-push gated, preventing an untested merge from becoming the first place release failures appear. | `.github/workflows/ci.yml` |
+
+| 2026-08-30 | Rechecked generation convergence after the seed lacked the source-controlled public-store class registry; bundle assembly now keeps policy metadata on the source plane and corpus bytes on the seed plane. | `scripts/build-bundle.mjs`; `kb/public-store-classes.json`; exact-SHA release-QE. |
+
+| 2026-08-30 | Rechecked generation convergence after the exact-SHA release-QE failure; the immutable seed's legacy gist evidence is carried explicitly into the projected bundle and is not labeled current-source evidence. | Commit `f526bab`; `scripts/release-projection.mjs`; `scripts/build-bundle.mjs`; `data/corpus-seed.json`. |
+
+| 2026-08-30 | Removed the forbidden live gists observation from the release-QE bundle step and made the coverage projection explicitly derive its public generation set from the sealed seed ledger. | Issue #201; `.github/workflows/ci.yml`; `scripts/release-projection.mjs`. |
+
+| 2026-08-30 | Reconciled the host-only updater after live v4.3.1 had no GitHub assets and the updater stranded the Stable Spine on 4.2.2-dev. | `bin/install.mjs` now keeps executable host synchronization moving when the optional KB refresh is unavailable; the release asset gate remains authoritative. |
+
+| 2026-08-30 | Automatic PR checks now converge through one bounded canonical runner; the older matrix is manual diagnostic coverage. | `.github/workflows/ci.yml`, `.github/workflows/qe-4-3.yml`, and `scripts/qa-runner.mjs` reduce duplicate observations while leaving protected publication authority unchanged. |
+| 2026-08-30 | Query-oracle provenance now preserves strict ancestry by default and explicitly supports fetched, content-bound source commits after squash merges; release-QE opts into that mode and tests it. | `scripts/retrieval-canary.mjs`, `scripts/public-verification-inputs.mjs`, `.github/workflows/ci.yml`, `tests/unit/retrieval-canary.test.mjs` |
+
+| 2026-08-30 | Version propagation is now a single source edit followed by consistency verification, and release QA binds the candidate to one SHA. | `scripts/set-version.mjs`, `scripts/sync-version.mjs`, and `scripts/qa-runner.mjs` remove the emergency publish path that let public and source versions diverge. |
+
+| 2026-08-23 | Candidate receipts now bind not only pass/fail counts but the skipped and failed suite identities used to decide convergence. | Commit `cc25c24` prevents a partial cross-platform observation from masquerading as a converged generation. |
+| 2026-08-23 | Windows candidate qualification probes the shared installer import before running its suites. | Hosted exact-SHA evidence isolated the failure to installer-import suites; convergence still requires every assertion and every receipt to PASS. |
+| 2026-08-23 | Candidate lane steps fail fast and preserve the exact partial receipt. | A failed step no longer launches later unrelated checks; convergence still requires every required receipt to PASS. |
+| 2026-08-23 | Windows installer-import evidence is process-isolated and the hosted conformance bound reflects measured execution. | Convergence still requires every separate receipt to PASS; no assertion is removed or weakened. |
+| 2026-08-23 | Candidate generation now uses only deterministic resource evidence; live-only preconditions remain an explicit separate regime, and Windows test invocation is shell-independent. | Commit `0e30d68` preserves one-generation artifact binding while removing two false blockers from the candidate path. |
+| 2026-08-23 | The candidate cannot enter artifact qualification unless all required QE lanes have completed, and failed receipts remain available for diagnosis. | Commit `b570e25` strengthens the one-generation release boundary without changing payload identity or publication authority. |
+| 2026-08-23 | Candidate convergence now consumes the new six-lane exact-SHA QE aggregate before artifact publication; the one-generation payload and public-channel rules are unchanged. | Commit `b3ddb0d` replaces the auto-triggered legacy matrix with fail-fast preflight, isolated receipts, and a zero-spend local deterministic contract in `.github/workflows/qe-4-3.yml`; no publication mutation was added. |
+| 2026-08-23 | Corrected the Windows argv boundary after exact-SHA job `97218861232` split the immutable release title; generation identity and artifact binding remain unchanged. | `scripts/windows-command.mjs` shares the measured cmd invocation contract with the release authority, and the focused authority suite asserts title, notes, bundle, and receipt remain distinct arguments. |
+| 2026-08-23 | Re-read the release-generation boundary after issue #163 exposed Windows shell argument splitting; one-generation and immutable-artifact requirements remain unchanged. | `scripts/release.mjs` preserves the exact title, notes, bundle, and receipt arguments on Windows; focused corpus-seed tests prove the release payload. |
+
+| Date | What changed | Why (with referents) |
+|---|---|---|
+| 2026-08-23 | QE artifact download now targets the canonical receipt directory, and Vitest retains bounded verbose diagnostics. | This prevents a converged candidate from being rejected because evidence landed one directory away, while preserving exact-SHA convergence rules. |
+| 2026-08-23 | Candidate receipts now retain bounded stdout/stderr tails for process-level failures. | Commit `1310fb6` makes convergence failures diagnosable from exact-SHA evidence without changing the one-generation or publication rules. |
+| 2026-08-21 | Re-read the shipped-code path after the release-QE failure exposed three index-persistence hash mismatches. | `.github/workflows/ci.yml` now invokes the existing `rvf-index-audit.mjs --repair` restamp before `scripts/build-bundle.mjs` enforces exact ledger closure. A local reproduction on the configured v4.2.1 seed reported `stamped=3`, then assembled 186 audited RVFs with zero index failures; no recursive latest lookup or unbuilt coverage generator is used. |
+| 2026-08-21 | Implemented the emergency correctness slice after Fable 5 and GPT-5.6-Sol convergence. | `.github/workflows/ci.yml` pins the immutable corpus seed; `scripts/build-bundle.mjs` validates strict ledger closure; `bin/install.mjs` retains live plugin roots by exact process-incarnation leases; and the protected publisher rechecks `origin/main` immediately before mutation. Focused integrated tests cover these paths. Rollback-storage receipts, fresh interactive-window proof, and generated coverage remain explicit post-restoration work and are not claimed shipped by this row. |

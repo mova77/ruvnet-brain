@@ -15,15 +15,29 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
+import { createHash } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 import { searchKb } from './forge-ask.mjs';
+import { kbBuildIdentity } from './kb-build-identity.mjs';
+import { keywordCandidates, keywordLaneEnabled } from './keyword-lane.mjs';
+import { applyJudge, loadJudge } from './judge-rank.mjs';
+import { describeSearchFailure } from './search-outcome.mjs';
+import { prepareRelatedSources, renderRelatedSources } from './grounded-response.mjs';
 import { rerankPairs, cePrefilterScores } from './forge-rerank.mjs';
 import {
   contentTokens,
   loadCards,
+  loadRepoAliases,
+  normalizeApostrophes,
   repositoryNames,
   routeReposFromCards,
 } from './card-lane.mjs';
+import {
+  REVIEWED_CAPABILITY_EVIDENCE,
+  buildReviewedCapabilityExcerpt,
+  routeCapabilityFamily,
+} from './capability-families.mjs';
 import { tokenize, buildCorpusStats, bm25Score } from './forge-hybrid.mjs';
 import {
   assessImplementation,
@@ -31,6 +45,31 @@ import {
   implementationNotice,
   requiresImplementationProof,
 } from './implementation-evidence.mjs';
+import {
+  exactIdentifiers,
+  exactMemberIndexPresence,
+  identifierBoost,
+  identifierCandidates,
+  identifierScan,
+  scannableIdentifiers,
+} from './identifier-lane.mjs';
+import {
+  freshnessAdvisory,
+  highestSemver,
+  isReleaseDocument,
+  compareSemver,
+  probeLiveVersions,
+  stalenessNotice,
+  versionIntent,
+} from './corpus-freshness.mjs';
+import {
+  QueryDeadlineExceeded,
+  armProcessWatchdog,
+  createDeadline,
+  describeDeadline,
+  resolveDeadlineMs,
+  DEADLINE_EXIT_CODE,
+} from './query-deadline.mjs';
 
 // TRANSCRIPT/dialogue stores need LEXICAL (BM25) candidate generation, not dense alone. A fact spoken
 // in passing ("…876 commits…") embeds poorly against a conceptual question, so dense buries it past
@@ -117,7 +156,7 @@ function manifestInventoryCandidates(dir, name, query, topN = 8) {
   const asksInventory = /\bnpm\b/.test(q)
     && /\b(?:crate|crates|cargo)\b/.test(q)
     && /\bworkspace\b/.test(q);
-  const namesRepo = new RegExp(`\\b${String(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(query);
+  const namesRepo = nameAppearsInQuery(name, query);
   if (!asksInventory || !namesRepo) return [];
   const e = bm25Corpus(dir, name);
   if (!e) return [];
@@ -293,7 +332,7 @@ function pythonFreeRustNeuralQuestion(query) {
 }
 
 function fixedModelHarnessEvolutionQuestion(query) {
-  const text = String(query || '');
+  const text = normalizeApostrophes(query || '');
   const harness =
     /\b(?:agent(?:'s)?\s+scaffolding|harness)\b/i.test(text);
   const improvement =
@@ -484,7 +523,8 @@ function sourceCardQueryMode(query) {
   return null;
 }
 
-function sourceCardHasUnsafePolarity(query) {
+export function sourceCardHasUnsafePolarity(query) {
+  query = normalizeApostrophes(query || ''); // "can’t" from a phone is still a negation
   return /\b(?:not|never|cannot|can't|doesn't|isn't|aren't|without)\b/i.test(query)
     || /\b(?:delete|destroy|discard|drop|erase|forget|lose|remove|wipe)(?:d|s|ing)?\b/i.test(query);
 }
@@ -1222,7 +1262,7 @@ async function sourcePassageTexts(dir, repo, allowedPaths) {
   const identity = `${stat.size}:${stat.mtimeMs}`;
   let cache = SOURCE_PASSAGE_CACHE.get(passageFile);
   if (!cache || cache.identity !== identity) {
-    cache = { identity, loaded: new Set(), texts: new Map() };
+    cache = { identity, loaded: new Set(), texts: new Map(), records: new Map() };
     SOURCE_PASSAGE_CACHE.set(passageFile, cache);
   }
   const unresolved = [...allowedPaths].filter((sourcePath) => !cache.loaded.has(sourcePath));
@@ -1231,13 +1271,21 @@ async function sourcePassageTexts(dir, repo, allowedPaths) {
     const needles = unresolved.map((sourcePath) => JSON.stringify(sourcePath));
     const input = fs.createReadStream(passageFile, { encoding: 'utf8' });
     const lines = readline.createInterface({ input, crlfDelay: Infinity });
+    let byteOffset = 0;
     try {
       for await (const line of lines) {
+        const lineOffset = byteOffset;
+        const lineBytes = Buffer.byteLength(line, 'utf8');
+        byteOffset += lineBytes + 1; // the passage index is LF-delimited JSONL
         if (!line.trim() || !needles.some((needle) => line.includes(needle))) continue;
         let passage;
         try { passage = JSON.parse(line); } catch { continue; }
         const sourcePath = String(passage?.path || '');
         if (!wanted.has(sourcePath)) continue;
+        const passageText = String(passage?.text || '');
+        const records = cache.records.get(sourcePath) || [];
+        if (records.length < 32) records.push({ offset: lineOffset, length: lineBytes, text: passageText });
+        cache.records.set(sourcePath, records);
         const previous = cache.texts.get(sourcePath) || '';
         if (previous.length >= 32_000) continue;
         cache.texts.set(
@@ -1254,6 +1302,35 @@ async function sourcePassageTexts(dir, repo, allowedPaths) {
   return new Map([...allowedPaths]
     .filter((sourcePath) => cache.texts.has(sourcePath))
     .map((sourcePath) => [sourcePath, cache.texts.get(sourcePath)]));
+}
+
+async function reviewedSourcePassage(dir, repo, sourcePath, expectedSha256) {
+  await sourcePassageTexts(dir, repo, new Set([sourcePath]));
+  const passageFile = [
+    path.join(dir, `${repo}.passages.jsonl`),
+    path.join(dir, `${repo}.big.passages.jsonl`),
+  ].find((file) => fs.existsSync(file));
+  if (!passageFile) return null;
+  const cache = SOURCE_PASSAGE_CACHE.get(passageFile);
+  let handle;
+  try {
+    handle = await fs.promises.open(passageFile, 'r');
+    for (const record of cache?.records.get(sourcePath) || []) {
+      const buffer = Buffer.alloc(record.length);
+      const { bytesRead } = await handle.read(buffer, 0, record.length, record.offset);
+      if (bytesRead !== record.length) continue;
+      let passage;
+      try { passage = JSON.parse(buffer.toString('utf8')); } catch { continue; }
+      if (passage?.path !== sourcePath || typeof passage?.text !== 'string') continue;
+      const digest = createHash('sha256').update(passage.text).digest('hex');
+      if (digest === expectedSha256) return passage.text;
+    }
+  } catch {
+    return null;
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+  return null;
 }
 
 async function graphMemoryPassageTexts(dir, repo, allowedPaths) {
@@ -1459,14 +1536,35 @@ function codeExampleWitnesses({
   return null;
 }
 
-function corpusAgeFor(dir, repos) {
+// A `git clone`/`npm install`/Docker COPY resets every tracked file's mtime to "now" — the same
+// checkout-freshness-vs-artifact-freshness gap ADR-069 named for brain-stamp.mjs's builtFromSha
+// (fixed by resolveBuiltFromSha, scripts/brain-stamp-resolve.mjs) and corpus-freshness.mjs's own
+// corpusSnapshotDate already works around. Prefer each store's recorded build time from
+// RVF-GENERATIONS.json; fall back to mtime only for a store with no generation record.
+function readGenerations(dir) {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(dir, 'RVF-GENERATIONS.json'), 'utf8'));
+    return raw?.stores || {};
+  } catch {
+    return {};
+  }
+}
+
+function builtUtcMs(generations, name) {
+  const key = Object.keys(generations).find((k) => k.toLowerCase() === String(name).toLowerCase());
+  const builtUtc = key ? generations[key]?.builtUtc : null;
+  return builtUtc && !Number.isNaN(Date.parse(builtUtc)) ? Date.parse(builtUtc) : null;
+}
+
+export function corpusAgeFor(dir, repos) {
+  const generations = readGenerations(dir);
   let oldest = null;
   let newest = null;
   for (const name of repos) {
     for (const candidate of [`${name}.big.rvf`, `${name}.rvf`]) {
       const storePath = path.join(dir, candidate);
       if (!fs.existsSync(storePath)) continue;
-      const mtimeMs = fs.statSync(storePath).mtimeMs;
+      const mtimeMs = builtUtcMs(generations, name) ?? fs.statSync(storePath).mtimeMs;
       if (oldest === null || mtimeMs < oldest.mtimeMs) oldest = { mtimeMs, name };
       if (newest === null || mtimeMs > newest.mtimeMs) newest = { mtimeMs, name };
       break;
@@ -1527,6 +1625,19 @@ async function sourceBackedCardLane({ dir, query, k, planned }) {
       )
       || k < 2
       || !planned?.repos?.length) return null;
+  // A SCOPED PACKAGE NAME IS A QUESTION ABOUT AN EXACT ARTIFACT, AND THIS LANE CANNOT TELL TWO
+  // NEAR-NAMED ARTIFACTS APART. Measured 2026-09-11: "What is the latest version of @ruvector/rvf
+  // and what changed in it recently?" was answered by THIS lane (routing.lane = source-backed-card,
+  // ceScore undefined — no retrieval, no reranking) with
+  // `ruvector/crates/rvf/rvf-node/package.json`. That is a DIFFERENT npm package, presented as the
+  // witness for the one the user named. The lane picks its witness by lexical overlap over
+  // <repo>.meta.json previews, which cannot distinguish `@ruvector/rvf` from `@ruvector/rvf-node`.
+  //
+  // Its sibling fast lane already refuses this exact class ("scoped package detail requires source
+  // retrieval (…)", card-lane.mjs answerFromCards) — the source lane simply never inherited the
+  // guard. Declining hands the question to the retrieval lane, which has both the exact-manifest
+  // boost (#31) and the deep exact-name rescue (#33 Part A) built for precisely this distinction.
+  if (scopedNamesIn(query).size) return null;
   const cards = loadCards(dir);
   if (!cards?.length) return null;
 
@@ -1537,8 +1648,20 @@ async function sourceBackedCardLane({ dir, query, k, planned }) {
     : planned.repos;
   for (const repo of proofRepos) {
     if (repo === 'concepts') continue;
-    const cardRepo = planned.cardRepos?.[repo] || repo;
-    const card = cards.find((candidate) => candidate.repo === cardRepo);
+    // ALIAS-AWARE, BECAUSE THE ROUTER IS. A store is routinely reached through a card written under
+    // a different heading — `metaharness` is served by the `agent-harness-generator` card, and
+    // store-root.mjs's darkStores() carries the identical fix with the identical example. Looking
+    // the card up by exact store name made this lane silently return null for every such store, so
+    // a question that the cards fully answer fell through to the cold embedder + cold reranker:
+    // tests/unit/forge-ask-all.test.mjs's colloquial scaffolding and cost-quality cases have been
+    // red on exactly that. `repositoryNames` is the ROUTER'S OWN resolver, imported rather than
+    // reimplemented; the exact-name lookup still wins so an explicit cardRepos mapping is honored.
+    const requestedCardRepo = planned.cardRepos?.[repo] || repo;
+    const aliasNames = new Set(repositoryNames(repo, dir).map((name) => String(name).toLowerCase()));
+    const card = cards.find((candidate) => candidate.repo === requestedCardRepo)
+      || cards.find((candidate) => aliasNames.has(String(candidate.repo).toLowerCase()));
+    // Downstream proof tokens must describe the card we ACTUALLY matched, not the name we asked for.
+    const cardRepo = card ? card.repo : requestedCardRepo;
     const metaFile = path.join(dir, `${repo}.meta.json`);
     if (!card || !fs.existsSync(metaFile)) continue;
 
@@ -2312,15 +2435,259 @@ async function sourceBackedCardLane({ dir, query, k, planned }) {
 // Discover the repos present in a bundle dir: every <repo>.rvf (the `.big.rvf` is the same repo's
 // sharp variant, not a separate repo; idmap/embed/passages sidecars are not stores). Returns the
 // unique base names, so searchKb can then pick big-vs-small per repo on its own.
+// A Brain that lived on exFAT/FAT/NTFS carries macOS AppleDouble `._<name>` twins (`._ruvector.rvf`) and
+// .DS_Store; they are the volume's, never a store (tests/unit/volume-metadata-not-stores.test.mjs).
 export function discoverRepos(dir) {
   const names = new Set();
   for (const f of fs.readdirSync(dir)) {
+    if (f.startsWith('._')) continue;                  // volume metadata, not a store
     const m = f.match(/^(.+?)(\.big)?\.rvf$/);
     if (!m) continue;                                  // not an rvf store
     if (/\.(idmap|embed)\b/.test(f)) continue;         // sidecar, not a store
     names.add(m[1]);
   }
   return [...names].sort();
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Hyphen-safe word boundary (issue #283). A bare `\b` boundary treats a hyphen as a word break,
+// so `\bruvector\b` also matches inside "ruvector-core" -- the SHORTER sibling of every
+// hyphen-prefixed compound store (ruvnet/ruvnet-brain, sparc/sparc-ide, ruos/ruos-macair,
+// electo1/electo1-js, ruvector/ruvector-core) falsely reads as "named" whenever the query actually
+// names the longer, compound one. This is the exact technique inventoryReposFromQuery already used
+// correctly (immediately below); isNamed/NAME_BOOST and manifestInventoryCandidates now share it
+// rather than each inventing their own bare-`\b` pattern.
+function nameAppearsInQuery(name, query) {
+  return new RegExp(`(?:^|[^a-z0-9._-])${escapeRegExp(name)}(?=$|[^a-z0-9._-])`, 'i').test(query);
+}
+
+export function deployedFamilyReposFromQuery(query, dir, availableRepos) {
+  const available = Array.isArray(availableRepos) ? availableRepos : [];
+  if (!available.length) return [];
+  const byLower = new Map(available.map((repo) => [String(repo).toLowerCase(), repo]));
+  const qIdentityPhrase = String(query || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  if (!qIdentityPhrase) return [];
+  for (const [canonical, aliases] of Object.entries(loadRepoAliases(dir))) {
+    const identityNames = [canonical, ...aliases];
+    const queryNamesFamily = identityNames.some((name) => {
+      const phrase = String(name || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+      return phrase.length >= 3
+        && new RegExp(`(?:^|\\s)${escapeRegExp(phrase)}(?:$|\\s)`).test(qIdentityPhrase);
+    });
+    if (!queryNamesFamily) continue;
+    const repos = [...new Set(identityNames
+      .map((name) => byLower.get(String(name).toLowerCase()))
+      .filter(Boolean))];
+    if (repos.length >= 2) return repos;
+  }
+  return [];
+}
+
+// ── THE ROUTER METADATA INDEX ─────────────────────────────────────────────────────────────────
+// metadataSourceRoute used to re-read and re-tokenize every <repo>.meta.json on EVERY query: 82 MB
+// across the 4.3.37 corpus, ~11-13 s cold. This keeps one inverted index per store file (token ->
+// entry ids), so the long-lived MCP worker parses each store once per KB build. The counts it yields
+// are the per-entry scan's counts exactly (tests/unit/router-metadata-index.test.mjs compares them).
+//
+// NEVER A STALE INDEX AFTER AN UPDATE. An update swaps the whole kb/ directory under the same path,
+// extracted files can carry archive mtimes, and a changed store can keep its byte size, so
+// (mtime, size) alone is not an identity. Every store index belongs to one KB BUILD IDENTITY
+// (kb-build-identity.mjs) and is keyed by the store file's own (dev, inode, mtime, size). A new
+// build of a directory replaces that directory's whole index before anything is served.
+//
+// COMPACT, AND BOUNDED. The first version kept a Map<token, Uint32Array> per store: 162.5 MB
+// retained for 199 stores (scripts/route-index-memory.mjs, 4.3.37 corpus), almost all of it object
+// and string overhead. Now each directory build has ONE token dictionary (token -> id, shared by
+// every store), and each store keeps three typed arrays in CSR form: its sorted token ids, offsets,
+// and the concatenated entry ids. Indexes for at most META_INDEX_DIRS_MAX directories are kept
+// (least recently used first out), so alternating between two KB directories does not rebuild.
+const META_INDEX_DIRS_MAX = 2;
+const _metaIndexes = new Map(); // resolved dir -> { build, dict: Map<token, id>, files: Map<file, store> }
+export { kbBuildIdentity };
+
+function metadataDirIndex(dir, build) {
+  const k = path.resolve(dir);
+  let d = _metaIndexes.get(k);
+  if (!d || d.build !== build) d = { build, dict: new Map(), files: new Map() };
+  _metaIndexes.delete(k);
+  _metaIndexes.set(k, d);
+  while (_metaIndexes.size > META_INDEX_DIRS_MAX) _metaIndexes.delete(_metaIndexes.keys().next().value);
+  return d;
+}
+
+function metadataIndex(dir, repo, d) {
+  const file = path.join(dir, `${repo}.meta.json`);
+  let stat;
+  try { stat = fs.statSync(file); } catch { return null; }
+  const key = `${stat.dev}:${stat.ino}|${stat.mtimeMs}|${stat.size}`;
+  const cached = d.files.get(file);
+  if (cached?.key === key) return cached;
+  let metadata;
+  try { metadata = parseMetadataFile(file); } catch { d.files.delete(file); return null; }
+  const lists = new Map(); // token id -> entry ids (temporary)
+  let id = 0;
+  for (const row of Object.values(metadata.entries || {})) {
+    for (const token of new Set(contentTokens(`${row.title || ''} ${row.preview || ''}`))) {
+      let tid = d.dict.get(token);
+      if (tid === undefined) d.dict.set(token, (tid = d.dict.size));
+      let list = lists.get(tid);
+      if (!list) lists.set(tid, (list = []));
+      list.push(id);
+    }
+    id++;
+  }
+  const tids = Uint32Array.from(lists.keys()).sort();
+  const offsets = new Uint32Array(tids.length + 1);
+  let total = 0;
+  for (let i = 0; i < tids.length; i++) { offsets[i] = total; total += lists.get(tids[i]).length; }
+  offsets[tids.length] = total;
+  const ids = new Uint32Array(total);
+  for (let i = 0; i < tids.length; i++) ids.set(lists.get(tids[i]), offsets[i]);
+  const store = { key, tids, offsets, ids };
+  d.files.set(file, store);
+  return store;
+}
+
+function metadataPostings(store, tid) {
+  let lo = 0;
+  let hi = store.tids.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    const v = store.tids[mid];
+    if (v === tid) return store.ids.subarray(store.offsets[mid], store.offsets[mid + 1]);
+    if (v < tid) lo = mid + 1; else hi = mid - 1;
+  }
+  return null;
+}
+
+// At most this many metadata stores join a route, all of them tied at the best overlap.
+export const METADATA_ROUTE_TIES = 3;
+
+// Metadata proposes a small bounded set of source stores; only normal retrieval can answer.
+export function metadataSourceRoute(query, dir, availableRepos) {
+  const terms = new Set(contentTokens(query));
+  if (terms.size < 3) return null;
+  const d = metadataDirIndex(dir, kbBuildIdentity(dir));
+  const candidates = [];
+  for (const repo of availableRepos) {
+    const index = metadataIndex(dir, repo, d);
+    if (!index) continue;
+    const perEntry = new Map();
+    for (const term of terms) {
+      const tid = d.dict.get(term);
+      const postings = tid === undefined ? null : metadataPostings(index, tid);
+      if (postings) for (const entryId of postings) perEntry.set(entryId, (perEntry.get(entryId) || 0) + 1);
+    }
+    // overlap: the best single entry's count of query terms. atTop: how many entries reach it.
+    let overlap = 0;
+    let atTop = 0;
+    for (const matches of perEntry.values()) {
+      if (matches > overlap) { overlap = matches; atTop = 1; } else if (matches === overlap) atTop++;
+    }
+    if (overlap >= 3) candidates.push({ repo, overlap, atTop });
+  }
+  // THE TIE-BREAK. On the 206-question novice need set most questions tie at the top overlap, and
+  // the tie used to be broken by repository NAME, so the alphabetically first store won and only it
+  // was searched. Keep up to METADATA_ROUTE_TIES of the stores tied at the best overlap, ordered by
+  // how many of their entries reach that overlap (a store that covers the need in many documents
+  // before one that covers it in a single preview); the name stays the last, deterministic key.
+  candidates.sort((a, b) => b.overlap - a.overlap || b.atTop - a.atTop || a.repo.localeCompare(b.repo));
+  const tied = candidates.filter(({ overlap }) => overlap === candidates[0]?.overlap).slice(0, METADATA_ROUTE_TIES);
+  const available = new Set(availableRepos);
+  const cardCandidates = (loadCards(dir) || []).filter((card) => available.has(card.repo))
+    .map((card) => ({ repo: card.repo, overlap: [...terms].filter((term) => card.tokenSet.has(term)).length }))
+    .filter(({ overlap }) => overlap >= 3)
+    .sort((a, b) => b.overlap - a.overlap || a.repo.localeCompare(b.repo));
+  // Keep both independent routing hints: compact cards and source metadata have different gaps.
+  const repos = [...new Set([...tied, ...cardCandidates.slice(0, 2)]
+    .map(({ repo }) => repo))];
+  return repos.length ? { repos, namedRepos: [], cardRepos: {}, confidence: 'candidate',
+    reason: 'bounded source metadata and card shortlist; retrieval must independently establish relevance' } : null;
+}
+
+function inventoryReposFromQuery(query, dir, availableRepos) {
+  const available = Array.isArray(availableRepos) ? availableRepos : [];
+  if (!available.length) return null;
+  const byLower = new Map(available.map((repo) => [String(repo).toLowerCase(), repo]));
+  const directives = [...String(query || '').matchAll(/\brepo:([a-z0-9._-]+)/gi)]
+    .map((match) => byLower.get(match[1].toLowerCase()))
+    .filter(Boolean);
+  if (directives.length) {
+    const repos = [...new Set(directives)];
+    return {
+      repos,
+      namedRepos: repos,
+      cardRepos: {},
+      inventoryScope: true,
+      confidence: 'named',
+      reason: `query explicitly selects deployed inventory repo(s): ${repos.join(', ')}`,
+    };
+  }
+
+  const qIdentityPhrase = String(query || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  if (!qIdentityPhrase) return null;
+  const familyRepos = deployedFamilyReposFromQuery(query, dir, available);
+  if (familyRepos.length) {
+    return {
+      repos: familyRepos,
+      namedRepos: familyRepos,
+      cardRepos: {},
+      inventoryScope: true,
+      familyScope: true,
+      confidence: 'named',
+      reason: `query names deployed inventory family: ${familyRepos.join(', ')}`,
+    };
+  }
+  const named = [];
+  const exactInventory = [];
+  const naturalProjectScope = [];
+  for (const repo of available) {
+    if (repo.length > 4 && nameAppearsInQuery(repo, query)) {
+      exactInventory.push(repo);
+    }
+    const names = repositoryNames(repo, dir);
+    const phrases = names.map((name) => String(name || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim())
+      .filter((phrase) => phrase.length >= 3);
+    if (phrases.some((phrase) =>
+      new RegExp(`(?:^|\\s)in\\s+(?:the\\s+)?${escapeRegExp(phrase)}\\s+(?:project|repo|repository)(?:$|\\s)`)
+        .test(qIdentityPhrase))) {
+      naturalProjectScope.push(repo);
+    }
+    if (phrases.some((phrase) => {
+      return new RegExp(`(?:^|\\s)${escapeRegExp(phrase)}(?:$|\\s)`).test(qIdentityPhrase);
+    })) {
+      named.push(repo);
+    }
+  }
+  if (naturalProjectScope.length) {
+    const repos = [...new Set(naturalProjectScope)];
+    return {
+      repos,
+      namedRepos: repos,
+      cardRepos: {},
+      inventoryScope: true,
+      naturalProjectScope: true,
+      confidence: 'named',
+      reason: `query explicitly selects deployed project repo(s): ${repos.join(', ')}`,
+    };
+  }
+  if (exactInventory.length) return {
+    repos: exactInventory, namedRepos: exactInventory, cardRepos: {}, confidence: 'named',
+    exactInventoryScope: true, reason: `query names deployed source store(s): ${exactInventory.join(', ')}`,
+  };
+  if (!named.length) return null;
+  const repos = [...new Set(named)];
+  return {
+    repos,
+    namedRepos: repos,
+    cardRepos: {},
+    inventoryScope: true,
+    confidence: 'named',
+    reason: `query names deployed inventory repo(s): ${repos.join(', ')}`,
+  };
 }
 
 // The scoped `@scope/name` tokens a query explicitly contains. ONE definition, because two places
@@ -2340,6 +2707,26 @@ export function scopedNamesIn(query) {
 // the trade can take it with KB_CE_MAX_PAIRS — the number is theirs to choose, with the curve in
 // front of them, which is not the same thing as choosing it for everyone by default.
 export const CE_MAX_PAIRS_DEFAULT = 0;
+
+// ── THE FULL-CORPUS FALLBACK BUDGET ───────────────────────────────────────────────────────────
+//
+// CE_MAX_PAIRS_DEFAULT above is 0 for the lane ADR-0059 measured: a ROUTED query, ~69 stores,
+// ~607 pairs, where no budget bought wall time without costing answers. That premise does not
+// survive the lane below it. When card routing cannot place a query the CLI fans out to EVERY
+// store, and the corpus has since grown to 184: measured 2026-09-11 on the installed store
+// (~/.cache/ruvnet-brain/kb, builtUtc 2026-08-20T07:16:20.675Z) the unscoped fanout for
+// "What is the latest version of @claude-flow/aidefence …" pools **6,691 pairs** — 11x the regime
+// ADR-0059 chose 0 for — and the cross-encoder reads every one of them in full. At the rate
+// measured on that exact pool (26.6 ms/pair on a quiet machine, 482 ms/pair under the load the
+// original report was taken at) that is 178 s to 54 minutes for ONE question, with no output and
+// no timeout. That is the hang.
+//
+// 408 IS NOT A NEW NUMBER. It is the value the repo's own cap study already landed on
+// (evals/runs/2026-07-27-cross-encoder-pool-cap.md, line 128: "B=408 is the value to use"):
+// floor1+dist B=408 keeps 113/120 top-1 identical, 194/220 top-3 retained, with +0/-0 graded
+// flips. Applying it HERE and ONLY here is the whole point — the routed lane, which is every
+// question in the held-out gate, still runs uncapped and byte-for-byte as before.
+export const FULL_CORPUS_MAX_PAIRS_DEFAULT = 408;
 
 // ── THE CROSS-ENCODER POOL CAP ────────────────────────────────────────────────────────────────
 //
@@ -2458,7 +2845,7 @@ export function cascadeRerankPool(candidates, { limit, s1 }) {
 // pool cap's effect on ANSWERS affordable: score the full 605-pair pool once, then replay every
 // candidate policy against those exact scores — exactly, not approximately. Works on shallow
 // copies because the boosts mutate ceScore, and a replay must not poison the next replay's input.
-export function selectResults({ query, ranked, k = 6 }) {
+export function selectResults({ query, ranked, k = 6, pruneIrrelevant = true }) {
   ranked = ranked.map((r) => ({ ...r }));
   const queriedNames = scopedNamesIn(query);
   // Repo-name affinity: when the question explicitly NAMES a repo ("Does QuDAG…", "what can SAFLA do",
@@ -2469,15 +2856,20 @@ export function selectResults({ query, ranked, k = 6 }) {
   // Word-boundary match on the repo name (not substring) so `fact` doesn't fire on "facts", while
   // multi-word names like `agent-harness-generator` still match. Boost clears a sibling that merely
   // *contains a file named after* the repo (e.g. dspy.ts/…/safla.ts) when the question names the repo.
-  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   // Length floor 3, not 4: the floor exists to keep trivial tokens from matching, but two REAL
   // stores have 3-char names (rvm, daa) and the old >=4 floor silently exempted them from the
   // affinity boost — "Can RVM partition hardware…" lost to ruvector's vendored crates/rvm/ copy
   // because rvm's own userguide never got the boost its name earned. Word-boundary matching
   // already prevents substring hits, so 3-char store names are safe to honor.
+  //
+  // A bare `\b` boundary is NOT hyphen-safe: a hyphen is a non-word character, so `\bruvector\b`
+  // also matches inside "ruvector-core" -- the SHORTER sibling of every hyphen-prefixed compound
+  // store falsely reads as named whenever the query actually names the longer, compound one.
+  // nameAppearsInQuery is the same hyphen-safe boundary inventoryReposFromQuery already uses
+  // correctly (above) -- reused here rather than inventing a second pattern (issue #283).
   const isNamed = (repo) => {
     const names = repositoryNames(repo);
-    return names.some((n) => n.length >= 3 && new RegExp(`\\b${esc(n)}\\b`, 'i').test(query));
+    return names.some((n) => n.length >= 3 && nameAppearsInQuery(n, query));
   };
   const NAME_BOOST = 2.0;
   for (const r of ranked) {
@@ -2537,6 +2929,44 @@ export function selectResults({ query, ranked, k = 6 }) {
       }
     }
   }
+  // ── EXACT-IDENTIFIER EVIDENCE (kb/identifier-lane.mjs) ───────────────────────────────────────
+  // An identifier is the one kind of token whose whole value is that it does NOT generalise, which
+  // is exactly what a bi-encoder is built to destroy. Candidates that carry the question's
+  // identifiers are lifted by what they EARNED: a mention is the floor (all an echo of the question
+  // can ever get), and the rank is decided by definition-shaped context and by the document's own
+  // path. Measured case: "Which is canonical: .swarm/memory.db or .swarm/agentdb-memory.db?"
+  for (const r of ranked) {
+    if (r.ceScore == null || !r._exactIdentifier) continue;
+    const boost = identifierBoost(r._exactIdentifier);
+    if (boost > 0) { r.ceScore += boost; r.identifierBoosted = boost; }
+  }
+
+  // ── VERSION INTENT: THE NEWEST RELEASE RECORD WINS (kb/corpus-freshness.mjs) ──────────────────
+  // "What is the latest version of X" is not a similarity question. Measured 0/8 current answers
+  // on 2026-09-11: agentdb returned a "v3.0.0-alpha.6 Publishing Guide" while the live registry was
+  // at 3.0.0-alpha.20, and agentic-qe returned v3.9.11 notes while THE SAME CORPUS holds the
+  // v3.13.2 changelog. The second one is not a coverage gap; it is a ranking gap, and it is the one
+  // this fixes: among the release records in the pool, the one naming the highest semver wins.
+  const intent = versionIntent(query);
+  if (intent.intent) {
+    let best = null;
+    for (const r of ranked) {
+      if (r.ceScore == null) continue;
+      r._releaseDoc = isReleaseDocument(r);
+      r._topSemver = highestSemver(`${r.title || ''}\n${r.fullText || r.text || ''}`);
+      if (r._releaseDoc && compareSemver(r._topSemver, best) > 0) best = r._topSemver;
+    }
+    for (const r of ranked) {
+      if (r.ceScore == null) continue;
+      if (r._releaseDoc) { r.ceScore += 2.0; r.releaseDocBoosted = true; }
+      // Only the release record that actually carries the newest version the pool knows about —
+      // a changelog chunk stuck three minor versions back is precisely the failure being fixed.
+      if (r._releaseDoc && best && r._topSemver && compareSemver(r._topSemver, best) === 0) {
+        r.ceScore += 3.0; r.newestReleaseBoosted = true;
+      }
+    }
+  }
+
   ranked.sort((a, b) => (b.ceScore ?? -Infinity) - (a.ceScore ?? -Infinity));
 
   // ── BARE ADR-NUMBER QUERIES ARE AMBIGUOUS (issue #33 Part B, Jan Lafko / @lafinak) ────────────
@@ -2628,7 +3058,24 @@ export function selectResults({ query, ranked, k = 6 }) {
   // Never hand back what the reranker already rejected. A negative cross-encoder score means "not
   // relevant to this query"; passing it along as a result is how noise becomes a conclusion. The
   // single best hit is always kept, so a caller can still see the strongest thing that exists.
-  const kept = results.filter((r, i) => i === 0 || (r.ceScore ?? -Infinity) >= 0);
+  //
+  // A candidate the repo-name-affinity boost above already fired on (r.nameBoosted) is ALSO exempt
+  // — a deliberate recall-over-precision call, not a lane-based one. Found live 2026-09-12 against
+  // the real release candidate: every "In the <repo> repository, ..." retrieval-canary query names
+  // its repo, and this filter was discarding the oracle's own verified-correct passage in exactly
+  // the repos where it scored negative on the cross-encoder's ABSOLUTE, post-boost scale — even
+  // though the query already told us which repo the answer must come from. A first attempt exempted
+  // whole search LANES (searchAll's fullCorpusLane) instead of individual candidates; Dual review
+  // caught that the live search_ruvnet path calls searchAll with allowFullCorpus:false, where that
+  // lane is unreachable — the lane-based version would have silently disabled this entire filter on
+  // every production query, not just named-repo ones. Gating on r.nameBoosted instead means: pruning
+  // stays ON in every lane, for every candidate, and the exemption applies only to the specific
+  // passages whose own repo the query's text literally names (or aliases) — an unrelated widened
+  // sibling repo's near-duplicate content (e.g. ruvector vendoring a copy of skygraph's own example)
+  // is untouched and still gets pruned like any other irrelevant noise.
+  const kept = pruneIrrelevant
+    ? results.filter((r, i) => i === 0 || r.nameBoosted || (r.ceScore ?? -Infinity) >= 0)
+    : results;
   const droppedIrrelevant = results.length - kept.length;
   results = kept;
 
@@ -2657,88 +3104,434 @@ export function selectResults({ query, ranked, k = 6 }) {
 }
 
 // Query every repo, pool, rerank on a common scale, return global top-k labeled by repo.
-export async function searchAll({
-  dir, query, k = 6, pool = 8, repos, _routeStage = false, allowFullCorpus = true,
+function traceRetrieval(record) {
+  const target = process.env.KB_RETRIEVAL_TRACE;
+  if (!target) return undefined;
+  try { fs.appendFileSync(target, `${JSON.stringify({ ts: new Date().toISOString(), ...record })}\n`); }
+  catch { /* diagnostics must never affect retrieval */ }
+  return undefined;
+}
+
+// Related documentation is additive: it never chooses the primary search scope or changes
+// relevance / implementation verdicts. Verify actual source bytes on every invocation.
+export async function relatedCapabilitySources({ dir, query, repos }) {
+  try {
+    const available = discoverRepos(dir);
+    const family = routeCapabilityFamily(query, available);
+    if (!family) return [];
+    const owner = family.repos[0];
+    const named = routeReposFromCards(query, dir, available).namedRepos || [];
+    if ((repos?.length && !repos.includes(owner)) || (named.length && !named.includes(owner))) return [];
+    const witness = await reviewedCapabilityWitness({ dir, repo: owner, family: family.family });
+    if (!witness) return [];
+    return [{
+      repo: witness.repo, path: witness.path, title: witness.title,
+      text: witness.text, evidenceClass: 'documentation',
+      relation: family.family,
+      passageSha256: witness._sourcePassageSha256,
+      excerptSha256: createHash('sha256').update(witness.text).digest('hex'),
+      scope: family.family === 'local-vector-storage'
+        ? 'Browser vector search and IndexedDB persistence documentation. Does not establish native Rust support, crash-recovery guarantees, or tested runtime behavior.'
+        : 'Explicit IPFS publish/load instructions requiring PINATA_API_JWT. Does not establish automatic, credential-free, or offline cross-project learning; runtime behavior not verified.',
+    }];
+  } catch { return []; } // Optional discovery cannot break primary retrieval.
+}
+
+export async function searchAll(options) {
+  const primary = await searchAllPrimary(options);
+  const relatedSources = await relatedCapabilitySources(options);
+  return { ...primary, ...(relatedSources.length ? { relatedSources } : {}) };
+}
+
+async function reviewedCapabilityWitness({ dir, repo, family }) {
+  const reviewed = REVIEWED_CAPABILITY_EVIDENCE[String(family || '')];
+  if (!reviewed || reviewed.repo !== repo) return null;
+  const metaFile = path.join(dir, `${repo}.meta.json`);
+  if (!fs.existsSync(metaFile)) return null;
+  let meta;
+  try { meta = parseMetadataFile(metaFile); }
+  catch { return null; }
+  const entry = Object.values(meta.entries || {}).find((item) =>
+    item?.path === reviewed.path && ['doc', 'skill', 'tutorial', 'adr'].includes(String(item.kind || '').toLowerCase()));
+  if (!entry) return null;
+  const sourceText = await reviewedSourcePassage(dir, repo, reviewed.path, reviewed.passageSha256);
+  if (!sourceText) return null;
+  const excerpt = buildReviewedCapabilityExcerpt(sourceText, reviewed);
+  if (!excerpt) return null;
+  return {
+    repo,
+    path: reviewed.path,
+    title: String(entry.title || path.basename(reviewed.path)),
+    kind: String(entry.kind || 'doc').toLowerCase(),
+    text: excerpt,
+    fullText: excerpt,
+    score: null,
+    ceScore: null,
+    bestDistance: null,
+    chunksJoined: 1,
+    truncated: false,
+    direct: [],
+    corroborating: [],
+    _lane: 'rescue',
+    _proofMethod: 'reviewed-capability-witness-candidate',
+    _sourcePassageSha256: reviewed.passageSha256,
+  };
+}
+
+// A bare "rUv" names the AUTHOR, not a provenance request. Newcomers write "which rUv tool gives my
+// agents memory?" or "rUv's agent orchestration framework": product questions that the old rule
+// sent to the gist store ALONE (measured 2026-10-01: 5 of 6 such probes on the 4.3.37 corpus).
+// A first fix matched any authorship WORD anywhere in the question, and review found that product
+// questions still contain those words ("lets my agents SHARE memory", "how many THREADS",
+// "hardware SPECS", "WRITES vectors to disk", "WRITING tests", "POST a task"). So "rUv" signals
+// provenance only in an authorship SHAPE:
+//   - rUv as the subject of an act of saying or publishing: "did/has rUv write|say|post|announce|
+//     share|publish ...", "has rUv been working on", or "rUv wrote|published|announced ...";
+//   - rUv's written artifact: "rUv's tutorial|blog post|article|essay|gist|write-up|announcement|
+//     newsletter|tweet|specification" (up to four words between), or "rUv's posts|talks|threads|
+//     notes|videos ABOUT/ON ...".
+export function ruvAuthorshipIntent(query) {
+  const q = normalizeApostrophes(query || '');
+  if (!/\brUv(?:'s)?(?!-)\b/i.test(q)) return false;
+  const actVerb = String.raw`(?:publish(?:ed)?|wr(?:ite|ote|itten)|post(?:ed)?|sa(?:y|id)|announc(?:e|ed)|shar(?:e|ed)|tweet(?:ed)?|blog(?:ged)?|talk(?:ed)?\s+about)`;
+  return new RegExp(String.raw`\b(?:did|has|have)\s+rUv\s+(?:\w+\s+){0,2}?(?:${actVerb}|been\s+(?:working|building|posting|writing))\b`, 'i').test(q)
+    || /\brUv\s+(?:has\s+|had\s+)?(?:published|wrote|written|posted|said|announced|tweeted|blogged)\b/i.test(q)
+    || /\brUv's\s+(?:[\w-]+\s+){0,4}?(?:tutorials?|blog(?:\s+posts?)?|articles?|essays?|gists?|write[- ]?ups?|announcements?|newsletters?|tweets?|specification)\b/i.test(q)
+    || /\brUv's\s+(?:posts?|talks?|threads?|notes|videos?)\s+(?:about|on)\b/i.test(q);
+}
+
+// The source-route plan for an unscoped question: which stores the bounded search opens, and why.
+// Pure routing (cards, deployed inventory, source metadata, intent owners, identifier widening); it
+// loads no model and retrieves nothing, so a route-only measurement calls exactly what search runs.
+// A REPOSITORY NAME IS NOT AN IDENTIFIER. "RuVector" is PascalCase, so the identifier lane read it as
+// a rare symbol, scanned every sidecar for "ruvector" and WIDENED the route to the stores that merely
+// depend on it (agentdb, agentic-flow). Their manifests declare `"ruvector": "^x"`, which the lane
+// counts as a definition (+5), so "RuVector HNSW vector search overview" was answered from agentdb
+// at 9.336 (plugin/test/capability-selection-questions.json; found 2026-10-01 on the 4.4.0 corpus).
+// The name routers already handle a named store; the identifier lane is for rare tokens. A token
+// that is the key or a registered alias of a deployed store therefore never widens the route and
+// never adds candidates in ANOTHER store. Inside the store it names it is still an identifier:
+// "In LatentMesh ADR-001, ..." finds latentmesh's own ADR-001 through it (the recall gate lost
+// that question when store names were dropped everywhere; measured 2026-10-01, final-a2adf94a).
+// `forStore(name)` gives the tokens the identifier lane may use while searching `name`.
+// ONLY NAMES ARE NAMES (review S5, 2026-10-01). The alias registry also lists CODE SYMBOLS a store owns
+// (kb/repo-aliases.json: ruvector -> RvfStore, RvfDatabase), so "Where does agentdb call
+// RvfDatabase.openReadonly?" lost RvfDatabase in every store but ruvector — exactly where it was asked about.
+// So a registered alias suppresses widening only when it is NAME-shaped (one word, or words joined by
+// spaces/hyphens; not camelCase/PascalCase/snake_case/dotted — kb/identifier-lane.mjs's own symbol shapes),
+// and ANY token the query itself uses as code (`Name.member`, `Name(`, `Name::`) is an identifier whatever
+// it is called. Ownership is a MULTI-map: one name may belong to several stores ("metaharness" is both a
+// deployed store and an alias of agent-harness-generator), and forStore(name) keeps it when ANY owner is name.
+const CODE_SHAPED_ALIAS = /^(?:[a-z]+(?:[A-Z][a-z0-9]+)+|(?:[A-Z][a-z0-9]+){2,}|[A-Za-z0-9]+(?:_[A-Za-z0-9]+)+|.*[.()]|.*::.*)$/;
+export function queryIdentifiers(dir, query) {
+  const owners = new Map(); // lower-cased store key or name-shaped alias -> Set of lower-cased store keys
+  const own = (name, store) => {
+    const key = String(name).toLowerCase();
+    if (!owners.has(key)) owners.set(key, new Set());
+    owners.get(key).add(String(store).toLowerCase());
+  };
+  for (const r of discoverRepos(dir)) own(r, r);
+  for (const [canonical, aliases] of Object.entries(loadRepoAliases(dir) || {})) {
+    own(canonical, canonical);
+    for (const a of aliases || []) if (!CODE_SHAPED_ALIAS.test(String(a).trim())) own(a, canonical);
+  }
+  const usedAsCode = new Set();
+  // Immediately followed by member access, a path separator or a call: "Name.method", "Name::new", "Name(".
+  // "RuVector. Then", "RuVector (the store)" are prose, not code.
+  for (const m of String(query || '').matchAll(/([A-Za-z_$][\w$-]*)(?:\.[A-Za-z_$]|::|\()/g)) usedAsCode.add(m[1].toLowerCase());
+  const exact = exactIdentifiers(query);
+  const scan = scannableIdentifiers(query);
+  const ownersOf = (t) => (usedAsCode.has(String(t).toLowerCase()) ? null : owners.get(String(t).toLowerCase()));
+  const keep = (t) => !ownersOf(t);
+  const forStore = (store) => {
+    const name = String(store).toLowerCase();
+    const ok = (t) => keep(t) || ownersOf(t).has(name);
+    return { identifierTokens: exact.filter(ok), identifierScanTokens: scan.filter(ok) };
+  };
+  return { identifierTokens: exact.filter(keep), identifierScanTokens: scan.filter(keep), forStore };
+}
+
+export function planSourceRoute({ dir, query, discovered, identifierScanTokens = queryIdentifiers(dir, query).identifierScanTokens, deadline = null }) {
+  const inventoryDirective = inventoryReposFromQuery(query, dir, discovered);
+  let planned = inventoryDirective && (
+    inventoryDirective.familyScope
+    || inventoryDirective.naturalProjectScope
+    || /\brepo:[a-z0-9._-]+\b/i.test(String(query || ''))
+  )
+    ? inventoryDirective
+    : routeReposFromCards(query, dir, discovered);
+  if (!planned.repos.length && inventoryDirective?.exactInventoryScope) planned = inventoryDirective;
+  const cardRejectedExternalQuery = planned.confidence === 'none'
+    && /outside the card catalogue/i.test(String(planned.reason || ''));
+  if (!planned.repos.length && !cardRejectedExternalQuery) {
+    planned = metadataSourceRoute(query, dir, discovered) || planned;
+  }
+  // Cost/quality questions have a known multi-repo answer surface.  Metadata overlap alone
+  // routinely routes these to an unrelated memory store (for example AgentDB), then forces the
+  // uncapped 6k+ passage fallback.  Keep the source search bounded to the reviewed owners; the
+  // cross-encoder still proves which one answers, and concepts remains the honest card fallback.
+  // AN OWNER LIST THAT MATCHES NOTHING MUST NOT OVERWRITE A ROUTE THAT DID. These intent
+  // overrides name the reviewed owners on the REAL corpus; on any other bundle the filter can
+  // collapse to `concepts` alone (or to nothing), and overwriting the card router's correct
+  // answer with that turned a card-answerable question into a cold embedder + cold reranker
+  // load. `concepts` is an aggregate primer store, never an implementation owner — it cannot
+  // carry the source proof these intents exist to find, so it does not count as a reason to
+  // override. Measured by tests/unit/forge-ask-all.test.mjs's colloquial cost-quality case.
+  const ownsSource = (repos) => repos.some((repo) => repo !== 'concepts');
+  if (costQualityTradeoffQuestion(query)) {
+    const costRepos = ['agentic-flow', 'metaharness', 'agentic-qe', 'concepts']
+      .filter((repo) => discovered.includes(repo));
+    if (ownsSource(costRepos)) {
+      planned = {
+        repos: costRepos,
+        namedRepos: [],
+        cardRepos: {},
+        confidence: 'described',
+        reason: 'cost/quality intent selects reviewed routing and evaluation owners',
+      };
+    }
+  }
+  // The harness-evolution question names a logical product whose deployed store is the
+  // `metaharness` alias.  Keep that route bounded; eval grading resolves the alias from the
+  // shipped repo-aliases registry instead of treating it as a different product.
+  if (fixedModelHarnessEvolutionQuestion(query)) {
+    const harnessRepos = ['metaharness', 'concepts'].filter((repo) => discovered.includes(repo));
+    if (ownsSource(harnessRepos)) {
+      planned = {
+        repos: harnessRepos,
+        namedRepos: [],
+        cardRepos: {},
+        confidence: 'described',
+        reason: 'fixed-model harness-evolution intent selects metaharness and its canonical card',
+      };
+    }
+  }
+  // Failure-triggered escalation is the companion cost-routing surface: agentic-flow owns the
+  // runtime provider choice while metaharness owns the harness/cascade policy.  The generic card
+  // router often ranks Ruflo's orchestration prose first, which is a real source but not the
+  // capability this question asks about.  Keep the reviewed owners together and bounded.
+  if (cheapFirstFailureEscalationQuestion(query)) {
+    const escalationRepos = ['agentic-flow', 'metaharness', 'concepts']
+      .filter((repo) => discovered.includes(repo));
+    if (ownsSource(escalationRepos)) {
+      planned = {
+        repos: escalationRepos,
+        namedRepos: [],
+        cardRepos: {},
+        confidence: 'described',
+        reason: 'cheap-first escalation intent selects runtime routing and harness owners',
+      };
+    }
+  }
+  // Gist-shaped questions are provenance lookups.  Route them to the public gist store instead
+  // of letting generic card words select an arbitrary product (which made valid gist questions
+  // return no evidence under the bounded path).
+  // (?!-) after rUv/rUv's: a bare word-boundary regex treats the hyphen in every "ruv-<product>"
+  // name (ruv-swarm, ruv-fann, ruv-neural, ...) as a word break, so \brUv\b matched "ruv" inside
+  // EVERY product name in the ecosystem -- any question naming a real repo got redirected to the
+  // public gist store instead of the repo it named. Found live 2026-09-12: 100% of natural-language
+  // questions about ruv-FANN's own sub-projects (ruv-swarm, Neuro-Divergent) returned unrelated
+  // gist content under this exact reason string. rUv (the person) is never itself hyphenated into
+  // a compound name, so excluding that one case removes the false positive without narrowing the
+  // genuine "what did rUv publish" gist-provenance intent this line exists to catch.
+  //
+  // "published" alone is a common English word (issue #285, same root shape as the rUv-hyphen
+  // fix above -- a common word/fragment overriding a legitimate product question). A bare
+  // `\bpublished\b` fires on any question that happens to ask about a documented number rather
+  // than an actual gist/announcement: "What is the published SWE-Bench score of ruv-swarm?" has
+  // empty namedRepos (ruv-swarm's content lives inside a different store, and the query never
+  // literally names it), so this alternative alone silently redirected the question away from
+  // the real answer. Fix: exclude the "published <metric> ... of/for/by <something>" measurement-
+  // attribution shape, which is never itself a request for a gist -- narrower than dropping
+  // "published" outright, so "What did rUv publish about X" and "What was published this week?"
+  // still route correctly. Reviewed every other alternative in this regex for the same shape:
+  // gist/write-up/announcement/fable.md/first-to-market/agentbbs/jacobian-lens/workspace-lens/
+  // interpretability-package are all specific tokens or multi-word phrases, not bare common
+  // English words, so "published" was the only one exhibiting this failure mode.
+  const publishedAsMeasurementAttribution = new RegExp(
+    '\\bpublished\\b'
+      + '(?:\\s+\\S+){0,4}?\\s+(?:score|scores|result|results|benchmark|benchmarks|number|numbers'
+      + '|metric|metrics|figure|figures|version|versions|release|releases|rating|ratings|ranking|rankings)\\b'
+      + '(?:\\s+\\S+){0,3}?\\s+(?:of|for|by)\\b',
+    'i',
+  ).test(String(query || ''));
+  const ruvAuthorship = ruvAuthorshipIntent(query);
+  const gistIntent = (
+    /\b(?:gist|write[- ]up|announcement|fable\.md|first\s+to\s+market|agentbbs|jacobian[- ]lens|workspace[- ]lens|interpretability\s+package)\b/i.test(String(query || ''))
+    || ruvAuthorship
+    || (/\bpublished\b/i.test(String(query || '')) && !publishedAsMeasurementAttribution)
+  );
+  if (gistIntent && discovered.includes('ruv-gists') && !planned.namedRepos?.length) {
+    planned = {
+      repos: ['ruv-gists'],
+      namedRepos: [],
+      cardRepos: {},
+      confidence: 'described',
+      reason: 'provenance intent selects the public rUv gist store',
+    };
+  }
+  const escalationRepo = ['meta', 'harness'].join('');
+  if (cheapFirstFailureEscalationQuestion(query) && discovered.includes(escalationRepo)) {
+    planned.repos = [
+      escalationRepo,
+      ...planned.repos.filter((repo) => repo !== escalationRepo),
+    ];
+    planned.cardRepos = {
+      ...planned.cardRepos,
+      [escalationRepo]: 'agent-harness-generator',
+    };
+    planned.reason = 'source intent selects the cheap-verify-frontier escalation harness';
+  }
+  if (replayablePromotionRollbackQuestion(query) && discovered.includes(escalationRepo)) {
+    planned.repos = [
+      escalationRepo,
+      ...planned.repos.filter((repo) => repo !== escalationRepo),
+    ];
+    planned.cardRepos = {
+      ...planned.cardRepos,
+      [escalationRepo]: 'agent-harness-generator',
+    };
+    planned.reason = 'source intent selects the receipt-backed promotion and rollback harness';
+  }
+  const learningRepo = ['ru', 'flo'].join('');
+  if (adaptiveRetrievalPromotionQuestion(query) && discovered.includes(learningRepo)) {
+    planned.repos = [
+      learningRepo,
+      ...planned.repos.filter((repo) => repo !== learningRepo),
+    ];
+    planned.cardRepos = {
+      ...planned.cardRepos,
+      [learningRepo]: learningRepo,
+    };
+    planned.reason = 'source intent selects the adaptive retrieval flywheel and its promotion gate';
+  }
+  if (replayableHarnessPolicyEvolutionQuestion(query) && discovered.includes(learningRepo)) {
+    planned.repos = [
+      learningRepo,
+      ...planned.repos.filter((repo) => repo !== learningRepo),
+    ];
+    planned.cardRepos = {
+      ...planned.cardRepos,
+      [learningRepo]: learningRepo,
+    };
+    planned.confidence = 'described';
+    planned.reason = 'source intent selects evolvable harness policy and replayable receipts';
+  }
+  if (livingAdrDriftQuestion(query) && discovered.includes(learningRepo)) {
+    planned.repos = [
+      learningRepo,
+      ...planned.repos.filter((repo) => repo !== learningRepo),
+    ];
+    planned.cardRepos = {
+      ...planned.cardRepos,
+      [learningRepo]: learningRepo,
+    };
+    planned.confidence = 'described';
+    planned.reason = 'source intent selects living ADR lifecycle and implementation-drift review';
+  }
+  const vectorRepo = ['ru', 'vector'].join('');
+  if (offlineOnDeviceSemanticIndexQuestion(query) && discovered.includes(vectorRepo)) {
+    planned.repos = [
+      vectorRepo,
+      ...planned.repos.filter((repo) => repo !== vectorRepo),
+    ];
+    planned.cardRepos = {
+      ...planned.cardRepos,
+      [vectorRepo]: vectorRepo,
+    };
+    planned.reason = 'source intent selects the on-device HNSW index and zero-server deployment';
+  }
+  // ── IDENTIFIER ROUTING (kb/identifier-lane.mjs) ───────────────────────────────────────────
+  // A cross-encoder cannot promote a document from a store that was never opened. The card
+  // router read "agentdb" out of the middle of the identifier `agentdb-memory.db` and searched
+  // agentdb; the defining source is ruflo's changelog #2786 and its memory-bridge.ts, and ruflo
+  // was never opened. A literal scan says exactly which stores carry the identifiers (measured
+  // 4.17 s over 466 MB, cached per process), so the route is WIDENED by that evidence. Widened,
+  // never narrowed: whatever the cards chose is still searched.
+  // An explicit `repo:<name>` selector and a natural-language project scope are both hard source
+  // boundaries. The identifier lane normally widens a natural-language route when an exact token
+  // appears in another store, but doing that violates the user's named scope and can multiply
+  // cross-encoder work without improving repository identity.
+  const hardRepoBoundary = /\brepo:[a-z0-9._-]+\b/i.test(String(query || ''))
+    || planned.naturalProjectScope === true;
+  if (identifierScanTokens.length && planned.repos.length && !hardRepoBoundary) {
+    deadline?.enter('identifier-scan');
+    const scan = identifierScan(dir, identifierScanTokens, { maxRepos: 2 });
+    const added = scan.repos.filter((repo) => discovered.includes(repo) && !planned.repos.includes(repo));
+    if (added.length) {
+      planned = {
+        ...planned,
+        repos: [...planned.repos, ...added],
+        reason: `${planned.reason}; widened to ${added.join(', ')} — ${identifierScanTokens.join(', ')} appear there`,
+      };
+    }
+  }
+  return planned;
+}
+
+async function searchAllPrimary({
+  dir, query, k = 6, pool = 64, repos, _routeStage = false,
+  allowFullCorpus = true, deadline = null,
 }) {
+  const startedAt = performance.now();
+  // The reranker needs a bounded candidate pool larger than the requested output list.
+  pool = Math.max(pool, k);
+  // THE FULL-CORPUS LANE IS THE ONE THAT CAN RUN AWAY. It is reached only when the caller named no
+  // repos and this is not the scoped sub-call — i.e. exactly the "router could not place it, search
+  // everything" path. Naming it once here is what lets the pair budget below apply to that lane and
+  // to nothing else.
+  const fullCorpusLane = (!repos || !repos.length) && !_routeStage;
+  // Rare, exact tokens the question names (a dotted filename, a camelCase symbol, an issue ref).
+  // Ordinary prose yields none, scans nothing, and pays nothing.
+  const { identifierScanTokens, forStore } = queryIdentifiers(dir, query);
+  deadline?.check('route');
   const discovered = (repos && repos.length) ? repos : discoverRepos(dir);
   let routing = null;
   if ((!repos || !repos.length) && !_routeStage) {
-    const planned = routeReposFromCards(query, dir, discovered);
-    const escalationRepo = ['meta', 'harness'].join('');
-    if (cheapFirstFailureEscalationQuestion(query) && discovered.includes(escalationRepo)) {
-      planned.repos = [
-        escalationRepo,
-        ...planned.repos.filter((repo) => repo !== escalationRepo),
-      ];
-      planned.cardRepos = {
-        ...planned.cardRepos,
-        [escalationRepo]: 'agent-harness-generator',
-      };
-      planned.reason = 'source intent selects the cheap-verify-frontier escalation harness';
-    }
-    if (replayablePromotionRollbackQuestion(query) && discovered.includes(escalationRepo)) {
-      planned.repos = [
-        escalationRepo,
-        ...planned.repos.filter((repo) => repo !== escalationRepo),
-      ];
-      planned.cardRepos = {
-        ...planned.cardRepos,
-        [escalationRepo]: 'agent-harness-generator',
-      };
-      planned.reason = 'source intent selects the receipt-backed promotion and rollback harness';
-    }
-    const learningRepo = ['ru', 'flo'].join('');
-    if (adaptiveRetrievalPromotionQuestion(query) && discovered.includes(learningRepo)) {
-      planned.repos = [
-        learningRepo,
-        ...planned.repos.filter((repo) => repo !== learningRepo),
-      ];
-      planned.cardRepos = {
-        ...planned.cardRepos,
-        [learningRepo]: learningRepo,
-      };
-      planned.reason = 'source intent selects the adaptive retrieval flywheel and its promotion gate';
-    }
-    if (replayableHarnessPolicyEvolutionQuestion(query) && discovered.includes(learningRepo)) {
-      planned.repos = [
-        learningRepo,
-        ...planned.repos.filter((repo) => repo !== learningRepo),
-      ];
-      planned.cardRepos = {
-        ...planned.cardRepos,
-        [learningRepo]: learningRepo,
-      };
-      planned.confidence = 'described';
-      planned.reason = 'source intent selects evolvable harness policy and replayable receipts';
-    }
-    if (livingAdrDriftQuestion(query) && discovered.includes(learningRepo)) {
-      planned.repos = [
-        learningRepo,
-        ...planned.repos.filter((repo) => repo !== learningRepo),
-      ];
-      planned.cardRepos = {
-        ...planned.cardRepos,
-        [learningRepo]: learningRepo,
-      };
-      planned.confidence = 'described';
-      planned.reason = 'source intent selects living ADR lifecycle and implementation-drift review';
-    }
-    const vectorRepo = ['ru', 'vector'].join('');
-    if (offlineOnDeviceSemanticIndexQuestion(query) && discovered.includes(vectorRepo)) {
-      planned.repos = [
-        vectorRepo,
-        ...planned.repos.filter((repo) => repo !== vectorRepo),
-      ];
-      planned.cardRepos = {
-        ...planned.cardRepos,
-        [vectorRepo]: vectorRepo,
-      };
-      planned.reason = 'source intent selects the on-device HNSW index and zero-server deployment';
-    }
+    let planned = planSourceRoute({ dir, query, discovered, identifierScanTokens, deadline });
     if (planned.repos.length && planned.repos.length < discovered.length) {
+      const routeMs = performance.now() - startedAt;
+      const requestedMember = String(query || '').match(/\b([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)\s*\(/);
+      if (requestedMember && planned.repos.length) {
+        const [, owner, member] = requestedMember;
+        const memberEvidence = exactMemberIndexPresence(dir, planned.repos, member);
+        if (memberEvidence.scannedRepos.length && !memberEvidence.present) {
+          const caveat = `No indexed passage in ${memberEvidence.scannedRepos.join(', ')} contains the exact member ${owner}.${member}. This is not evidence of global nonexistence; the corpus may be incomplete or stale.`;
+          return {
+            repos: memberEvidence.scannedRepos,
+            perRepo: Object.fromEntries(memberEvidence.scannedRepos.map((repo) => [repo, caveat])),
+            results: [], pooled: 0, pooledAll: 0, cappedOut: 0,
+            prefiltered: 0, prefilterTokens: 0, prefilterMs: 0,
+            corpusAge: corpusAgeFor(dir, memberEvidence.scannedRepos),
+            adrCollision: null,
+            evidence: { grade: 'insufficient_evidence', topScore: null, droppedIrrelevant: 0, caveat },
+            implementation: {
+              required: true, verdict: 'unproven', implementationSources: [],
+              retrievedImplementationSources: [], requestedMember: { owner, member },
+              unprovenReason: 'exact-member-not-established',
+            },
+            routing: {
+              attempted: true, accepted: false, confidence: planned.confidence,
+              reason: planned.reason, candidateRepos: memberEvidence.scannedRepos,
+              fallback: 'qualified-indexed-absence',
+            },
+            diagnostics: traceRetrieval({ query, routeMs: +routeMs.toFixed(2),
+              candidateRepos: memberEvidence.scannedRepos.length, retrievedCandidates: 0,
+              scoredCandidates: 0, lane: 'exact-member-index-absence' }),
+          };
+        }
+      }
+      const sourceProofStartedAt = performance.now();
       const sourceCard = await sourceBackedCardLane({ dir, query, k, planned });
-      if (sourceCard) return sourceCard;
-      const scoped = await searchAll({
+      if (sourceCard) {
+        traceRetrieval({ query, family: planned.family || null, routeMs: +routeMs.toFixed(2),
+          sourceProofMs: +(performance.now() - sourceProofStartedAt).toFixed(2),
+          candidateRepos: planned.repos.length, retrievedCandidates: sourceCard.pooledAll || 0,
+          scoredCandidates: 0, lane: 'source-backed-card' });
+        return sourceCard;
+      }
+      const scopedStartedAt = performance.now();
+      const scoped = await searchAllPrimary({
         dir,
         query,
         k,
@@ -2746,7 +3539,9 @@ export async function searchAll({
         repos: planned.repos,
         _routeStage: true,
         allowFullCorpus,
+        deadline,
       });
+      const scopedSearchMs = performance.now() - scopedStartedAt;
       const scopedErrors = Object.values(scoped.perRepo)
         .filter((value) => typeof value === 'string' && value.startsWith('ERR:'));
       const implementationRequired = requiresImplementationProof(query);
@@ -2781,6 +3576,10 @@ export async function searchAll({
             implementationRequired,
             implementationVerdict: scoped.implementation?.verdict || 'not-required',
           },
+          diagnostics: traceRetrieval({ query, family: planned.family || null,
+            routeMs: +routeMs.toFixed(2), scopedSearchMs: +scopedSearchMs.toFixed(2),
+            candidateRepos: planned.repos.length, lane: 'bounded-source-search',
+            retrievedCandidates: scoped.pooledAll || 0, scoredCandidates: scoped.pooled || 0 }),
         };
       }
       const scopedRouting = {
@@ -2800,6 +3599,10 @@ export async function searchAll({
         return {
           ...scoped,
           routing: scopedRouting,
+          diagnostics: traceRetrieval({ query, family: planned.family || null,
+            routeMs: +routeMs.toFixed(2), scopedSearchMs: +scopedSearchMs.toFixed(2),
+            candidateRepos: planned.repos.length, lane: 'bounded-source-search',
+            retrievedCandidates: scoped.pooledAll || 0, scoredCandidates: scoped.pooled || 0 }),
         };
       }
       routing = scopedRouting;
@@ -2838,6 +3641,13 @@ export async function searchAll({
     }
   }
   const list = discovered;
+  const routeMs = performance.now() - startedAt;
+  // The full set of real, independently-indexed store names, for the identifier-lane's
+  // foreign-repo-name guard (issue #286 RC3, kb/identifier-lane.mjs's identifierEvidence): an
+  // identifier that IS itself one of these names has an authoritative home already, so a
+  // DIFFERENT repo's own subtree merely sharing that name should not earn the same "authoritatively
+  // named after this" credit.
+  const knownRepos = new Set(discovered.map((r) => String(r).toLowerCase()));
   const perRepo = {};
   // CORPUS AGE (issue #31, Jan Lafko): the brain is a periodic snapshot, and a model quoting a
   // version from it had NO signal that the fact might trail live reality. Derive the queried
@@ -2869,6 +3679,9 @@ export async function searchAll({
   const RESCUE_DEPTH = Math.max(64, pool);
 
   const searchOne = async (name) => {
+    // Between-repo checkpoint: the fanout is the phase most likely to be running when a large
+    // corpus eats the budget, and a repo is the smallest unit it can be interrupted between.
+    deadline?.check(`retrieve:${name}`);
     try {
       // The concepts store holds ALL repos' prose primers in one place, so it needs a deeper pool than a
       // single source repo — otherwise the queried repo's own primer is crowded out by the other 18 before
@@ -2916,10 +3729,20 @@ export async function searchAll({
         cands = cands.concat(inventory);
       }
       {
-        const seen = new Set(cands.map((candidate) => candidate.path));
-        const claims = quotedClaimCandidates(dir, name, query)
-          .filter((candidate) => !seen.has(candidate.path));
-        cands = cands.concat(claims);
+        // A file that carries every quoted claim earns the quoted-claim boost whether or not dense
+        // retrieval already pooled it. This used to ADD only the files dense missed and DROP the
+        // flag on files dense found, so the claim-bearing file dense ranked HIGHER lost the +10
+        // that a lower-ranked copy would have earned -- an inversion. Merge the flag onto the
+        // existing candidate, exactly as the ADR lane below does (E3, need-baseline 2026-10-01).
+        const byPath = new Map(cands.map((candidate) => [candidate.path, candidate]));
+        for (const claim of quotedClaimCandidates(dir, name, query)) {
+          const existing = byPath.get(claim.path);
+          if (existing) existing._quotedClaims = true;
+          else {
+            cands.push(claim);
+            byPath.set(claim.path, claim);
+          }
+        }
       }
       {
         const byPath = new Map(cands.map((candidate) => [candidate.path, candidate]));
@@ -2940,6 +3763,25 @@ export async function searchAll({
         const details = rvfBackendCandidates(dir, name, query)
           .filter((candidate) => !seen.has(candidate.path));
         cands = cands.concat(details);
+      }
+      // The identifier lane rides the exempt `rescue` lane for the same reason #33 Part A does: a
+      // boost cannot rescue a candidate that never reached the pool, and an identifier's own
+      // document is routinely buried past rank 40 by dense retrieval.
+      // A store's own name counts as an identifier only while searching that store (queryIdentifiers).
+      const own = forStore(name);
+      if (own.identifierScanTokens.length) {
+        const seen = new Set(cands.map((candidate) => candidate.path));
+        const scan = identifierScan(dir, own.identifierScanTokens, { maxRepos: 2 });
+        const byIdentifier = identifierCandidates(scan, name, own.identifierTokens, 8, knownRepos)
+          .filter((candidate) => !seen.has(candidate.path));
+        cands = cands.concat(byIdentifier);
+      }
+      // THE KEYWORD LANE (kb/keyword-lane.mjs; ADR-090 §9 amended 2026-10-01). Off unless
+      // RUVNET_BRAIN_KEYWORD_LANE=1, because its query-time index build cost +2.1 s median (see
+      // keyword-lane.mjs). When on, repository stores add up to REPO_KEYWORD_TOPN keyword-matched
+      // files that dense did not pool; transcript stores keep their own deeper BM25 lane below.
+      if (!isTranscriptStore(name) && keywordLaneEnabled()) {
+        cands = cands.concat(keywordCandidates(dir, name, query, { exclude: new Set(cands.map((c) => c.path)) }));
       }
       if (isTranscriptStore(name)) {
         const seen = new Set(hits.map((h) => h.path));
@@ -2973,13 +3815,21 @@ export async function searchAll({
     }
   }));
   const pooledAll = perRepoHits.flat();
+  const retrievalMs = performance.now() - startedAt - routeMs;
   // The pool's own order is the cap's tie-break, so it has to survive into any recorded trace —
   // otherwise a replay would break ties differently from production and quietly measure a
   // different policy than the one being shipped.
   for (let i = 0; i < pooledAll.length; i++) pooledAll[i]._poolIdx = i;
+  // An explicit KB_CE_MAX_PAIRS is the operator's word and wins on every lane. Absent that, the
+  // full-corpus fallback takes the measured B=408 budget (see FULL_CORPUS_MAX_PAIRS_DEFAULT) and
+  // every other lane keeps CE_MAX_PAIRS_DEFAULT — which is 0, i.e. unchanged.
   const capLimit = process.env.KB_CE_MAX_PAIRS !== undefined
     ? Math.max(0, parseInt(process.env.KB_CE_MAX_PAIRS, 10) || 0)
-    : CE_MAX_PAIRS_DEFAULT;
+    : fullCorpusLane
+      ? (process.env.KB_FULL_CORPUS_MAX_PAIRS !== undefined
+        ? Math.max(0, parseInt(process.env.KB_FULL_CORPUS_MAX_PAIRS, 10) || 0)
+        : FULL_CORPUS_MAX_PAIRS_DEFAULT)
+      : CE_MAX_PAIRS_DEFAULT;
   // THE CASCADE (ADR-058). Stage 1 reads every pooled pair at a truncated length and stage 2 gives
   // the survivors the full read. Both stages are the SAME model on the SAME logit scale, which is
   // what makes stage 1 a real approximation of stage 2 rather than a second opinion — the property
@@ -2994,14 +3844,17 @@ export async function searchAll({
   let s1 = null, prefilterMs = 0;
   if (cascadeK > 0 && pooledAll.length > cascadeK) {
     const t0 = Date.now();
-    s1 = await cePrefilterScores(query, pooledAll, { maxLength: cascadeTokens });
+    s1 = await cePrefilterScores(query, pooledAll, { maxLength: cascadeTokens, deadline });
     prefilterMs = Date.now() - t0;
   }
   const { kept: candidates, dropped: cappedOut } = s1
     ? cascadeRerankPool(pooledAll, { limit: cascadeK, s1 })
     : capRerankPool(pooledAll, { limit: capLimit });
   // ONE cross-encoder pass over the whole cross-repo pool → a single comparable relevance scale.
-  const ranked = await rerankPairs(query, candidates);
+  deadline?.check('rerank');
+  const rerankStartedAt = performance.now();
+  const ranked = await rerankPairs(query, candidates, { deadline });
+  const rerankMs = performance.now() - rerankStartedAt + prefilterMs;
   // Recording the SCORED pool (not the answer) is what makes a pool-policy change measurable: one
   // 605-pair run, then selectResults replayed against those exact scores for any candidate policy.
   if (process.env.KB_CE_TRACE) {
@@ -3022,7 +3875,10 @@ export async function searchAll({
       })),
     }) + '\n');
   }
-  const { results, adrCollision, evidence, implementation } = selectResults({ query, ranked, k });
+  // THE LEARNED JUDGE (kb/judge-rank.mjs, ADR-099 arm C): off unless RUVNET_BRAIN_JUDGE=1 and a
+  // trained kb/judge-weights.json is present; then it re-scores the pool with its threshold at 0.
+  const judged = applyJudge(loadJudge(dir), query, ranked);
+  const { results, adrCollision, evidence, implementation } = selectResults({ query, ranked: judged, k });
 
   // `pooled` stays the number of pairs the cross-encoder read IN FULL — that is what the count
   // has always meant to a reader. `pooledAll`/`cappedOut` report what the cap withheld, because a
@@ -3035,6 +3891,11 @@ export async function searchAll({
     pooled: candidates.length, pooledAll: pooledAll.length, cappedOut,
     prefiltered: s1 ? pooledAll.length : 0, prefilterTokens: s1 ? cascadeTokens : 0, prefilterMs,
     corpusAge, adrCollision, evidence, implementation, routing,
+    diagnostics: traceRetrieval({ query, family: null,
+      routeMs: +routeMs.toFixed(2), retrievalMs: +retrievalMs.toFixed(2),
+      rerankMs: +rerankMs.toFixed(2), candidateRepos: list.length,
+      retrievedCandidates: pooledAll.length, scoredCandidates: candidates.length,
+      lane: (!repos || !repos.length) && !_routeStage ? 'full-corpus' : 'scoped-search' }),
   };
 }
 
@@ -3045,15 +3906,50 @@ function parseArgs() {
     dir: get('--dir') || '.',
     query: get('--q') || get('--query'),
     k: parseInt(get('--k') || '6', 10),
-    pool: parseInt(get('--pool') || '8', 10),
+    pool: parseInt(get('--pool') || '64', 10),
     repos: (get('--repos') || '').split(',').map((s) => s.trim()).filter(Boolean),
+    bounded: a.includes('--bounded'),
   };
 }
 
 async function main() {
-  const { dir, query, k, pool, repos } = parseArgs();
+  const { dir, query, k, pool, repos, bounded } = parseArgs();
   if (!query) { console.error('Usage: node forge-ask-all.mjs --dir <bundle-dir> --q "question" [--k 6] [--pool 8] [--repos a,b]'); process.exit(2); }
-  const { repos: used, perRepo, results, pooled, pooledAll, cappedOut, prefiltered, prefilterTokens, adrCollision, evidence, implementation } = await searchAll({ dir, query, k, pool, repos });
+  // EVERY QUESTION ENDS. The cooperative deadline interrupts between repos and between
+  // cross-encoder batches; the watchdog is the backstop for a phase that blocks the event loop
+  // past its own checkpoint. Both name the phase that overran, because "it hung" is not a
+  // diagnosis anyone can act on. See kb/query-deadline.mjs for the measurement that forced this.
+  const deadline = createDeadline({ ms: resolveDeadlineMs() });
+  const disarm = armProcessWatchdog(deadline, {
+    // Reap any forked cross-encoder children before the forced exit, so a timeout can never leave
+    // orphaned work behind (verified with `ps` after a forced timeout).
+    onExpire: async () => {
+      try {
+        const m = await import(new URL('./forge-rerank.mjs', import.meta.url).href);
+        await m.ceWorkerShutdown();
+      } catch { /* nothing to reap */ }
+    },
+  });
+  let searched;
+  try {
+    searched = await searchAll({
+      dir, query, k, pool, repos, allowFullCorpus: !bounded, deadline,
+    });
+  } catch (e) {
+    if (e instanceof QueryDeadlineExceeded) {
+      console.error(`\n${describeDeadline(e)}`);
+      try {
+        const m = await import(new URL('./forge-rerank.mjs', import.meta.url).href);
+        await m.ceWorkerShutdown();
+      } catch { /* nothing to reap */ }
+      disarm();
+      process.exit(DEADLINE_EXIT_CODE);
+    }
+    disarm();
+    throw e;
+  }
+  disarm();
+  const { repos: used, perRepo, results, pooled, pooledAll, cappedOut, prefiltered, prefilterTokens, adrCollision, evidence, implementation, corpusAge } = searched;
   // ── GONG LAYER (CLI): all repos erroring is an OUTAGE, not a quiet zero. Banner + exit 1 + alarm.
   // The non-zero exit is load-bearing: scripts/nightly-wrapper.sh's canary and any cron/CI caller
   // rely on it — a total failure that exits 0 is exactly the silent death this exists to kill.
@@ -3062,8 +3958,7 @@ async function main() {
     console.error('\n🚨🚨🚨  RUVNET BRAIN IS DOWN — ALL ' + used.length + ' repos failed to search.  🚨🚨🚨');
     console.error('This is NOT an empty result; retrieval itself is broken.');
     console.error('First error: ' + failed[0][1]);
-    console.error('Fix:    cd ~/.cache/ruvnet-brain/kb && npm i');
-    console.error('Verify: npx github:stuinfla/ruvnet-brain --doctor\n');
+    console.error(describeSearchFailure({ dir: path.resolve(dir) }));
     try {
       const alarm = await import(new URL('./brain-alarm.mjs', import.meta.url).href);
       await alarm.reportBrainDown({ error: failed[0][1], source: 'cli:forge-ask-all' });
@@ -3079,6 +3974,17 @@ async function main() {
       .catch(() => {});
   }
   console.log(`\n=== RuvNet Brain (cross-repo) — "${query}" ===`);
+  // PARITY WITH THE MCP SURFACE (kb/corpus-freshness.mjs). The CLI has computed corpusAge on every
+  // query since issue #31 and printed NONE of it, so the same brain warned an MCP caller that its
+  // version facts were a snapshot and told a terminal caller nothing. Same sentence, one source.
+  const staleness = stalenessNotice(corpusAge);
+  if (staleness) console.log(staleness);
+  const intent = versionIntent(query);
+  if (intent.intent) {
+    const liveVersions = await probeLiveVersions(intent.packages);
+    const advisory = freshnessAdvisory({ query, dir, corpusAge, liveVersions });
+    if (advisory) console.log(advisory);
+  }
   // Surface the ambiguity BEFORE the results, so it is read as a caveat on everything below rather
   // than a footnote after the reader has already accepted the first hit as "the" answer.
   if (adrCollision) console.log(`⚠ ${adrCollision.note}`);
@@ -3101,15 +4007,23 @@ async function main() {
     : cappedOut ? ` (cross-encoded ${pooled} of ${pooledAll}; ${cappedOut} beyond the pair budget)` : '';
   console.log(`repos searched: ${used.join(', ')}  |  per-repo hits: ${JSON.stringify(perRepo)}  |  pooled candidates: ${pooled}${poolNote}\n`);
   results.forEach((r, i) => {
-    console.log(`#${i + 1}  repo=${r.repo}  ce=${r.ceScore == null ? 'n/a' : r.ceScore.toFixed(3)}  vec=${r.bestDistance?.toFixed(4)}${r.kind ? `  kind=${r.kind}` : ''}  evidence=${r.evidenceClass || 'unknown'}${r.lifecycleStatus ? `  lifecycle=${r.lifecycleStatus}` : ''}`);
-    console.log(`path : ${r.repo}/${r.path}`);
-    console.log(`title: ${r.title}`);
-    if (r.designIntentWarning) console.log(r.designIntentWarning);
-    console.log(`chars: ${(r.fullText || '').length} | chunks: ${r.chunksJoined}${r.truncated ? ' (truncated)' : ''}`);
+    const proof = r._proofMethod ? `  proof=${r._proofMethod}` : '';
+    console.log(`#${i + 1}  repo=${r.repo}  ce=${r.ceScore == null ? 'n/a' : r.ceScore.toFixed(3)}  vec=${r.bestDistance?.toFixed(4)}${r.kind ? `  kind=${r.kind}` : ''}  evidence=${r.evidenceClass || 'unknown'}${proof}${r.lifecycleStatus ? `  lifecycle=${r.lifecycleStatus}` : ''}`);
+    // Header fields are ONE line each: a newline in corpus-derived text could otherwise forge a header (G-004).
+    const line = (v) => String(v ?? '').replace(/[\r\n]+/g, ' ');
+    console.log(`path : ${r.repo}/${line(r.path)}`);
+    console.log(`title: ${line(r.title)}`);
+    if (r.designIntentWarning) console.log(line(r.designIntentWarning));
+    // `chars:` is the EXACT length of the body printed below: kb/verify-citation.mjs consumes the body by this
+    // count, so a citation-shaped line inside a document can never be read as a hit (ADR-0102 G-004, #236).
+    const body = r.fullText || r.text || '';
+    console.log(`chars: ${body.length} | chunks: ${r.chunksJoined}${r.truncated ? ' (truncated)' : ''}`);
     console.log('----- full document -----');
-    console.log(r.fullText || r.text || '');
+    console.log(body);
     console.log('===================================================================\n');
   });
+  const related = renderRelatedSources(prepareRelatedSources(searched.relatedSources));
+  if (related) console.log(related);
 }
 
 // REALPATH BOTH SIDES, not path.resolve(). REPRODUCED LIVE 2026-07-27: path.resolve() normalizes

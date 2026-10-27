@@ -1,28 +1,88 @@
 ---
 id: ADR-013
 title: The Onboarding Console — RuvNet Brain becomes a mirror, an advisor, and only then a configurator
-status: Implemented
+status: Accepted
 date: 2026-07-14
-updated: 2026-07-30
+updated: 2026-10-25
 updated_source: derived-from-git
 authors: [Stuart Kerr, Claude Code]
-tags: [onboarding, ux, config, stack, memory-health, savings, safety]
+tags: [onboarding, ux, config, stack, memory-health, savings, safety, coverage]
 supersedes: []
-related: [ADR-0012 (grounding gate), ruflo/plugins/ruflo-ruvector ADR-0001 (pin + smoke-test contract)]
+related: [ADR-0012 (grounding gate), ADR-0069 (artifact-bound source coverage), ruflo/plugins/ruflo-ruvector ADR-0001 (pin + smoke-test contract)]
+governs:
+  - scripts/onboarding-console.mjs
+  - scripts/console-runtime-identity.mjs
+  - console/*
+  - plugin/commands/configure.md
+created_at: 2026-07-14T17:28:48-04:00
+created_at_source: derived-from-git
+updated_at: 2026-09-11T00:00:00-04:00
+updated_at_source: authored-current
+reviewed_digest: d59ce9988da9
 ---
 
 # ADR-013: The Onboarding Console
 
-**Status**: Implemented
+**Status**: Accepted
+
+The Console is implemented. Decision status and implementation state are
+separate axes: `Accepted` records the architectural decision, while the governed runtime and tests
+establish what is built.
 **Date**: 2026-07-14
-**Updated**: 2026-07-18 — reconciled the body status with the frontmatter (`Implemented`): the console
-shipped and is live (`/configure` / `/rvbc`, served from `scripts/onboarding-console.mjs`). The body had
-been left at `Proposed` while the frontmatter said `Implemented` — a file disagreeing with itself, exactly
-the ADR-drift this project's own hooks warn about.
+**Updated**: 2026-07-18 — recorded that the console shipped and is live (`/configure` / `/rvbc`,
+served from `scripts/onboarding-console.mjs`). That revision used `Implemented` as the decision status;
+the 2026-08-21 currency pass corrected the decision axis to `Accepted` while retaining implementation
+truth in the governed runtime, tests, and this record.
 
 **Updated 2026-07-30** — the Settings surface now distinguishes a working control from a persisted
 preference. A choice is interactive only when a runtime consumes it and the effect can be verified;
 declared-but-unenforced choices remain named with the missing path instead of appearing as switches.
+
+**Updated 2026-08-01** — issue #79 exposed that a detached Console process could outlive an update
+and pass the old branded-root probe while retaining an incompatible API router. The server-side
+lifecycle contract is now explicit: each project scope has a mode-0600 instance receipt, the live
+server exposes a non-secret `/api/runtime` identity, reuse requires an exact API/source identity
+match, and only a receipt-proven instance accepts token-authenticated graceful shutdown. A legacy or
+foreign listener is never killed; the current Console binds a free port and persists that instance
+for subsequent reuse. The issue #79 transaction now stages and syntax-verifies `.console-runtime`
+before host activation, persists its exact version/source identity, activates it only after host and
+Stable Spine convergence, and restores the prior runtime if activation or receipt finalization fails.
+The convergence receipt reports `pending-console-restart` when an owned instance still serves older
+bytes; the next launch uses the receipt/token lifecycle above to replace it safely. The running
+Console reads its version from that staged `runtime-identity.json` before consulting any host plugin
+registry, so a Codex-only installation has a valid ownership receipt and can replace stale bytes on
+the same URL. Real-browser acceptance builds both candidates through the installer's canonical
+runtime transaction rather than a parallel hand-maintained fixture manifest.
+
+**Updated 2026-08-02** — Console integrity issues #83, #85, #86, and #87 make four trust boundaries
+explicit. Bundled maintainer lessons carry imported-owner provenance, legacy fingerprints are
+quarantined, and imported/demonstration rows cannot become personal policy. Compaction survival now
+requires a fresh structurally valid versioned snapshot (with validated Ruflo legacy migration paths),
+not arbitrary file existence. The packed and staged Console runtime must contain a valid provider
+catalog; native boolean provider detection remains visible with an explicit degraded state if that
+catalog cannot load. Finally, normal installs add reviewed subscription-covered managed models to an
+existing user catalog without overwriting user rows or adding metered authority, while the Console
+shows the complete launchable development inventory and marks the latest routing receipt separately.
+
+**Updated 2026-08-01** — issue #81 identified the residual project-discovery split left after issue #19.
+`scripts/memory-doctor.mjs` now owns the common and configured candidate-root policy, canonical
+root/store de-duplication, scoped explicit-root behavior, and display naming. The standalone doctor
+and Console import that same policy, so a machine-wide fleet count can no longer mean `~/Code` on
+one surface while the Console scans `~/source`, `~/work`, or user-configured roots on another.
+
+**Updated 2026-08-21, corrected 2026-09-11** — This section originally described a third Console
+Coverage page (`console/coverage.html`/`.css`/`.js`, a `GET /api/coverage` route, and an installed
+`/ruvnet-brain:coverage` terminal command backed by `plugin/scripts/coverage.mjs`) as already
+delivered. A source-bound currency review found none of those five paths exist anywhere in this
+repository's git history — they were designed here but never built. The actual, still-open decision
+for that sub-feature is **ADR-0069 (Source coverage is artifact-bound, complete, and
+release-blocking)**, whose own `status: Proposed` and `governs:` list (which includes the same five
+paths) confirms it is unbuilt as of this review, not this ADR. `governs:` above has been corrected
+to drop the two literal entries (`plugin/commands/coverage.md`, `plugin/scripts/coverage.mjs`) this
+ADR never actually built; the historical Currency-log row below is left as the record of what was
+believed at the time, not restated as current fact. Everything else this ADR governs — the primary
+Console and How to Use It pages, `scripts/onboarding-console.mjs`, `scripts/console-runtime-identity.mjs`
+— remains built and live, unaffected by this correction.
 
 ## Context
 
@@ -200,6 +260,38 @@ their computer; they just want it to work."* This becomes **principle 6**:
 - **Proven live:** `--print-state` returns real data from this machine (773 wiring sites across 12
   projects, 104 memory stores, memory health 100/100 on 4 probed dims); `--print-stack` returns the
   real 39-package audit; the 15 engine tests pass.
-- **Known follow-up (public ship):** the console currently runs from the repo. To ship inside the
-  installed plugin bundle for all users, the server + engines need vendoring under `plugin/` (the
-  engines live in `scripts/`). Filed, not yet done.
+- **Public installation:** implemented. `beginConsoleRuntimeTransaction()` stages the complete
+  `CONSOLE_RUNTIME_SURFACE` under the installed KB, validates it, binds its byte digest into
+  `runtime-identity.json`, and activates it only after host convergence. The Coverage page travels
+  inside that same runtime; the coverage ledger itself travels inside the knowledge bundle as
+  `COVERAGE.json` and `COVERAGE.md`.
+
+## Amendment (2026-09-11) — the coverage page exists, as `console/scope.*`
+
+The page the 2026-09-11 currency row below called "ADR-0069's, still unbuilt" was built later the same
+day under the name **scope**: `console/scope.html`, `console/scope.js`, `console/scope.css`, served at
+`/scope` with `GET /api/scope` (`gatherScope()`/`computeScope()` in `scripts/onboarding-console.mjs`;
+`447bd8a9` tests first, `807fbe30`, `d9b631b5`, merged at `1f956632`). Under this ADR's ordering it is a
+**Mirror-only** surface: it reads the installed `COVERAGE.json` and `RVF-GENERATIONS.json`, renders every
+repo and gist with rUv's last change beside the date the brain read it, states its own as-of date first,
+and offers no Apply. Its data rule — covered-and-current ⇔ `artifact.sourceCommit === upstream.sha`;
+dates `upstream.committedAt` (repos) / `updatedAt` (gists) against `artifact.ingestedAt ??
+RVF-GENERATIONS.stores[x].builtUtc`; never the shipped `status` field — is ADR-0069's and is recorded
+there. The `console/*` glob already governs the new files, so `governs:` does not change. The
+2026-07-14 sentence under *Implementation* ("The Coverage page travels inside that same runtime") is true
+again under the new name: `CONSOLE_RUNTIME_SURFACE` lists `console/` whole.
+
+## Currency log
+| 2026-10-25 | Review `d59ce9988da9` (4.7.21): decision unchanged; the console stays a mirror and advisor first. `scripts/onboarding-console.mjs` moved twice: the session-surfacing memory probe no longer passes on any `.claude/hooks` folder and also recognises the enabled `ruvnet-brain` plugin's own SessionStart hook (Dream Cycle #322 port), and Apply on the quiet-learner card counts as progress only when `ruflo memory distill status` shows the last distillation moved forward (#377). | Reviewed the `scripts/onboarding-console.mjs` diff 320b778b..63ca7c0d (be30a804, d441061b); no other governed file moved. |
+| 2026-09-27 | Currency review: decision unchanged. Motion since last review: a worktree merge, an orphaned-file deletion sweep, and a learner-scope read fix in onboarding-console.mjs. None touch the console's mirror/advisor/configurator ordering. | Reviewed `scripts/onboarding-console.mjs`, `scripts/console-runtime-identity.mjs`, `console/CONTRACT.md`, `console/activity.js`, `console/app.js`, `console/architecture.html` against the commits listed above; reviewed_digest c8c5b7ca0fa8. |
+
+| 2026-09-16 | Re-read the Console runtime and client after the continuity consistency repair. Resolver refusal is UNKNOWN rather than a guessed store read; refresh responses and the client expose settled, failed, and already-running states. | Reviewed `scripts/onboarding-console.mjs` and `console/app.js`; the regression uses the real spawned server and rendered page token. Recall quality remains unclaimed when unprobed. reviewed_digest b957f4e6d0c8. |
+
+| 2026-09-11 | Currency review at commit 7296c984: decision unchanged and reinforced; one amendment recorded above (the scope page). Motion since a5584de3: seven Mirror-truth fixes to the cards — `c98b64d5` the Complete-Brain card measures the installed root (184 stores / 979 MB) instead of a dev-only restore path that read 0 MB; `95506827` memory health scores the canonical `.swarm/memory.db` and labels the coordination store it does not score; `65762b4f` nightly renders choice, enforcement and last run as three facts instead of one boolean; `d61c05d3` the gates survey reads the hooks the host loads and lists six on-disk blocking gates with no registration; `31cb432f` wiring counts the plugins Claude Code has enabled; `17eb6d48` trust labels KB generation, running brain and installed plugin and says when they differ; `ec85ac68` savings keeps the sign of msSaved and counts unmeasured rows — plus `8747d2f8` (gatherSavings' REPO-relative legacy ledger made injectable so a fixture cannot read the owner's 2026-07-14 rows) and the scope page `447bd8a9` / `807fbe30` / `d9b631b5` merged at `1f956632`. Every change makes Mirror render measured state; none adds an Apply or weakens consent; each landed with a test that failed on the prior code. | Reviewed `scripts/onboarding-console.mjs`, `console/app.js`, `console/index.html`, `console/scope.html`; the page's data rule is ADR-0069's. reviewed_digest b957f4e6d0c8. |
+| 2026-09-11 | Currency review at commit 2eef2024: decision unchanged for the built console; code drifted only in a duplicated, unbuilt `governs:` claim, corrected in the text above (not the status). The two governed drift commits since 2026-08-30 (`6a6ba72f`, `e7a84b71`) touch `scripts/console-runtime-identity.mjs` and `scripts/onboarding-console.mjs` and are testability/release-qualification only (a snapshot clock injected for tests; more files added to `CONSOLE_RUNTIME_SURFACE`'s digest list) — no architectural change. Separately found: `plugin/commands/coverage.md` and `plugin/scripts/coverage.mjs` never existed in this repo's git history (`git log --all` on both is empty), yet were both claimed built here since 2026-08-21; removed them from `governs:` and corrected the prose — that sub-feature is ADR-0069's (status Proposed, still unbuilt). | Reviewed `scripts/onboarding-console.mjs` and `scripts/console-runtime-identity.mjs`; cross-checked ADR-0069's own `governs:`/`status` for the coverage-page claim. reviewed_digest b957f4e6d0c8. |
+| 2026-08-30 | The configurator documentation now reflects the live settings form: ordinary user preferences have runtime consumers and are served through the shared save path. | `console/app.js`, `scripts/onboarding-console.mjs`, and `plugin/scripts/runtime-preferences.mjs` are the current implementation boundary. |
+
+| Date | What changed | Why (with referents) |
+|---|---|---|
+| 2026-08-21 | Added the third Coverage page, installed-ledger API, terminal command, and their two-track lifecycle contract; corrected decision status to `Accepted` while retaining the implemented runtime truth. | `console/coverage.html`, `console/coverage.js`, `scripts/onboarding-console.mjs`, `scripts/console-runtime-identity.mjs`, `plugin/commands/coverage.md`, and `plugin/scripts/coverage.mjs` now expose one installed `COVERAGE.json` projection without creating another mutable source of facts. |
+| 2026-08-02 | Recorded the shipped provider, runtime-identity, compaction, provenance, and project-discovery trust boundaries. | Issues #79, #81, #83, #85, #86, and #87 changed the governed Console runtime and its acceptance boundaries. |

@@ -25,6 +25,7 @@ let preStateHash = null;          // echoed on /api/apply so the server can refu
 let lastMemory = null;            // last rendered memory card, so the late fleet scan can merge into it
 const renderedRecIds = new Set();
 const renderedRecommendations = new Map();
+const recommendationSources = new Map();
 let stateRecsSettled = false;
 let stackRecsSettled = false;
 // Health advocacy (ADR-027) hydrates from /api/memory, the slowest source. Until it has answered,
@@ -109,6 +110,8 @@ const fmtMs = (ms) => {
   const m = Math.floor(s / 60);
   return `${m} m ${Math.round(s % 60)} s`;
 };
+// Signed time. A negative saving means routes were SLOWER than baseline — a finding, never a dash.
+const fmtSignedMs = (ms) => (ms == null || Number.isNaN(Number(ms)) ? '—' : (Number(ms) < 0 ? `−${fmtMs(-Number(ms))}` : fmtMs(ms)));
 
 const fmtDate = (iso) => {
   if (!iso) return '—';
@@ -303,8 +306,7 @@ function updateVerdict() {
   const v = $('#verdict');
   if (!v || found.capsTotal == null) return;      // nothing measured yet — say nothing
 
-  const behind = (found.pkgTotal != null && found.pkgCurrent != null)
-    ? found.pkgTotal - found.pkgCurrent : null;
+  const behind = found.pkgNeedsLook != null ? found.pkgNeedsLook : null;
 
   // What actually wants the reader's attention, in blast-radius order.
   const needsLook = [];
@@ -314,6 +316,7 @@ function updateVerdict() {
   const caveats = [];
   if (found.capsUnknown) caveats.push(`${found.capsUnknown} capabilit${found.capsUnknown === 1 ? "y" : "ies"} we could not check`);
   if (found.memNotTested) caveats.push(`${found.memNotTested} memory dimension${found.memNotTested === 1 ? '' : 's'} not probed this session`);
+  if (found.pkgUnchecked) caveats.push(`${found.pkgUnchecked} package${found.pkgUnchecked === 1 ? '' : 's'} whose version we could not check`);
 
   const good = !needsLook.length;
   const headline = good
@@ -321,8 +324,10 @@ function updateVerdict() {
     : `Mostly good — ${needsLook.join(' and ')}.`;
 
   const detail = `${found.capsOn} of ${found.capsTotal} capabilities are on`
+    + (found.capsIdle ? `, ${found.capsIdle} set up but not running` : '')
     + (found.capsAbsent ? `, ${found.capsAbsent} not installed` : '')
-    + (behind === 0 ? ', and every package on your stack is current' : '')
+    + (behind === 0 && !found.pkgUnchecked ? ', and every package on your stack is current' : '')
+    + (behind === 0 && found.pkgUnchecked ? ', and no checked package is behind' : '')
     + '.';
 
   v.replaceChildren(
@@ -355,6 +360,7 @@ function renderHost(host, generatedAt) {
       BRAIN_INSTALLED_VERSION = String(host.brainVersion);
       const vc = $('#brain-ver');
       if (vc) { vc.textContent = `v${BRAIN_INSTALLED_VERSION}`; vc.hidden = false; }
+      if (LAST_TRUST) renderUpdateGong(LAST_TRUST);
     }
     const meta = $('#host-meta');
     if (meta) {
@@ -762,6 +768,12 @@ function renderStack(data) {
 
   found.pkgTotal = total;
   found.pkgCurrent = current;
+  // RNBC QA 2026-10-01: the verdict used to compute "behind" as total − current, so 34 plugin
+  // packages whose marketplace revision is simply not checked were announced as "34 packages
+  // behind" directly above a stack card saying "Nothing needs attention". Behind is what the audit
+  // MEASURED as behind or broken; not-checked is its own caveat.
+  found.pkgNeedsLook = behind + broken;
+  found.pkgUnchecked = Math.max(0, total - current - behind - broken - ahead);
   updateFoundStrip();
 
   pkgs.sort((a, b) =>
@@ -775,6 +787,8 @@ function renderStack(data) {
     ahead ? el('span', {}, ', ', el('b', {}, fmtInt(ahead)), ' ahead of the registry (which is legal)') : '',
     broken ? el('span', {}, ', ', el('b', {}, fmtInt(broken)), ' broken') : '',
     behind ? el('span', {}, ', ', el('b', {}, fmtInt(behind)), ' behind') : '',
+    found.pkgUnchecked ? el('span', {}, ', ', el('b', {}, fmtInt(found.pkgUnchecked)),
+      ' installed but not version-checked (plugin marketplace revisions are not compared)') : '',
     '.', infoBtn('Your stack', STACK_INFO)));
 
   if (pkgs.length) {
@@ -801,10 +815,17 @@ function renderStack(data) {
     // (the purge:shadows recommendation — evidence, cost, undo); the in-sync majority collapses
     // to a single verified line with a peel-back for whoever wants the full inventory.
     const staleRows = shadows.filter((s) => s.stale);
-    const syncCount = shadows.length - staleRows.length;
+    // A cached copy with NO global install has nothing to "match" — RNBC QA 2026-10-01 measured
+    // four "cache 0.1.12 · global ?" rows each wearing a green "in sync" chip under "All 8 cached
+    // copies match your installs". They are counted and labelled for what they are.
+    const orphanRows = shadows.filter((s) => !s.stale && !s.global);
+    const syncCount = shadows.length - staleRows.length - orphanRows.length;
+    const orphanNote = orphanRows.length
+      ? ` ${fmtInt(orphanRows.length)} more ${orphanRows.length === 1 ? 'is a cached copy' : 'are cached copies'} of a package with no global install to compare against.`
+      : '';
     main.push(el('aside', { class: 'shadows' },
       el('p', { class: 'shadows-title' }, 'Shadow copies in the npx cache',
-        staleRows.length ? chip(`${staleRows.length} stale`, 'warn') : chip('all in sync', 'green')),
+        staleRows.length ? chip(`${staleRows.length} stale`, 'warn') : chip(orphanRows.length ? 'none stale' : 'all in sync', 'green')),
       staleRows.length ? el('p', { class: 'shadows-sub' },
         'npx keeps private copies in ', el('code', {}, '~/.npm/_npx'),
         '. A stale one quietly answers instead of your newer install — every command still “works”, which is exactly why it’s invisible. These need dealing with:') : null,
@@ -820,18 +841,18 @@ function renderStack(data) {
         el('span', { class: 'shadow-dir' }, s.dir || ''),
       )),
       el('p', { class: 'shadows-ok' },
-        staleRows.length
-          ? `The other ${fmtInt(syncCount)} cached ${syncCount === 1 ? 'copy matches' : 'copies match'} your installs — re-checked on every audit.`
+        (staleRows.length || orphanRows.length
+          ? `${staleRows.length ? 'The other ' : ''}${fmtInt(syncCount)} cached ${syncCount === 1 ? 'copy matches' : 'copies match'} your installs — re-checked on every audit.`
           : shadows.length === 1
             ? 'The 1 cached copy matches your install — re-checked on every audit; nothing is hiding stale.'
-            : `All ${fmtInt(shadows.length)} cached copies match your installs — re-checked on every audit; nothing is hiding stale.`),
+            : `All ${fmtInt(shadows.length)} cached copies match your installs — re-checked on every audit; nothing is hiding stale.`) + orphanNote),
       el('details', { class: 'sub' },
         el('summary', {}, `Peel it back — ${shadows.length === 1 ? 'the 1 cached copy' : `all ${fmtInt(shadows.length)} cached copies`}`),
         el('div', { class: 'sub-body' },
           shadows.map((s) => el('div', { class: 'shadow-row' },
             el('span', { class: 'shadow-name' }, s.name || '—'),
             el('span', { class: 'shadow-vers' }, `cache ${s.version ?? '?'} · global `, el('b', {}, s.global ?? '?')),
-            s.stale ? chip('stale', 'warn') : chip('in sync', 'green'),
+            s.stale ? chip('stale', 'warn') : s.global ? chip('in sync', 'green') : chip('no global install', 'grey', 'Nothing installed globally to compare this cached copy with'),
             el('span', { class: 'shadow-dir' }, s.dir || ''),
           ))))));
   }
@@ -1098,7 +1119,14 @@ function capRow(row) {
       checkboxEligible
         ? capCheckbox(row)
         : wantsAdvice
-          ? (turnOn
+          ? (row.setting
+            ? el('p', { class: 'cap-turnon' },
+                el('span', { class: 'cap-turnon-lb' }, 'to turn it on'),
+                'use the switch in Settings — ',
+                el('button', { class: 'btn btn-ghost btn-sm cap-setting-jump', type: 'button', onclick: () => jumpToSetting(String(row.setting)) },
+                  'take me to it'),
+                ' (saved with an undo)')
+            : turnOn
             ? el('p', { class: 'cap-turnon' },
                 el('span', { class: 'cap-turnon-lb' }, 'to turn it on'),
                 String(turnOn.human || 'run'), ' — ', el('code', {}, String(turnOn.cmd)))
@@ -1216,7 +1244,7 @@ function renderCapabilities(data) {
   setChips('chips-capabilities', chips);
   // Feed the verdict line. It needs the same counts this card just derived, and deriving them a
   // second time somewhere else is how two surfaces start disagreeing about one machine.
-  found.capsOn = on; found.capsOff = off; found.capsAbsent = absent; found.capsUnknown = unknown;
+  found.capsOn = on; found.capsOff = off; found.capsAbsent = absent; found.capsUnknown = unknown; found.capsIdle = idle;
   found.capsTotal = rows.length;
   updateFoundStrip();
 
@@ -1235,6 +1263,9 @@ function renderCapabilities(data) {
   const counts = [
     on ? el('span', {}, el('b', {}, fmtInt(on)), ' on') : null,
     off ? el('span', {}, el('b', {}, fmtInt(off)), ' off') : null,
+    // RNBC QA 2026-10-01: idle rows were in the chips but missing from this sentence, so "11
+    // capabilities: 7 on, 1 not installed, and 1 we could not check" silently lost two.
+    idle ? el('span', {}, el('b', {}, fmtInt(idle)), ' set up but not running') : null,
     absent ? el('span', {}, el('b', {}, fmtInt(absent)), ' not installed') : null,
     unknown ? el('span', {}, el('b', {}, fmtInt(unknown)), ' we could not check') : null,
   ].filter(Boolean);
@@ -1344,7 +1375,7 @@ async function loadCapabilities(attempt = 0) {
     const r = await fetchCapabilities();
     if (r.status === 404) { capsMissingEndpoint(); return; }
     if (!r.ok) throw new Error(`/api/capabilities answered HTTP ${r.status}`);
-    if (r.data && r.data.warming) {
+    if (r.data && (r.data.warming || r.data.stale === true)) {
       // "Not measured yet" is NOT "off" — this card's entire reason for existing. Rendering a
       // warming answer would produce an empty row list, which on this surface says "you own
       // nothing", the single most damaging thing this page could get wrong.
@@ -1690,14 +1721,26 @@ function addRecommendations(recs, source) {
       'Ordered by what you’re working on — machine-wide updates first (they affect every project), then your most recently active projects.'));
   }
   let dropped = 0;
-  const nodes = [];
+  const next = new Map();
   for (const rec of Array.isArray(recs) ? recs : []) {
-    if (!rec || rec.id == null || renderedRecIds.has(rec.id)) continue;
-    // The DDD invariant, honored in the UI too: no evidence/cost/undo → not rendered.
+    if (!rec || rec.id == null) continue;
+    // A fresh audit replaces this source, including an empty result after an update.
     if (!Array.isArray(rec.evidence) || !rec.evidence.length || !rec.cost || !rec.undo) { dropped += 1; continue; }
-    renderedRecIds.add(rec.id);
-    renderedRecommendations.set(rec.id, rec);
-    nodes.push(buildRecCard(rec));
+    next.set(rec.id, rec);
+  }
+  const previous = recommendationSources.get(source) || new Map();
+  recommendationSources.set(source, next);
+  const nodes = [];
+  for (const id of new Set([...previous.keys(), ...next.keys()])) {
+    const rec = next.get(id) || [...recommendationSources.values()].map(rows => rows.get(id)).find(Boolean);
+    const existing = document.getElementById(`rec-${id}`);
+    if (!rec) {
+      existing?.remove(); renderedRecIds.delete(id); renderedRecommendations.delete(id);
+      continue;
+    }
+    renderedRecIds.add(id); renderedRecommendations.set(id, rec);
+    const card = buildRecCard(rec);
+    if (existing) existing.replaceWith(card); else nodes.push(card);
   }
   // Ordering is by BLAST RADIUS, not arrival time — the slow sources arrive last and matter most.
   //
@@ -1721,7 +1764,10 @@ function addRecommendations(recs, source) {
  * A full grouped-sections layout is a deliberate follow-up: its group order and whether user/machine
  * split into two visible groups are product decisions the owner reserved. */
 const REC_SCOPE_LABEL = {
-  project: { text: 'Just this project', tone: 'cyan', title: 'Applying this changes only the project you are in right now.' },
+  // "One project", not "Just this project": a reconcile proposal names and changes a DIFFERENT project
+  // from the one the console is serving (RNBC QA 2026-10-01 — the pill said "the project you are in
+  // right now" over a card that rewires npx-project while the console served qa-project).
+  project: { text: 'One project only', tone: 'cyan', title: 'Applying this changes only the one project this proposal names — nothing machine-wide.' },
   user: { text: 'Every project · your account', tone: 'amber', title: 'Applying this changes behaviour for every project under your user account.' },
   machine: { text: 'Every project · this machine', tone: 'amber', title: 'Applying this changes behaviour for every project on this computer.' },
 };
@@ -2011,6 +2057,22 @@ function renderMemory(mem) {
       el('p', { class: 'fineprint' },
         'Dimensions we didn’t probe this session are excluded from the score — shown grey below, never assumed. A known-broken dimension caps the score.'))));
 
+  // Two files can sit in .swarm/. The score is about ONE of them, and the reader is told which — the
+  // card once rendered the MCP coordination store's 15,824 rows as if they were the project memory.
+  if (h.stores && h.stores.coordination && h.stores.coordination.exists && h.stores.canonical && h.stores.canonical.exists) {
+    const k = h.stores.canonical; const c = h.stores.coordination;
+    const scoredIsCanonical = h.stores.scored === k.path;
+    const rows = (s) => (s.rows == null ? '' : ` (${fmtInt(s.rows)} rows)`);
+    main.push(el('p', { class: 'fineprint' },
+      'Scored store: ', el('code', {}, scoredIsCanonical ? k.path : c.path), rows(scoredIsCanonical ? k : c), '. ',
+      'Also present: ', el('code', {}, scoredIsCanonical ? c.path : k.path), rows(scoredIsCanonical ? c : k),
+      scoredIsCanonical
+        ? ' — the MCP coordination store, not scored: a different container from the one '
+        : ' — the canonical store, not scored because it holds no rows; ',
+      scoredIsCanonical ? el('code', {}, 'ruflo memory store') : el('code', {}, 'ruflo memory store'),
+      scoredIsCanonical ? ' writes.' : ' writes there once used.'));
+  }
+
   const learn = renderLearnings(mem.learnings);
   if (learn) main.push(learn);
 
@@ -2099,17 +2161,24 @@ function renderRouterEngine(re) {
   const pool = Array.isArray(re.pool) ? re.pool : [];
   const TIER_ORDER = { mechanical: 0, cheap: 1, mid: 2, frontier: 3 };
   const byTier = (a, b) => (TIER_ORDER[a.tier] ?? 9) - (TIER_ORDER[b.tier] ?? 9);
-  const lensTable = (rows, costOf, costHead) => el('div', { class: 'scroll-x' },
+  const recommended = (Array.isArray(re.decisions) ? re.decisions : []).find((decision) => decision && decision.model);
+  const lensTable = (rows, costOf, costHead, { showRouting = false } = {}) => el('div', { class: 'scroll-x' },
     el('table', { class: 'tb rp-tb' },
       el('thead', {}, el('tr', {},
         el('th', { scope: 'col' }, 'Bucket'), el('th', { scope: 'col' }, 'Model'),
-        el('th', { scope: 'col' }, costHead))),
+        el('th', { scope: 'col' }, costHead),
+        showRouting ? el('th', { scope: 'col' }, 'Routing') : null)),
       el('tbody', {}, rows.map((p) => el('tr', {},
         el('td', { class: 'rp-band' }, p.tier || '—'),
         el('td', {}, el('div', { class: 'rp-model' }, prettyModel(p.id))),
         el('td', { class: 'cell-mono num' }, costOf(p)),
+        showRouting ? el('td', {}, recommended?.model === p.id
+          ? chip('last selected', 'green', recommended.reason || 'The latest router receipt selected this model.')
+          : 'available') : null,
       )))));
-  // Development: only what this machine's harness can launch; best (cheapest-marginal) per bucket.
+  // Development is an inventory, not a recommendation filter. The previous one-row-per-tier
+  // projection hid equal-cost Fable behind Opus based solely on array order. Every launchable row
+  // remains visible; the latest actual routing receipt is a separate marker.
   const bestPerTier = (rows, price) => {
     const seen = {};
     for (const p of rows) {
@@ -2118,9 +2187,9 @@ function renderRouterEngine(re) {
     }
     return Object.values(seen).sort(byTier);
   };
-  const devRows = bestPerTier(
-    pool.filter((p) => (p.harness || []).includes('claude-code')),
-    (p) => (p.subscriptionCovered ? -1 : p.marginalPerMTok ?? Infinity));
+  const devRows = pool
+    .filter((p) => (p.harness || []).includes('claude-code'))
+    .sort((a, b) => byTier(a, b) || String(a.id).localeCompare(String(b.id)));
   const prodRows = bestPerTier(
     pool.filter((p) => p.listPerMTok != null && p.provider !== 'local'),
     (p) => p.listPerMTok ?? Infinity);
@@ -2130,7 +2199,7 @@ function renderRouterEngine(re) {
       el('span', { class: 'rp-obj' }, 'you, in Claude Code — models your plan covers win at $0 marginal')),
     lensTable(devRows,
       (p) => (p.subscriptionCovered ? el('b', { title: 'covered by your subscription — zero marginal cost' }, '$0 · yours') : money(p.marginalPerMTok)),
-      'Your cost'));
+      'Your cost', { showRouting: true }));
   const prodBlock = el('div', { class: 'rp-profile' },
     el('div', { class: 'rp-head' },
       el('span', { class: 'rp-name' }, 'Production'),
@@ -2140,7 +2209,7 @@ function renderRouterEngine(re) {
   const poolFoot = el('p', { class: 'fineprint' },
     re.catalogSource === 'built-in-fallback'
       ? `No personal catalog found — showing a minimal built-in set of ${pool.length}. Run \`node scripts/model-router-setup.mjs\` to build your real catalog, then the engine weighs yours on every call.`
-      : `Best pick per bucket shown; the engine weighs all ${pool.length} candidates in its catalog on every call — nothing is retired by being off this summary.`);
+      : `All ${devRows.length} launchable Claude Code models are shown. The engine weighs all ${pool.length} candidates; the routing marker comes from its latest receipt, never catalog order.`);
 
   // Decisions: dedupe consecutive identical picks, keep 3, humanize the reason head. The full
   // append-only log stays on disk — this is a pulse, not a table of record.
@@ -2306,6 +2375,25 @@ function renderDistribution(u) {
     el('p', { class: 'fineprint' }, u.note));
 }
 
+// One provider's key chip. THREE states, never two: found, not found, and NOT CHECKED. The third
+// exists because an instrument that could not run has found nothing — it has not found "no key"
+// (issue #86). Pure and total, so the not-checked branch cannot be reached by accident.
+function providerKeyChip(id, keys, keysVerified, names) {
+  const name = names[id] || id;
+  if (!keysVerified) {
+    return el('span', {
+      class: 'plan-key unknown',
+      title: `Not checked: Brain could not load its provider catalog, so it cannot tell whether an API key for ${name} is set on this machine`,
+    }, el('span', { class: 'plan-key-mark', 'aria-hidden': 'true' }, '?'), ` ${name}`);
+  }
+  const found = !!keys[id];
+  return el('span', {
+    class: `plan-key ${found ? 'yes' : 'no'}`,
+    title: found ? `An API key for ${name} is set on this machine`
+                 : `No API key for ${name} found on this machine`,
+  }, el('span', { class: 'plan-key-mark', 'aria-hidden': 'true' }, found ? '✓' : '✗'), ` ${name}`);
+}
+
 // Plan block (issue #24, applying sparkling's #21 redesign) — three genuinely different questions
 // used to render as one flat row of identical "chips": which subscription this runs on ("house" — a
 // word nobody outside the source knows), whether cheap-task routing is on, and which OTHER API keys
@@ -2332,19 +2420,21 @@ function renderProviders(sv) {
 
   // BOX 1 — YOUR PLAN. The one choice here that changes cost: which subscription MetaHarness treats
   // as $0. Footer checklist: which OTHER providers have a real API key on this machine — honest now.
+  //
+  // Issue #86: `keys` is only a MEASUREMENT while the verified provider catalog actually loaded. When
+  // that asset was missing from the packaged runtime, the server fell back to native detections and
+  // said so in providerCatalog — and this checklist ignored it, printing a confident "✗ … No API key
+  // for Gemini found on this machine" straight off `keys`. That turned an internal packaging failure
+  // into a stated fact about the user's credentials. Not-checked is now its own third state.
+  const catalogHealth = re.providerCatalog || null;
+  const keysVerified = !catalogHealth
+    || (catalogHealth.keysVerified !== false && catalogHealth.status !== 'degraded');
   const others = ['anthropic', 'openai', 'google', 'xai'].filter((id) => id !== house.provider);
   const checklist = el('div', { class: 'plan-keys' },
-    el('span', { class: 'plan-keys-lab' }, 'Other keys found:'),
-    ...others.map((id) => {
-      const ok = !!keys[id];
-      return el('span', {
-        class: `plan-key ${ok ? 'yes' : 'no'}`,
-        title: ok ? `An API key for ${KEY_NAME[id]} is set on this machine`
-                  : `No API key for ${KEY_NAME[id]} found on this machine`,
-      },
-        el('span', { class: 'plan-key-mark', 'aria-hidden': 'true' }, ok ? '✓' : '✗'),
-        ` ${KEY_NAME[id]}`);
-    }));
+    el('span', { class: 'plan-keys-lab' }, keysVerified ? 'Other keys found:' : 'Other keys:'),
+    ...others.map((id) => providerKeyChip(id, keys, keysVerified, KEY_NAME)),
+    ...(keysVerified ? [] : [el('span', { class: 'plan-keys-note' },
+      `Not checked — Brain could not load its provider catalog${catalogHealth && catalogHealth.detail ? ` (${catalogHealth.detail})` : ''}.`)]));
   const planBox = el('div', { class: 'plan-box' },
     el('span', { class: 'plan-label' }, 'Your plan', infoBtn('Your plan and OpenRouter', PROVIDERS_INFO)),
     head('is-house', houseName, action('Change', 'provider')),
@@ -2505,8 +2595,8 @@ function renderSavings(sv) {
         el('div', { class: 'total-num' }, fmtInt(taskCount)),
         el('div', { class: 'total-lab' }, 'tasks routed')),
       el('div', { class: 'total-tile' },
-        el('div', { class: 'total-num' }, util ? fmtUsd(util.frontierUsd) : (totals && totals.msSaved >= 0 ? fmtMs(totals.msSaved) : '—')),
-        el('div', { class: 'total-lab' }, util ? `if all on ${frontierName}` : 'time saved'))));
+        el('div', { class: 'total-num' }, util ? fmtUsd(util.frontierUsd) : (totals && totals.msSaved != null ? fmtSignedMs(totals.msSaved) : '—')),
+        el('div', { class: 'total-lab' }, util ? `if all on ${frontierName}` : (totals && totals.msSaved < 0 ? 'time cost' : 'time saved')))));
   }
 
   // WP2a — provenance, worn openly: these numbers are receipts, not projections.
@@ -2515,7 +2605,21 @@ function renderSavings(sv) {
     el('span', { class: 'prov-dot', 'aria-hidden': 'true' }),
     el('span', {}, 'real numbers — recomputed from your ',
       el('b', {}, `${fmtInt(receiptCount)} receipt${receiptCount === 1 ? '' : 's'}`),
-      ', never projected')));
+      ', never projected',
+      sv && sv.skippedUnmeasured
+        ? el('span', { class: 'muted' }, ` · ${fmtInt(sv.skippedUnmeasured)} row${sv.skippedUnmeasured === 1 ? '' : 's'} carried no $ or time and ${sv.skippedUnmeasured === 1 ? 'is' : 'are'} not counted`)
+        : '')));
+
+  // TIME, WITH ITS SIGN, ALWAYS. When the utilization hero is present the tile above shows frontier $
+  // instead of time, and the only other place the time result appeared turned negatives into a dash.
+  // A net loss is a finding about the router, not an embarrassment to hide.
+  if (totals && totals.msSaved != null) {
+    const neg = totals.msSaved < 0;
+    blocks.push(el('p', { class: `fineprint${neg ? ' bp-warn' : ''}` },
+      neg ? 'Time cost: ' : 'Time saved: ', el('b', {}, fmtSignedMs(totals.msSaved)),
+      totals.timedCount != null ? ` across ${fmtInt(totals.timedCount)} timed route${totals.timedCount === 1 ? '' : 's'}` : '',
+      neg ? ' — routed tasks took longer than their baseline in aggregate.' : '.'));
+  }
 
   // The distribution — how many tasks went to each bucket, and the saved-vs-frontier math.
   // (computed above, so the totals-strip can stand down when this hero is doing the talking)
@@ -2581,7 +2685,7 @@ function fieldBeats(f) {
  * same widget — same markup, same "not chosen" honesty rule, same info-bubble mechanics — as every
  * config.json field, rather than a bespoke control invented for one setting.
  */
-function buildSettingsField(f, values, defaults, refreshDirty) {
+function buildSettingsField(f, values, defaults, refreshDirty, overrides = null) {
   const labId = `lab-${f.key}`;
   const helpId = `help-${f.key}`;
   const ctl = el('div', { class: 'field-ctl' });
@@ -2630,20 +2734,27 @@ function buildSettingsField(f, values, defaults, refreshDirty) {
     // that this is a recommendation and not their current setting.
     const chosen = values[f.key] === true || values[f.key] === false;
     const rec = defaults[f.key] === true;
-    const input = el('input', { type: 'checkbox', 'aria-labelledby': labId, 'aria-describedby': helpId, onchange: refreshDirty });
+    // A NOT-CHOSEN field is sent only once the person has touched it. RNBC QA 2026-10-01: every field
+    // was posted on every save, so changing ONLY "Your model house" on a fresh machine also saved the
+    // pre-filled recommendation nightly:true — and saveConfig() installed the nightly LaunchAgent the
+    // person never touched. A recommendation is not a choice until someone makes it.
+    let touched = false;
+    const input = el('input', { type: 'checkbox', 'aria-labelledby': labId, 'aria-describedby': helpId,
+      onchange: () => { touched = true; refreshDirty(); } });
     input.checked = chosen ? values[f.key] === true : rec;
     initialValue = input.checked;
     ctl.append(el('label', { class: 'switch' }, input, el('span', { class: 'track', 'aria-hidden': 'true' })));
     if (!chosen) ctl.append(notChosenField(rec ? 'on' : 'off'));
-    collector = () => ({ include: true, value: input.checked });
+    collector = () => ({ include: chosen || touched, touched: !chosen && touched, value: input.checked });
   } else if (f.type === 'enum' && Array.isArray(f.options)) {
     const name = `seg-${f.key}`;
     const seg = el('div', { class: 'seg', role: 'radiogroup', 'aria-labelledby': labId, 'aria-describedby': helpId });
     const inputs = [];
     const chosen = f.options.some((opt) => Object.is(values[f.key], opt));
     const rec = f.options.includes(defaults[f.key]) ? defaults[f.key] : f.options[0];
+    let touched = false;
     for (const opt of f.options) {
-      const input = el('input', { type: 'radio', name, value: String(opt), onchange: refreshDirty });
+      const input = el('input', { type: 'radio', name, value: String(opt), onchange: () => { touched = true; refreshDirty(); } });
       input.optionValue = opt;
       input.checked = chosen ? Object.is(values[f.key], opt) : Object.is(opt, rec);
       inputs.push(input);
@@ -2660,7 +2771,7 @@ function buildSettingsField(f, values, defaults, refreshDirty) {
     }
     ctl.append(seg);
     if (!chosen) ctl.append(notChosenField(segLabel(f.key, rec)));
-    collector = () => ({ include: true, value: inputs.find((i) => i.checked)?.optionValue });
+    collector = () => ({ include: chosen || touched, touched: !chosen && touched, value: inputs.find((i) => i.checked)?.optionValue });
   } else {
     const input = el('input', {
       type: 'text', class: 'text-input', 'aria-labelledby': labId, 'aria-describedby': helpId, oninput: refreshDirty,
@@ -2671,6 +2782,15 @@ function buildSettingsField(f, values, defaults, refreshDirty) {
     collector = () => ({ include: true, value: input.value });
   }
 
+  // A project file that overrides this key for the runtime that reads it (see projectOverrides()
+  // on the server). Saving here still changes the user-level choice; the note says why this project
+  // will not follow it.
+  const ov = overrides && overrides.values && Object.hasOwn(overrides.values, f.key) ? overrides : null;
+  if (ov) {
+    ctl.append(el('p', { class: 'field-override bp-warn', role: 'note' },
+      'This project overrides this setting: ', el('b', {}, String(typeof ov.values[f.key] === 'boolean' ? (ov.values[f.key] ? 'on' : 'off') : segLabel(f.key, ov.values[f.key]))),
+      ' (from ', el('code', {}, ov.path), '). A change saved here applies to your other projects, not this one.'));
+  }
   const row = el('div', { class: 'field', id: `field-${f.key}` },
     el('div', {},
       el('span', { class: 'field-label', id: labId }, f.label || f.key, infoBtn(f.label || f.key, fieldBeats(f))),
@@ -2686,6 +2806,11 @@ function buildSettingsField(f, values, defaults, refreshDirty) {
  * single advocacy field backed by user-settings.mjs — same widget, same save/undo/error handling,
  * only the endpoint and the file it names in its own copy differ.
  */
+// The last save's undo, per form, kept OUTSIDE the form so it survives a repaint. RNBC QA 2026-10-01:
+// the form is rebuilt whenever a background measurement lands, and the "Undo save" button vanished
+// with it — the undo was still in the server's journal, with no way left to reach it.
+const PENDING_SAVE_UNDO = new Map();
+
 function buildSettingsForm(cfg, { endpoint }) {
   const values = cfg.values || {};
   // What the project would pick FOR you, kept strictly apart from what you actually picked. The
@@ -2702,14 +2827,20 @@ function buildSettingsForm(cfg, { endpoint }) {
     for (const [key, get] of Object.entries(collectors)) {
       const g = get();
       if (g.secret) { if (g.include) return true; continue; }
+      if (g.touched) return true;
       if (g.value !== initial[key]) return true;
     }
     return false;
   }
-  function refreshDirty() { if (saveBtn) saveBtn.disabled = !isDirty(); }
+  function refreshDirty() {
+    const dirty = isDirty();
+    if (saveBtn) saveBtn.disabled = !dirty;
+    // read by renderSettings: a repaint must not discard choices the person has not saved yet
+    form.dataset.dirty = dirty ? '1' : '';
+  }
 
   for (const f of cfg.schema) {
-    const { row, collector, initialValue } = buildSettingsField(f, values, defaults, refreshDirty);
+    const { row, collector, initialValue } = buildSettingsField(f, values, defaults, refreshDirty, cfg.projectOverrides);
     collectors[f.key] = collector;
     if (f.type !== 'secret' && !f.secret) initial[f.key] = initialValue;
     form.append(row);
@@ -2722,6 +2853,45 @@ function buildSettingsForm(cfg, { endpoint }) {
       'Saves to ', el('code', {}, cfg.path || '~/.claude/ruvnet-brain/config.json'),
       ' in your user folder. Each choice is enforced by its named runtime; encrypted secrets and scheduler state never live in this browser response.')),
     resultSlot);
+
+  // Renders the saved note and its Undo. Called on a successful save AND whenever this form is
+  // rebuilt while an undo is still pending, so a repaint cannot strand the undo.
+  function showSaved(data) {
+    // Not every store behind this form has an undo token — so the button only appears when one exists.
+    const undoBtn = data.undoToken ? el('button', {
+      class: 'btn btn-undo btn-sm', type: 'button',
+      // try/catch, because this is an async onclick with a network call in it. The server's own
+      // explanation is shown verbatim on failure: "this undo has already been used" and "your
+      // settings were saved again after this point" are the two cases people will actually hit.
+      onclick: async (ev) => {
+        const btn = ev.currentTarget;
+        btn.disabled = true;
+        try {
+          const r = await postJSON('/api/undo', { undoToken: data.undoToken });
+          const ok = r.ok && r.data?.ok;
+          if (!ok) btn.disabled = false;
+          if (ok || /already been used|saved again after/.test(r.data?.log || '')) PENDING_SAVE_UNDO.delete(endpoint);
+          resultSlot.replaceChildren(el('div', { class: `form-note ${ok ? 'n-ok' : 'n-err'}`, role: 'status' },
+            ok
+              ? 'Settings restored from the backup. Reload to see the restored values.'
+              : (r.status === 403 ? TOKEN_MSG
+                : `Undo didn’t complete — ${r.data?.log || 'the backup file still exists, nothing is lost.'}`)));
+        } catch (err) {
+          btn.disabled = false;
+          resultSlot.replaceChildren(el('div', { class: 'form-note n-err', role: 'alert' },
+            `Undo couldn’t reach the console server: ${err.message || err}. Nothing was changed.`));
+        }
+      },
+    }, 'Undo save') : null;
+    resultSlot.replaceChildren(el('div', { class: 'form-note n-ok', role: 'status' },
+      frag(BADGE_OK),
+      el('div', { class: 'fn-body' },
+        el('b', {}, 'Saved.'), ' Your choices are in ',
+        el('span', { class: 'fn-path' }, cfg.path || 'your user folder'), '.',
+        data.backup ? el('span', {}, ' Backup kept at ', el('span', { class: 'fn-path' }, data.backup), '.') : ''),
+      undoBtn));
+  }
+  if (PENDING_SAVE_UNDO.has(endpoint)) showSaved(PENDING_SAVE_UNDO.get(endpoint));
 
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -2739,46 +2909,12 @@ function buildSettingsForm(cfg, { endpoint }) {
       if (code === 403) {
         resultSlot.replaceChildren(el('div', { class: 'form-note n-err', role: 'alert' }, TOKEN_MSG));
       } else if (data && data.ok) {
-        // Not every store behind this form has an undo token — saveAdvocacy() (user-settings.mjs)
-        // returns a real backup path but no journalled undoToken the way saveConfig() does, so this
-        // button simply does not appear for that form rather than pretending a capability exists.
-        const undoBtn = data.undoToken ? el('button', {
-          class: 'btn btn-undo btn-sm', type: 'button',
-          // try/catch, because this is an async onclick with a network call in it. Without one, a
-          // dropped connection rejected the promise, left the button permanently disabled and printed
-          // NOTHING — the user is looking at a dead undo button with no idea whether it ran. The
-          // server's own explanation is shown verbatim on failure: "this undo has already been used"
-          // and "your settings were saved again after this point" are the two cases people will
-          // actually hit, and both are worth reading.
-          onclick: async (ev) => {
-            const btn = ev.currentTarget;
-            btn.disabled = true;
-            try {
-              const r = await postJSON('/api/undo', { undoToken: data.undoToken });
-              const ok = r.ok && r.data?.ok;
-              if (!ok) btn.disabled = false;
-              resultSlot.replaceChildren(el('div', { class: `form-note ${ok ? 'n-ok' : 'n-err'}`, role: 'status' },
-                ok
-                  ? 'Settings restored from the backup. Reload to see the restored values.'
-                  : (r.status === 403 ? TOKEN_MSG
-                    : `Undo didn’t complete — ${r.data?.log || 'the backup file still exists, nothing is lost.'}`)));
-            } catch (err) {
-              btn.disabled = false;
-              resultSlot.replaceChildren(el('div', { class: 'form-note n-err', role: 'alert' },
-                `Undo couldn’t reach the console server: ${err.message || err}. Nothing was changed.`));
-            }
-          },
-        }, 'Undo save') : null;
-        resultSlot.replaceChildren(el('div', { class: 'form-note n-ok', role: 'status' },
-          frag(BADGE_OK),
-          el('div', { class: 'fn-body' },
-            el('b', {}, 'Saved.'), ' Your choices are in ',
-            el('span', { class: 'fn-path' }, cfg.path || 'your user folder'), '.',
-            data.backup ? el('span', {}, ' Backup kept at ', el('span', { class: 'fn-path' }, data.backup), '.') : ''),
-          undoBtn));
+        if (data.undoToken) PENDING_SAVE_UNDO.set(endpoint, data); else PENDING_SAVE_UNDO.delete(endpoint);
+        showSaved(data);
         for (const [key, get] of Object.entries(collectors)) {
           const g = get(); if (!g.secret) initial[key] = g.value;
         }
+        form.dataset.dirty = ''; // saved: nothing left to protect from a repaint
         announce('Settings saved.');
       } else {
         // The server says WHY — a rejected value names itself ("routing: expected one of auto, off").
@@ -2805,8 +2941,116 @@ function buildSettingsForm(cfg, { endpoint }) {
  * now just the advocacy dial (ADR-032 §DDD-0004 "the three channels": this control is the volume knob
  * on the speech channel). Two stores, two forms, one shared widget — see buildSettingsField/Form.
  */
+// THREE FACTS, SIDE BY SIDE: "switch: off · agent: loaded · last completed run: never". The toggle
+// above this line shows a single state only when the saved choice and the scheduler agree (see
+// reconcileNightly on the server); this line shows all three regardless, so "on" can never again be
+// printed over a config file that says off and a job that has never completed a run.
+function nightlyFactsLine(f) {
+  const choice = f.choice === true ? 'on' : f.choice === false ? 'off' : 'never chosen';
+  const agent = f.enforcement === 'on' ? 'loaded'
+    : f.enforcement === 'off' ? 'not scheduled'
+      : f.enforcement === 'degraded' ? 'degraded'
+        : f.enforcement === 'unsupported' ? 'unsupported here' : String(f.enforcement || 'unknown');
+  const run = f.lastRun === 'ok' ? (f.lastRunAt ? fmtDate(f.lastRunAt) : 'completed')
+    : f.lastRun === 'never-ran' ? 'never'
+      : f.lastRun === 'failed' ? 'failed' : String(f.lastRun || 'unknown');
+  // Each fact carries ITS OWN evidence. RNBC QA 2026-10-01: the agent's evidence ("No LaunchAgent
+  // plist at …") was printed after "last completed run: failed", reading as the reason the run
+  // failed — while the run's real failure (a preflight refusal, a week earlier) was never shown.
+  const runWhen = f.lastRun === 'failed' && f.lastRunAt ? ` ${fmtDate(f.lastRunAt)}` : '';
+  return el('p', { class: `fineprint field-facts${f.agree === false ? ' bp-warn' : ''}` },
+    'switch: ', el('b', {}, choice),
+    ' · agent: ', el('b', {}, agent),
+    f.enforcementEvidence ? el('span', { class: 'muted nf-agent-ev' }, ` (${f.enforcementEvidence})`) : '',
+    ' · last completed run: ', el('b', {}, run + runWhen),
+    f.lastRunEvidence && f.lastRun !== 'ok' ? el('span', { class: 'muted nf-run-ev' }, ` (${f.lastRunEvidence})`) : '',
+    f.agree === false ? ' — these disagree, so the toggle above shows no single state until they do.' : '');
+}
+
+let suiteUpdateTimer = null;
+let suiteUpdateBusy = false;
+let suiteUpdateWasActive = false;
+function suiteUpdateSummary(state) {
+  const labels = { running: 'Update in progress', succeeded: 'Last update completed successfully',
+    failed: 'Last update failed', interrupted: 'Last update has no completed result',
+    checked: 'Last run checked for updates; it did not apply them', 'never-run': 'No update run has been recorded' };
+  const label = state.status === 'succeeded' && state.unverified?.length ? 'Update finished; some checks remain unverified' : labels[state.status];
+  return `${label || 'Update status unknown'}${state.finishedAt ? ` · ${fmtDate(state.finishedAt)}` : ''}${state.error ? ` · ${state.error}` : ''}`;
+}
+function renderSuiteUpdate(state) {
+  if (!state) return;
+  const updateFinished = suiteUpdateWasActive && !state.active && ['succeeded', 'failed'].includes(state.status);
+  suiteUpdateWasActive = !!state.active;
+  if (updateFinished) void recheckMachine(); // Measure the changed machine once, including partial failures.
+  let card = document.getElementById('card-suite-update');
+  if (!card) {
+    card = el('section', { class: 'card sub-card rail-act', id: 'card-suite-update', 'aria-labelledby': 'suite-update-heading' },
+      el('div', { class: 'body' },
+        el('h2', { id: 'suite-update-heading' }, 'Keep all tools updated'),
+        chip('recommended', 'cyan'),
+        el('p', { class: 'fineprint' }, 'One coordinated update for your installed developer tools, plugins and Brain knowledge. Enable nightly updates and run the same coordinator now.'),
+        el('label', { for: 'suite-update-channel' }, 'Release policy '),
+        el('select', { id: 'suite-update-channel' },
+          el('option', { value: '', disabled: true }, 'Policy not measured'),
+          el('option', { value: 'latest' }, 'Latest (recommended)'),
+          el('option', { value: 'alpha' }, 'Alpha')),
+        el('p', { class: 'fineprint' }, 'Alpha uses published alpha releases for supported Ruv tools, with Latest as the fallback. Other providers keep their own release channels; installed newer versions are preserved.'),
+        el('button', { class: 'btn btn-apply', id: 'suite-update-run', type: 'button', onclick: async () => {
+          if (suiteUpdateBusy) return;
+          const button = document.getElementById('suite-update-run');
+          const channel = document.getElementById('suite-update-channel').value;
+          suiteUpdateBusy = true; button.disabled = true;
+          try {
+            const result = await postJSON('/api/suite-update', { channel });
+            if (!result.ok || !result.data.ok) throw new Error(result.status === 403 ? TOKEN_MSG : result.data.error || 'The update could not start.');
+            renderSuiteUpdate(result.data.state);
+          } catch (error) { document.getElementById('suite-update-result').textContent = String(error.message || error); }
+          finally { suiteUpdateBusy = false; void pollSuiteUpdate(); }
+        } }, 'Keep all tools updated'),
+        el('p', { id: 'suite-update-result', role: 'status', 'aria-live': 'polite' }),
+        el('p', { id: 'suite-update-nightly', class: 'fineprint' })));
+    document.getElementById('card-settings')?.before(card);
+  }
+  const select = document.getElementById('suite-update-channel');
+  // Preserve an unsaved policy choice during receipt polling.
+  if (!select.dataset.initialized) {
+    select.value = state.channel || '';
+    select.dataset.initialized = '1';
+  }
+  select.disabled = !!state.active;
+  const button = document.getElementById('suite-update-run');
+  button.disabled = suiteUpdateBusy || !!state.active || !state.available || state.lockState !== 'idle';
+  button.textContent = state.active ? 'Updating…' : 'Keep all tools updated';
+  document.getElementById('suite-update-result').textContent = state.available ? suiteUpdateSummary(state) : state.policyError || 'The coordinated updater is unavailable.';
+  document.getElementById('suite-update-nightly').textContent = `Nightly updates: ${state.nightlyState === 'on' ? 'enabled' : state.nightlyState === 'off' ? 'not scheduled' : 'not verified'}. Saved scope: ${state.scope === 'all' ? 'all installed tools' : state.scope === 'ruvnet' ? 'Ruv tools' : 'not measured'}. Clicking this button includes existing npm, Homebrew, uv, Cargo and native tools. It does not install missing tools or change project dependencies.`;
+  let activity = document.getElementById('suite-update-activity');
+  if (!activity) {
+    activity = el('section', { class: 'body', id: 'suite-update-activity', 'aria-label': 'Tool update activity' });
+    document.getElementById('card-activity')?.append(activity);
+  }
+  activity.replaceChildren(el('h3', {}, 'Tool update activity'),
+    el('p', { role: 'status' }, suiteUpdateSummary(state)),
+    state.startedAt ? el('p', { class: 'fineprint' }, `Started ${fmtDate(state.startedAt)} · ${state.mode === 'check' ? 'check only' : 'apply'}`) : '',
+    state.steps?.length ? el('ul', {}, state.steps.map(step => el('li', {}, `${step.name}: ${step.state}`))) : '',
+    state.unverified?.length ? el('details', { class: 'sub' }, el('summary', {}, 'Checks not verified'),
+      el('ul', {}, state.unverified.map(note => el('li', {}, note)))) : '',
+    state.exclusions?.length ? el('details', { class: 'sub' }, el('summary', {}, `${state.exclusions.length} tools preserved`),
+      el('ul', {}, state.exclusions.map(item => el('li', {}, `${item.name}: ${item.reason}`)))) : '',
+    state.sourceSha256 ? el('details', { class: 'sub' }, el('summary', {}, 'Update receipt'), el('p', { class: 'fineprint' }, `Updater source: ${state.sourceSha256.slice(0, 16)}`)) : '');
+}
+async function pollSuiteUpdate() {
+  try { renderSuiteUpdate(await getJSON('/api/suite-update')); }
+  catch { const result = document.getElementById('suite-update-result'); if (result) result.textContent = 'Update status could not be measured. Reload to reconnect.'; }
+  if (!suiteUpdateTimer) suiteUpdateTimer = setInterval(() => { if (!document.hidden) void pollSuiteUpdate(); }, 3000);
+}
+
 function renderSettings(cfg, us, bp) {
   const body = $('#body-settings');
+  // UNSAVED CHOICES SURVIVE A REPAINT. RNBC QA 2026-10-01: a background measurement landing while
+  // someone was mid-way through the Settings form rebuilt it and silently threw their selections
+  // away. While any form here has unsaved changes the card is left exactly as the person has it;
+  // the next repaint after they save (or undo their edits) brings it current.
+  if (body && body.querySelector('form.settings-form[data-dirty="1"]')) return;
   // `bp` is NOT counted here any more: its field is rendered by #card-brain at the top of the page,
   // and counting a control this card does not show would make the "N options" chip a lie by one.
   const groups = [cfg, us].filter((c) => c && Array.isArray(c.schema) && c.schema.length);
@@ -2848,7 +3092,13 @@ function renderSettings(cfg, us, bp) {
         onclick: () => { document.getElementById('card-brain')?.scrollIntoView({ behavior: 'smooth', block: 'center' }); },
       }, 'Take me to it')));
   }
-  if (cfg && Array.isArray(cfg.schema) && cfg.schema.length) main.push(buildSettingsForm(cfg, { endpoint: '/api/save-config' }));
+  if (cfg && Array.isArray(cfg.schema) && cfg.schema.length) {
+    const form = buildSettingsForm(cfg, { endpoint: '/api/save-config' });
+    const facts = cfg.runtime && cfg.runtime.nightly && cfg.runtime.nightly.facts;
+    const slot = facts ? form.querySelector('#field-nightly') : null;
+    if (slot) slot.append(nightlyFactsLine(facts));
+    main.push(form);
+  }
   if (us && Array.isArray(us.schema) && us.schema.length) main.push(buildSettingsForm(us, { endpoint: '/api/save-advocacy' }));
   if (unavailable.length) {
     main.push(el('section', { class: 'settings-unavailable', 'aria-labelledby': 'settings-unavailable-h' },
@@ -2886,6 +3136,59 @@ let bpBusy = false;
 
 function bpField(bp) {
   return (bp && Array.isArray(bp.schema) && bp.schema[0]) || null;
+}
+
+/* ------------------------------------------------------------ inventory */
+
+// Renders /api/state's `inventory` section: the installed brain's stores BY NAME, joined with their
+// upstream repo and build commit. Ranked by recency (server-side) — never alphabetical. Read-only.
+function renderInventory(inv) {
+  const body = $('#body-inventory');
+  if (!body) return;
+  if (!inv || inv.available !== true) {
+    setChips('chips-inventory', [chip('can’t read the manifest', 'nt')]);
+    body.replaceChildren(el('p', { class: 'muted' },
+      inv && inv.reason ? inv.reason : 'The console could not read RVF-GENERATIONS.json from the installed brain, so it is not guessing a list.'));
+    return;
+  }
+  // "stores", not "repositories": gist and concept stores are in this list too (RNBC QA 2026-10-01).
+  const chips = [chip(`${fmtInt(inv.count)} stores`, 'green')];
+  if (inv.privateCount > 0) chips.push(chip(`${fmtInt(inv.privateCount)} private`, 'cyan', 'Fenced private stores — never leave this machine'));
+  if (inv.releaseTag) chips.push(chip(`generation ${inv.releaseTag}`, 'grey'));
+  setChips('chips-inventory', chips);
+
+  // totalBytes sums each store's .rvf only. It was labelled "on disk" beside a Brain-power card
+  // reporting the same 207 stores as 1.25 GB installed (RVF + passages + sidecars) — both true, but
+  // only one of them is the disk footprint. Say which bytes this is.
+  const mb = inv.totalBytes ? `${(inv.totalBytes / 1e6).toFixed(0)} MB of vector files` : null;
+  const summary = el('p', { class: 'muted' },
+    `${fmtInt(inv.count)} searchable stores`,
+    // withProvenance counts rows whose SOURCE.json names an upstream repository — not commits (nearly
+    // every row shows its build commit below).
+    inv.withProvenance != null ? `, ${fmtInt(inv.withProvenance)} with a named upstream repository` : '',
+    mb ? `, ${mb}.` : '.');
+
+  const rows = (inv.stores || []).map((s) => el('li', { class: 'inv-row', 'data-name': s.name.toLowerCase() },
+    el('span', { class: 'mono inv-name' }, s.name),
+    s.private ? chip('private', 'cyan') : null,
+    s.sourceRepo && /^https?:\/\//.test(s.sourceRepo)
+      ? el('a', { class: 'inv-src', href: s.sourceRepo, target: '_blank', rel: 'noopener noreferrer' }, s.sourceRepo.replace(/^https?:\/\/(www\.)?github\.com\//, ''))
+      : el('span', { class: 'muted inv-src' }, s.sourceRepo || '—'),
+    el('span', { class: 'mono muted inv-meta' },
+      s.sourceCommit ? `@${s.sourceCommit}` : '', s.builtUtc ? ` · built ${String(s.builtUtc).slice(0, 10)}` : ''),
+  ));
+  const list = el('ul', { class: 'inv-list', 'aria-label': 'Repositories in the brain' }, ...rows);
+  const filter = el('input', {
+    class: 'inv-filter', type: 'search', placeholder: 'Filter by name…', 'aria-label': 'Filter repositories by name',
+    oninput: (e) => {
+      const q = String(e.target.value || '').trim().toLowerCase();
+      let shown = 0;
+      for (const li of list.children) { const hit = !q || li.dataset.name.includes(q); li.hidden = !hit; if (hit) shown += 1; }
+      count.textContent = q ? `${fmtInt(shown)} of ${fmtInt(inv.count)} match` : '';
+    },
+  });
+  const count = el('span', { class: 'muted inv-count', 'aria-live': 'polite' });
+  body.replaceChildren(summary, el('div', { class: 'inv-tools' }, filter, count), list);
 }
 
 function renderBrainPower(bp) {
@@ -2969,6 +3272,22 @@ function bpProfileControl(profile) {
     },
   ];
   const radios = [];
+  // What the number on the card IS, said in words. `installed` is the brain on this disk; the
+  // bundle is what a restore would copy from. A choice with neither measured says so — a dash
+  // for a measured zero was the "— stores · 0 MB" lie this card carried until 2026-09-11.
+  const metaFor = (option, choice) => {
+    if (option.value === 'ruvector') return `1 store · ${bpSize(choice.bytes)}`;
+    if (choice.installed) return `${choice.installed.storeCount} stores · ${bpSize(choice.installed.bytes)} installed`;
+    if (choice.restoreBundle?.present) return `${choice.restoreBundle.storeCount} stores · ${bpSize(choice.restoreBundle.bytes)} in the local bundle`;
+    return 'not installed · size measured after restore';
+  };
+  // The restore mechanism, named — the same branch order saveBrainProfile() takes on Apply.
+  const restoreFor = (choice) => {
+    const where = choice.restoreBundle?.path || 'the release bundle path';
+    if (choice.restoreVia === 'local-bundle') return { warn: false, text: `Apply restores from the signed local bundle at ${where}.` };
+    if (choice.restoreVia === 'signed-download') return { warn: false, text: `No local bundle on this machine (${where}) — Apply downloads the signed complete release with forge-update and verifies it before anything lands. Size is measured after it does.` };
+    return { warn: true, text: `Complete Brain cannot be restored on this machine: no local bundle at ${where} and forge-update.mjs is not installed. Run the Brain update first.` };
+  };
   const cards = options.map((option) => {
     const choice = profile.choices?.[option.value] || {};
     const input = el('input', {
@@ -2985,12 +3304,13 @@ function bpProfileControl(profile) {
       el('span', { class: 'bp-profile-copy' },
         el('span', { class: 'bp-profile-title' }, option.title,
           option.value === current ? chip('active', 'green') : null),
-        el('span', { class: 'bp-profile-meta' },
-          `${choice.storeCount || (option.value === 'ruvector' ? 1 : '—')} ${choice.storeCount === 1 ? 'store' : 'stores'} · ${bpSize(choice.bytes)}`),
+        el('span', { class: 'bp-profile-meta' }, metaFor(option, choice)),
         el('span', { class: 'bp-profile-desc' }, option.copy),
-        choice.available === false
-          ? el('span', { class: 'bp-profile-desc bp-warn' }, 'The complete release bundle is not available on this machine; run the Brain update first.')
-          : null));
+        option.value === 'complete'
+          ? (() => { const r = restoreFor(choice); return el('span', { class: `bp-profile-desc${r.warn ? ' bp-warn' : ''}` }, r.text); })()
+          : (choice.available === false
+            ? el('span', { class: 'bp-profile-desc bp-warn' }, 'No RuVector store exists on this machine or in a local bundle; run the Brain update first.')
+            : null)));
   });
 
   apply.onclick = async () => {
@@ -3091,10 +3411,10 @@ async function bpFlip(next) {
    has to wonder again whether a piece is missing or merely elsewhere.
 
    THE RULE THAT KEEPS IT HONEST is user-settings.mjs's own: a switch is not shipped until something
-   reads it. The remaining schema keys (learningScope, autoApply, newProjectDefaults) exist in the
-   settings store and are deliberately NOT rendered as controls, because nothing enforces them yet —
-   a row of checkboxes that govern nothing is the single fastest way to make every other switch on
-   this page untrustworthy. */
+   reads it. The ordinary schema keys (learningScope, advocacy, autoApply, newProjectDefaults) are
+   rendered by the shared Settings form below and saved through the user-settings writer. Only
+   controls with a real runtime consumer are included; a row that governs nothing would make every
+   other switch on this page untrustworthy. */
 function bpParts(bp) {
   const off = !!bp.off;
   const part = (title, chipText, tone, ...text) => el('div', { class: 'bp-part' },
@@ -3120,7 +3440,7 @@ function bpParts(bp) {
       'Version updates and the health alarm keep running even when the brain is off — an off machine ',
       'has to be able to receive the fix for an off-state bug. The nightly refresh is the part of that ',
       'you can pause: it is the ',
-      el('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => jumpToSetting('nightly') }, 'Nightly brain refresh'),
+      el('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => jumpToSetting('nightly') }, 'Nightly coordinated updates'),
       ' switch in Settings.'),
 
     part('Installed knowledge',
@@ -3132,11 +3452,16 @@ function bpParts(bp) {
       'best for cross-repository reasoning; RuVector Only is the compact choice for people who only ',
       'need the RuVector source. Nightly updates preserve whichever profile is selected.'),
 
-    el('p', { class: 'fineprint' },
-      'There are three more switches in the settings file — what it learns from, whether it may act ',
-      'on its own, and whether new projects inherit these choices. They are deliberately not shown ',
-      'as controls here: nothing enforces them yet, and a switch that governs nothing would make ',
-      'every real switch on this page worth less.'));
+    // RNBC QA 2026-10-01: this used to say these switches were "deliberately not shown … nothing
+    // enforces them yet" — while the Settings card rendered all of them and learn-capture,
+    // the console's guarded remedy loop and SessionStart seeding each read one. A sentence about the
+    // page that the page itself contradicts is the failure this card exists to prevent.
+    el('p', { class: 'fineprint bp-more-settings' },
+      'Four more choices shape what the brain does while it is on — what it learns from, how much it ',
+      'jumps in, whether it may act on its own, and whether new projects inherit these choices. They ',
+      'are in ',
+      el('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => jumpToSetting('learningScope') }, 'Settings'),
+      ', and each one names the runtime that enforces it.'));
 }
 
 /* -------------------------------------------------- section 7: trust & provenance
@@ -3149,17 +3474,22 @@ const TRUST_INFO = {
   signature: [
     { k: 'What is this?', t: 'The sha256 fingerprint of the release bundle, published as its own asset on every GitHub release.' },
     { k: 'Why does it matter?', t: 'If your download’s fingerprint matches the published one, the bundle is byte-identical to what was released — nothing altered, nothing truncated.' },
-    { k: 'How do I use it?', t: 'Run shasum -a 256 ruvnet-brain.zip on your download and compare. v3.3 adds a one-click local check right here.' },
+    { k: 'How do I use it?', t: 'Run shasum -a 256 ruvnet-brain.zip on your download and compare. A one-click local check here is planned.' },
   ],
   sbom: [
     { k: 'What is this?', t: 'A Software Bill of Materials — the complete, machine-readable list of every package inside the bundle.' },
     { k: 'Why does it matter?', t: 'You can see what’s in the box without unzipping it, and scanners can watch it for known vulnerabilities.' },
-    { k: 'How does it help me?', t: 'v3.3 attaches a CycloneDX SBOM to every release; this row will then show its package count and digest, measured from the published asset.' },
+    { k: 'How does it help me?', t: 'Attaching a CycloneDX SBOM to every release is planned; this row will then show its package count and digest, measured from the published asset.' },
   ],
   channel: [
     { k: 'What is this?', t: 'How your plugin updates: riding the latest release, or pinned to a version you chose.' },
     { k: 'Why does it matter?', t: 'This stack ships fast — latest keeps you current. Pinning holds a known-good release when you need repeatable builds.' },
     { k: 'How does it help me?', t: 'Read from your plugin cache on disk, never assumed. Version pinning is planned — both choices will live on this row.' },
+  ],
+  versions: [
+    { k: 'What is this?', t: 'The three version numbers this machine is actually running: the knowledge-base generation (RVF-GENERATIONS.json), the running brain (runtime-identity.json, else the plugin cache), and the installed plugin (installed_plugins.json). Each is read from its own file.' },
+    { k: 'Why does it matter?', t: 'After an update they should all match. While they differ, this page is describing more than one release at once — the header chip, the install-channel row and the knowledge base were once three different numbers with nothing saying so.' },
+    { k: 'How does it help me?', t: 'If they disagree, finish the update (one restart picks up boot-level declarations) and re-check. "Not measured" means the file was not there to read — never a guess.' },
   ],
   advisor: [
     { k: 'What is this?', t: 'A coming mode switch. Full lets the console apply consent-gated, undoable fixes; Advisor makes every Apply button read-only — it shows the exact command and steps aside.' },
@@ -3186,7 +3516,7 @@ function renderTrust(t) {
     rel.ok ? chip('sha256 published ✓', 'green', 'The release bundle’s fingerprint is published and was read live this session')
            : chip('digest unreachable', 'warn', 'Couldn’t read the published digest this session'),
     sb.present ? chip(`SBOM · ${sb.componentCount} component${sb.componentCount === 1 ? '' : 's'} ✓`, 'green', 'A local CycloneDX SBOM was found and read live this session')
-                : chip('SBOM — v3.3', 'coming', 'A CycloneDX SBOM ships with every release from v3.3'),
+                : chip('SBOM — planned', 'coming', 'Releases do not carry a CycloneDX SBOM yet; it is planned'),
     ch.installed ? chip(ch.channel === 'pinned' ? 'pinned' : 'latest channel', 'cyan') : chip('no plugin install', 'grey'),
   ]);
 
@@ -3216,7 +3546,7 @@ function renderTrust(t) {
   /* 2 · SBOM — real once `npm run sbom` has been run locally; honest empty state until then */
   rows.push(trustRow({
     name: 'SBOM', info: TRUST_INFO.sbom, coming: !sb.present,
-    status: sb.present ? chip(`${sb.componentCount} component${sb.componentCount === 1 ? '' : 's'}`, 'green') : chip('coming · v3.3', 'coming'),
+    status: sb.present ? chip(`${sb.componentCount} component${sb.componentCount === 1 ? '' : 's'}`, 'green') : chip('planned', 'coming'),
     value: sb.present ? [
       el('p', {}, 'A ', el('b', {}, `CycloneDX ${sb.specVersion || ''}`.trim()), ' SBOM exists on this machine: ',
         el('b', {}, `${sb.componentCount} component${sb.componentCount === 1 ? '' : 's'}`),
@@ -3229,9 +3559,8 @@ function renderTrust(t) {
       el('p', {}, sb.error
         ? `Found sbom/ruvnet-brain.cdx.json but couldn’t read it (${sb.error}).`
         : 'Not generated yet on this machine — nothing to show, so nothing is shown.'),
-      el('p', {}, 'Run ', el('code', {}, 'npm run sbom'),
-        ' to produce a CycloneDX SBOM of the shipped dependency tree right now. From ', el('b', {}, 'v3.3'),
-        ' every published release carries one too, measured from the release asset itself.'),
+      el('p', {}, 'Published releases do not carry an SBOM yet — attaching one, measured from the release asset itself, is planned. ',
+        'From a source checkout, ', el('code', {}, 'npm run sbom'), ' produces a CycloneDX SBOM of the shipped dependency tree.'),
     ],
   }));
 
@@ -3256,6 +3585,29 @@ function renderTrust(t) {
     ],
   }));
 
+  /* 3b · versions — three files, three numbers; either they agree or the page says they do not.
+     The header chip (running brain), this card's channel row (installed plugin) and the KB's own
+     ledger (generation) were three different numbers on one page with nothing reconciling them. */
+  const v = t.versions || {};
+  const vChip = v.agree === true ? chip('in sync', 'green', 'KB generation, running brain and installed plugin all report the same version')
+    : v.agree === false ? chip('differ', 'warn', 'At least two of the measured versions disagree')
+      : chip('partly measured', 'grey', 'Fewer than two versions could be read on this machine');
+  const vShow = (x) => (x ? `v${x}` : 'not measured');
+  rows.push(trustRow({
+    name: 'Versions', info: TRUST_INFO.versions,
+    status: vChip,
+    value: [
+      el('p', {}, 'KB generation ', el('b', {}, vShow(v.kbGeneration)),
+        ' · running brain ', el('b', {}, vShow(v.runningBrain)),
+        ' · installed plugin ', el('b', {}, v.installedPlugin ? `v${v.installedPlugin}` : 'none'),
+        ...(v.latestRelease ? [' · latest release ', el('b', {}, `v${v.latestRelease}`)] : [])),
+      v.agree === false
+        ? el('p', { class: 'bp-warn' }, 'These should match once an update has fully landed. While they differ, this page is describing more than one release at once.')
+        : null,
+      el('span', { class: 'trust-src' }, 'RVF-GENERATIONS.json · runtime-identity.json / plugin cache · installed_plugins.json'),
+    ],
+  }));
+
   /* 4 · advisor mode — display-only preview, clearly labeled */
   const advNote = el('p', { class: 'adv-note' },
     'Full is on: every change stays consent-gated, with its undo recorded first. The switch itself is planned — today it’s a preview and changes nothing.');
@@ -3274,7 +3626,7 @@ function renderTrust(t) {
         el('button', { class: 'adv-opt on', type: 'button', title: 'Your current behavior — consent-gated changes with undo' },
           el('span', { class: 'pc-dot', 'aria-hidden': 'true' }), 'Full — recommended'),
         advisorBtn,
-        el('span', { class: 'preview-tag' }, 'preview · v3.3')),
+        el('span', { class: 'preview-tag' }, 'preview · planned')),
       advNote,
     ],
   }));
@@ -3282,7 +3634,7 @@ function renderTrust(t) {
   body.replaceChildren(
     el('p', { class: 'lead-stat' },
       'Provenance you can check, not take on faith — ', el('b', {}, String(liveCount)),
-      ` measurement${liveCount === 1 ? ' is' : 's are'} live today; the rest of this card names exactly what v3.3 will measure.`,
+      ` measurement${liveCount === 1 ? ' is' : 's are'} live today; the rest of this card names exactly what is planned and not yet measured.`,
       infoBtn('Trust & provenance', TRUST_CARD_INFO)),
     el('div', { class: 'trust-list', 'data-trust-ready': '1' }, ...rows),
   );
@@ -3299,6 +3651,10 @@ function trustSkeleton() {
 /* ---------------------------------------------- header update gong (owner, 2026-07-24) */
 
 let BRAIN_INSTALLED_VERSION = null; // set by renderHost from /api/state's host.brainVersion
+// The last /api/trust payload. State and trust load in parallel; when trust lands first the gong is
+// decided with no installed version, so renderHost decides it again once the version is known
+// (RNBC 2026-10-01: under load the gong never appeared).
+let LAST_TRUST = null;
 
 // Numeric x.y.z only; -dev/-rc suffixes are deliberately ignored so a tie is NEVER "newer" —
 // a false gong is the nag this page promises not to be. Latest unreachable (null) is UNKNOWN,
@@ -3318,10 +3674,15 @@ function renderUpdateGong(t) {
   const latest = t && t.release && t.release.tag ? String(t.release.tag).replace(/^v/, '') : null;
   if (!BRAIN_INSTALLED_VERSION || !latest || cmpVer(latest, BRAIN_INSTALLED_VERSION) <= 0) { btn.hidden = true; return; }
   const cmd = 'npx ruvnet-brain --update';
-  btn.textContent = `⟳ update available · v${latest} — click to update`;
+  // SHORT ON PURPOSE. RNBC QA 2026-10-01: the long label ("⟳ update available · vX — click to update",
+  // then "copied — paste in any terminal: npx …") overflowed the brand block and sat UNDER the
+  // "what's in the brain" link at 1440px, so clicking the gong navigated to the scope page instead.
+  // The full instruction lives in the title and the live region.
+  btn.textContent = `⟳ v${latest} available`;
+  btn.title = `A newer release (v${latest}) is out — click to copy the update command: ${cmd}`;
   btn.onclick = async () => {
-    try { await navigator.clipboard.writeText(cmd); btn.textContent = `copied — paste in any terminal: ${cmd}`; }
-    catch { btn.textContent = `run in any terminal: ${cmd}`; }
+    try { await navigator.clipboard.writeText(cmd); btn.textContent = '✓ update command copied'; announce(`Copied: ${cmd} — paste it in any terminal.`); }
+    catch { btn.textContent = `run: ${cmd}`; announce(`Run in any terminal: ${cmd}`); }
   };
   btn.hidden = false;
 }
@@ -3329,6 +3690,7 @@ function renderUpdateGong(t) {
 async function loadTrust() {
   try {
     const t = await getJSON('/api/trust');
+    LAST_TRUST = t;
     renderTrust(t);
     renderUpdateGong(t);
   } catch (err) {
@@ -3411,14 +3773,14 @@ function renderFreshness(state, { polling = false, justLanded = false } = {}) {
   }
   const at = state && (state.measuredAt || state.cachedAt || state.generatedAt);
   if (at) FRESH_BASE = at;
-  if (justLanded) {
-    pill.className = 'chip tone-green';
-    pill.textContent = 'measured just now';
-    return;
-  }
   if (!at || stampWithdrawn(at)) {
     pill.className = polling ? 'chip tone-cyan' : 'chip tone-warn';
     pill.textContent = polling ? 're-measuring your machine…' : 'this reading was cleared — click to measure again';
+    return;
+  }
+  if (justLanded) {
+    pill.className = 'chip tone-green';
+    pill.textContent = `machine reading updated · as of ${fmtAge(at)}`;
     return;
   }
   pill.className = polling ? 'chip tone-cyan' : (state && state.stale ? 'chip tone-warn' : 'chip tone-grey');
@@ -3466,7 +3828,7 @@ function startFreshnessPolling() {
         // ONE painter — the same loadState() the first paint uses, so a polled repaint can never
         // drift from an initial one. It also refreshes preStateHash and the recommendations, which a
         // sections-only repaint silently left pointing at the pre-measurement machine.
-        await loadState({ landed: true });
+        await loadState({ landed: true, snapshot: st });
         // The other cards measure on their own clocks (stack, capabilities, fleet). Re-ask them here
         // rather than letting the page claim page-wide freshness on the strength of state alone.
         void loadStack();
@@ -3495,7 +3857,12 @@ async function doManualRefresh() {
     announce('The refresh could not be started.');
     return;
   }
-  if (body.started === false && pill) {
+  if (body.refresh?.status === 'failed') {
+    if (pill) { pill.className = 'chip tone-warn'; pill.textContent = 'refresh failed — click to try again'; }
+    announce(`The refresh failed: ${body.refresh.error || 'the measurement child exited'}.`);
+    return;
+  }
+  if (body.started === false && body.refresh?.status === 'already-running' && pill) {
     // Honest, and not an error: a measurement was already running, so this click joined it instead
     // of starting a second full scan of the same machine.
     pill.className = 'chip tone-cyan';
@@ -3513,10 +3880,12 @@ async function doManualRefresh() {
    that painted the same bytes twice and cost a round-trip on every open. There is now one call, and
    the "live" reading arrives the only way it can without freezing the server — from the detached
    child, via the freshness poller. */
-async function loadState({ landed = false } = {}) {
+async function loadState({ landed = false, snapshot = null } = {}) {
   try {
-    const state = await getJSON('/api/state');
+    const state = snapshot || await getJSON('/api/state');
     $('#global-error').hidden = true;
+    renderSuiteUpdate(state.suiteUpdate);
+    void pollSuiteUpdate();
 
     // WARMING: NOTHING HAS BEEN MEASURED FOR THIS PROJECT YET. Paint NOTHING. Every render* below
     // would turn a missing section into a positive claim — renderWiring(undefined) prints "No wiring
@@ -3533,6 +3902,7 @@ async function loadState({ landed = false } = {}) {
     renderHost(state.host, state.generatedAt);
     const s = state.sections || {};
     renderBrainPower(s.brainPower);
+    renderInventory(s.inventory);
     renderWiring(s.wiring);
     lastMemory = s.memory;
     renderMemory(s.memory);
@@ -3583,6 +3953,9 @@ function renderGates(g) {
   setChips('chips-gates', [
     chip(`${s.blocking} can block`, caught ? 'green' : 'cyan'),
     chip(caught ? `${caught} caught` : 'nothing caught yet', caught ? 'green' : 'grey'),
+    ...(s.unregisteredBlocking
+      ? [chip(`${s.unregisteredBlocking} unwired`, 'warn', 'Blocking gates that exist in the plugin but are registered in no hooks.json — they cannot stop anything until wired')]
+      : []),
   ]);
 
   const main = [];
@@ -3603,6 +3976,33 @@ function renderGates(g) {
       ? el('span', { class: 'muted' }, ` Wired twice, so it runs twice: ${dupes.join(', ')}.`)
       : '',
     infoBtn('What caught Claude', GATES_INFO)));
+
+  // WHICH hooks.json the plugin numbers came from. On an installed host the console's own repo path
+  // has no plugin/hooks/, and the card used to silently count zero plugin gates while Claude Code
+  // was loading them from the plugin cache. Named here so a zero can never again pass for absence.
+  main.push(el('p', { class: 'fineprint' },
+    g.pluginPath
+      ? ['Plugin gates read from ', el('code', {}, g.pluginPath),
+        g.pluginSource === 'installed' ? ' — the plugin Claude Code loads on this machine.'
+          : g.pluginSource === 'repo' ? ' — this repository checkout, not an installed plugin.' : '.']
+      : ['No plugin hooks.json was found on this machine — only machine-wide hooks are counted above.']));
+
+  // Blocking gates the launcher knows that NOTHING registers. "0 can block" and "4 enforcers are
+  // unplugged" are different sentences; only the second tells the owner what to do.
+  const unplugged = Array.isArray(g.unregistered) ? g.unregistered : [];
+  if (unplugged.length) {
+    main.push(el('p', { class: 'lead-stat' },
+      el('b', {}, String(unplugged.length)),
+      ` blocking gate${unplugged.length === 1 ? '' : 's'} exist${unplugged.length === 1 ? 's' : ''} in the plugin but ${unplugged.length === 1 ? 'is' : 'are'} registered in no hooks.json — ${unplugged.length === 1 ? 'it' : 'they'} cannot stop anything until wired: `,
+      ...unplugged.flatMap((u, i) => [i ? ', ' : '', el('code', {}, u.name), u.onDisk ? '' : el('span', { class: 'muted' }, ' (file missing)')]),
+      '.'));
+  }
+  if (Array.isArray(g.git) && g.git.length) {
+    main.push(el('p', { class: 'fineprint' },
+      'Git hooks in this checkout — they stop commits, not tool calls, so they are not in the count above: ',
+      ...g.git.flatMap((h, i) => [i ? ', ' : '', el('code', {}, h.name), h.executable ? '' : el('span', { class: 'muted' }, ' (not executable — will not run)')]),
+      '.'));
+  }
 
   if (caught) {
     // Deliberately NOT the .wire-lane grid: its fixed columns are sized for (count, label, meaning)
@@ -3660,7 +4060,7 @@ const WARM_RETRY_MAX = 60;
 async function loadMemoryFleet(attempt = 0) {
   try {
     const m = await getJSON('/api/memory');
-    if (m && m.warming) {
+    if (m && (m.warming || m.stale === true)) {
       // The fleet scan is the slowest thing the console does. Until it lands, the memory card keeps
       // whatever /api/state already gave it and simply does not claim a fleet — it must never render
       // "0 projects", which on this card would read as "nothing on your machine learns anything".
@@ -3691,8 +4091,8 @@ async function loadMemoryFleet(attempt = 0) {
 async function loadStack(attempt = 0) {
   try {
     const stack = await getJSON('/api/stack');
-    if (stack && stack.warming) {
-      setChips('chips-stack', [chip('auditing your stack…', 'wait')]);
+    if (stack && (stack.warming || stack.stale === true)) {
+      setChips('chips-stack', [chip(stack.warming ? 'auditing your stack…' : 're-measuring your stack…', 'wait')]);
       if (attempt < WARM_RETRY_MAX) setTimeout(() => { void loadStack(attempt + 1); }, WARM_RETRY_MS);
       else { setChips('chips-stack', [chip('audit is taking unusually long', 'warn')]); recsSettled('stack', false); }
       return;   // skeleton stays: an empty package list would read as "nothing is installed"
@@ -3768,7 +4168,7 @@ const MOCK_STATE = {
       values: { openrouterKey: true, nightly: true, routing: 'auto', qeFleet: false },
       schema: [
         { key: 'openrouterKey', label: 'OpenRouter API key', type: 'secret', help: 'Unlocks cheap-model routing + the self-improvement loop', secret: true },
-        { key: 'nightly', label: 'Nightly brain refresh', type: 'bool', help: 'Rebuild the KB from pinned SHAs overnight' },
+        { key: 'nightly', label: 'Nightly coordinated updates', type: 'bool', help: 'Rebuild the KB from pinned SHAs overnight' },
         { key: 'routing', label: 'Token-smart routing', type: 'enum', options: ['auto', 'off'], help: 'Route cheap tasks to smaller models' },
         { key: 'qeFleet', label: 'On-demand QE fleet', type: 'bool', help: 'Agentic-QE test fleet, spun up on request' },
       ],
@@ -3891,7 +4291,7 @@ async function mockGet(url) {
 
 async function mockPost(url, body) {
   await sleep(850);
-  if (url === '/api/refresh') return { status: 200, ok: true, data: { ok: true, refreshing: true, started: true } };
+  if (url === '/api/refresh') return { status: 200, ok: true, data: { ok: true, refreshing: true, started: true, refresh: { status: 'started', runId: 'mock-refresh' } } };
   if (url === '/api/save-brain-power') {
     return { status: 200, ok: true, data: { ok: true, off: !!(body.values || {}).off, log: 'mock: the switch moved and was read back from disk' } };
   }
@@ -4011,6 +4411,7 @@ function renderLessons(data) {
   if (c.awaitingYou) chips.push(chip(`${c.awaitingYou} awaiting you`, 'amber', 'Recorded, but not yet agreed to by you. Until you decide, it does not enforce at full strength.'));
   if (c.active) chips.push(chip(`${c.active} on`, 'green'));
   if (c.off) chips.push(chip(`${c.off} off`, 'grey', 'Switched off by you. The record of where you taught it is kept.'));
+  if (c.quarantined) chips.push(chip(`${c.quarantined} imported`, 'nt', 'Maintainer or demonstration history. It is visible for audit but cannot become your personal policy.'));
   if (c.blocking) chips.push(chip(`${c.blocking} can stop me`, 'cyan', 'These interrupt me at their moment and I cannot continue until the check passes.'));
   setChips('chips-lessons', chips);
 
@@ -4022,6 +4423,7 @@ function renderLessons(data) {
     const box = el('input', {
       type: 'checkbox', class: 'lesson-switch', id: `lsw-${r.id}`,
       'aria-label': `${isOn ? 'Turn off' : 'Turn on'}: ${r.statement.slice(0, 60)}`,
+      disabled: r.quarantined || null,
     });
     box.checked = isOn;
 
@@ -4073,7 +4475,11 @@ function renderLessons(data) {
       chip(r.origin, r.userStated ? 'green' : 'nt',
         r.userStated
           ? 'You said this. Only lessons you stated yourself are allowed to reach the strongest level.'
-          : 'I inferred this from what happened. A lesson I inferred can never be raised to "Stops me", however often it fires — the model does not get to ratify its own rules.'),
+          : (r.sourceClass === 'imported-owner' || r.sourceClass === 'demonstration')
+            ? (r.quarantined
+              ? 'This came from bundled maintainer or demonstration history. It is not your statement and cannot be turned into your personal policy.'
+              : 'This came from imported maintainer history and was ratified, so it is in force here. You can switch it off; it cannot be raised to "Stops me".')
+            : 'I inferred this from what happened. A lesson I inferred can never be raised to "Stops me", however often it fires — the model does not get to ratify its own rules.'),
       r.taughtCount ? chip(`taught ${r.taughtCount}×`, 'grey') : null,
       r.awaitingYou ? chip('awaiting your decision', 'amber', 'Recorded, but you have not agreed to it yet.') : null,
     ].filter(Boolean);
@@ -4097,9 +4503,9 @@ function renderLessons(data) {
           : null,
         r.projects && r.projects.length
           ? el('p', null, el('strong', null, 'Learned in: '), r.projects.join(', ')) : null,
-        el('p', { class: 'muted' },
-          'Turning this off hides the rule without deleting the record of where you taught it — ',
-          'you can switch it back on here at any time.')));
+        el('p', { class: 'muted' }, r.quarantined
+          ? 'This imported record is quarantined for audit. It cannot be switched on or ratified as your policy.'
+          : 'Turning this off hides the rule without deleting the record of where you taught it — you can switch it back on here at any time.')));
 
     list.append(el('div', { class: `cap-row lesson-row${r.demoted ? ' is-off' : ''}` },
       // NO `for=` here. The label WRAPS its checkbox, which is already an implicit association; a
@@ -4142,9 +4548,10 @@ function partitionLessons(list, rows) {
   // the card whose job is to be the truth about it, and printed BECAUSE they used the control we
   // gave them. Found by GPT-5.6-Sol, 2026-07-24. A group's heading must be derivable from the state
   // of the rows inside it, which is why the counts below are computed from the split, never passed in.
-  const asks = [], inForce = [], off = [];
+  const asks = [], inForce = [], off = [], quarantined = [];
   rows.forEach((r, i) => {
-    if (r.demoted) off.push(kids[i]);
+    if (r.quarantined) quarantined.push(kids[i]);
+    else if (r.demoted) off.push(kids[i]);
     else if (r.awaitingYou) asks.push(kids[i]);
     else inForce.push(kids[i]);
   });
@@ -4170,6 +4577,12 @@ function partitionLessons(list, rows) {
       el('summary', null,
         `${off.length} ${off.length === 1 ? 'rule you switched off' : 'rules you switched off'} — not in force; switch back on any time`),
       el('div', { class: 'cap-list' }, ...off)));
+  }
+  if (quarantined.length) {
+    out.push(el('details', { class: 'lessons-more' },
+      el('summary', null,
+        `${quarantined.length} imported maintainer or demonstration ${quarantined.length === 1 ? 'record' : 'records'} — quarantined, not your policy`),
+      el('div', { class: 'cap-list' }, ...quarantined)));
   }
   return out;
 }

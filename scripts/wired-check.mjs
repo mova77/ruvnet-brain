@@ -51,6 +51,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { loadLessons, TRIGGERS, STATUS } from './lesson-store.mjs';
+import { continuityRegistrations, isAllowedContinuityRegistration } from '../plugin/scripts/continuity-hook-policy.mjs';
 
 const REPO = path.resolve(import.meta.dirname, '..');
 const argv = process.argv.slice(2);
@@ -69,8 +70,51 @@ const argv = process.argv.slice(2);
  * every entry on every run, below, so they cannot rot unseen.
  */
 const STANDALONE = [
+  ['full-suite-gate', 'explicit historical developer diagnostic; reviewed requirement-bound qualification owns promotion, so no automatic release caller'],
+  ['spike-run', 'ADR-086 Step 14 oracle feasibility-spike driver, run by hand against disposable snapshots outside the checkout. '
+    + 'It is deliberately NOT imported by the pipeline: Step 14 only proves or disproves that a trustworthy unattended label '
+    + 'producer exists, and Step 15 owns any prepareCorpusCandidate wiring. The three modules it drives (source-units, '
+    + 'produce-questions, validate-labels) are each wired to a real caller; this driver is the human entry point.'],
+  ['gate', 'retired automatic-hook helper and manual benchmark retained for explicit human use; no workflow or scheduler invokes this expensive command'],
+  ['route-gold-rank', 'human-run measurement harness: routes question sets through kb/forge-ask-all.mjs planSourceRoute (no model) and reports where the gold store lands, with Wilson intervals; nothing to schedule'],
+  ['abstain-trace', 'human-run measurement harness: traces why the reranker abstains on novice needs whose gold repository was searched (pool membership, cross-encoder on production text, best chunk and gold span); minutes of model time, never scheduled'],
+  ['doc2query-generate', 'build-time generator (ADR-099 arm A): newcomer-style questions per documentation file through the subscription host; run where the corpus is built, never on a customer machine; not yet in the corpus pipeline'],
+  ['doc2query-reach', 'human-run measurement harness: builds per-store RVF entry indexes from doc2query output and measures how often they bring the gold file into the pool; nothing to schedule'],
+  ['sona-query-adapter-eval', 'human-run experiment (ADR-099 arm B): trains a SONA MicroLoRA query adapter on the need-set train split and measures held-out dense rank of the gold file; needs @ruvector/sona from a scratch install; nothing to schedule'],
+  ['judge-train', 'human-run trainer: fits the learned judge (ADR-099 arm C) offline on the need-set train split from recorded cross-encoder pools and reports held-out; writes kb/judge-weights.json only on request; nothing to schedule'],
+  ['need-set-split', 'human-run measurement tool: writes the frozen, repository-stratified train / held-out split every learning arm (ADR-099) trains and is measured on; nothing to schedule'],
+  ['abstain-threshold-sweep', 'human-run measurement harness: replays measured runs at other abstain thresholds (no model) and reports confident hits, confident misses, off-topic abstain and held-out routed with Wilson intervals; nothing to schedule'],
+  ['route-latency-warm','human-run measurement harness: paired warm latency of two or more search runtimes in one process, load-gated, with paired bootstrap intervals; minutes to hours of model time, never scheduled'],
+  ['route-index-memory', 'human-run measurement harness: retained memory and cold/warm time of the router metadata index (needs node --expose-gc); nothing to schedule'],
+  ['recommendation-eval', 'human-run measurement harness (ADR-0093): scores the package recommender against evals/recommendation-eval*.json with Wilson intervals; its frozen numbers are asserted by tests/unit/package-recommender.test.mjs, which imports evaluate()'],
+  ['recommendation-e2e', 'human-run measurement harness (ADR-0093 rev 2): spawns the real search worker in a temp brain home and the real hook producer per eval prompt; load-gated and model-bound, so never scheduled'],
+  ['recommendation-judge-score', 'human-run measurement harness (ADR-0093 rev 2): scores a host-model judge\'s picks against an e2e judge key with Wilson intervals; nothing to schedule'],
+  ['recommendation-floor', 'human-run measurement harness (ADR-0093 rev 3): derives the semantic similarity floor on the tuning set only and applies it to judged e2e runs; nothing to schedule'],
+  ['recommendation-real-host', 'human-run measurement harness (ADR-0093 rev 3): fresh `claude -p` sessions with this checkout\'s hook against a warm worker; spends model budget, never scheduled'],
+  ['recommendation-real-host-score', 'human-run measurement harness (ADR-0093 rev 3): scores a real-host run and its agreement with the simulated host; nothing to schedule'],
+  ['recommendation-latency','human-run measurement harness (ADR-0093): paired cold-process latency of advocacy-route with the package flag off vs on; load-sensitive, so never scheduled'],
+  ['package-cards', 'ADR-0093 (Proposed) package-card generator, run by hand to refresh plugin/scripts/package-cards.json from the installed corpus. NOT YET NIGHTLY: the bundle step that would seal package-cards.json into the signed corpus is ADR-0093 phase 2 and is deliberately unbuilt while the recommender is default-off'],
+  ['dream-issue-gate','pure Dream Cycle disposition policy; invoked by the external issue adapter, never a GitHub writer'],
+  ['sync-census', 'explicit maintainer census writer; a destructive source-to-surface refresh is never scheduled'],
+  ['customer-state-matrix', 'human-run release-qualification harness (2026-09-30): applies ONE published release through the real '
+    + 'customer door to a COPY of a real install in one customer state at a time; it downloads releases and writes multi-GB '
+    + 'scratch trees, so it is never scheduled. Its install seam is corpus-canary.mjs\'s own (imported), and the states it '
+    + 'found are pinned as unit tests (tests/unit/customer-state-matrix.test.mjs and the per-defect tests).'],
+  ['hook-qualify', 'human-run hook qualification matrix (claude/codex/grok host contracts, repeat + concurrency, optional real-host Layer 2 that spends a real turn per host) run on an idle machine before a hook release; its core and host scanners are imported by it and by tests/unit/hook-qualify.test.mjs, and it is deliberately not scheduled or in CI because Layer 2 needs signed-in hosts'],
+  ['grounding-turn-replay', 'human-run measurement harness for grounding-turn-gate.mjs (ADR-0030 #1 and shadow #2/#3): replays real transcripts read-only through the same pure functions the hooks call, sharing completion-claim-replay.mjs\'s turn walkers; nothing to schedule'],
+  ['duplicate-gate-replay','human-run tuning harness for plugin/scripts/duplicate-gate.mjs: replays the gate over git history, read-only, when its thresholds are re-tuned; it imports the gate\'s own scoring functions, so there is no second copy to drift and nothing to schedule'],
+  ['sync-commands', 'explicit maintainer alias synchronizer; run deliberately before release, never from a lifecycle hook'],
+  ['handoff-asset', 'client explainer handoff to a named host, run by a human per docs/CLIENT-ASSET-HANDOFF.md '
+    + '(added 32b7b7ca 2026-09-11 with the TriSmart sub-product); nothing may schedule a copy to a client '
+    + 'machine. Surfaced 2026-09-11 the first time wired-check ran with no agent worktrees under '
+    + '.claude/worktrees/ — their package.json copies had been counted as callers all day.'],
   ['lesson-seed', 'one-shot seeding, run deliberately by a human'],
   ['lesson-ratify', 'the human control surface — a CLI is its entire purpose'],
+  ['lesson-migrate-agentdb', 'one-time reconciliation between the two AgentDB lesson stores and the '
+    + 'one plugin lesson store, run deliberately by a human/model, never scheduled. Completion is '
+    + 'checked by tests/diagnostics/lesson-migrate-agentdb.test.mjs (0 pending rows), a machine drift '
+    + 'canary over the developer\'s own AgentDB stores (outside the hermetic suite; run it by hand) rather '
+    + 'than automated invocation — the same shape as lesson-seed/lesson-ratify above.'],
   ['stamp-sweep', 'ADR-056 §2 — the ONE-TIME backfill half of the stamp rule. A human runs it once '
     + '(--apply) to reach the files nobody is editing; the ongoing half is the md-stamp PostToolUse '
     + 'hook, which IS wired. Deliberately not in a gate: it WRITES to documents, and a writer that '
@@ -84,22 +128,26 @@ const STANDALONE = [
     + '`--window`). Its former automatic 36-hour dump was deliberately retired from the machine-wide '
     + 'SessionStart hook after 61KB of output hid the current checkpoint; SessionStart now prints the '
     + 'checkpoint plus a compact lesson index and directs topic recall through `ruflo memory search`.'],
-  ['onboarding-console', 'human-started local server reached through the shipped `/rvbc`, `/rvcb`, '
+  ['onboarding-console', 'human-started local server reached through the shipped `/rnbc`, `/rnb`, `/rvbc`, `/rvcb`, '
     + '`/brain-console`, and `/ruvnet-brain:configure` command documents. The command host executes '
     + 'those instructions; there is intentionally no in-process source caller for a long-running CLI.'],
   ['ingest-meeting', 'one-shot ingestion, run by hand'],
   ['fix-metaharness-memretrieve', 'one-shot historical repair; kept for the record'],
   ['gen-console-images', 'build-time asset generation, run by hand'],
   ['adr-backfill', 'one-shot backfill by a human; its result is enforced by adr-format.test.mjs'],
-  ['stamp-existing-rvf-generations', 'one-shot maintainer migration that binds already-built canonical '
-    + 'RVFs to RVF-GENERATIONS.json and optionally prunes legacy sidecars; build-bundle.mjs consumes '
-    + 'and validates the resulting manifest, so scheduling this destructive migration would be wrong'],
   ['release', 'the ship path, run by a human'],
-  // Run by the launchd nightly, which lives OUTSIDE this repo — so no in-repo caller can exist.
-  // This is the one category the scanner genuinely cannot reach, and saying so is the honest form.
-  ['self-update', 'launchd nightly (out-of-repo scheduler)'],
+  ['execution-preflight', 'external orchestration boundary — invoked by the host before consequential Ruflo/Codex execution; no in-repo caller exists because the host supplies the live Brain and AgentDB receipts'],
+  ['fix-workstream', 'session-supervised coordination CLI run explicitly by the integration owner or an '
+    + 'isolated writing agent to start and hand off a fix lane. Scheduling it would violate its safety '
+    + 'boundary: it prepares evidence but never merges, pushes, publishes, deletes, or cleans worktrees'],
+  ['self-update', 'author-run candidate rebuild; --apply is guarded by worktree-integrity.mjs and is not scheduled'],
+  ['ingest-new-repos', 'author-run corpus expansion; --apply is guarded by worktree-integrity.mjs and is not scheduled'],
   ['count-chunks', 'human-run CLI — recount + restamp chunk surfaces (--check for drift); no scheduler'],
-  ['brain-stamp', 'invoked by self-update.mjs:249, the nightly launchd driver (com.ruvnet.brain-nightly)'],
+  ['derive-passage-content-map', 'human-run maintainer tool — regenerates data/retrieval-passage-content-digests.json '
+    + 'from a corpus built with ordinal passage ids, only when the frozen fixture changes; '
+    + 'tests/unit/retrieval-passage-identity.test.mjs fails if the committed map stops matching the fixture, '
+    + 'so a stale map cannot go unnoticed and there is nothing to schedule'],
+  ['brain-stamp', 'invoked by the author-run self-update.mjs candidate builder'],
   ['lesson-promote', 'human-run CLI — promotion is manual (--apply); no scheduler yet (automation is ADR-029 #4, open)'],
   ['behavioral-l1-l4', 'behavioural harness invoked by its own test file — not a product path'],
   // A measurement harness, not a product path: it answers "would bounding the cross-encoder pool
@@ -124,10 +172,9 @@ const STANDALONE = [
   // plist's own ProgramArguments on 2026-07-23, not assumed from the header comment alone:
   ['clear-claude-tmp', 'launchd, every 3h (out-of-repo scheduler) — confirmed live: '
     + 'com.stuartkerr.clear-claude-tmp.plist is loaded and its ProgramArguments invoke this exact file'],
-  ['nightly-gists', 'launchd nightly 21:47 (out-of-repo scheduler) — confirmed live: '
-    + 'com.ruvnet.brain-gists.plist is loaded and its ProgramArguments invoke this exact file'],
-  ['nightly-wrapper', 'launchd nightly 03:15 (out-of-repo scheduler) — confirmed live: '
-    + 'com.ruvnet.brain-nightly.plist is loaded and its ProgramArguments invoke this exact file'],
+  ['nightly-gists', 'manual re-embed of the developer checkout gists store (the launchd job '
+    + 'com.ruvnet.brain-gists was retired 2026-10-26: no installed brain reads that store)'],
+  ['nightly-wrapper', 'author-run maintenance harness, deliberately unscheduled; refuses primary, nested, and dirty worktrees'],
   ['routing-flywheel', 'launchd nightly 04:45 --dry-run (out-of-repo scheduler) — confirmed live: '
     + 'com.ruvnet.routing-flywheel.plist is loaded and its ProgramArguments invoke this exact file'],
   ['install-npx-witness', 'one-shot idempotent installer for the com.ruvnet.npx-witness launchd job, '
@@ -210,6 +257,27 @@ const STANDALONE = [
     + 'ground-before-write. Per ADR-0014 ownership moved to the Kling skill (confirmed live: a copy '
     + 'ships at ~/.claude/skills/klingai/scripts/kling-preflight.sh); NOT currently wired into any '
     + 'settings.json there either — honestly dormant until a user opts in, not a silent gap'],
+
+  // H5 (2026-09-26 dead-code audit): decision-gate.mjs's REGISTRY['bash'] was the only production
+  // caller of these three — never registered in plugin/hooks/hooks.json or codex-hooks.json
+  // (continuity-hook-policy.mjs's own header: "remains reachable through hook-shim's dispatch table
+  // by explicit invocation" only). Removing that dead route makes each of these genuinely uncalled
+  // by any product path. Not deleted: each exports pure, independently-tested logic with its own
+  // passing suite — identifier-preflight.test.mjs / spend-guard.test.mjs import and exercise these
+  // functions directly, and tests/unit/lesson-gate.test.mjs imports degradation-watch.mjs's
+  // `dependentEvent` to cross-check lesson-hooks.sh's own pattern. A test importing an export is not
+  // a product caller (same distinction this file already draws for correction-detect-measure above),
+  // so these are honestly STANDALONE rather than silently left to read as still-wired.
+  ['identifier-preflight', 'H5: orphaned by decision-gate.mjs\'s dead bash route (REGISTRY[\'bash\'] '
+    + 'removed 2026-09-26). Pure `check`/`identifierIn` logic remains directly imported and exercised '
+    + 'by its own tests/unit/identifier-preflight.test.mjs; no product path calls it'],
+  ['spend-guard', 'H5: orphaned by decision-gate.mjs\'s dead bash route (REGISTRY[\'bash\'] removed '
+    + '2026-09-26). Its logic remains directly imported and exercised by its own '
+    + 'tests/unit/spend-guard.test.mjs; no product path calls it'],
+  ['degradation-watch', 'H5: orphaned by decision-gate.mjs\'s dead bash route (REGISTRY[\'bash\'] '
+    + 'removed 2026-09-26). Its `dependentEvent` export remains directly imported by '
+    + 'tests/unit/lesson-gate.test.mjs (cross-checked against lesson-hooks.sh\'s own pattern) and by '
+    + 'its own test file; no product path calls it'],
 ];
 // REMOVED 2026-07-22, each verified before removal:
 //   check-legibility / check-indexation / status-honesty — claimed "invoked from the workflow";
@@ -226,6 +294,8 @@ const STANDALONE = [
  * small lie that hides a real gap. Held work is VISIBLE work.
  */
 const HELD = {
+  'source-tree': 'ADR-086 oracle-source-units/2 groundwork, not consumed by the current v1 oracle pipeline. Requires complete parser-adapter integration and source-bound inventory acceptance before activation; no production extraction-completeness claim.',
+  'unit-inventory': 'ADR-086 parser-independent v2 inventory core, currently exercised only by tests. Requires adapters for the declared source scope plus pipeline integration and failure-path qualification; cannot authorize a C3 pass.',
   'correction-detect': 'N3 lesson extraction. Re-measured 2026-07-23 on a reproducible held-out split '
     + 'of 1,328 real transcripts (scripts/correction-detect-measure.mjs): 5 real detector bugs fixed, '
     + 'corpus detections 2->8, ~50-100% precision at n=4 on the holdout. TWO measured findings now bound '
@@ -295,19 +365,57 @@ const INVENTORY_ROOTS = [
  * invoker outside the roots proves the ROOTS are incomplete — the fix is to add the root, never to
  * write an exemption. That rule caught its own author within a minute of the gate first running.
  */
-const CALLER_ROOTS = ['scripts', 'plugin', 'console', 'bin', '.github', '.claude', 'package.json'];
+// `dream.config.json` is executable configuration, not documentation: the Dream compiler runs its
+// controlPlaneProbes and evaluatorEntrypoints. Excluding it made two real scheduled callers look
+// dead while the same scanner already trusted workflow YAML and package.json command manifests.
+const CALLER_ROOTS = [
+  'scripts', 'plugin', 'console', 'bin', '.github', '.claude', 'package.json', 'dream.config.json',
+];
 const CALLER_EXTS = new Set(['.mjs', '.js', '.sh', '.json', '.html', '.yml', '.yaml']);
+export const REQUIRED_OPERATIONAL_EXPORTS = [
+  // 4.4 update robustness (2026-09-30): bin/install.mjs syncHostsAfterUpdate replaces an owned stale
+  // Console and prunes dead Console receipts through these; host claude/codex calls go through runHostCli.
+  { rel: 'scripts/console-instances.mjs', symbol: 'replaceStaleConsoles' },
+  { rel: 'scripts/console-instances.mjs', symbol: 'readConsoleReceipts' },
+  { rel: 'scripts/host-cli.mjs', symbol: 'runHostCli' },
+  { rel: 'scripts/corpus-reconcile.mjs', symbol: 'syncCorpusInputs' },
+  { rel: 'scripts/corpus-aggregates.mjs', symbol: 'rebuildCorpusAggregates' },
+  { rel: 'scripts/corpus-reconcile.mjs', symbol: 'acquireCorpusGeneration' },
+  { rel: 'scripts/corpus-reconcile.mjs', symbol: 'reconcileAndPrepareCorpusCandidate' },
+  { rel: 'scripts/gist-receipts.mjs', symbol: 'buildGistAggregate' },
+  // Step 3 (2026-09-13): the single canonical public-prose selection entry point, same rigor as
+  // buildGistAggregate above.
+  { rel: 'scripts/public-inputs.mjs', symbol: 'materializePublicInputs' },
+  // Step 5 (2026-09-13): the single canonical assembly entry point (replaces the old ad hoc
+  // discover/copy/rebind logic previously scattered across build-bundle.mjs's module top level) and
+  // the single canonical release-coverage-projection entry point it calls in-process. Both are wired
+  // from build-bundle.mjs's own CLI wrapper at the bottom of the same file.
+  { rel: 'scripts/build-bundle.mjs', symbol: 'assembleBundle' },
+  { rel: 'scripts/release-projection.mjs', symbol: 'createReleaseProjection' },
+  // Step 13 (2026-09-13): the C2 deep store audit — measured recall, hash-verified segments, id-map /
+  // passage / source-map correspondence — that corpus-candidate.mjs fails closed on.
+  { rel: 'scripts/rvf-index-audit.mjs', symbol: 'auditCorpusStores' },
+  // Step 15 (2026-09-14): the C3 retrieval-accuracy gate. prepareCorpusCandidate shells out to its
+  // CLI after single-pass assembly; corpus-candidate.mjs and release.mjs both import its
+  // readAccuracyReport reader so candidate acceptance and publication can never drift apart.
+  { rel: 'scripts/oracle/retrieval-accuracy.mjs', symbol: 'runRetrievalAccuracy' },
+  // ADR-086 amendment (2026-09-15): the BLOCKING retrieval gate. C3 above still runs and still ships,
+  // but as a published diagnostic; this is the module that can refuse a candidate. prepareCorpusCandidate
+  // shells out to its CLI after single-pass assembly, and corpus-candidate.mjs and release.mjs both
+  // import its readRecallReport reader so candidate acceptance and publication can never drift apart.
+  { rel: 'scripts/oracle/repo-recall.mjs', symbol: 'runRepoRecall' },
+];
 
 const isTestFile = (f) => /\.(test|spec)\.(mjs|js)$/.test(path.basename(f))
   || f.includes(`${path.sep}tests${path.sep}`) || f.startsWith(`tests${path.sep}`);
 
-function walk(abs, recurse, out = []) {
+function walk(abs, recurse, out = [], prune = () => false) {
   let entries = [];
   try { entries = fs.readdirSync(abs, { withFileTypes: true }); } catch { return out; }
   for (const e of entries) {
     const full = path.join(abs, e.name);
     if (e.isDirectory()) {
-      if (recurse && e.name !== 'node_modules' && !e.name.startsWith('.')) walk(full, recurse, out);
+      if (recurse && e.name !== 'node_modules' && !e.name.startsWith('.') && !prune(full)) walk(full, recurse, out, prune);
     } else out.push(full);
   }
   return out;
@@ -343,7 +451,18 @@ function callerFiles(repo = REPO) {
     // wired into pre-push and `wired-check` went on reporting it `manual`. This file's own note names
     // the remedy: "an invoker outside the roots proves the ROOTS are incomplete — the fix is to add
     // the root, never to" special-case the module. Same rule, applied to the extension filter.
-    for (const f of walk(abs, true)) {
+    // Pruned BEFORE descending (see the worktrees note below): 100+ agent worktrees under .claude/ are full
+    // repository copies, and walking them only to drop every file afterwards dominated this audit's run time.
+    const worktrees = path.join(repo, '.claude', 'worktrees');
+    for (const f of walk(abs, true, [], (dir) => dir === worktrees)) {
+      // `.claude/` is a caller root because `.claude/settings.json` genuinely invokes hooks. But
+      // `.claude/worktrees/<agent>/` holds FULL COPIES of this repository (Claude Code agent
+      // worktrees), and a copy of the repo is not a caller of the repo. Measured 2026-09-11: with any
+      // worktree present, card-from-source read `wired` via `.claude/worktrees/…/package.json`
+      // (`manual` with none present), handoff-asset read `wired` while invoked by nothing, and the
+      // MANUAL class read 0 all day. Same rule as the `kb/` exclusion in this file's header.
+      const rel = path.relative(repo, f).split(path.sep).join('/');
+      if (rel.startsWith('.claude/worktrees/')) continue;
       if (CALLER_EXTS.has(path.extname(f))) { out.push(f); continue; }
       if (path.extname(f) === '' && path.basename(path.dirname(f)) === 'git-hooks') out.push(f);
     }
@@ -360,8 +479,11 @@ function callerFiles(repo = REPO) {
  */
 export function callerPattern(fileName) {
   const q = fileName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // Filenames must be complete tokens: gates.mjs is not corpus-aggregates.mjs,
+  // and version.mjs.map is not a caller of version.mjs.
+  const bounded = `(?<![\\w.-])${q}(?![\\w.-])`;
     // eslint-disable-next-line no-useless-escape
-  return new RegExp(`["'\`][^"'\`\\n]*${q}|(?:node|bash|sh|exec|spawn\\w*)\\s+[^\\n]*${q}`);
+  return new RegExp(`["'\`][^"'\`\\n]*${bounded}|(?:node|bash|sh|exec|spawn\\w*)\\s+[^\\n]*${bounded}`);
 }
 
 /**
@@ -411,6 +533,26 @@ export function stripComments(src, ext) {
       return l;
     })
     .join('\n');
+}
+
+/** Source text cache whose lifetime is one audit call; never shared across invocations. */
+export function createInvocationSourceCache(readFile = fs.readFileSync) {
+  const text = new Map();
+  const uncommented = new Map();
+  const read = (file) => {
+    if (!text.has(file)) {
+      try { text.set(file, readFile(file, 'utf8')); } catch { text.set(file, null); }
+    }
+    return text.get(file);
+  };
+  const commentFree = (file) => {
+    if (!uncommented.has(file)) {
+      const src = read(file);
+      uncommented.set(file, src === null ? null : stripComments(src, path.extname(file)));
+    }
+    return uncommented.get(file);
+  };
+  return { read, commentFree };
 }
 
 /**
@@ -469,7 +611,7 @@ export function npmScriptsNaming(pkgSrc, modFile) {
  * Automated means: npm itself runs it (a lifecycle name), or some file — a workflow, a shell hook,
  * or another composite npm script — invokes it by name.
  */
-export function npmScriptAutomated(names, files, repo = REPO) {
+export function npmScriptAutomated(names, files, repo = REPO, sourceCache = createInvocationSourceCache()) {
   for (const n of names) {
     if (NPM_AUTO_LIFECYCLE.has(n)) return { automated: true, via: `npm lifecycle (\`${n}\` is run by npm itself)` };
   }
@@ -478,31 +620,60 @@ export function npmScriptAutomated(names, files, repo = REPO) {
     const re = new RegExp(`(?:npm|pnpm|yarn|npm-run-all|run-s|run-p)\\s+(?:run\\s+)?${esc(n)}(?![\\w:-])`);
     for (const f of files) {
       const rel = path.relative(repo, f).split(path.sep).join('/');
-      let src = '';
-      try { src = fs.readFileSync(f, 'utf8'); } catch { continue; }
+      const src = sourceCache.commentFree(f);
+      if (src === null) continue;
       // A composite script in package.json ("test:all": "npm run test:unit && …") IS automation.
-      if (re.test(stripComments(src, path.extname(f)))) return { automated: true, via: `${rel} runs \`${n}\`` };
+      if (re.test(src)) return { automated: true, via: `${rel} runs \`${n}\`` };
     }
   }
   return { automated: false, via: null };
 }
 
 /** Count REAL callers. Tests excluded deliberately: all seven failures had passing tests. */
-export function callersOf(mod, files, repo = REPO) {
+export function callersOf(mod, files, repo = REPO, sourceCache = createInvocationSourceCache()) {
   const re = callerPattern(mod.file);
   const hits = [];
   for (const f of files) {
     const rel = path.relative(repo, f).split(path.sep).join('/');
     if (rel === mod.rel) continue;              // self
     if (isTestFile(rel)) continue;              // a test is not a caller
-    let src = '';
-    try { src = fs.readFileSync(f, 'utf8'); } catch { continue; }
-    if (re.test(stripComments(src, path.extname(f)))) hits.push(rel);
+    // Cheap substring pre-filter: callerPattern() only ever matches text that contains the literal file
+    // name, so skipping the regex when the name is absent cannot change the result, only its cost.
+    if (!sourceCache.read(f)?.includes(mod.file)) continue;
+    const src = sourceCache.commentFree(f);
+    if (src !== null && re.test(src)) hits.push(rel);
   }
   return hits;
 }
 
-export function audit({ repo = REPO, standalone = STANDALONE, held = HELD } = {}) {
+export function operationalExportAudit({ repo = REPO, required = REQUIRED_OPERATIONAL_EXPORTS,
+  sourceCache = createInvocationSourceCache() } = {}) {
+  const files = callerFiles(repo);
+  const rows = required.map(({ rel, symbol }) => {
+    const sourceFile = path.join(repo, rel);
+    const source = sourceCache.read(sourceFile) || '';
+    const quoted = symbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const exported = new RegExp(`\\bexport\\s+(?:async\\s+)?function\\s+${quoted}\\s*\\(`).test(source);
+    if (!exported) return { rel, symbol, state: 'missing', callers: [] };
+    const declaration = new RegExp(`\\bexport\\s+(?:async\\s+)?function\\s+${quoted}\\s*\\(`, 'g');
+    const invocation = new RegExp(`\\b${quoted}\\s*\\(`);
+    const callers = [];
+    for (const file of files) {
+      const callerRel = path.relative(repo, file).split(path.sep).join('/');
+      if (isTestFile(callerRel)) continue;
+      let body = sourceCache.commentFree(file);
+      if (body === null) continue;
+      body = body.replace(declaration, 'export function __operational_definition__(');
+      if (invocation.test(body)) callers.push(callerRel);
+    }
+    return { rel, symbol, state: callers.length ? 'wired' : 'unwired', callers };
+  });
+  return { rows };
+}
+
+export function audit({ repo = REPO, standalone = STANDALONE, held = HELD,
+  operationalExports = REQUIRED_OPERATIONAL_EXPORTS, readFile = fs.readFileSync, sourceCache = null } = {}) {
+  const invocationSource = sourceCache ?? createInvocationSourceCache(readFile);
   const dupes = [];
   const seen = new Map();
   for (const [name, why] of standalone) {
@@ -515,27 +686,28 @@ export function audit({ repo = REPO, standalone = STANDALONE, held = HELD } = {}
   for (const m of all) {
     if (seen.has(m.base)) { rows.push({ ...m, state: 'exempt', why: seen.get(m.base) }); continue; }
     if (held[m.base]) { rows.push({ ...m, state: 'held', why: held[m.base] }); continue; }
-    const callers = callersOf(m, files, repo);
+    const callers = callersOf(m, files, repo, invocationSource);
     let state = callers.length ? 'wired' : 'unwired';
     let why;
     // ADR-056: callers that are ONLY the package.json line defining the script are not automation.
     if (callers.length && callers.every((c) => c === 'package.json')) {
-      let pkgSrc = '';
-      try { pkgSrc = fs.readFileSync(path.join(repo, 'package.json'), 'utf8'); } catch { /* none */ }
+      const pkgSrc = invocationSource.read(path.join(repo, 'package.json')) || '';
       const names = npmScriptsNaming(pkgSrc, m.file);
       if (names.length) {
-        const auto = npmScriptAutomated(names, files, repo);
+        const auto = npmScriptAutomated(names, files, repo, invocationSource);
         if (!auto.automated) {
           state = 'manual';
           const list = names.map((n) => `\`${n}\``).join(', ');
           why = `defined as npm script ${list} and invoked by NOTHING automated — reachable only by a `
-            + `human typing \`npm run ${names[0]}\`. Built and correct; not in any ship path.`;
+            + `human typing \`npm run ${names[0]}\`. This wiring audit does not establish operational `
+            + `correctness.`;
         }
       }
     }
     rows.push({ ...m, state, callers, ...(why ? { why } : {}) });
   }
-  return { rows, dupes, inventory: all.length };
+  const operationalRows = operationalExportAudit({ repo, required: operationalExports, sourceCache: invocationSource }).rows;
+  return { rows, operationalRows, dupes, inventory: all.length };
 }
 
 /**
@@ -564,9 +736,12 @@ export function audit({ repo = REPO, standalone = STANDALONE, held = HELD } = {}
  * exists to prevent), different surface. Two new, narrow predicates, each modelling the REAL
  * mechanism Claude Code / the lesson dispatcher actually uses, not a generic text search:
  *
- *   CHECK B — HOOK WIRING. Walks the real reachability chain: plugin/hooks/hooks.json (what we
- *   ship) → hook-shim.mjs's own TABLE (resolving its id-based indirection explicitly, since a hook
- *   id like "route-dispatch" is not the string "route-dispatch.sh") → this repo's own
+ *   CHECK B — HOOK WIRING. Walks the real reachability chain for both supported hosts:
+ *   plugin/hooks/hooks.json (Claude Code) → hook-shim.mjs's own TABLE (resolving its id-based
+ *   indirection explicitly, since a hook id like "route-dispatch" is not the string
+ *   "route-dispatch.sh"); and plugin/hooks/codex-hooks.json → bin/install.mjs's Stable Spine copy
+ *   (codex-hook-wrapper.mjs installed as codex-hook.mjs) → codex-hook-adapter.mjs. It also reads
+ *   this repo's own
  *   .claude/settings.json → the user's REAL ~/.claude/settings.json (what is actually installed on
  *   THIS machine — never checked before). One further hop is closed by a small fixed-point pass
  *   (the unprompted-speech runtime spawns anticipate.sh/lesson-hooks.sh as candidate producers),
@@ -641,8 +816,11 @@ const HOOK_HELD = {
 };
 
 /** Read+JSON.parse a file. null on ANY failure (missing, unreadable, malformed) — never throws. */
-function readJsonSafe(file) {
-  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
+function readJsonSafe(file, sourceCache) {
+  try {
+    const src = sourceCache ? sourceCache.read(file) : fs.readFileSync(file, 'utf8');
+    return src === null ? null : JSON.parse(src);
+  } catch { return null; }
 }
 
 /** Every `command` string inside a hooks.json / settings.json shaped `{ hooks: {...} }` document. */
@@ -668,10 +846,32 @@ function hookShimIdIn(cmd) {
   return m ? m[1] : null;
 }
 
+/** The dispatch id after Codex's inline bootstrap and numeric timeout. Same grammar as hook-registry. */
+function codexHookIdIn(cmd) {
+  const m = cmd.match(/"\s+\d+\s+([a-zA-Z][\w-]*)/);
+  return m ? m[1] : null;
+}
+
+/**
+ * Derive the Stable Spine wrapper copy from the installer source. The Codex manifest names the
+ * durable installed target (`codex-hook.mjs`), while the repository inventory contains its source
+ * (`codex-hook-wrapper.mjs`). Both names plus the actual copy operation must be present; otherwise
+ * there is no proven bridge and the hook stays unwired.
+ */
+function installedCodexHookWrapper(repo, sourceCache) {
+  const src = sourceCache.read(path.join(repo, 'bin/install.mjs'));
+  if (src === null) return null;
+  const stripped = sourceCache.commentFree(path.join(repo, 'bin/install.mjs'));
+  const source = stripped.match(/hookWrapperSource\s*=\s*path\.join\([\s\S]{0,240}?['"]([\w.-]+\.mjs)['"]\)/)?.[1];
+  const target = stripped.match(/const codexHookWrapperPath[\s\S]{0,260}?['"]([\w.-]+\.mjs)['"]\)/)?.[1];
+  const copiesSource = /fs\.copyFileSync\(hookWrapperSource,\s*tmp\)/.test(stripped);
+  return source && target && copiesSource ? { source, target } : null;
+}
+
 /** hook-shim.mjs's own dispatch TABLE: id -> file. Parsed, not re-implemented — it IS the authority. */
-function hookShimTable(repo) {
-  let src = '';
-  try { src = fs.readFileSync(path.join(repo, 'plugin/scripts/hook-shim.mjs'), 'utf8'); } catch { return {}; }
+function hookShimTable(repo, sourceCache) {
+  const src = sourceCache.read(path.join(repo, 'plugin/scripts/hook-shim.mjs'));
+  if (src === null) return {};
   const map = {};
   const re = /'([\w-]+)':\s*{\s*file:\s*'([\w.-]+)'/g;
   let m; while ((m = re.exec(src))) map[m[1]] = m[2];
@@ -688,16 +888,36 @@ function hookHeaderDeclares(src) { return HOOK_EVENT_RE.test(src.slice(0, 1600))
 
 /**
  * CHECK B — HOOK WIRING. See the file-level comment above for the full reasoning. Walks the real
- * chain from the real entry points (plugin/hooks/hooks.json, this repo's .claude/settings.json, the
- * user's actual ~/.claude/settings.json) through hook-shim.mjs's id-based indirection, then closes
- * one further hop with a small fixed-point pass restricted to files already proven reachable.
+ * chain from the real entry points (both plugin hook manifests, this repo's .claude/settings.json,
+ * the user's actual ~/.claude/settings.json) through each host's real indirection, then closes one
+ * further hop with a small fixed-point pass restricted to files already proven reachable.
  */
 export function hookWiringAudit({
   repo = REPO,
   homeSettingsFile = path.join(os.homedir(), '.claude', 'settings.json'),
   held = HOOK_HELD,
+  sourceCache = createInvocationSourceCache(),
 } = {}) {
-  const table = hookShimTable(repo);
+  const retirementFiles = [
+    path.join(repo, 'plugin/hooks/hooks.json'),
+    path.join(repo, 'plugin/hooks/codex-hooks.json'),
+    path.join(repo, '.claude/settings.json'),
+    path.join(repo, '.codex/hooks.json'),
+  ];
+  const automaticHooksConstrained = retirementFiles.every((file) => {
+    const doc = readJsonSafe(file, sourceCache);
+    if (!doc?.hooks) return false;
+    const packageRegistry = file.endsWith('/plugin/hooks/hooks.json') || file.endsWith('/plugin/hooks/codex-hooks.json');
+    const rows = Object.entries(doc.hooks).flatMap(([event, groups]) => (groups ?? []).flatMap((group) =>
+      (group?.hooks ?? []).map((hook) => ({ event, matcher: group.matcher ?? '', command: hook.command }))));
+    const host = file.endsWith('/plugin/hooks/codex-hooks.json') ? 'codex' : 'claude';
+    return packageRegistry
+      ? rows.length === continuityRegistrations(host).length
+        && rows.every((row) => isAllowedContinuityRegistration({ ...row, host }))
+      : rows.length === 0;
+  });
+  const table = hookShimTable(repo, sourceCache);
+  const codexWrapper = installedCodexHookWrapper(repo, sourceCache);
   const reached = new Map(); // basename -> Set(reason)
   const add = (name, reason) => {
     if (!name) return;
@@ -705,16 +925,21 @@ export function hookWiringAudit({
     reached.get(name).add(reason);
   };
 
-  const scanConfig = (file, label) => {
-    const doc = readJsonSafe(file);
+  const scanConfig = (file, label, { codex = false } = {}) => {
+    const doc = readJsonSafe(file, sourceCache);
     if (!doc || !doc.hooks) return;
     for (const cmd of commandStrings(doc.hooks)) {
-      for (const b of basenamesIn(cmd)) add(b, label);
-      const id = hookShimIdIn(cmd);
-      if (id && table[id]) add(table[id], `${label} (hook-shim id "${id}")`);
+      const basenames = basenamesIn(cmd);
+      for (const b of basenames) add(b, label);
+      const id = codex ? codexHookIdIn(cmd) : hookShimIdIn(cmd);
+      if (id && table[id]) add(table[id], `${label} (${codex ? 'Codex dispatch' : 'hook-shim'} id "${id}")`);
+      if (codex && codexWrapper && basenames.includes(codexWrapper.target)) {
+        add(codexWrapper.source, `${label} via bin/install.mjs Stable Spine copy (${codexWrapper.target})`);
+      }
     }
   };
   scanConfig(path.join(repo, 'plugin/hooks/hooks.json'), 'plugin/hooks/hooks.json');
+  scanConfig(path.join(repo, 'plugin/hooks/codex-hooks.json'), 'plugin/hooks/codex-hooks.json', { codex: true });
   scanConfig(path.join(repo, '.claude/settings.json'), '.claude/settings.json (this repo)');
   scanConfig(homeSettingsFile, '~/.claude/settings.json (this machine)');
 
@@ -723,14 +948,29 @@ export function hookWiringAudit({
   const scriptsDir = path.join(repo, 'plugin/scripts');
   let all = [];
   try { all = fs.readdirSync(scriptsDir).filter((f) => /\.(mjs|sh)$/.test(f)); } catch { /* no dir */ }
+  // H6 (2026-09-26 dead-code audit): hook-shim.mjs is a DISPATCH TABLE, not a script that
+  // unconditionally executes everything it mentions. `scanConfig()` above already proves reachability
+  // for a TABLE entry CORRECTLY — only when its id is genuinely dispatched by a real command string in
+  // a manifest. Letting hook-shim.mjs ALSO participate as a "from" in the generic fixed-point pass
+  // below double-counts every OTHER entry in its TABLE as "spawned", because the pass's own predicate
+  // (callerPattern) matches any quoted filename — and every TABLE entry is, by construction, a quoted
+  // filename in hook-shim.mjs's source, dispatched or not. Measured: before this exclusion,
+  // design-wall.sh, route-dispatch.sh, verify-interface.sh, learn-capture.sh,
+  // md-stamp.mjs, signal-watch.mjs, routing-outcome-capture.mjs and swarm-slot-recycler.mjs all read
+  // "wired · via spawned by plugin/scripts/hook-shim.mjs" while zero manifest (hooks.json,
+  // codex-hooks.json, this repo's or the user's settings.json) ever dispatches most of their ids —
+  // exactly the false positive this check exists to catch. Excluding it here does not remove any
+  // GENUINE reachability: every id hook-shim.mjs's TABLE actually dispatches was already added by
+  // scanConfig() above, before this loop runs at all.
   for (let i = 0; i < 10; i++) {
     let changed = false;
     for (const from of [...reached.keys()]) {
-      let src = ''; try { src = fs.readFileSync(path.join(scriptsDir, from), 'utf8'); } catch { continue; }
-      const stripped = stripComments(src, path.extname(from));
+      if (from === 'hook-shim.mjs') continue;
+      const src = sourceCache.commentFree(path.join(scriptsDir, from));
+      if (src === null) continue;
       for (const cand of all) {
         if (reached.has(cand)) continue;
-        if (callerPattern(cand).test(stripped)) { add(cand, `spawned by plugin/scripts/${from}`); changed = true; }
+        if (callerPattern(cand).test(src)) { add(cand, `spawned by plugin/scripts/${from}`); changed = true; }
       }
     }
     if (!changed) break;
@@ -739,26 +979,41 @@ export function hookWiringAudit({
   const rows = [];
   for (const f of all) {
     if (HOOK_PLUMBING_NAMES.has(f)) continue; // plumbing, not a hook body — never part of the census
-    let src = ''; try { src = fs.readFileSync(path.join(scriptsDir, f), 'utf8'); } catch { continue; }
+    const src = sourceCache.read(path.join(scriptsDir, f));
+    if (src === null) continue;
     const declared = hookHeaderDeclares(src);
     const isReached = reached.has(f);
     if (!declared && !isReached) continue; // not hook-intended at all — outside the census
     if (isReached) rows.push({ file: f, state: 'wired', sources: [...reached.get(f)] });
+    else if (automaticHooksConstrained && declared) rows.push({
+      file: f,
+      state: 'retired',
+      why: 'legacy automatic Brain hooks remain retired; only the declared continuity plane (see plugin/hooks/hook-contracts.json) is wired',
+    });
     else if (held[f]) rows.push({ file: f, state: 'held', why: held[f] });
     else rows.push({ file: f, state: 'unwired' });
   }
   return { rows, plumbing: HOOK_PLUMBING };
 }
 
-/** The trigger tokens requested by lesson-hooks.sh's `case "$EVENT" in` block — the sole authority. */
-function lessonHooksRequestedTriggers(repo) {
-  let src = '';
-  try { src = fs.readFileSync(path.join(repo, 'plugin/scripts/lesson-hooks.sh'), 'utf8'); } catch { return new Set(); }
-  const stripped = stripComments(src, '.sh');
+/**
+ * The trigger tokens requested by lesson-hooks.sh — the sole authority. A trigger reaches the gate
+ * two ways: a static `case "$EVENT" in ... TRIGGERS="<name>"` label, or a dynamic conditional append
+ * (`ARGS+=(--trigger <name>)`, e.g. `ship`, appended only when a live regex matches the real command
+ * text). Reading only the static form means a trigger whose SOLE live path is dynamic is invisible
+ * to this audit — and Check C would then depend on an unrelated dead case label merely coexisting in
+ * the file to report it correctly, which breaks the moment that dead label is ever cleaned up.
+ */
+function lessonHooksRequestedTriggers(repo, sourceCache) {
+  const src = sourceCache.read(path.join(repo, 'plugin/scripts/lesson-hooks.sh'));
+  if (src === null) return new Set();
+  const stripped = sourceCache.commentFree(path.join(repo, 'plugin/scripts/lesson-hooks.sh'));
   const requested = new Set();
   const re = /TRIGGERS="([^"]*)"/g;
   let m;
   while ((m = re.exec(stripped))) { for (const t of m[1].split(/\s+/)) if (t) requested.add(t); }
+  const dynRe = /ARGS\+=\(--trigger\s+"?([A-Za-z][\w-]*)"?\)/g;
+  while ((m = dynRe.exec(stripped))) { requested.add(m[1]); }
   return requested;
 }
 
@@ -766,8 +1021,9 @@ function lessonHooksRequestedTriggers(repo) {
  * CHECK C — LESSON-TRIGGER WIRING. See the file-level comment above for the full reasoning
  * (advisory-only, deliberately, because the store is per-user/per-machine state outside this repo).
  */
-export function lessonTriggerAudit({ repo = REPO, lessonsFile = undefined } = {}) {
-  const requested = lessonHooksRequestedTriggers(repo);
+export function lessonTriggerAudit({ repo = REPO, lessonsFile = undefined,
+  sourceCache = createInvocationSourceCache() } = {}) {
+  const requested = lessonHooksRequestedTriggers(repo, sourceCache);
   const lessons = loadLessons(lessonsFile);
   const live = lessons.filter((l) => !l.demoted && (l.status === STATUS.RATIFIED || l.status === STATUS.ACTIVE));
   const labelOf = (trigger) => Object.values(TRIGGERS).find((t) => t.key === trigger)?.label || trigger;
@@ -781,15 +1037,18 @@ const invokedDirectly = process.argv[1]
   && path.resolve(process.argv[1]).endsWith(`wired-check${path.extname(process.argv[1])}`);
 
 if (invokedDirectly) {
-  const { rows, dupes, inventory } = audit();
+  const sourceCache = createInvocationSourceCache();
+  const { rows, operationalRows, dupes, inventory } = audit({ sourceCache });
   const by = (s) => rows.filter((r) => r.state === s);
   const unwired = by('unwired');
+  const operationalUnwired = operationalRows.filter((row) => row.state !== 'wired');
 
-  const hookAudit = hookWiringAudit();
+  const hookAudit = hookWiringAudit({ sourceCache });
   const hookBy = (s) => hookAudit.rows.filter((r) => r.state === s);
   const hookUnwired = hookBy('unwired');
+  const hookRetired = hookBy('retired');
 
-  const lessonAudit = lessonTriggerAudit();
+  const lessonAudit = lessonTriggerAudit({ sourceCache });
 
   if (!argv.includes('--quiet')) {
     console.log(`\n  ${inventory} first-party module(s) in the inventory`);
@@ -800,6 +1059,16 @@ if (invokedDirectly) {
     if (unwired.length) {
       console.log(`\n  A module with no caller is not a feature. Either wire it to a real user path,`);
       console.log(`  or add it to STANDALONE in this file WITH A TRUE REASON.\n`);
+    }
+
+    console.log(`  ${operationalRows.length} release-critical operational export(s) checked · `
+      + `${operationalUnwired.length} UNWIRED\n`);
+    for (const row of operationalUnwired) {
+      console.log(`    ✗ ${row.rel}#${row.symbol} — exported, but no production invocation reaches it`);
+    }
+    if (operationalUnwired.length) {
+      console.log('\n  Importing or re-exporting a function is not operation. A release-critical export must');
+      console.log('  be invoked through a production path whose module is itself wired.\n');
     }
 
     // Every exemption, every run. v1 never printed these, so 3 false reasons rotted unseen for a
@@ -818,10 +1087,10 @@ if (invokedDirectly) {
     if (dupes.length) console.log(`  ✗ DUPLICATE exemption(s): ${dupes.join(', ')}\n`);
 
     // ── CHECK B: HOOK WIRING ──────────────────────────────────────────────────────────────────
-    console.log(`\n  ── HOOK WIRING — plugin/scripts/*.sh|*.mjs vs plugin/hooks/hooks.json, `
+    console.log(`\n  ── HOOK WIRING — plugin/scripts/*.sh|*.mjs vs plugin/hooks/{hooks,codex-hooks}.json, `
       + `.claude/settings.json, ~/.claude/settings.json ──\n`);
     console.log(`  ${hookAudit.rows.length} hook-intended script(s) in the census`);
-    console.log(`    ${hookBy('wired').length} wired · ${hookBy('held').length} held · `
+    console.log(`    ${hookBy('wired').length} wired · ${hookRetired.length} retired · ${hookBy('held').length} held · `
       + `${hookUnwired.length} UNWIRED\n`);
 
     for (const u of hookUnwired) {
@@ -833,6 +1102,8 @@ if (invokedDirectly) {
     }
 
     for (const h of hookBy('held')) console.log(`    ⏸ plugin/scripts/${h.file}\n       ${h.why}\n`);
+
+    for (const r of hookRetired) console.log(`    ○ plugin/scripts/${r.file}\n       ${r.why}\n`);
 
     for (const w of hookBy('wired')) {
       console.log(`    ✓ plugin/scripts/${w.file}\n       via ${w.sources.join('; ')}`);
@@ -859,6 +1130,6 @@ if (invokedDirectly) {
     }
   }
 
-  const bad = unwired.length || dupes.length || hookUnwired.length;
+  const bad = unwired.length || operationalUnwired.length || dupes.length || hookUnwired.length;
   process.exit(argv.includes('--check') && bad ? 1 : 0);
 }

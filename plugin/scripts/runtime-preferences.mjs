@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { projectDirectory } from './project-identity.mjs';
 
 const DEFAULT_HOME = os.homedir();
 const PROJECT_FILE = '.swarm/ruvnet-brain-settings.json';
@@ -66,6 +67,18 @@ function validSettings(raw = {}) {
     newProjectDefaults: source.newProjectDefaults === true,
     advocacy: Number.isInteger(source.advocacy) && source.advocacy >= 1 && source.advocacy <= 5
       ? source.advocacy : 3,
+    // ADR-063 / issue #103. Unknown keys are DROPPED by this function, so a setting absent here is
+    // silently unreadable no matter what the Console writes — which is how the first cut of the
+    // managed-memory boundary read `advise` even when the file said `block`.
+    //
+    // NOTE THE DUPLICATION, deliberately not "fixed" here: scripts/user-settings.mjs SETTINGS_SCHEMA
+    // is the authority for these keys and this is a second enumeration of it. Deriving one from the
+    // other is the obvious move and it is the WRONG one — this file ships inside plugin/, that one
+    // does not, so the import would resolve in the checkout and throw ERR_MODULE_NOT_FOUND on a real
+    // install. Same trap as kb/forge-update.mjs reaching for ../scripts. The honest fix is a drift
+    // test that reads both files, not a bridge that breaks installs.
+    managedMemoryBoundary: ['advise', 'read-only', 'block'].includes(source.managedMemoryBoundary)
+      ? source.managedMemoryBoundary : 'advise',
   };
 }
 
@@ -263,7 +276,93 @@ export function seedProjectDefaults(options = {}) {
 
 if (process.argv.includes('--learning-scope')) {
   process.stdout.write(`${loadRuntimePreferences().values.learningScope}\n`);
+} else if (process.argv.includes('--managed-memory-boundary')) {
+  // ADR-063 / issue #103. hijack-ruvnet.sh is POSIX sh and must not parse JSON, so it asks here —
+  // the same idiom learn-capture.sh already uses for --learning-scope. Falls back to the shipped
+  // default rather than erroring: a hook that cannot read a preference must never refuse a command
+  // because of it, so an unreadable settings file degrades to `advise`, which blocks nothing.
+  process.stdout.write(`${loadRuntimePreferences().values.managedMemoryBoundary || 'advise'}\n`);
 } else if (process.argv.includes('--seed-project')) {
   const result = seedProjectDefaults();
   if (!result.ok) process.exitCode = 1;
+}
+
+/**
+ * WHERE THE LEARNER LIVES — ONE ANSWER, SHARED BY THE WRITER AND EVERY READER.
+ *
+ * ISSUE #139, filed by @ObiWanKenobi, and he is right about the shape. the learning flusher resolved
+ * the learning scope properly and then writes to `HOME` or `PROJECT` accordingly. The console read
+ * the learner with a HARDCODED cwd — first `SYSTEM_HOME` (issue #136), then `process.cwd()` after
+ * the fix. Both are hardcodes. Neither asks which scope is in effect.
+ *
+ * In his words: `process.cwd()` "happens to be correct only because `project` is the default. Set
+ * `RUVNET_LEARNING_SCOPE=user` and the bug inverts: the flush feeds `~/.claude-flow/neural` while
+ * the console reads `<project>/.claude-flow/neural`. Same card, same false positive, opposite
+ * direction."
+ *
+ * That is this repo's signature defect once more — one fact (WHERE the learner is) implemented in
+ * three places, agreeing by coincidence rather than by construction. It has now arrived as #104,
+ * #134, #136 and #139. So the fact moves here, next to the preferences it depends on, and the
+ * writer and the readers call the same function. A future scope becomes one edit, not three.
+ */
+export function learningScope(options = {}) {
+  const env = options.env ?? process.env;
+  const cwd = projectDirectory({ env, cwd: options.cwd ?? env.RUVNET_BRAIN_PROJECT_DIR ?? process.cwd() });
+  const configured = env.RUVNET_LEARNING_SCOPE
+    || loadRuntimePreferences({ ...options, cwd }).values.learningScope;
+  return ['off', 'project', 'user'].includes(configured) ? configured : 'project';
+}
+
+/**
+ * The cwd to run `ruflo hooks intelligence` in — the directory whose `.claude-flow/neural` the
+ * configured scope actually uses. `ruflo` reports `Data Dir: <cwd>/.claude-flow/neural`, so cwd IS
+ * the store selector; getting it wrong measures a store nothing writes to. Measured on one machine
+ * during #136: the home store held 1,216 trajectories last trained 6.9 DAYS ago while the served
+ * project held 9,940 last trained 22 SECONDS ago, and the console said "your learner has gone
+ * quiet" about the one training every few seconds.
+ */
+export function learnerCwd(options = {}) {
+  return learningContext(options).learnerCwd;
+}
+
+/** One scope snapshot for Console observation, remedies and the learning queue. Never creates paths. */
+export function learningContext(options = {}) {
+  const env = options.env ?? process.env;
+  const requestedHome = options.home ?? env.HOME ?? os.homedir();
+  let home; try { home = fs.realpathSync.native(requestedHome); } catch { home = path.resolve(requestedHome); }
+  const projectDir = projectDirectory({ env, cwd: options.cwd ?? env.RUVNET_BRAIN_PROJECT_DIR ?? process.cwd() });
+  const scope = learningScope({ ...options, env, cwd: projectDir });
+  const learner = scope === 'user' ? home : projectDir;
+  let persistedOff = false;
+  let consentUnknown = !!env.RUVNET_LEARNING_SCOPE && !['off', 'project', 'user'].includes(env.RUVNET_LEARNING_SCOPE);
+  for (const file of Object.values(preferencePaths({ ...options, env, cwd: projectDir })).slice(0, 2)
+    .concat(preferencePaths({ ...options, env, cwd: projectDir }).project)) {
+    try {
+      const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) consentUnknown = true;
+      for (const name of ['values', 'settings']) if (raw && Object.hasOwn(raw, name)) {
+        const inner = raw[name];
+        if (!inner || typeof inner !== 'object' || Array.isArray(inner)) consentUnknown = true;
+      }
+      const value = (raw.values || raw.settings || raw).learningScope;
+      persistedOff ||= value === 'off';
+      if (value !== undefined && !['off', 'project', 'user'].includes(value)) consentUnknown = true;
+    } catch (error) { if (!['ENOENT', 'ENOTDIR'].includes(error.code)) consentUnknown = true; }
+  }
+
+  const state = env.RUVNET_BRAIN_STATE_DIR || path.join(home, '.config', 'ruvnet-brain');
+  let brainOff = env.RUVNET_BRAIN_OFF === '1';
+  try { fs.statSync(path.join(state, 'brain-off')); brainOff = true; }
+  catch (error) { if (!['ENOENT', 'ENOTDIR'].includes(error.code)) brainOff = true; }
+  let adopted = scope === 'user' || env.RUVNET_LEARNING_SCOPE === 'project';
+  try {
+    const swarm = path.join(projectDir, '.swarm');
+    adopted ||= fs.lstatSync(swarm).isDirectory() && fs.realpathSync.native(swarm) === swarm;
+  } catch { /* No implicit adoption or directory creation. */ }
+  return {
+    scope, projectDir, home, learnerCwd: learner, adopted, enabled: scope !== 'off' && !brainOff && !consentUnknown && !persistedOff && adopted,
+    disabledReason: consentUnknown ? 'unknown-consent' : brainOff ? 'brain-off' : scope === 'off' || persistedOff ? 'learning-off' : !adopted ? 'unadopted' : null,
+    queueDir: scope === 'user' ? path.join(home, '.cache', 'ruvnet-brain', 'learn')
+      : path.join(projectDir, '.swarm', 'ruvnet-brain-learn'),
+  };
 }

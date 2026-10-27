@@ -19,6 +19,7 @@
 //   • Bind 127.0.0.1 only; mint a random per-launch token; every mutating POST must echo it (else 403).
 
 import http from 'node:http';
+import { createSuiteUpdater } from './console-suite-update.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -27,11 +28,14 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync, execFileSync, spawn } from 'node:child_process';
 
 import { auditModel, installedVersion } from './stack-sync.mjs';
-import { findStores, diagnose } from './memory-doctor.mjs';
+import { acquireDeveloperLock } from '../plugin/scripts/developer-update-lock.mjs';
+import { candidateRoots, findStores, findProjects, diagnose } from './memory-doctor.mjs';
 import { buildStackRecommendations, buildWiringRecommendations, summarizeWiring, scoreMemoryHealth, buildHealthRecommendations, buildCapabilityRecommendations } from './console-engine.mjs';
 import { planFor } from './remedy-registry.mjs';
 import { auditAll as capabilityAuditAll } from './capability-registry.mjs';
 import { getVersion } from './version.mjs';
+import { consoleRuntimeDigest } from './console-runtime-identity.mjs';
+import { isCorpusReleaseTag } from '../kb/corpus-release-identity.mjs';
 // L5 (ADR-028): the audit is the one place that observes live capability state, so it is where an
 // OFFERED-then-now-`on` transition becomes an APPLIED — the numerator of the precision metric that
 // tells the owner whether advocacy is landing or nagging. Both are pure reads/appends and never throw.
@@ -41,10 +45,11 @@ import { loadCatalog as engineCatalog, catalogSource as engineCatalogSource, loa
 import { effectivePrices, loadLabelledRows, MIN_LABELS, OUTCOMES } from './metaharness-router.mjs';
 import { utilization } from './router-utilization.mjs';
 import { loadCatalog, detectProvider, frontierFor } from './model-catalog.mjs';
+import { providerAvailability } from './provider-availability.mjs';
 import { learnings } from './learnings.mjs';
 import { gatesSurvey } from './gates.mjs';
 // The write-safety primitives, borrowed rather than re-implemented. See saveConfig for why.
-import { withLock, writeAtomic, LOCK_WAIT_MS, loadSettings, saveSettings, SETTINGS_SCHEMA as USER_SETTINGS_SCHEMA } from './user-settings.mjs';
+import { withLock, writeAtomic, LOCK_WAIT_MS, loadSettings, saveSettings, revertSettings, SETTINGS_SCHEMA as USER_SETTINGS_SCHEMA } from './user-settings.mjs';
 // The brain on/off switch (ADR-054). The sentinel is the enforcement artifact; settings.json holds
 // only a mirror. The console is the ONE surface allowed to flip it — protect-brain-state.sh walls
 // the file off from agent edits — so both halves of the write live here, in saveBrainPower().
@@ -59,26 +64,251 @@ import {
 } from '../kb/brain-profile.mjs';
 // Lessons: read model + the two user verbs. Every mutation goes through lesson-store's own
 // updateLessons/ratify/demote/restore — this file adds a SURFACE, never a second writer.
-import { loadLessons, updateLessons, ratify, demote, restore, pending, weightOf, TRIGGERS, ENFORCEMENT, ORIGIN, STATUS } from './lesson-store.mjs';
+import { loadLessons, updateLessons, ratify, demote, restore, pending, weightOf, TRIGGERS, ENFORCEMENT, ORIGIN, SOURCE_CLASS, STATUS } from './lesson-store.mjs';
 import {
   openRouterCredentialStatus,
   saveOpenRouterCredential,
+  loadRuntimePreferences,
 } from '../plugin/scripts/runtime-preferences.mjs';
+import { observeLearning as observeScopedLearning } from '../plugin/scripts/learning-store.mjs';
 import { applyNightlyChoice, nightlyStatus } from './nightly-controller.mjs';
+// One canonical answer to "which directory is this, and have I counted it already?" — shared with
+// the PreCompact snapshot producer (#85) and with memory-doctor's root scan (#107).
+import { canonicalPath, pathIdentity, projectDirectory } from '../plugin/scripts/project-identity.mjs';
+import { resolveProjectStore } from '../plugin/scripts/project-store-resolver.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.dirname(__dirname);
 const CONSOLE_DIR = path.join(REPO, 'console');
-const HOME = os.homedir();
-const NPM_PREFIX = path.join(HOME, '.npm-global');
-const CONFIG_DIR = path.join(HOME, '.claude/ruvnet-brain');
+const SYSTEM_HOME = os.homedir();
+
+/**
+ * The console's explicit root boundary. It scopes only console-owned configuration, state, cache,
+ * and discovery; global binaries, account credentials, and external tool state retain SYSTEM_HOME.
+ */
+export function consoleRootFromEnvironment(env = process.env, systemHome = SYSTEM_HOME) {
+  const configured = env.RUVNET_CONSOLE_ROOT;
+  if (!configured) return systemHome;
+  if (typeof configured !== 'string' || !path.isAbsolute(configured)) {
+    throw new Error('RUVNET_CONSOLE_ROOT must be an absolute path');
+  }
+  return path.resolve(configured);
+}
+
+// A test or an embedded caller can isolate the console's owned files and discovery roots without
+// redefining the operating-system home directory. Normal launches retain the OS home exactly.
+const CONSOLE_ROOT = consoleRootFromEnvironment();
+const NPM_PREFIX = path.join(SYSTEM_HOME, '.npm-global');
+const CONFIG_DIR = path.join(CONSOLE_ROOT, '.claude/ruvnet-brain');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
-const UNDO_JOURNAL = path.join(HOME, '.cache/ruvnet-brain/console-undo.jsonl');
+const UNDO_JOURNAL = path.join(CONSOLE_ROOT, '.cache/ruvnet-brain/console-undo.jsonl');
 const INSTALLED_KB = process.env.RUVNET_BRAIN_KB
-  || path.join(HOME, '.cache', 'ruvnet-brain', 'kb');
+  || path.join(CONSOLE_ROOT, '.cache', 'ruvnet-brain', 'kb');
 const COMPLETE_BRAIN_SOURCE = process.env.RUVNET_BRAIN_COMPLETE_SOURCE
   || path.join(REPO, 'dist', 'ruvnet-brain');
 const TOKEN = crypto.randomBytes(24).toString('hex');
+const RUNTIME_RECEIPT_DIR = path.join(CONSOLE_ROOT, '.cache', 'ruvnet-brain', 'console-instances');
+const RUNTIME_PRODUCT = 'ruvnet-brain-console';
+const RUNTIME_SCHEMA = 1;
+const RUNTIME_API_CONTRACT = 1;
+const RUNTIME_SCRIPT = fs.realpathSync(fileURLToPath(import.meta.url));
+// The generation this process IS, derived from every byte it executes and serves — not from this one
+// file. #79: a Console whose entrypoint was unchanged but whose imported modules and frontend had been
+// replaced reported the same identity as the candidate that replaced it, so the launcher reused a
+// pre-update router behind a post-update page. Same function, same surface, same list as the installer
+// stages (scripts/console-runtime-identity.mjs), so the two halves of this fact cannot drift.
+const RUNTIME_SOURCE_SHA256 = consoleRuntimeDigest(REPO);
+
+function consoleCandidateRoots() {
+  return candidateRoots({ home: CONSOLE_ROOT, configPath: CONFIG_PATH });
+}
+
+function canonicalScope(cwd = process.cwd()) {
+  return canonicalPath(cwd) ?? path.resolve(cwd);
+}
+
+function runtimeReceiptPath(cwd = process.cwd()) {
+  const scope = canonicalScope(cwd);
+  const scopeId = crypto.createHash('sha256').update(scope).digest('hex').slice(0, 24);
+  return path.join(RUNTIME_RECEIPT_DIR, `${scopeId}.json`);
+}
+
+function runtimeIdentity({ port, cwd = process.cwd(), pid = process.pid, startedAt = new Date().toISOString() }) {
+  return {
+    product: RUNTIME_PRODUCT,
+    schema: RUNTIME_SCHEMA,
+    apiContract: RUNTIME_API_CONTRACT,
+    pid,
+    port,
+    startedAt,
+    scope: canonicalScope(cwd),
+    scriptRealpath: RUNTIME_SCRIPT,
+    runtimeVersion: brainVersionOnDisk(),
+    sourceSha256: RUNTIME_SOURCE_SHA256,
+  };
+}
+
+function validRuntimeReceipt(receipt, file) {
+  if (!receipt || typeof receipt !== 'object') return false;
+  if (process.platform !== 'win32') {
+    try { if ((fs.statSync(file).mode & 0o777) !== 0o600) return false; } catch { return false; }
+  }
+  return receipt.product === RUNTIME_PRODUCT
+    && receipt.schema === RUNTIME_SCHEMA
+    && receipt.apiContract === RUNTIME_API_CONTRACT
+    && Number.isInteger(receipt.pid) && receipt.pid > 0
+    && Number.isInteger(receipt.port) && receipt.port > 0 && receipt.port <= 65535
+    && typeof receipt.startedAt === 'string'
+    && typeof receipt.scope === 'string'
+    && typeof receipt.scriptRealpath === 'string'
+    && typeof receipt.runtimeVersion === 'string'
+    && /^[a-f0-9]{64}$/.test(receipt.sourceSha256 || '')
+    && /^[a-f0-9]{48}$/.test(receipt.controlToken || '');
+}
+
+function publicRuntimeIdentity(receipt) {
+  const { controlToken: _secret, ...identity } = receipt;
+  return identity;
+}
+
+function writeRuntimeReceipt(receipt, file = runtimeReceiptPath(receipt.scope)) {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  if (process.platform !== 'win32') fs.chmodSync(path.dirname(file), 0o700);
+  const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  try {
+    fs.writeFileSync(tmp, `${JSON.stringify(receipt)}\n`, { mode: 0o600, flag: 'wx' });
+    if (process.platform !== 'win32') fs.chmodSync(tmp, 0o600);
+    fs.renameSync(tmp, file);
+  } finally {
+    try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch { /* best effort */ }
+  }
+  return file;
+}
+
+function removeOwnedRuntimeReceipt(file, controlToken) {
+  const current = readJSON(file);
+  if (!current || current.controlToken !== controlToken) return false;
+  try { fs.unlinkSync(file); return true; } catch { return false; }
+}
+
+function sameRuntimeIdentity(left, right) {
+  return ['product', 'schema', 'apiContract', 'pid', 'port', 'startedAt', 'scope',
+    'scriptRealpath', 'runtimeVersion', 'sourceSha256'].every((key) => left?.[key] === right?.[key]);
+}
+
+function probeRuntime(port, timeout = 800) {
+  return new Promise((resolve) => {
+    const req = http.get({ host: '127.0.0.1', port, path: '/api/runtime', timeout }, (res) => {
+      let body = '';
+      res.on('data', (chunk) => {
+        body += chunk;
+        if (body.length > 16_384) req.destroy();
+      });
+      res.on('end', () => {
+        if (res.statusCode !== 200) return resolve(null);
+        try { resolve(JSON.parse(body)); } catch { resolve(null); }
+      });
+      res.on('error', () => resolve(null));
+    });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+  });
+}
+
+function probeHttpEndpoint(port, endpoint = '/api/runtime', timeout = 800) {
+  return new Promise((resolve) => {
+    const req = http.get({ host: '127.0.0.1', port, path: endpoint, timeout }, (res) => {
+      res.resume();
+      res.on('end', () => resolve({ reachable: true, status: res.statusCode }));
+    });
+    req.on('error', () => resolve({ reachable: false, status: null }));
+    req.on('timeout', () => { req.destroy(); resolve({ reachable: false, status: null }); });
+  });
+}
+
+function requestRuntimeShutdown(port, controlToken, timeout = 1_500) {
+  return new Promise((resolve) => {
+    const body = JSON.stringify({ controlToken });
+    const req = http.request({
+      host: '127.0.0.1', port, path: '/api/runtime/shutdown', method: 'POST', timeout,
+      headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) },
+    }, (res) => {
+      res.resume();
+      res.on('end', () => resolve(res.statusCode === 202));
+    });
+    req.on('error', () => resolve(false));
+    req.on('timeout', () => { req.destroy(); resolve(false); });
+    req.end(body);
+  });
+}
+
+async function waitForRuntimeToStop(port, timeout = 3_000) {
+  const until = Date.now() + timeout;
+  while (Date.now() < until) {
+    if (!await probeRuntime(port, 150)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return false;
+}
+
+async function inspectConsoleRuntime({ cwd = process.cwd(), preferredPort = Number(process.env.CONSOLE_PORT) || 7411 } = {}) {
+  const receiptFile = runtimeReceiptPath(cwd);
+  if (!fs.existsSync(receiptFile)) {
+    const endpoint = await probeHttpEndpoint(preferredPort);
+    return endpoint.reachable
+      ? { state: 'foreign-port', scope: canonicalScope(cwd), port: preferredPort }
+      : { state: 'not-running', scope: canonicalScope(cwd) };
+  }
+  const receipt = readJSON(receiptFile);
+  if (!validRuntimeReceipt(receipt, receiptFile)) return { state: 'receipt-invalid', scope: canonicalScope(cwd) };
+  const live = await probeRuntime(receipt.port);
+  if (!live) {
+    const endpoint = await probeHttpEndpoint(receipt.port);
+    return endpoint.reachable
+      ? { state: 'legacy-unowned', scope: canonicalScope(cwd), port: receipt.port }
+      : { state: 'stale-receipt', scope: canonicalScope(cwd), port: receipt.port };
+  }
+  if (!sameRuntimeIdentity(live, publicRuntimeIdentity(receipt))) {
+    return { state: 'legacy-unowned', scope: canonicalScope(cwd), port: receipt.port };
+  }
+  const candidate = runtimeIdentity({ port: receipt.port, cwd, pid: receipt.pid, startedAt: receipt.startedAt });
+  const current = sameRuntimeIdentity(live, candidate);
+  return {
+    state: current ? 'current' : 'stale-running',
+    scope: canonicalScope(cwd),
+    port: receipt.port,
+    live,
+    candidate: publicRuntimeIdentity(candidate),
+  };
+}
+
+async function launchConsole({ port = Number(process.env.CONSOLE_PORT) || 7411, open = false, cwd = process.cwd() } = {}) {
+  const status = await inspectConsoleRuntime({ cwd, preferredPort: port });
+  if (status.state === 'current') {
+    const url = `http://127.0.0.1:${status.port}/`;
+    console.log(`\n  🧠  RuvNet Brain — Onboarding Console (already running)\n      ${url}\n`);
+    if (open) openBrowser(url);
+    return { reused: true, port: status.port };
+  }
+
+  if (status.state === 'stale-running') {
+    const receiptFile = runtimeReceiptPath(cwd);
+    const receipt = readJSON(receiptFile);
+    const stopped = validRuntimeReceipt(receipt, receiptFile)
+      && await requestRuntimeShutdown(receipt.port, receipt.controlToken)
+      && await waitForRuntimeToStop(receipt.port);
+    if (stopped) {
+      console.log(`  replacing owned stale Console on port ${receipt.port}…`);
+      return { reused: false, server: startServer({ port: receipt.port, open, cwd }) };
+    }
+    console.error('  owned stale Console did not release its port — starting the current Console separately');
+  }
+
+  if (status.state === 'stale-receipt' || status.state === 'receipt-invalid') {
+    try { fs.unlinkSync(runtimeReceiptPath(cwd)); } catch { /* already gone or unreadable */ }
+  }
+  return { reused: false, server: startServer({ port, open, cwd }) };
+}
 
 const NPX_RUV = /npx\s+(?:-y\s+|--yes\s+)?(?:@claude-flow\/[\w-]+|claude-flow|ruflo|ruvector|ruv-swarm|flow-nexus|metaharness|@metaharness\/[\w-]+|agentic-qe|aqe)(?:@[\w.-]+)?/;
 
@@ -123,45 +353,6 @@ function robustReadJSON(db, sql) {
 const VENDOR = ['/clones/', '/node_modules/', '/vendor/', '/upstream/', '.claude-backup', '_snapshots',
   '/ruvnet-repos/', '/ruvnet_repos/'];
 
-// ── Candidate scan roots (issue #19) ────────────────────────────────────────────────────────────
-// A single hardcoded `~/Code` silently reports "0" on any machine that keeps projects somewhere
-// else (a reporter's `~/source`, `~/dev`, `~/work`, …) — a confident zero that just means "didn't
-// look in the right place". Scan every root that actually exists on THIS machine, plus a user
-// override in config.json (`scanRoots`, absolute paths or relative to $HOME) when present.
-const DEFAULT_SCAN_ROOTS = ['Code', 'code', 'src', 'source', 'projects', 'dev', 'work'];
-function candidateRoots() {
-  const cfg = readJSON(CONFIG_PATH) || {};
-  const configured = Array.isArray(cfg.scanRoots) && cfg.scanRoots.length > 0
-    ? cfg.scanRoots.map((r) => (path.isAbsolute(r) ? r : path.join(HOME, r)))
-    : DEFAULT_SCAN_ROOTS.map((d) => path.join(HOME, d));
-  const seen = new Set();
-  const roots = [];
-  for (const r of configured) {
-    const resolved = path.resolve(r);
-    if (seen.has(resolved)) continue;
-    seen.add(resolved);
-    try { if (fs.statSync(resolved).isDirectory()) roots.push(resolved); } catch { /* doesn't exist on this machine — skip silently */ }
-  }
-  return roots;
-}
-function findProjects(root) {
-  const out = new Set();
-  const walk = (dir, depth) => {
-    if (depth > 4) return;
-    let ents; try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
-    for (const e of ents) {
-      const p = path.join(dir, e.name);
-      if (VENDOR.some((m) => (p + '/').includes(m))) continue;
-      if (e.isDirectory()) {
-        if (e.name === '.claude') { out.add(dir); continue; }
-        if (e.name.startsWith('.') || e.name === 'node_modules') continue;
-        walk(p, depth + 1);
-      } else if (e.name === '.mcp.json') out.add(dir);
-    }
-  };
-  walk(root, 0);
-  return [...out].sort();
-}
 // Text that PRINTS the word npx is not an npx call site. Two of the sites this card warned about were
 // `echo "Session ended. Run: npx aqe learn status"` — advice being displayed to the user, matched as
 // though the machine were executing it. Strip quoted echo/printf payloads before classifying.
@@ -181,9 +372,9 @@ function wiringSurvey() {
   // must never count the same project twice.
   const seenProjects = new Set();
   const projects = [];
-  for (const root of candidateRoots()) {
+  for (const root of consoleCandidateRoots()) {
     for (const proj of findProjects(root)) {
-      const resolved = path.resolve(proj);
+      const resolved = pathIdentity(proj) ?? path.resolve(proj);
       if (seenProjects.has(resolved)) continue;
       seenProjects.add(resolved);
       projects.push({ proj, root });
@@ -214,22 +405,134 @@ function wiringSurvey() {
       if (mech) sites.push({ scope: 'project', project: projName, file: '.mcp.json', event: 'MCP', matcher: name, spec: full.slice(0, 160), mechanism: mech });
     }
   }
+  // THE MACHINE-WIDE FILE (console audit 2026-09-11). Plugins are switched on in ~/.claude/settings.json
+  // and nowhere else, and this survey never read that file — so the card said `plugin: 0` on a machine
+  // with 14 enabled, ruvnet-brain among them. Each enabled plugin is one global PLUGIN site. The file's
+  // own hooks go through the same classifier the project scan uses, so a machine-wide npx or
+  // global-binary hook is counted in the same words as a project one.
+  const machine = readJSON(path.join(CONSOLE_ROOT, '.claude', 'settings.json'));
+  if (machine) {
+    for (const [event, groups] of Object.entries(machine.hooks || {})) {
+      const list = Array.isArray(groups) ? groups : [groups];
+      for (const g of list) {
+        const hookArr = Array.isArray(g?.hooks) ? g.hooks : (g?.command ? [g] : []);
+        for (const h of hookArr) {
+          const mech = classifyCommand(h?.command);
+          if (mech) sites.push({ scope: 'global', file: '~/.claude/settings.json', event, matcher: g?.matcher ?? '*', spec: String(h.command).slice(0, 160), mechanism: mech });
+        }
+      }
+    }
+    for (const [name, on] of Object.entries(machine.enabledPlugins || {})) {
+      if (on === true) sites.push({ scope: 'global', file: '~/.claude/settings.json', event: 'plugin', matcher: name, spec: name, mechanism: 'PLUGIN' });
+    }
+  }
   return { sites, summary: summarizeWiring(sites) };
 }
 
 // ── Memory health (read-only probes for the project the console was launched from) ────────────────
-function sessionHookExists() {
-  return fs.existsSync(path.join(HOME, '.claude/hooks/agentdb-ensure.sh')) || fs.existsSync(path.join(HOME, '.claude/hooks'));
+// Dream Cycle 2026-09-18 (memory-durability, round-trip-proof): this used to also pass on ANY
+// `.claude/hooks` directory existing, so a machine whose hooks folder holds only an unrelated
+// script (a different plugin, a stale leftover) scored `sessionSurfacing: ok` and printed "the
+// global SessionStart hook surfaces project state at launch" — a claim about a hook that was never
+// installed. Only the specific recall hook's presence can support that claim.
+//
+// Dream Cycle 2026-09-19 (memory-durability, managed-boundary): the fix above still checked only
+// the LEGACY standalone `agentdb-ensure.sh` global hook. It ignored the mechanism this very repo
+// ships and documents as the automatic one — `plugin/hooks/hooks.json`'s own SessionStart entry,
+// which every session restores via `project-progression-session-start.mjs` (wired through
+// `session-start-core.mjs`) whenever the `ruvnet-brain` plugin itself is enabled. A machine that
+// installed this plugin the real, current way (Claude Code's marketplace flow) and never separately
+// placed the legacy global shell hook scored `sessionSurfacing: warn` — a false negative, flagged
+// as an open scope question by PR #296's independent critic, not chased there to keep that change
+// to one conceptual fix. `pluginEnabled()` mirrors the exact `k.startsWith('ruvnet-brain@')` check
+// `capability-registry.mjs`'s `wiredForRoute()` already uses for the same "is our plugin the one
+// Claude Code will actually load" question, rather than re-deriving a second way to ask it.
+function pluginEnabled() {
+  const settings = readJSON(path.join(CONSOLE_ROOT, '.claude', 'settings.json'));
+  return Object.entries(settings?.enabledPlugins || {}).some(([k, v]) => k.startsWith('ruvnet-brain@') && v === true);
 }
-function probeMemory(projectDir) {
-  const db = path.join(projectDir, '.swarm/memory.db');
-  const probes = {};
-  // compaction survival + session surfacing are filesystem facts, always checkable
-  const snap = fs.existsSync(path.join(projectDir, 'agentdb-sessions.jsonl')) || fs.existsSync(path.join(projectDir, '.swarm/agentdb-sessions.jsonl'));
-  probes.compactionSurvival = snap ? { status: 'ok', detail: 'a PreCompact snapshot file is present' } : { status: 'warn', detail: 'no PreCompact snapshot found for this project yet' };
-  probes.sessionSurfacing = sessionHookExists() ? { status: 'ok', detail: 'the global SessionStart hook surfaces project state at launch' } : { status: 'warn', detail: 'no SessionStart recall hook found' };
+function sessionHookExists() {
+  if (fs.existsSync(path.join(CONSOLE_ROOT, '.claude/hooks/agentdb-ensure.sh'))) return 'agentdb-ensure';
+  if (pluginEnabled()) return 'ruvnet-brain-plugin';
+  return null;
+}
+// WHICH FILE IS THE PROJECT'S MEMORY STORE IS NOT A CONSTANT (issue #127).
+//
+// This probed only `.swarm/memory.db`. A reporter on ruflo 3.34.0 measured their live store — 31MB
+// with a fresh project-state checkpoint — sitting in `.swarm/agentdb-memory.db`, so the card scored
+// the project on an empty file and reported "no project-state checkpoint found" and "liveness: 1
+// entries" about a store that had neither problem. The card's own remedy could not fix it, because
+// the data was never missing; the probe was looking elsewhere.
+//
+// I could NOT reproduce their attribution on this machine: same ruflo 3.34.0, both with and without
+// an explicit --path, a fresh `ruflo memory store` lands in `.swarm/memory.db` (proven by exact-key
+// SQL against both files). So which name the CLI picks is evidently config- or environment-
+// dependent, and hard-coding EITHER name is how this breaks again on the next machine.
+//
+// So the probe stops guessing and asks the filesystem: consider both known names, and use whichever
+// actually holds rows. That is correct on their machine and on mine without knowing why they differ.
+//
+// THE SECOND HALF OF THAT LESSON (console audit 2026-09-11). "Whichever holds rows" was implemented
+// as "whichever is LARGER", and on a machine where BOTH hold rows that picked the wrong one: the
+// card scored ruvnet-brain on `.swarm/agentdb-memory.db` — 15,824 rows, the MCP coordination store
+// the global CLAUDE.md warns is a DIFFERENT container — and rendered "15824 entries, 100% embedded"
+// while the canonical `.swarm/memory.db`, the file `ruflo memory store` writes, held 5. The #127
+// reporter's cases (canonical absent, or present but empty) still resolve to the coordination store;
+// a canonical store that holds rows is now always the one scored, and BOTH files are reported so the
+// page can say which it scored and which it did not.
+const MEMORY_DB_NAMES = ['memory.db', 'agentdb-memory.db'];
+// Row count that never throws and never hangs on a live store: null means "unreadable this instant".
+function memoryRows(file) {
+  if (!fs.existsSync(file)) return null;
+  const r = robustRead(file, 'SELECT count(*) FROM memory_entries;');
+  return r.ok ? (r.value === null ? 0 : parseInt(r.value, 10)) : null;
+}
+export function memoryStores(projectDir) {
+  let canonicalPath;
+  let resolutionError = null;
+  try { canonicalPath = resolveProjectStore({ projectDir }).canonicalAgentDbPath; }
+  catch (error) {
+    // A resolver refusal (foreign store, broken symlink, or ambiguous project) is an
+    // authoritative UNKNOWN. Never probe a guessed path after the resolver declines it.
+    canonicalPath = path.join(projectDir, '.swarm', MEMORY_DB_NAMES[0]);
+    resolutionError = String(error?.message || error);
+  }
+  const coordinationPath = path.join(path.dirname(canonicalPath), MEMORY_DB_NAMES[1]);
+  const canonical = resolutionError
+    ? { path: canonicalPath, exists: null, rows: null, status: 'unknown', error: resolutionError }
+    : { path: canonicalPath, exists: fs.existsSync(canonicalPath), rows: memoryRows(canonicalPath) };
+  const coordination = resolutionError
+    ? { path: coordinationPath, exists: null, rows: null, status: 'unknown', error: 'canonical project store could not be resolved' }
+    : { path: coordinationPath, exists: fs.existsSync(coordinationPath), rows: memoryRows(coordinationPath) };
+  // Coordination storage is a separate diagnostic container. It can never become project memory
+  // merely because the canonical file is absent, empty, busy, or larger.
+  return { canonical, coordination, scored: canonical.path, resolutionError };
+}
+export function resolveMemoryDb(projectDir) {
+  return memoryStores(projectDir).scored;
+}
+
+function probeMemory(projectDir, { now = Date.now() } = {}) {
+  const stores = memoryStores(projectDir);
+  const db = stores.scored;
+  const probes = { stores };
+  // Compaction survival is a ruflo write at PreCompact (project-state-auto-* + exact readback); a refusal
+  // reaches the hook-failures summary. It is not re-probed at render.
+  probes.compactionSurvival = { status: 'notTested', detail: 'PreCompact stores a project-state-auto-* checkpoint through ruflo and reads it back; failures appear in the SessionStart hook-failures summary' };
+  const sessionHookVia = sessionHookExists();
+  probes.sessionSurfacing = sessionHookVia === 'agentdb-ensure'
+    ? { status: 'ok', detail: 'the global SessionStart hook surfaces project state at launch', via: sessionHookVia }
+    : sessionHookVia === 'ruvnet-brain-plugin'
+      ? { status: 'ok', detail: 'the ruvnet-brain plugin\'s own SessionStart hook surfaces project state at launch', via: sessionHookVia }
+      : { status: 'warn', detail: 'no SessionStart recall hook found', via: null };
   // recall quality: honestly NOT probed at render (a true probe needs an embedding query; left for an explicit deep test)
   probes.recallQuality = { status: 'notTested', detail: 'not checked this session — a real recall probe needs an embedding round-trip, which render deliberately avoids' };
+
+  if (stores.resolutionError) {
+    probes.liveness = { status: 'unknown', detail: `canonical project store could not be resolved: ${stores.resolutionError}` };
+    probes.coverage = { status: 'unknown', detail: 'project checkpoint cannot be assessed until the canonical store resolves' };
+    return probes;
+  }
 
   if (!fs.existsSync(db)) {
     probes.liveness = { status: 'fail', detail: 'this project has no memory store (.swarm/memory.db) yet' };
@@ -253,12 +556,14 @@ function probeMemory(projectDir) {
   const liveNote = integ.mode === 'immutable=1' ? ' and in active use' : '';
   if (integrity !== 'ok') probes.liveness = { status: 'fail', detail: `store is corrupt (integrity_check: ${integrity})` };
   else if (total === null) probes.liveness = { status: 'notTested', detail: 'store opened but counts were unavailable this instant' };
-  else if (total > 0) probes.liveness = { status: 'ok', detail: `store is live${liveNote}, integrity ok, ${total} entries${embedded != null && total ? `, ${Math.round((embedded / total) * 100)}% embedded` : ''} (read-only)` };
-  else probes.liveness = { status: 'warn', detail: 'store exists but is empty' };
+  // The file is NAMED in the sentence, so "15824 entries" can never again be read as the canonical
+  // store's count when it was the coordination store's.
+  else if (total > 0) probes.liveness = { status: 'ok', detail: `${path.basename(db)} is live${liveNote}, integrity ok, ${total} entries${embedded != null && total ? `, ${Math.round((embedded / total) * 100)}% embedded` : ''} (read-only)` };
+  else probes.liveness = { status: 'warn', detail: `${path.basename(db)} exists but is empty` };
 
   const cp = robustRead(db, "SELECT max(updated_at) FROM memory_entries WHERE key LIKE 'project-state-current%';");
   if (cp.ok && cp.value) {
-    const ageH = (Date.now() - Number(cp.value) * (String(cp.value).length <= 10 ? 1000 : 1)) / 3.6e6;
+    const ageH = (now - Number(cp.value) * (String(cp.value).length <= 10 ? 1000 : 1)) / 3.6e6;
     probes.coverage = Number.isFinite(ageH) && ageH < 48
       ? { status: 'ok', detail: `project checkpoint present, ~${Math.max(0, ageH).toFixed(0)}h old` }
       : { status: 'warn', detail: 'project checkpoint present but stale (>2 days)' };
@@ -273,19 +578,7 @@ function probeMemory(projectDir) {
 // machine has 100+. That is far too slow to sit on the page's first paint, so it is its own endpoint
 // (/api/memory) and hydrates late, exactly like the stack audit does.
 function scanFleet() {
-  // memory-doctor.mjs's findStores() defaults to ~/Code and cannot be edited here (issue #19) — so
-  // pass it every candidate root explicitly and de-dupe (it also always appends a couple of known
-  // extra paths regardless of root, which the Set below folds together instead of duplicating).
-  const seen = new Set();
-  const stores = [];
-  for (const root of candidateRoots()) {
-    for (const db of findStores(root)) {
-      const resolved = path.resolve(db);
-      if (seen.has(resolved)) continue;
-      seen.add(resolved);
-      stores.push(db);
-    }
-  }
+  const stores = findStores();
   const fleet = [];
   for (const db of stores) {
     const d = diagnose(db);
@@ -297,23 +590,38 @@ function scanFleet() {
   return fleet;
 }
 function gatherMemory(cwd, { fleet = true } = {}) {
-  // health = for the project the console was launched from (fall back to this repo)
-  const project = fs.existsSync(path.join(cwd, '.swarm/memory.db')) ? cwd : REPO;
-  const projName = project.replace(HOME + '/Code/', '').replace(HOME + '/', '~/');
-  const health = scoreMemoryHealth({ project: projName, probes: probeMemory(project) });
+  // health = for the project the console was launched from (fall back to this repo). The scope is
+  // resolved through projectDirectory() — the same call the PreCompact producer makes — so a console
+  // launched from a subdirectory probes the project root the hook actually wrote to, instead of
+  // warning that a snapshot it can see on disk does not exist (#85).
+  const scope = projectDirectory({ cwd });
+  let project = scope;
+  try { project = resolveProjectStore({ projectDir: scope }).projectRoot; } catch { /* probe reports unavailable */ }
+  const projName = project.replace(CONSOLE_ROOT + '/Code/', '').replace(CONSOLE_ROOT + '/', '~/');
+  const probes = probeMemory(project);
+  const health = scoreMemoryHealth({ project: projName, probes });
+  // Which file the score is about, and which file it deliberately is not — both with row counts.
+  const short = (p) => String(p).replace(CONSOLE_ROOT, '~');
+  health.stores = probes.stores ? {
+    scored: short(probes.stores.scored),
+    canonical: { ...probes.stores.canonical, path: short(probes.stores.canonical.path) },
+    coordination: { ...probes.stores.coordination, path: short(probes.stores.coordination.path) },
+  } : null;
   return { fleet: fleet ? scanFleet() : null, health };
 }
 
 // ── Savings ledger (receipts only) ────────────────────────────────────────────────────────────────
-function gatherSavings() {
+function gatherSavings({ repo = REPO } = {}) {
   // Primary source is the real routing-receipts ledger written by scripts/route-cheap.mjs.
   const files = [
-    path.join(HOME, '.claude/metaharness/routing-receipts.jsonl'),
-    path.join(HOME, '.cache/ruvnet-brain/metaharness-receipts.jsonl'),
+    path.join(SYSTEM_HOME, '.claude/metaharness/routing-receipts.jsonl'),
+    path.join(SYSTEM_HOME, '.cache/ruvnet-brain/metaharness-receipts.jsonl'),
     // Canonical user-level ledger (issue #36 — the hooks no longer scatter per-CWD copies).
-    path.join(HOME, '.cache/ruvnet-brain/token-ledger.jsonl'),
+    path.join(SYSTEM_HOME, '.cache/ruvnet-brain/token-ledger.jsonl'),
     // Legacy location, still read so an existing user's history is not orphaned by the move.
-    path.join(REPO, 'plugin/scripts/.ruvnet-brain/token-ledger.jsonl'),
+    // `repo` is injectable because on a developer checkout this file is REAL history (2 rows from
+    // 2026-07-14 on the owner's machine) and HOME isolation alone cannot keep it out of a fixture.
+    path.join(repo, 'plugin/scripts/.ruvnet-brain/token-ledger.jsonl'),
   ];
   const receipts = [];
   let baselineUsd = 0;
@@ -349,10 +657,16 @@ function gatherSavings() {
     }
   }
   const usdSaved = +receipts.reduce((a, r) => a + (r.measuredUsd || 0), 0).toFixed(4);
+  const timed = receipts.filter((r) => r.measuredMs !== null);
   const totals = receipts.length ? {
     count: receipts.length,
     usdSaved,
+    // SIGNED, and it stays signed. A net-slower ledger sums negative and is REPORTED negative — the
+    // page once turned that into a dash (console audit 2026-09-11: −46,737 ms across 25 timed
+    // routes, 23 of them slower than baseline, rendered as "—"). A loss is a finding about the
+    // router; `timedCount` says how many routes the number is even about.
     msSaved: receipts.reduce((a, r) => a + (r.measuredMs || 0), 0),
+    timedCount: timed.length,
     baselineUsd: +baselineUsd.toFixed(4),
     pctSaved: baselineUsd > 0 ? Math.round((usdSaved / baselineUsd) * 100) : null,
   } : null;
@@ -363,7 +677,7 @@ function gatherSavings() {
 const CONFIG_SCHEMA = [
   { key: 'openrouterKey', label: 'OpenRouter API key', type: 'secret', secret: true, help: 'Unlocks cheap-model routing and the self-improvement loop. Stored only in your user folder.' },
   { key: 'provider', label: 'Your model house', type: 'enum', options: ['auto', 'anthropic', 'openai', 'codex', 'google', 'xai'], help: 'Which stack is yours? Sets your frontier model + savings baseline — Claude → Fable 5, ChatGPT → GPT-5.6 Sol, Codex → Sol, Gemini → 3.1 Pro, Grok → 4.5. “auto” detects from your keys.' },
-  { key: 'nightly', label: 'Nightly brain refresh', type: 'bool', help: 'Rebuild the knowledge base from pinned versions overnight so answers stay current.' },
+  { key: 'nightly', label: 'Nightly coordinated updates', type: 'bool', help: 'Run the same update coordinator overnight using your saved release policy and tool scope.' },
   { key: 'routing', label: 'Token-smart routing', type: 'enum', options: ['auto', 'off'], help: 'Send cheap, mechanical tasks to smaller, cheaper models automatically.' },
   { key: 'qeFleet', label: 'On-demand QE test fleet', type: 'bool', help: 'Let RuvNet Brain spin up an Agentic-QE test fleet when you ask it to.' },
 ];
@@ -401,39 +715,139 @@ function unsupportedConfigControls() {
  * off, and the Settings form shows the shipped default beside it as a recommendation rather than as
  * a fact about their machine.
  */
+/**
+ * NIGHTLY REFRESH IS THREE FACTS, NOT ONE BOOLEAN (console audit 2026-09-11). The toggle rendered
+ * `nightly: true` because the LaunchAgent was loaded, while ~/.claude/ruvnet-brain/config.json said
+ * `nightly: false` and the job had never completed a run. Three independently measured things —
+ * the CHOICE the user saved (config.json), the ENFORCEMENT the scheduler adapter reports (loaded,
+ * off, degraded), and the OUTCOME of the last completed run (its receipt) — had been collapsed into
+ * the one the user did not set. A single boolean is emitted only when choice and enforcement agree;
+ * otherwise the field is null (never chosen, or in disagreement) and `facts` carries all three so
+ * the page can print them side by side. Pure, so the rule is testable without a scheduler.
+ */
+export function reconcileNightly({ choice, schedule }) {
+  const enforcement = schedule?.state ?? 'unknown';
+  const run = schedule?.runHealth ?? null;
+  const enforced = enforcement === 'on' ? true : enforcement === 'off' ? false : null;
+  const chosen = choice === true || choice === false ? choice : null;
+  const agree = chosen === null ? null : (enforced !== null && chosen === enforced);
+  return {
+    value: agree === true ? chosen : null,
+    facts: {
+      choice: chosen,
+      enforcement,
+      enforcementEvidence: schedule?.evidence ?? null,
+      lastRun: run?.state ?? 'unknown',
+      lastRunEvidence: run?.evidence ?? null,
+      lastRunAt: run?.receipt?.finishedAt ?? run?.receipt?.startedAt ?? null,
+      agree,
+    },
+  };
+}
+
+// The one thing the console never showed: WHICH repositories are in the brain, by name. It has
+// always carried the count (206) and never the inventory — the owner asked for this list more than
+// a dozen times. RVF-GENERATIONS.json is the manifest that matches disk exactly (verified 206 = 206);
+// SOURCE.json is the provenance subset (104) that carries the upstream URL. Join on store name,
+// never restate either. Ranked by build recency — never alphabetical (relevance-ordering rule).
+function gatherInventory() {
+  const generations = readJSON(path.join(INSTALLED_KB, 'RVF-GENERATIONS.json'));
+  const source = readJSON(path.join(INSTALLED_KB, 'SOURCE.json'));
+  const stores = generations?.stores && typeof generations.stores === 'object' ? generations.stores : null;
+  if (!stores) return { available: false, reason: 'RVF-GENERATIONS.json not readable in the installed brain', count: 0, stores: [] };
+  // SOURCE.json has carried `stores` as an array in some generations and a name-keyed object in
+  // others; accept both rather than silently joining nothing (measured 2026-09-16: object form,
+  // and the array-only read reported withProvenance=0 for a brain with 104 provenance rows).
+  const provenance = new Map();
+  const sourceRows = Array.isArray(source?.stores) ? source.stores
+    : source?.stores && typeof source.stores === 'object'
+      ? Object.entries(source.stores).map(([name, row]) => ({ name, ...row })) : [];
+  for (const row of sourceRows) {
+    if (row?.name) provenance.set(String(row.name).toLowerCase(), row);
+  }
+  const rows = Object.entries(stores).map(([name, gen]) => {
+    const prov = provenance.get(name.toLowerCase());
+    return {
+      name,
+      sourceRepo: prov?.sourceRepo || null,
+      sourceCommit: gen?.sourceCommit ? String(gen.sourceCommit).slice(0, 7) : null,
+      builtUtc: gen?.builtUtc || null,
+      bytes: Number(gen?.bytes) || 0,
+      model: gen?.model || null,
+      private: prov?.updateManaged === false,
+    };
+  }).sort((a, b) => String(b.builtUtc || '').localeCompare(String(a.builtUtc || '')) || a.name.localeCompare(b.name));
+  return {
+    available: true,
+    count: rows.length,
+    withProvenance: rows.filter((r) => r.sourceRepo).length,
+    privateCount: rows.filter((r) => r.private).length,
+    brainVersion: generations.brainVersion || null,
+    releaseTag: generations.releaseTag || null,
+    totalBytes: rows.reduce((sum, r) => sum + r.bytes, 0),
+    stores: rows,
+  };
+}
+
+/**
+ * Keys a project-level <project>/.swarm/ruvnet-brain-settings.json overrides FOR THE RUNTIME THAT
+ * READS IT. runtime-preferences merges that file over the user-level choices, and route-cheap, the
+ * managed-CLI gate (routing, qeFleet) and learn-capture (learningScope) obey the merge.
+ * The console saves user-level values only, so without this a project seeded by "Apply these choices
+ * to new projects" silently ignored every later change made here (RNBC QA 2026-10-01). Only keys whose
+ * consumer honours the project file are reported — advocacy, autoApply and provider are read at user
+ * level by their consumers, so a project value for them changes nothing and is not claimed to.
+ */
+const PROJECT_HONOURED_KEYS = Object.freeze(['routing', 'qeFleet', 'learningScope']);
+function projectOverrides(keys) {
+  try {
+    const prefs = loadRuntimePreferences({ cwd: process.cwd() });
+    if (!prefs.projectInherited) return null;
+    const raw = readJSON(prefs.paths.project) || {};
+    const values = raw.values && typeof raw.values === 'object' ? raw.values : raw;
+    const out = {};
+    for (const key of keys) {
+      if (PROJECT_HONOURED_KEYS.includes(key) && Object.hasOwn(values, key) && prefs.values[key] === values[key]) out[key] = values[key];
+    }
+    return Object.keys(out).length ? { path: prefs.paths.project.replace(CONSOLE_ROOT, '~'), values: out } : null;
+  } catch { return null; }
+}
+
 function gatherConfig() {
   const cfg = readJSON(CONFIG_PATH) || {};
   const credential = openRouterCredentialStatus({ cwd: process.cwd() });
   const schedule = nightlyStatus();
   const bool = (v) => (v === true ? true : v === false ? false : null);
+  const nightly = reconcileNightly({ choice: bool(cfg.nightly), schedule });
   const unavailable = unsupportedConfigControls();
   if (!schedule.artifact.supported) {
     unavailable.push({
       key: 'nightly',
-      label: 'Nightly brain refresh',
+      label: 'Nightly coordinated updates',
       reason: schedule.evidence,
     });
   }
   return {
-    path: CONFIG_PATH.replace(HOME, '~'),
+    path: CONFIG_PATH.replace(CONSOLE_ROOT, '~'),
     exists: fs.existsSync(CONFIG_PATH),
     values: {
       openrouterKey: credential.configured,                // boolean only — never the secret itself
       provider: typeof cfg.provider === 'string' && cfg.provider ? cfg.provider : null,
-      nightly: schedule.state === 'on' ? true : schedule.state === 'off' ? false : null,
+      nightly: nightly.value,
       routing: cfg.routing === 'off' ? 'off' : cfg.routing === 'auto' ? 'auto' : null,
       qeFleet: bool(cfg.qeFleet),
     },
     // What the project would pick FOR you, kept separate from what you actually picked. The form can
     // then say "recommended: on" without ever claiming that is the current state.
     defaults: { provider: 'auto', nightly: true, routing: 'auto', qeFleet: false },
+    projectOverrides: projectOverrides(CONFIG_SCHEMA.map((field) => field.key)),
     schema: CONFIG_SCHEMA.filter((field) =>
       !Object.hasOwn(CONFIG_CONTROL_SUPPORT, field.key)
       && (field.key !== 'nightly' || schedule.artifact.supported)),
     unavailable,
     runtime: {
       openrouterKey: credential,
-      nightly: schedule,
+      nightly: { ...schedule, facts: nightly.facts },
     },
   };
 }
@@ -464,13 +878,14 @@ function gatherAdvocacy() {
   const chosen = raw && typeof raw === 'object' && raw.settings && typeof raw.settings === 'object'
     ? raw.settings : {};
   return {
-    path: state.path.replace(HOME, '~'),
+    path: state.path.replace(CONSOLE_ROOT, '~'),
     exists: state.exists,
     values: Object.fromEntries(LIVE_USER_FIELDS.map((field) => [
       field.key,
       Object.hasOwn(chosen, field.key) ? state.values[field.key] : null,
     ])),
     defaults: Object.fromEntries(LIVE_USER_FIELDS.map((field) => [field.key, field.default])),
+    projectOverrides: projectOverrides(LIVE_USER_SETTING_KEYS),
     schema: LIVE_USER_FIELDS,
     unavailable: [],
   };
@@ -510,9 +925,20 @@ function saveAdvocacy(values) {
   const result = saveSettings(supplied);
   if (!result.ok) return { ok: false, rejected: result.errors || [], log: result.log };
   publishSettingsToCache();
+  // THE SAVE IS REVERSIBLE FROM WHERE IT WAS MADE. The Settings card promises "every save is
+  // reversible", and saveSettings already writes the backup and the existedBefore flag its own
+  // revertSettings() consumes — but this form returned no undo token, so the console showed an Undo
+  // button for config.json and none here (RNBC QA 2026-10-01). Journalled only after the write.
+  const undoToken = journalUndo({
+    kind: 'restore-user-settings',
+    file: result.file,
+    backup: result.backup,
+    existedBefore: result.existedBefore,
+  });
   return {
     ok: true,
-    backup: result.backup ? result.backup.replace(HOME, '~') : null,
+    undoToken,
+    backup: result.backup ? result.backup.replace(CONSOLE_ROOT, '~') : null,
     values: Object.fromEntries(LIVE_USER_SETTING_KEYS.map((key) => [key, result.values[key]])),
     log: result.log,
   };
@@ -549,10 +975,23 @@ function gatherBrainProfile() {
     : installed.stores.length === 1
       ? PROFILE_RUVECTOR
       : PROFILE_COMPLETE;
+  // THE "— stores · 0 MB" LIE (console audit 2026-09-11). `choices.complete` was rendered from
+  // `source` — the restore BUNDLE at COMPLETE_BRAIN_SOURCE, which on an installed host resolves to
+  // <runtime>/dist/ruvnet-brain and never exists after install — while `installed`, measured three
+  // lines up (184 stores, 979 MB on the owner's machine), went unused. discoverStoreFamilies()
+  // swallows ENOENT into [], so a complete brain rendered as zero and wore an `active` badge over it.
+  // Two different questions are now answered separately: what is INSTALLED here, and by which path
+  // Apply→complete could RESTORE it here. The path order mirrors saveBrainProfile()'s own branches
+  // (local bundle, then the signed forge-update download, then nothing), so the card describes the
+  // exact mechanism Apply would take — never a hopeful one, never a number nobody measured.
   const source = measureBrainProfile(COMPLETE_BRAIN_SOURCE);
+  const bundlePresent = source.stores.includes(PROFILE_RUVECTOR) && source.storeCount > 1;
   const updaterAvailable = fs.existsSync(path.join(INSTALLED_KB, 'forge-update.mjs'));
+  const restoreVia = bundlePresent ? 'local-bundle' : updaterAvailable ? 'signed-download' : null;
+  const completeInstalled = actual === PROFILE_COMPLETE;
+  const restorePath = COMPLETE_BRAIN_SOURCE.replace(CONSOLE_ROOT, '~');
   return {
-    path: INSTALLED_KB.replace(HOME, '~'),
+    path: INSTALLED_KB.replace(CONSOLE_ROOT, '~'),
     values: { brainProfile: actual },
     stored: settings.values.brainProfile,
     disagreement: settings.values.brainProfile !== actual,
@@ -561,10 +1000,20 @@ function gatherBrainProfile() {
     installed,
     choices: {
       complete: {
-        available: (source.stores.includes(PROFILE_RUVECTOR) && source.storeCount > 1)
-          || updaterAvailable,
-        storeCount: source.storeCount,
-        bytes: source.bytes,
+        available: restoreVia !== null,
+        // From the INSTALLED brain when complete is what is installed; from the local bundle when one
+        // exists to restore from; otherwise null — never a 0 that nothing measured.
+        storeCount: completeInstalled ? installed.storeCount : bundlePresent ? source.storeCount : null,
+        bytes: completeInstalled ? installed.bytes : bundlePresent ? source.bytes : null,
+        installed: completeInstalled ? { storeCount: installed.storeCount, bytes: installed.bytes } : null,
+        restoreBundle: {
+          present: bundlePresent,
+          path: restorePath,
+          storeCount: bundlePresent ? source.storeCount : null,
+          bytes: bundlePresent ? source.bytes : null,
+        },
+        updaterAvailable,
+        restoreVia,
       },
       ruvector: {
         available: installed.stores.includes(PROFILE_RUVECTOR)
@@ -573,7 +1022,7 @@ function gatherBrainProfile() {
         bytes: installed.byStore.ruvector ?? source.byStore.ruvector ?? null,
       },
     },
-    restoreSource: COMPLETE_BRAIN_SOURCE.replace(HOME, '~'),
+    restoreSource: COMPLETE_BRAIN_SOURCE.replace(CONSOLE_ROOT, '~'),
   };
 }
 
@@ -584,7 +1033,7 @@ function gatherBrainPower() {
     off: state.off,
     since: state.since,
     reason: state.reason,
-    switchPath: state.path.replace(HOME, '~'),
+    switchPath: state.path.replace(CONSOLE_ROOT, '~'),
     // The RESOLVED answer — what the machine actually does — not the mirror's opinion of it.
     values: { brainEnabled: !state.off },
     defaults: { brainEnabled: BRAIN_FIELD.default },
@@ -666,7 +1115,7 @@ function saveBrainProfile(values) {
     removed: changed.removed || [],
     bytesFreed: changed.bytesFreed || 0,
     mirrored: mirrored.ok,
-    backup: mirrored.backup ? mirrored.backup.replace(HOME, '~') : null,
+    backup: mirrored.backup ? mirrored.backup.replace(CONSOLE_ROOT, '~') : null,
     log: mirrored.ok
       ? (profile === PROFILE_RUVECTOR
         ? `RuVector Only is active — ${changed.removed.length} unselected artifact(s) removed`
@@ -720,6 +1169,14 @@ function publishSettingsToCache() {
     if (!c || !c.data || !c.data.sections) return;
     c.data.sections.config = gatherConfig();
     c.data.sections.userSettings = gatherAdvocacy();
+    // The Savings card reads two of the same choices (routing, and whether an OpenRouter key exists).
+    // Patching only Settings left the Savings card saying "No key added" / the old routing state on
+    // the next reload, beside a Settings card saying the opposite (RNBC QA 2026-10-01).
+    if (c.data.sections.savings) {
+      const cfgNow = readJSON(CONFIG_PATH) || {};
+      c.data.sections.savings.routing = cfgNow.routing === 'off' ? 'off' : cfgNow.routing === 'auto' ? 'auto' : null;
+      try { c.data.sections.savings.routerEngine = gatherRouterEngine(); } catch { /* the refresh replaces it */ }
+    }
     writeCache(STATE_CACHE, new Date(0).toISOString(), c.data, c.scope ?? null);
   } catch { /* the authoritative stores are already correct; refresh will replace an unreadable cache */ }
 }
@@ -754,7 +1211,7 @@ function saveBrainPower(values) {
     ok: true,
     off: state.off,
     since: state.since,
-    backup: mirrored.backup ? mirrored.backup.replace(HOME, '~') : null,
+    backup: mirrored.backup ? mirrored.backup.replace(CONSOLE_ROOT, '~') : null,
     values: { brainEnabled: !state.off },
     // Honest about the half-failure rather than reporting a clean success: the switch is what counts
     // and it moved, but say so plainly if the visible record did not follow it.
@@ -805,7 +1262,21 @@ function gatherLessons() {
   const lessons = all.map((l) => {
     const trig = TRIGGER_BY_KEY.get(l.trigger);
     const meaning = ENFORCEMENT_MEANING[l.enforcement] || { label: l.enforcement, detail: '' };
-    const userStated = l.origin === ORIGIN.USER_STATED;
+    const userStated = l.origin === ORIGIN.USER_STATED && l.sourceClass === SOURCE_CLASS.CURRENT_USER;
+    // Quarantine is about whether history can BECOME policy, so it applies to an imported row that
+    // was never ratified. A row that WAS ratified is delivered by lessonsFor() today whatever its
+    // source class — RNBC QA 2026-10-01 measured 12 such rows filed here as "quarantined, cannot be
+    // switched on" behind a checked, disabled box while the gate enforced every one of them. A rule in
+    // force must be reported in force and must keep a working off switch.
+    const importedClass = l.sourceClass === SOURCE_CLASS.IMPORTED_OWNER || l.sourceClass === SOURCE_CLASS.DEMONSTRATION;
+    const quarantined = importedClass && l.status !== STATUS.RATIFIED && l.status !== STATUS.ACTIVE;
+    const origin = l.sourceClass === SOURCE_CLASS.CURRENT_USER
+      ? 'you taught me this'
+      : l.sourceClass === SOURCE_CLASS.IMPORTED_OWNER
+        ? 'imported maintainer history — not yours'
+        : l.sourceClass === SOURCE_CLASS.DEMONSTRATION
+          ? 'demonstration data — not personal policy'
+          : 'I inferred this from what happened';
     return {
       id: l.id,
       statement: l.statement,
@@ -817,8 +1288,10 @@ function gatherLessons() {
       enforcementLabel: meaning.label,
       enforcementDetail: meaning.detail,
       // Provenance drives trust, so it is stated plainly and never flattened into a badge colour.
-      origin: userStated ? 'you taught me this' : 'I inferred this from what happened',
+      origin,
+      sourceClass: l.sourceClass,
       userStated,
+      quarantined,
       taughtCount: l.repeatCount || 0,
       projects: Array.isArray(l.projects) ? l.projects : [],
       evidence: l.evidence || null,
@@ -827,10 +1300,11 @@ function gatherLessons() {
       ratified: l.status === STATUS.RATIFIED || l.status === STATUS.ACTIVE,
       demoted: !!l.demoted,
       // The one thing the user is being ASKED, as opposed to merely shown.
-      awaitingYou: l.status === STATUS.CANDIDATE && !l.demoted,
+      awaitingYou: l.status === STATUS.CANDIDATE && !l.demoted && !quarantined,
       // Honest ceiling: ratifying a model-inferred lesson can NOT raise it to block
       // (lesson-store.mjs:380). Say so before they click, not after.
       canReachBlock: userStated,
+      canRatify: !importedClass,
       intendedEnforcement: l.intendedEnforcement || null,
     };
   });
@@ -854,6 +1328,7 @@ function gatherLessons() {
       active: lessons.filter((l) => l.ratified && !l.demoted).length,
       awaitingYou: lessons.filter((l) => l.awaitingYou).length,
       off: lessons.filter((l) => l.demoted).length,
+      quarantined: lessons.filter((l) => l.quarantined).length,
       blocking: lessons.filter((l) => l.enforcement === 'block' && l.ratified && !l.demoted).length,
     },
     // TASK 2: this endpoint bypasses serveCached entirely and had NO timestamp of any kind. It is
@@ -884,6 +1359,9 @@ function setLesson(body) {
   }
   const before = loadLessons().find((l) => l.id === id);
   if (!before) return { ok: false, log: `nothing changed — no lesson with id ${id}` };
+  if (action === 'ratify' && (before.sourceClass === SOURCE_CLASS.IMPORTED_OWNER || before.sourceClass === SOURCE_CLASS.DEMONSTRATION)) {
+    return { ok: false, log: 'nothing changed — imported or demonstration history cannot become personal policy' };
+  }
 
   try {
     updateLessons((fresh) => spec.fn(id, fresh));
@@ -924,7 +1402,7 @@ function setLesson(body) {
 // setImmediate either (deferring synchronous work still blocks the loop when it runs). A machine with
 // no fleet scan yet is reported `warming`, never as a fabricated zero.
 let ACTIVITY_MACHINE_CACHE = null;
-const CONSOLE_CACHE_PATH = path.join(HOME, '.cache/ruvnet-brain/console-cache.json');
+const CONSOLE_CACHE_PATH = path.join(CONSOLE_ROOT, '.cache/ruvnet-brain/console-cache.json');
 
 // ── Warm-cache serving (2026-07-17, the demo-hang fix) ─────────────────────────────────────────────
 // Every read-model here does multi-second synchronous work: gatherState ~13s, gatherStack ~22s,
@@ -1123,11 +1601,35 @@ function writeCache(file, at, data, scope = null) {
  */
 let REFRESH_CHILD = null;
 const REFRESH_WEDGED_MS = 5 * 60 * 1000;
-function kickRefresh({ force = false } = {}) {
-  if (process.env.RUVNET_CONSOLE_DISABLE_BACKGROUND_REFRESH === '1') return false;
+let REFRESH_STATE = Object.freeze({ status: 'idle', runId: null, error: null });
+export function refreshState() { return REFRESH_STATE; }
+export function classifyRefreshState({ disabled = false, running = false, debounced = false, failed = null, runId = null } = {}) {
+  if (disabled) return Object.freeze({ status: 'disabled', runId: null, error: null });
+  if (failed) return Object.freeze({ status: 'failed', runId, error: String(failed) });
+  if (running || debounced) return Object.freeze({ status: 'already-running', runId, error: debounced ? 'debounced' : null });
+  return Object.freeze({ status: 'started', runId, error: null });
+}
+export function settleRefreshState({ currentRunId, runId, code = 0, signal = null } = {}) {
+  if (currentRunId !== runId) return null;
+  if (code !== 0 || signal) return classifyRefreshState({ failed: signal ? `signal ${signal}` : `exit ${code}`, runId });
+  return Object.freeze({ status: 'settled', runId, error: null });
+}
+let FOLLOW_UP_REFRESH = null;
+export function kickRefreshDetailed({ force = false, followUp = false, cwd = process.cwd(), spawnRefresh = spawn } = {}) {
+  if (process.env.RUVNET_CONSOLE_DISABLE_BACKGROUND_REFRESH === '1') {
+    REFRESH_STATE = classifyRefreshState({ disabled: true });
+    return REFRESH_STATE;
+  }
   const now = Date.now();
-  if (REFRESH_CHILD && now - LAST_REFRESH_KICK < REFRESH_WEDGED_MS) return false;  // one at a time
-  if (!force && now - LAST_REFRESH_KICK < 15000) return false;   // debounce: at most one background refresh / 15s
+  if (REFRESH_CHILD && now - LAST_REFRESH_KICK < REFRESH_WEDGED_MS) {
+    if (followUp) FOLLOW_UP_REFRESH = { cwd, spawnRefresh };
+    REFRESH_STATE = classifyRefreshState({ running: true, runId: REFRESH_STATE.runId });
+    return FOLLOW_UP_REFRESH ? { ...REFRESH_STATE, queued: true } : REFRESH_STATE;
+  }
+  if (!force && now - LAST_REFRESH_KICK < 15000) {
+    REFRESH_STATE = classifyRefreshState({ debounced: true, runId: REFRESH_STATE.runId });
+    return REFRESH_STATE;
+  }
   LAST_REFRESH_KICK = now;
   try {
     // cwd = the SERVED project, NOT REPO. This was `cwd: REPO` and it was a real console-honesty bug
@@ -1140,14 +1642,45 @@ function kickRefresh({ force = false } = {}) {
     // inherit it. Machine-level caches (stack/activity/trust) don't depend on cwd, so this is safe
     // for them; it only fixes the project-scoped ones. NOT a change to the withhold-vs-recompute
     // contract (the 2026-07-17 outage) — only to which project the background compute is about.
-    const child = spawn(process.execPath, [SELF, '--refresh-cache'], { detached: true, stdio: 'ignore', cwd: process.cwd() });
+    const child = spawnRefresh(process.execPath, [SELF, '--refresh-cache'], { detached: true, stdio: 'ignore', cwd });
     REFRESH_CHILD = child;
+    const runId = `${process.pid}-${now}`;
+    REFRESH_STATE = classifyRefreshState({ runId });
+    const drainFollowUp = () => {
+      const queued = FOLLOW_UP_REFRESH;
+      FOLLOW_UP_REFRESH = null; // Any number of forced mutations coalesce into one scan.
+      if (!queued) return;
+      // The old child may have published after the mutation withdrew its earlier snapshot.
+      // Withdraw again only after that writer has exited, before the post-mutation child starts.
+      expireCachesEmbedding([STATE_CACHE, STACK_CACHE, MEMORY_CACHE, CAPABILITY_CACHE]);
+      kickRefreshDetailed({ ...queued, force: true });
+    };
     // unref() only releases the event-loop hold; these listeners still fire while the server lives.
-    child.on('exit', () => { REFRESH_CHILD = null; });
-    child.on('error', () => { REFRESH_CHILD = null; });
+    child.on('exit', (code, signal) => {
+      // An older child can exit after a newer run has started. It may only settle its own run.
+      const settled = settleRefreshState({ currentRunId: REFRESH_STATE.runId, runId, code, signal });
+      if (!settled) return;
+      REFRESH_CHILD = null;
+      REFRESH_STATE = settled;
+      drainFollowUp();
+    });
+    child.on('error', (error) => {
+      const settled = settleRefreshState({ currentRunId: REFRESH_STATE.runId, runId, code: 1, signal: error?.message || error });
+      if (!settled) return;
+      REFRESH_CHILD = null;
+      REFRESH_STATE = settled;
+      drainFollowUp();
+    });
     child.unref();   // let it outlive this request; it writes the caches and exits on its own
-    return true;
-  } catch { REFRESH_CHILD = null; return false; /* a failed spawn just means the cache ages until the next kick */ }
+    return REFRESH_STATE;
+  } catch (error) {
+    REFRESH_CHILD = null;
+    REFRESH_STATE = classifyRefreshState({ failed: error?.message || error });
+    return REFRESH_STATE;
+  }
+}
+function kickRefresh(options = {}) {
+  return kickRefreshDetailed(options).status === 'started';
 }
 
 /**
@@ -1311,7 +1844,7 @@ function serveCached(res, file, decorate = (d) => d, scopeKey = null) {
 
   // WARM — including over-ceiling. Never compute inline here; hand back what we measured, say when,
   // and let the detached child produce the next one.
-  const fresh = freshnessOf(c.at);
+  const fresh = { ...freshnessOf(c.at), ...(FOLLOW_UP_REFRESH ? { stale: true, refreshQueued: true } : {}) };
   kickRefresh();
   return sendJSON(res, 200, {
     ...decorate(c.data),
@@ -1374,10 +1907,13 @@ function refreshFleetCache() {
   const seen = new Set();
   // Scan every candidate root (issue #19) — this is what made machine-wide totals read 0 on a
   // machine whose projects live under ~/source instead of ~/Code.
-  for (const root of candidateRoots()) {
+  for (const root of consoleCandidateRoots()) {
     for (const s of findMemoryStores(root)) {
-      const resolved = path.resolve(s.project);
-      if (seen.has(resolved)) continue; // a project visible under two roots (e.g. a symlink) counts once
+      // pathIdentity, not path.resolve: resolve() normalises `.`/`..` and nothing else, so a project
+      // reached through a symlink OR through the other capitalisation of a case-insensitive volume
+      // was two distinct strings for one directory, and its memories were summed twice (#107).
+      const resolved = pathIdentity(s.project) ?? path.resolve(s.project);
+      if (seen.has(resolved)) continue; // a project visible under two roots counts once
       seen.add(resolved);
       const n = Number(robustRead(s.db, "SELECT COUNT(*) FROM memory_entries WHERE status='active'").value || 0);
       if (n > 0) {
@@ -1405,7 +1941,12 @@ function findMemoryStores(root) {
       const p = path.join(dir, e.name);
       if (VENDOR.some((m) => (p + '/').includes(m))) continue;
       if (e.name === '.swarm') {
-        if (fs.existsSync(path.join(p, 'memory.db'))) out.push({ project: dir, db: path.join(p, 'memory.db') });
+        // Fleet activity is project memory, so resolve the canonical store rather than selecting a
+        // coordination database by size. The latter is diagnostic-only and can contain unrelated rows.
+        try {
+          const resolved = resolveProjectStore({ projectDir: dir }).canonicalAgentDbPath;
+          if (fs.existsSync(resolved)) out.push({ project: dir, db: resolved });
+        } catch { /* an unresolvable directory is not a project store */ }
         continue;
       }
       if (e.name.startsWith('.') || e.name === 'node_modules') continue;
@@ -1416,8 +1957,16 @@ function findMemoryStores(root) {
   return out;
 }
 function gatherActivity(cwd) {
-  const project = fs.existsSync(path.join(cwd, '.swarm/memory.db')) ? cwd : REPO;
-  const db = path.join(project, '.swarm/memory.db');
+  let project;
+  let db;
+  try {
+    const resolved = resolveProjectStore({ projectDir: projectDirectory({ cwd }) });
+    project = resolved.projectRoot;
+    db = resolved.canonicalAgentDbPath;
+  } catch {
+    const measuredAt = new Date().toISOString();
+    return { generatedAt: measuredAt, project: path.basename(cwd), hasStore: false, continuity: 'unavailable', ...freshnessOf(measuredAt) };
+  }
   if (!fs.existsSync(db)) {
     // No store to read — the existence check above IS the entire measurement, so it IS the
     // observation instant. Stamped here, not with a value taken before the check ran.
@@ -1503,15 +2052,27 @@ function gatherRouterEngine() {
   const cfg = readJSON(CONFIG_PATH) || {};
   // User-constraint detection (Brain-side by design — a fact about THIS user, not routing logic):
   // an OpenRouter key decides whether metered cross-provider candidates are even reachable.
-  let openrouterKey = !!process.env.OPENROUTER_API_KEY;
-  if (!openrouterKey) openrouterKey = !!(cfg.openrouterKey && String(cfg.openrouterKey).length > 8);
+  // The SAME reader the Settings card uses (env → SOPS+age store → legacy plaintext). This read only
+  // env + plaintext, so a key saved through Settings (encrypted, plaintext retired) showed "No key
+  // added" here under a Settings row saying "•••• set" (RNBC QA 2026-10-01).
+  let openrouterKey = false;
+  try { openrouterKey = openRouterCredentialStatus({ cwd: process.cwd() }).configured === true; }
+  catch { openrouterKey = !!process.env.OPENROUTER_API_KEY || !!(cfg.openrouterKey && String(cfg.openrouterKey).length > 8); }
   // House (issue #21): three mechanisms used to disagree — Settings wrote config.json's `provider`,
   // but the chip strip derived "yours" from whichever pool candidate happened to be
   // subscriptionCovered first, sourced from profile.json (a file nothing in the console writes). The
   // user's Settings choice is now the single source of truth, via the SAME detectProvider() the
   // savings.utilization frontier calc already uses (config → env → catalog default) — so this and
   // the frontier calc can never disagree either.
-  let house, providerKeys = {};
+  const subscriptions = detectSubscriptions();
+  let house;
+  let providerKeys = providerAvailability(null, subscriptions);
+  // `keysVerified` is the machine-readable half of `status`, and it is the field every consumer must
+  // consult BEFORE presenting `keys` as a fact about the user's machine (issue #86). `status` alone
+  // was published and then ignored: the Console rendered a confident "✗ no API key found" per
+  // provider straight off `keys`, so a missing catalog asset — an internal packaging failure — was
+  // shown to the user as a verified finding about their credentials. Unknown outranks off.
+  let providerCatalog = { status: 'degraded', keysVerified: false, detail: 'provider catalog was not loaded; native boolean detections are shown' };
   try {
     const hcat = loadCatalog();
     house = detectProvider(hcat, { provider: cfg.provider });
@@ -1520,11 +2081,12 @@ function gatherRouterEngine() {
     // key found". Read each provider's real detect_env vars — minus the CLAUDECODE / CLAUDE_CODE_ENTRYPOINT
     // run-context markers (which are not credentials), exactly as detectProvider() itself filters them —
     // so the UI's "key found / not found" is now true instead of decorative.
-    const IGNORE_ENV = new Set(['CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT']);
-    for (const [name, p] of Object.entries(hcat.providers || {})) {
-      providerKeys[name] = (p.detect_env || []).some((k) => !IGNORE_ENV.has(k) && !!process.env[k]);
-    }
-  } catch { house = { provider: cfg.provider && cfg.provider !== 'auto' ? cfg.provider : 'anthropic', source: 'default' }; }
+    providerKeys = providerAvailability(hcat, subscriptions);
+    providerCatalog = { status: 'ok', keysVerified: true, detail: 'verified provider catalog loaded' };
+  } catch (error) {
+    house = { provider: cfg.provider && cfg.provider !== 'auto' ? cfg.provider : 'anthropic', source: 'default' };
+    providerCatalog = { status: 'degraded', keysVerified: false, detail: `provider catalog unavailable: ${String(error?.message || error)}` };
+  }
   return {
     engine: {
       package: '@metaharness/router', installed,
@@ -1533,12 +2095,13 @@ function gatherRouterEngine() {
       outcomesLog: OUTCOMES.replace(os.homedir(), '~'),
     },
     keys: { openrouter: openrouterKey, ...providerKeys },
+    providerCatalog,
     // Paid seats, found at USER level. `keys` above is env-var API keys only, which is exactly why a
     // user with ChatGPT Max and Claude Max read as "auto" — neither plan puts a key in the
     // environment. These two fields are what let the UI say "you already have this" instead of
     // asking someone to paste a credential they are already paying not to need.
-    subscriptions: detectSubscriptions(),
-    preferredSeat: preferredSeat(detectSubscriptions()),
+    subscriptions,
+    preferredSeat: preferredSeat(subscriptions),
     profile: { present: !!profile, path: PROFILE_PATH.replace(os.homedir(), '~') },
     catalogSource: engineCatalogSource(),   // 'catalog' | 'built-in-fallback' — so the UI never calls the stub a real catalog
     house,
@@ -1649,15 +2212,19 @@ async function fetchReleaseDigest() {
 // in the heading of the console"). Plugin-cache dir first — the truth on installed machines — then
 // the repo's plugin.json for dev checkouts. null hides the chip rather than guessing.
 function brainVersionOnDisk() {
+  const runtimeIdentity = readJSON(path.join(REPO, 'runtime-identity.json'));
+  if (typeof runtimeIdentity?.runtimeVersion === 'string' && runtimeIdentity.runtimeVersion) {
+    return runtimeIdentity.runtimeVersion.replace(/^v/, '');
+  }
   try { const v = readInstallChannel().version; if (v) return String(v).replace(/^v/, ''); } catch { /* fall through */ }
   try { return getVersion(); } catch { return null; }
 }
 function readInstallChannel() {
-  const reg = readJSON(path.join(HOME, '.claude/plugins/installed_plugins.json'));
+  const reg = readJSON(path.join(SYSTEM_HOME, '.claude/plugins/installed_plugins.json'));
   const entries = reg && reg.plugins && reg.plugins['ruvnet-brain@ruvnet-brain'];
   const e = Array.isArray(entries) ? entries[0] : null;
   if (!e || !e.installPath || !fs.existsSync(e.installPath)) return { installed: false };
-  const km = readJSON(path.join(HOME, '.claude/plugins/known_marketplaces.json'));
+  const km = readJSON(path.join(SYSTEM_HOME, '.claude/plugins/known_marketplaces.json'));
   const src = km && km['ruvnet-brain'] && km['ruvnet-brain'].source;
   const pinned = !!(src && (src.ref || src.tag || src.commit)); // no pin recorded → tracking latest
   return {
@@ -1665,7 +2232,7 @@ function readInstallChannel() {
     version: path.basename(e.installPath) || e.version || null, // the plugin cache version dir IS the truth
     channel: pinned ? 'pinned' : 'latest',
     lastUpdated: e.lastUpdated || null,
-    cacheDir: String(e.installPath).replace(HOME, '~'),
+    cacheDir: String(e.installPath).replace(SYSTEM_HOME, '~'),
     repo: (src && src.repo) || null,
   };
 }
@@ -1683,6 +2250,34 @@ function readInstallChannel() {
  * practice, because the check that did exist only ever triggered a blocking recompute rather than an
  * honest stale-serve.
  */
+/**
+ * THREE VERSIONS ON ONE PAGE (console audit 2026-09-11): the header chip said v4.3.21 (running
+ * brain), the Install-channel row said v4.3.22 (plugin cache), the installed KB's RVF-GENERATIONS.json
+ * said 4.3.10 — and nothing said they differed. Each is read from its own file and LABELED. `agree`
+ * is true only when every measured one is identical, null when fewer than two could be read. A
+ * version that cannot be read is null, never guessed.
+ */
+export function versionFacts({ release = null } = {}) {
+  const gen = readJSON(path.join(INSTALLED_KB, 'RVF-GENERATIONS.json'));
+  const kbGeneration = typeof gen?.brainVersion === 'string' && gen.brainVersion ? gen.brainVersion.replace(/^v/, '') : null;
+  const runningBrain = brainVersionOnDisk();
+  let installedPlugin = null;
+  try { installedPlugin = readInstallChannel().version || null; } catch { installedPlugin = null; }
+  // A CORPUS RELEASE IS NOT A VERSION (ADR-086 step 16). `releases/latest` can now carry a
+  // `corpus-sha256-<64 hex>` content address, and stripping a leading "v" off one yields a 78-char
+  // string that this panel would have printed in the "latest release" slot beside `4.3.22`-shaped
+  // numbers — in the one panel whose whole job is to make version disagreement visible. That is not
+  // a version disagreement; it is a category error, and showing it as one would be the panel lying.
+  // So the two identities are reported in two fields, each labeled for what it actually is.
+  const rawTag = typeof release?.tag === 'string' && release.tag ? release.tag : null;
+  const corpusTag = isCorpusReleaseTag(rawTag) ? rawTag : null;
+  const latestRelease = rawTag && !corpusTag ? rawTag.replace(/^v/, '') : null;
+  const known = [kbGeneration, runningBrain, installedPlugin].filter(Boolean);
+  const agree = known.length < 2 ? null : known.every((x) => x === known[0]);
+  return { kbGeneration, runningBrain, installedPlugin, latestRelease, latestCorpusRelease: corpusTag,
+    agree, known: known.length };
+}
+
 async function gatherTrust() {
   // COLD ONLY: no successful release read has ever landed, so there is nothing to withhold or serve
   // stale — the one exception serveCached() itself carves out for its own caches.
@@ -1694,7 +2289,7 @@ async function gatherTrust() {
     const generatedAt = new Date().toISOString();
     const data = { generatedAt, release };
     if (release.ok) { TRUST_CACHE = { at: Date.parse(generatedAt), data }; saveConsoleCache(); }
-    return { ...data, channel: readInstallChannel(), sbom: readSbom(), ...freshnessOf(generatedAt) };
+    return { ...data, channel: readInstallChannel(), sbom: readSbom(), versions: versionFacts({ release }), ...freshnessOf(generatedAt) };
   }
 
   // WARM — including over-ceiling. Never await the network here; hand back what we measured, say
@@ -1703,7 +2298,7 @@ async function gatherTrust() {
   if (fresh.stale) kickTrustRefresh();
   // Disk facts stay live even when the release read is served from cache — the SBOM file and install
   // channel can change (a fresh `npm run sbom`, a plugin update) between two calls inside the ceiling.
-  return { ...TRUST_CACHE.data, channel: readInstallChannel(), sbom: readSbom(), ...fresh };
+  return { ...TRUST_CACHE.data, channel: readInstallChannel(), sbom: readSbom(), versions: versionFacts({ release: TRUST_CACHE.data.release }), ...fresh };
 }
 
 // ── Assemble the read-models ─────────────────────────────────────────────────────────────────────
@@ -1795,7 +2390,7 @@ export function preferredSeat(subs) {
 function gatherState(cwd, { fleet = true } = {}) {
   const wiring = wiringSurvey();
   const memory = gatherMemory(cwd, { fleet });
-  try { memory.learnings = learnings(); } catch { memory.learnings = null; }
+  try { memory.learnings = learnings({ cwd }); } catch { memory.learnings = null; }
   const savings = gatherSavings();
   const cfgNow = readJSON(CONFIG_PATH) || {};
   // issue #20: the Savings card's "Turn on smart routing" CTA must reflect what was actually saved —
@@ -1806,7 +2401,7 @@ function gatherState(cwd, { fleet = true } = {}) {
   // agentic-flow, and the Savings card claiming "Smart routing: ON" while the Capabilities card said
   // "not installed" — in the same render — was the contradiction that made the whole page untrustworthy.
   // The card now carries the same measurement the capability row uses, so the two cannot disagree.
-  savings.routingInstalled = fs.existsSync(path.join(HOME, '.npm-global/bin/agentic-flow'));
+  savings.routingInstalled = fs.existsSync(path.join(SYSTEM_HOME, '.npm-global/bin/agentic-flow'));
   try { savings.routerEngine = gatherRouterEngine(); } catch { savings.routerEngine = null; }
   try {
     const cat = loadCatalog();
@@ -1852,8 +2447,8 @@ function gatherState(cwd, { fleet = true } = {}) {
     token: TOKEN,
     generatedAt: new Date().toISOString(),
     preStateHash,
-    host: { user: os.userInfo().username, platform: process.platform, node: process.version, npmPrefix: NPM_PREFIX.replace(HOME, '~'), brainVersion: brainVersionOnDisk() },
-    sections: { wiring, memory, savings, config, userSettings, brainPower, gates, recommendations },
+    host: { user: os.userInfo().username, platform: process.platform, node: process.version, npmPrefix: NPM_PREFIX.replace(SYSTEM_HOME, '~'), brainVersion: brainVersionOnDisk() },
+    sections: { wiring, memory, savings, config, userSettings, brainPower, gates, recommendations, inventory: gatherInventory() },
   };
   // Cache the last good state so repeat page-loads paint instantly, same as the stack audit does.
   // TOKEN is per-server-run and must never touch disk — ?fast=1 splices the live one back in.
@@ -1873,9 +2468,9 @@ function gatherStack() {
   // ISSUE #22 — carry `source` ('npm-global' | 'plugin') + marketplace through so the console can show
   // (and count) tools installed via the Claude Code plugin marketplace, not just `npm install -g` ones.
   const rows = a.rows.map((r) => ({ name: r.name, installed: r.installed, target: r.target, tag: r.tag, state: r.state, source: r.source ?? 'npm-global', marketplace: r.marketplace ?? null }));
-  const shadows = a.shadows.map((s) => ({ name: s.name, version: s.version, global: s.global, dir: String(s.dir).replace(HOME, '~'), stale: !!(s.global && s.version !== s.global) }));
+  const shadows = a.shadows.map((s) => ({ name: s.name, version: s.version, global: s.global, dir: String(s.dir).replace(SYSTEM_HOME, '~'), stale: !!(s.global && s.version !== s.global) }));
   const by = (st) => rows.filter((r) => r.state === st).length;
-  const summary = { total: rows.length, behind: by('BEHIND'), broken: by('BROKEN'), ahead: by('AHEAD'), current: by('CURRENT'), unresolved: by('UNRESOLVED'), shadows: shadows.length, stale: a.stale.length };
+  const summary = { total: rows.length, behind: by('BEHIND'), broken: by('BROKEN'), ahead: by('AHEAD'), current: by('CURRENT'), unresolved: by('UNRESOLVED'), unverified: by('INSTALLED_UNVERIFIED'), shadows: shadows.length, stale: a.stale.length };
   const recommendations = buildStackRecommendations({ rows: a.rows, stale: a.stale });
   const result = { error: a.error, packages: rows, shadows, summary, recommendations };
   // Cache the last good audit so repeat page-loads render instantly ("as of HH:MM — re-checking").
@@ -1897,57 +2492,33 @@ function journalUndo(entry) {
   fs.appendFileSync(UNDO_JOURNAL, JSON.stringify({ token, at: new Date().toISOString(), ...entry }) + '\n');
   return token;
 }
-function runNode(scriptRelPath, args) {
-  const r = spawnSync(process.execPath, [path.join(REPO, scriptRelPath), ...args], { encoding: 'utf8', timeout: 16 * 60 * 1000, cwd: REPO });
+function runNode(scriptRelPath, args, options = {}) {
+  const r = spawnSync(process.execPath, [path.join(REPO, scriptRelPath), ...args], { encoding: 'utf8', timeout: 16 * 60 * 1000, cwd: REPO, ...options });
   return { ok: r.status === 0, code: r.status, log: `${r.stdout || ''}${r.stderr || ''}`.trim().slice(-4000) };
+}
+function elapsedMs(startedAt) {
+  return Math.round((performance.now() - startedAt) * 1000) / 1000;
 }
 
 // A wiring recommendation's `project` id is relative to whichever candidate root it was found under
 // (issue #19) — reconstruct the absolute path by checking each root, so reconcile/undo can act on a
 // project under ~/source just as well as one under ~/Code.
 function resolveProjectDir(project) {
-  for (const root of candidateRoots()) {
+  for (const root of consoleCandidateRoots()) {
     const p = path.join(root, project);
     if (fs.existsSync(p)) return p;
   }
-  return path.join(HOME, 'Code', project); // last-resort fallback: the previous fixed behavior
+  return path.join(CONSOLE_ROOT, 'Code', project); // last-resort fallback: the previous fixed behavior
 }
 // Re-derive the currently-valid recommendation set, so apply can only ever act on something STILL true.
 /**
  * Observe the learner's REAL state, for the health recommendations.
  *
- * Deliberately reads the GLOBAL learner (`cwd: HOME`), because that is the store the capture flush
- * actually writes to. Reading the project-local `.claude-flow/neural` instead is exactly the mistake
- * that made the console display a dead learner (5 trajectories, last trained 6 days earlier) while
- * the live one held 412 — rUv documents this fragmentation as issue #2245, "four contradictory
- * sources". Until it is unified upstream we read the store that learning writes, never the corpse.
+ * The queue and learner are selected together for the served project. Apply uses this same
+ * snapshot and remeasures it, so a successful child exit alone cannot clear a learning finding.
  */
 function observeLearning() {
-  const queueDir = path.join(os.homedir(), '.cache', 'ruvnet-brain', 'learn');
-  let queueDepth = 0;
-  try {
-    for (const f of fs.readdirSync(queueDir)) {
-      if (!f.endsWith('.jsonl')) continue;
-      queueDepth += fs.readFileSync(path.join(queueDir, f), 'utf8').split('\n').filter(Boolean).length;
-    }
-  } catch { /* no queue dir yet — depth stays 0, which is honest */ }
-
-  let lastTrainSeconds = null; let trajectories = 0;
-  try {
-    const r = spawnSync(path.join(os.homedir(), '.npm-global/bin/ruflo'),
-      ['hooks', 'intelligence', '--status'],
-      {
-        cwd: os.homedir(),
-        env: { ...process.env, RUFLO_DAEMON_AUTOSTART: '0' },
-        encoding: 'utf8',
-        timeout: 20_000,
-      });
-    const out = `${r.stdout || ''}`;
-    const t = out.match(/Last Training:\s*(\d+)s ago/);
-    const j = out.match(/Trajectories\s*\|\s*(\d+)/);
-    if (t) lastTrainSeconds = Number(t[1]);
-    if (j) trajectories = Number(j[1]);
-  } catch { /* ruflo absent or slow — leave null, and null NEVER produces a recommendation */ }
+  const learning = observeScopedLearning({ cwd: projectDirectory() });
 
   // The fleet is what makes ADR-027's North Star recommendation constructible at all — without it,
   // `learning:distill-fleet` can never be built, so it can never be offered, so clicking it would be
@@ -1959,7 +2530,7 @@ function observeLearning() {
   // produces no recommendation, which is the correct answer when we have not looked.
   const fleet = readJSON(MEMORY_CACHE)?.data?.fleet ?? [];
 
-  return { queueDepth, lastTrainSeconds, trajectories, fleet };
+  return { ...learning, fleet };
 }
 
 function currentValidIds(onlyId = null) {
@@ -1987,7 +2558,7 @@ function currentValidIds(onlyId = null) {
   // offering nothing to do about it — detection without a remedy, which ADR-027 prohibits.
   if (validateAll || healthOnly) {
     try {
-      const project = process.cwd();
+      const project = projectDirectory();
       const health = scoreMemoryHealth({ project: path.basename(project), probes: probeMemory(project) });
       for (const r of buildHealthRecommendations({ memory: health, learning: observeLearning() })) ids.add(r.id);
     } catch { /* an advisory surface must never break the apply path */ }
@@ -2004,11 +2575,15 @@ function currentValidIds(onlyId = null) {
   return { ids, auditRows };
 }
 function apply(ids) {
+  const startedAt = performance.now();
+  const phaseMs = { revalidationMs: 0, undoJournalMs: 0, childRemedyMs: 0 };
   const results = [];
   for (const id of ids) {
     // Re-read immediately before EACH fix. A batch can change the validity of the next item; one
     // pre-flight snapshot for the whole list would let item 2 run against the world item 1 changed.
+    const revalidationStartedAt = performance.now();
     const { ids: validNow } = currentValidIds(id);
+    phaseMs.revalidationMs += elapsedMs(revalidationStartedAt);
     if (!validNow.has(id)) { results.push({ id, ok: false, skipped: true, error: 'worldMoved', log: 'Skipped — this is already resolved, or your machine changed since the page loaded. Nothing was done. Reload to see the current state.' }); continue; }
 
     // ONE dispatch, through the registry (scripts/remedy-registry.mjs). This used to be a chain of
@@ -2050,16 +2625,46 @@ function apply(ids) {
     // flag exists so it cannot recur here.
     if (plan.exec.usesServerProject) args = [...args, '--project', process.cwd()];
     if (plan.exec.needsReceipt) {
-      const receipt = path.join(HOME, '.cache', 'ruvnet-brain', 'undo', `${plan.key}-${stamp()}.json`);
+      const receipt = path.join(CONSOLE_ROOT, '.cache', 'ruvnet-brain', 'undo', `${plan.key}-${stamp()}.json`);
       undoSpec.receipt = receipt;
       args = [...args, '--receipt', receipt];
     }
 
+    const journalStartedAt = performance.now();
     const undoToken = journalUndo(undoSpec);
-    const res = runNode(plan.exec.script, args);
+    phaseMs.undoJournalMs += elapsedMs(journalStartedAt);
+    const remedyStartedAt = performance.now();
+    const learningBefore = id === 'learning:train' ? observeLearning() : null;
+    const res = runNode(plan.exec.script, args, learningBefore ? {
+      cwd: learningBefore.projectDir,
+      env: { ...process.env, RUVNET_BRAIN_PROJECT_DIR: learningBefore.projectDir },
+    } : {});
+    if (res.ok && learningBefore) {
+      const after = observeLearning();
+      res.ok = learningProgressed(learningBefore, after);
+      if (!res.ok) res.log += `\nNo measured learning progress: ${learningProgressDetail(learningBefore, after)}. Reload to inspect the remaining evidence.`;
+    }
+    phaseMs.childRemedyMs += elapsedMs(remedyStartedAt);
     results.push({ id, ...res, undoToken });
   }
-  return { results };
+  // This receipt contains only aggregate durations, never the applied ids, paths, command output,
+  // or undo tokens. It makes an end-user-visible delay diagnosable without exposing their machine.
+  return { results, timings: { ...phaseMs, totalMs: elapsedMs(startedAt) } };
+}
+
+/**
+ * #377: Apply on "Your learner has gone quiet" counts as progress only when `ruflo memory distill
+ * status` shows the learner's last distillation moved FORWARD. A readable store alone is not progress.
+ */
+export function learningProgressed(before, after) {
+  const was = Date.parse(before?.lastDistillAt || '');
+  const now = Date.parse(after?.lastDistillAt || '');
+  return !!(before?.statusKnown && after?.statusKnown && after.distillKnown === true
+    && Number.isFinite(now) && (!Number.isFinite(was) || now > was));
+}
+export function learningProgressDetail(before, after) {
+  return `learner ${after?.learningDb || before?.learningDb || 'unresolved'}; last distillation `
+    + `${before?.lastDistillAt || 'not recorded'} → ${after?.distillKnown === true ? (after.lastDistillAt || 'not recorded') : 'unknown'}`;
 }
 
 function autoEligibleIds(recommendations = []) {
@@ -2131,7 +2736,7 @@ function validateConfigPatch(values) {
  */
 function saveConfig(values) {
   try { fs.mkdirSync(CONFIG_DIR, { recursive: true }); }
-  catch (e) { return { ok: false, log: `could not create ${CONFIG_DIR.replace(HOME, '~')}: ${e.message}` }; }
+  catch (e) { return { ok: false, log: `could not create ${CONFIG_DIR.replace(CONSOLE_ROOT, '~')}: ${e.message}` }; }
 
   const { clean, rejected } = validateConfigPatch(values);
   // Nothing valid to write is not a save. Saying "Saved." here would be the dead-button failure with
@@ -2168,7 +2773,12 @@ function saveConfig(values) {
     credentialChange = saveOpenRouterCredential(requestedSecret, { cwd: process.cwd() });
     if (!credentialChange.ok) return { ok: false, rejected, log: credentialChange.log };
   }
-  if (requestedNightly !== undefined) {
+  // The page sends every field the person has ever chosen, so changing only the model house carries the
+  // already-saved nightly value with it. Re-running the installer for a choice the scheduler already
+  // satisfies rewrote the plist and re-registered the runner on every unrelated save (RNBC review
+  // 2026-10-01). Only a request that differs from the measured scheduler state is a scheduler change; a
+  // degraded or unknown state still goes to the installer, which is how it gets repaired.
+  if (requestedNightly !== undefined && nightlyStatus().state !== (requestedNightly ? 'on' : 'off')) {
     nightlyChange = applyNightlyChoice(requestedNightly);
     if (!nightlyChange.ok) {
       rollbackCredential();
@@ -2193,7 +2803,7 @@ function saveConfig(values) {
     // A successfully encrypted credential retires the legacy plaintext field on this same commit.
     if (credentialChange?.ok) delete next.openrouterKey;
     try { writeAtomic(CONFIG_PATH, JSON.stringify(next, null, 2) + '\n'); }
-    catch (e) { return { ok: false, backup, log: `write failed: ${e.message}${backup ? `; your previous settings are at ${backup.replace(HOME, '~')}` : ''}` }; }
+    catch (e) { return { ok: false, backup, log: `write failed: ${e.message}${backup ? `; your previous settings are at ${backup.replace(CONSOLE_ROOT, '~')}` : ''}` }; }
     try { fs.chmodSync(CONFIG_PATH, 0o600); } catch { /* best effort on non-posix */ }
 
     // The undo token is journalled only AFTER the write succeeded. Recording an undo for a save that
@@ -2207,7 +2817,7 @@ function saveConfig(values) {
       secretPath: credentialChange?.path ?? null,
       secretExisted: credentialChange?.existed ?? null,
     });
-    return { ok: true, backup: backup ? backup.replace(HOME, '~') : null, undoToken, rejected };
+    return { ok: true, backup: backup ? backup.replace(CONSOLE_ROOT, '~') : null, undoToken, rejected };
   });
 
   if (held.timedOut) {
@@ -2269,6 +2879,10 @@ function undo(undoToken) {
   if (!fs.existsSync(UNDO_JOURNAL)) return { ok: false, log: 'no undo history' };
   const journal = readUndoJournal();
   const entry = journal.find((e) => e.token === undoToken);
+  // "Saved again after this point" is decided by POSITION in the append-only journal, never by the `at`
+  // stamp: it has millisecond resolution and two saves do land in the same millisecond (a Linux runner,
+  // 2026-10-01), which made the later save invisible and let a stale undo wipe it.
+  const savedLater = (kind) => journal.slice(journal.indexOf(entry) + 1).some((e) => e.kind === kind && e.token && e.token !== undoToken);
   if (!entry) return { ok: false, log: 'that undo token was not found' };
 
   // ONE UNDO, ONCE. The token was never consumed, so the same button replayed forever: clicking it
@@ -2289,7 +2903,7 @@ function undo(undoToken) {
     // An undo can only speak for the last write. If something was written after it, the honest answer
     // is to refuse and say so — restoring anyway would be destroying newer data while claiming to
     // protect older data.
-    const laterSave = journal.some((e) => e.kind === 'restore-config' && e.at > entry.at && e.token !== undoToken);
+    const laterSave = savedLater('restore-config');
     if (laterSave) {
       return { ok: false, log: 'your settings were saved again after this point, so this undo would wipe out that newer save — nothing was changed. Use the undo from the most recent save, or restore a backup by hand.' };
     }
@@ -2301,7 +2915,7 @@ function undo(undoToken) {
       try {
         const bytes = fs.readFileSync(entry.backup);
         held = withLock(CONFIG_PATH, () => writeAtomic(CONFIG_PATH, bytes));
-      } catch (e) { return { ok: false, log: `restore failed: ${e.message} — your backup at ${entry.backup.replace(HOME, '~')} is intact` }; }
+      } catch (e) { return { ok: false, log: `restore failed: ${e.message} — your backup at ${entry.backup.replace(CONSOLE_ROOT, '~')} is intact` }; }
       if (held.timedOut) return { ok: false, log: `another process is writing your settings and did not finish within ${LOCK_WAIT_MS}ms — NOTHING was restored and your backup is intact; try again` };
       try { fs.chmodSync(CONFIG_PATH, 0o600); } catch { /* best effort on non-posix */ }
       const effectFailures = restoreConfigEffects(entry);
@@ -2329,14 +2943,33 @@ function undo(undoToken) {
     }
     return { ok: false, log: 'no backup available to restore' };
   }
+  if (entry.kind === 'restore-user-settings') {
+    // Same "an undo speaks only for the last write" rule as restore-config: a later save through this
+    // form would be wiped out by restoring an older backup.
+    const laterSave = savedLater('restore-user-settings');
+    if (laterSave) {
+      return { ok: false, log: 'your settings were saved again after this point, so this undo would wipe out that newer save — nothing was changed. Use the undo from the most recent save.' };
+    }
+    const r = revertSettings({ file: entry.file, backup: entry.backup || undefined, existedBefore: entry.existedBefore });
+    if (!r.ok) return { ok: false, log: r.log };
+    markUndoConsumed(undoToken);
+    publishSettingsToCache();
+    return { ok: true, log: entry.backup ? 'restored your previous settings' : 'removed the settings file (there was none before this save)' };
+  }
   // EVERY branch below marks its token consumed on success, for the reason spelled out on the
   // restore-config branch above: these all copy a saved snapshot over a live file, so replaying one
   // re-applies an old state over whatever the user has done since. The replay guard at the top of
   // this function covers all kinds; these calls are what arm it.
   if (entry.kind === 'reinstall-version' && entry.pkg && entry.prevVersion) {
-    const r = spawnSync('npm', ['install', '-g', '--prefix', NPM_PREFIX, `${entry.pkg}@${entry.prevVersion}`], { encoding: 'utf8', timeout: 15 * 60 * 1000 });
-    if (r.status === 0) markUndoConsumed(undoToken);
-    return { ok: r.status === 0, log: r.status === 0 ? `reinstalled ${entry.pkg}@${entry.prevVersion}` : (r.stderr || '').slice(-800) };
+    let lock;
+    try {
+      lock = acquireDeveloperLock();
+      const r = spawnSync('npm', ['install', '-g', '--prefix', NPM_PREFIX, `${entry.pkg}@${entry.prevVersion}`], { encoding: 'utf8', timeout: 15 * 60 * 1000,
+        env: { ...process.env, RUVNET_DEVELOPER_UPDATE_TOKEN: lock.token } });
+      if (r.status === 0) markUndoConsumed(undoToken);
+      return { ok: r.status === 0, log: r.status === 0 ? `reinstalled ${entry.pkg}@${entry.prevVersion}` : (r.stderr || '').slice(-800) };
+    } catch (error) { return { ok: false, log: error.message }; }
+    finally { lock?.release(); }
   }
   if (entry.kind === 'restore-backup' && entry.project) {
     const dir = resolveProjectDir(entry.project);
@@ -2361,10 +2994,10 @@ function undo(undoToken) {
     const base = `${path.basename(entry.db)}.rescue-`;
     let baks = [];
     try { baks = fs.readdirSync(dir).filter((n) => n.startsWith(base)).sort(); } catch { /* dir gone */ }
-    if (!baks.length) return { ok: false, log: `no pre-repair backup found next to ${entry.db.replace(HOME, '~')} — nothing was restored` };
+    if (!baks.length) return { ok: false, log: `no pre-repair backup found next to ${entry.db.replace(CONSOLE_ROOT, '~')} — nothing was restored` };
     const from = path.join(dir, baks[baks.length - 1]);
     try { fs.copyFileSync(from, entry.db); }
-    catch (e) { return { ok: false, log: `could not restore ${from.replace(HOME, '~')}: ${e.message}` }; }
+    catch (e) { return { ok: false, log: `could not restore ${from.replace(CONSOLE_ROOT, '~')}: ${e.message}` }; }
     markUndoConsumed(undoToken);
     return { ok: true, log: `restored your memory store from the snapshot taken before the repair (${baks[baks.length - 1]})` };
   }
@@ -2413,7 +3046,7 @@ function undo(undoToken) {
 // The undo kinds this function actually implements. Exported so the closure test can check the
 // registry against the REAL handler set rather than a hand-copied list that would drift from it.
 export const HANDLED_UNDO_KINDS = Object.freeze([
-  'restore-config', 'reinstall-version', 'restore-backup',
+  'restore-config', 'restore-user-settings', 'reinstall-version', 'restore-backup',
   'restore-memory-backup', 'restore-store-backups', 'restore-project-distill', 'auto-rebuild', 'none',
 ]);
 
@@ -2422,7 +3055,10 @@ const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; cha
 function serveStatic(req, res) {
   const rel = decodeURIComponent(req.url.split('?')[0]).replace(/^\/+/, '') || 'index.html';
   const file = path.join(CONSOLE_DIR, rel);
-  if (!file.startsWith(CONSOLE_DIR) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) return send(res, 404, 'text/plain', 'not found');
+  // Containment by path, not by string prefix: `startsWith(CONSOLE_DIR)` also accepted a sibling such
+  // as `<root>/console-anything/…` reached with an encoded `..` (RNBC review 2026-10-01).
+  const inside = path.relative(CONSOLE_DIR, file);
+  if (!inside || inside === '..' || inside.startsWith(`..${path.sep}`) || path.isAbsolute(inside) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) return send(res, 404, 'text/plain', 'not found');
   let body = fs.readFileSync(file);
   const ext = path.extname(file);
   if (ext === '.html') body = Buffer.from(String(body).replace('</head>', `<script>window.__CONSOLE_TOKEN__=${JSON.stringify(TOKEN)}</script></head>`));
@@ -2477,6 +3113,10 @@ function openBrowser(url) {
   }
 }
 function startServer({ port = Number(process.env.CONSOLE_PORT) || 7411, open = false, cwd = process.cwd() } = {}) {
+  const suiteUpdater = createSuiteUpdater({ home: CONSOLE_ROOT, brainHome: process.env.RUVNET_BRAIN_HOME || path.join(CONSOLE_ROOT, '.cache/ruvnet-brain'), markNightly: () => saveConfig({ nightly: true }) });
+  const controlToken = crypto.randomBytes(24).toString('hex');
+  let activeRuntime = null;
+  let receiptFile = null;
   const server = http.createServer(async (req, res) => {
     // DNS-rebinding guard: this server binds 127.0.0.1 only. Reject any request whose Host header
     // isn't loopback, so a malicious web page can't rebind a hostname to 127.0.0.1 and read local state.
@@ -2486,6 +3126,19 @@ function startServer({ port = Number(process.env.CONSOLE_PORT) || 7411, open = f
     }
     try {
       const url = req.url.split('?')[0];
+      // This identity endpoint is deliberately cache-independent and never exposes the shutdown
+      // token. The private receipt is ownership proof; this endpoint only proves which generation
+      // is listening before reuse or replacement.
+      if (req.method === 'GET' && url === '/api/runtime') {
+        return sendJSON(res, activeRuntime ? 200 : 503, activeRuntime || { error: 'runtime not ready' });
+      }
+      if (req.method === 'POST' && url === '/api/runtime/shutdown') {
+        const body = await readBody(req);
+        if (body.controlToken !== controlToken) return sendJSON(res, 403, { error: 'bad or missing control token' });
+        sendJSON(res, 202, { ok: true, stopping: true });
+        setImmediate(() => server.close());
+        return;
+      }
       // Heavy read-models: ALWAYS cache-first (fast=1 or not — both land here now). The handler
       // never blocks the event loop; kickRefresh() recomputes in a detached child. See writeCache/
       // serveCached above and the --refresh-cache CLI mode. TOKEN is injected at serve time so it
@@ -2493,7 +3146,7 @@ function startServer({ port = Number(process.env.CONSOLE_PORT) || 7411, open = f
       if (req.method === 'GET' && url === '/api/state') {
         // project-scoped: never serve another project's cached state. The measuring lives in the
         // --refresh-cache child; this handler only ever reads a file and stamps the token on it.
-        return serveCached(res, STATE_CACHE, (d) => ({ ...d, token: TOKEN }), cwd);
+        return serveCached(res, STATE_CACHE, (d) => ({ ...d, token: TOKEN, suiteUpdate: suiteUpdater.state() }), cwd);
       }
       // ── /api/capabilities — "what do I own, and is it on?" ──────────────────────────────────────
       //
@@ -2535,13 +3188,24 @@ function startServer({ port = Number(process.env.CONSOLE_PORT) || 7411, open = f
         // the request path before the instant-open fix.
         return serveCached(res, STACK_CACHE);
       }
-      if (req.method === 'GET' && url === '/api/activity') return sendJSON(res, 200, gatherActivity(cwd));
+      if (req.method === 'GET' && url === '/api/suite-update') return sendJSON(res, 200, suiteUpdater.state());
+      if (req.method === 'GET' && url === '/api/activity') return sendJSON(res, 200, { ...gatherActivity(cwd), suiteUpdate: suiteUpdater.state() });
       if (req.method === 'GET' && url === '/api/lessons') return sendJSON(res, 200, gatherLessons());
       if (req.method === 'GET' && url === '/api/trust') return sendJSON(res, 200, await gatherTrust());
       if (req.method === 'GET' && url === '/tips') { req.url = '/tips.html'; return serveStatic(req, res); }
+      // What's in the brain: derived from the installed root's own receipts on every request (read-only,
+      // no network, ~ms) — a coverage listing served from a stale cache would defeat its one purpose.
+      if (req.method === 'GET' && url === '/api/scope') return sendJSON(res, 200, gatherScope());
+      if (req.method === 'GET' && url === '/scope') { req.url = '/scope.html'; return serveStatic(req, res); }
       if (req.method === 'POST') {
         const body = await readBody(req);
         if (body.token !== TOKEN) return sendJSON(res, 403, { error: 'bad or missing token' });
+        if (url === '/api/suite-update') {
+          const origin = req.headers.origin;
+          if (origin && origin !== `http://${req.headers.host}`) return sendJSON(res, 403, { error: 'forbidden origin' });
+          const result = suiteUpdater.start(body.channel);
+          return sendJSON(res, result.status || (result.ok ? 202 : 500), result);
+        }
         if (url === '/api/apply') return sendJSON(res, 200, apply(Array.isArray(body.ids) ? body.ids : []));
         if (url === '/api/save-config') return sendJSON(res, 200, saveConfig(body.values || {}));
         if (url === '/api/save-advocacy') return sendJSON(res, 200, saveAdvocacy(body.values || {}));
@@ -2567,8 +3231,8 @@ function startServer({ port = Number(process.env.CONSOLE_PORT) || 7411, open = f
           //     refresh that did not start must not report that it did, so `started` is the child's
           //     real answer, not a constant.
           expireCachesEmbedding([STATE_CACHE, STACK_CACHE, MEMORY_CACHE, CAPABILITY_CACHE]);
-          const started = kickRefresh({ force: true });
-          return sendJSON(res, 200, { ok: true, refreshing: true, started });
+          const refresh = kickRefreshDetailed({ force: true, followUp: true, cwd });
+          return sendJSON(res, 200, { ok: refresh.status !== 'failed', started: refresh.status === 'started', refreshing: refresh.status === 'started' || refresh.status === 'already-running', refresh });
         }
         if (url === '/api/undo') return sendJSON(res, 200, undo(body.undoToken));
         if (url === '/api/set-lesson') return sendJSON(res, 200, setLesson(body));
@@ -2582,9 +3246,14 @@ function startServer({ port = Number(process.env.CONSOLE_PORT) || 7411, open = f
     if (e.code === 'EADDRINUSE' && port !== 0) { console.error(`  port ${port} busy — trying a free one…`); startServer({ port: 0, open, cwd }); }
     else { console.error(`  server error: ${e.message}`); process.exit(1); }
   });
+  server.on('close', () => {
+    if (receiptFile) removeOwnedRuntimeReceipt(receiptFile, controlToken);
+  });
   server.listen(port, '127.0.0.1', () => {
     const actual = server.address().port;
     const url = `http://127.0.0.1:${actual}/`;
+    activeRuntime = runtimeIdentity({ port: actual, cwd });
+    receiptFile = writeRuntimeReceipt({ ...activeRuntime, controlToken });
     console.log(`\n  🧠  RuvNet Brain — Onboarding Console`);
     console.log(`      ${url}`);
     console.log(`      read-only until you click · token-gated · ^C to stop\n`);
@@ -2617,7 +3286,7 @@ function startServer({ port = Number(process.env.CONSOLE_PORT) || 7411, open = f
     // precise moment a first-time user is deciding whether this thing works. The child does that
     // scan now (see --refresh-cache), and gatherActivity reports `warming` until it lands.
     if (open) openBrowser(url);
-    // Browser acceptance pre-warms a disposable HOME and disables only this redundant second scan.
+    // Browser acceptance pre-warms a disposable fixture root and disables only this redundant second scan.
     // The production default is unchanged: every ordinary console start refreshes in the background.
     if (process.env.RUVNET_CONSOLE_DISABLE_BACKGROUND_REFRESH !== '1') kickRefresh({ force: true });
   });
@@ -2629,6 +3298,7 @@ if (process.argv[1] && path.resolve(process.argv[1]).endsWith('onboarding-consol
   const args = process.argv.slice(2);
   if (args.includes('--print-state')) { console.log(JSON.stringify(gatherState(process.cwd()), null, 2)); }
   else if (args.includes('--print-stack')) { console.log(JSON.stringify(gatherStack(), null, 2)); }
+  else if (args.includes('--runtime-status')) { console.log(JSON.stringify(await inspectConsoleRuntime())); }
   else if (args.includes('--refresh-cache')) {
     // Runs as a DETACHED CHILD of the server (kickRefresh) — or standalone to pre-warm. Computes the
     // heavy read-models HERE, in a separate process, so the server's event loop is never blocked, and
@@ -2667,7 +3337,8 @@ if (process.argv[1] && path.resolve(process.argv[1]).endsWith('onboarding-consol
       const fleet = scanFleet();
       let recommendations = [];
       try {
-        const health = scoreMemoryHealth({ project: path.basename(process.cwd()), probes: probeMemory(process.cwd()) });
+        const project = projectDirectory();
+        const health = scoreMemoryHealth({ project: path.basename(project), probes: probeMemory(project) });
         recommendations = buildHealthRecommendations({ memory: health, learning: { ...observeLearning(), fleet } });
       } catch { /* advisory only */ }
       writeCache(MEMORY_CACHE, new Date().toISOString(), { fleet, recommendations }, process.cwd());
@@ -2705,29 +3376,164 @@ if (process.argv[1] && path.resolve(process.argv[1]).endsWith('onboarding-consol
     process.exit(0);
   }
   else if (args.includes('--serve') || args.length === 0) {
-    // Hitting the command again should land on the console you already have, not spawn a second
-    // server on a random port and a second tab. If one is already up, just point the browser at it.
-    const port = Number(process.env.CONSOLE_PORT) || 7411;
-    const open = args.includes('--open');
-    const url = `http://127.0.0.1:${port}/`;
-    const alive = await new Promise((resolve) => {
-      const req = http.get({ host: '127.0.0.1', port, path: '/', timeout: 800 }, (res) => {
-        let b = ''; res.on('data', (c) => { b += c; if (b.length > 4096) res.destroy(); });
-        res.on('end', () => resolve(res.statusCode === 200 && /RuvNet Brain/.test(b)));
-        res.on('error', () => resolve(false));
-      });
-      req.on('error', () => resolve(false));
-      req.on('timeout', () => { req.destroy(); resolve(false); });
+    await launchConsole({
+      port: Number(process.env.CONSOLE_PORT) || 7411,
+      open: args.includes('--open'),
+      cwd: process.cwd(),
     });
-    if (alive) {
-      console.log(`\n  🧠  RuvNet Brain — Onboarding Console (already running)\n      ${url}\n`);
-      if (open) openBrowser(url);
-    } else { startServer({ port, open, cwd: process.cwd() }); }
   }
-  else { console.log(`\n  onboarding-console — the RuvNet Brain configure page\n\n    --serve [--open]   start the local server (and open your browser)\n    --print-state      print the read-only state JSON and exit (for tests)\n    --print-stack      print the stack audit JSON and exit\n`); }
+  else { console.log(`\n  onboarding-console — the RuvNet Brain configure page\n\n    --serve [--open]   start or safely replace the scoped local server\n    --runtime-status   print candidate, receipt, and live runtime status\n    --print-state      print the read-only state JSON and exit (for tests)\n    --print-stack      print the stack audit JSON and exit\n`); }
+}
+
+// ── "What's in the brain" (the scope page) ─────────────────────────────────────────────────────────
+// Every verdict comes from the installed brain's OWN receipts, never from the shipped `status` word.
+// Measured 2026-09-11 (KB audit): release-projection.mjs:80 stamps every seeded row CURRENT — 63 real
+// rows had sourceCommit ≠ upstream.sha. GitHub `updatedAt` is metadata (222/227 repos moved on it in
+// one week) and `pushedAt` leads the default-branch HEAD on 39/227; only `committedAt` dates the commit
+// the brain ingests. Gists have no branches, so their `updatedAt` IS the content date — and the shipped
+// COVERAGE row carries no sourceCommit for them (479/479 null); the gist receipt set
+// (ruv-gists.sources.json → versionSha) is the brain's record of which revision it holds.
+//
+// The truth per row is `brainSha === upstreamSha`. A store with no recorded source commit is
+// "unverified" — never promoted to current on the strength of a date or a label. A store whose
+// .big.rvf is not at the installed root is "not in the brain", whatever the record says.
+const SCOPE_SENTENCE = "If rUv's last change to a repo is on or before the date the brain read it, everything in that repo is in the brain. If it's after, the brain is behind on that repo by the difference.";
+const SCOPE_DAY_MS = 86_400_000;
+const SCOPE_STALE_DAYS = 7;
+// A row's `desc` is what the thing DOES, so the page's search answers "is the stuff on Federation in
+// Ruflo?" — a description question — not only name lookups. Bounded so a README pasted into a card
+// cannot bloat 700 rows.
+const SCOPE_DESC_MAX = 200;
+const scopeBounded = (s) => (s.length > SCOPE_DESC_MAX ? `${s.slice(0, SCOPE_DESC_MAX - 1)}…` : s);
+
+/**
+ * Pure: the installed brain's capability-cards.md → Map(lowercased repo/store name → first line of
+ * its card, bounded). The card file is the ONLY per-repo description that ships to a customer
+ * machine (data/ruvnet-registry.json is repo-side and never installs — measured 2026-09-12). Format,
+ * measured on 182 sections: `## <name>`, one line saying what it does, one auto-derivation note.
+ */
+function parseCapabilityCards(text) {
+  const cards = new Map();
+  if (typeof text !== 'string') return cards;
+  const lines = text.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const h = /^##\s+(\S.*?)\s*$/.exec(lines[i]);
+    if (!h) continue;
+    let j = i + 1;
+    while (j < lines.length && !lines[j].trim()) j += 1;
+    const first = j < lines.length && !lines[j].startsWith('#') ? lines[j].trim() : '';
+    if (first) cards.set(h[1].toLowerCase(), scopeBounded(first));
+  }
+  return cards;
+}
+
+function scopeDesc(row, { isGist, store, gistId, gistSources, cards }) {
+  if (isGist) {
+    // A gist's only words are its file names (COVERAGE upstream.files; the receipt's files as fallback).
+    const files = row.upstream?.files ?? gistSources?.gists?.[gistId]?.files ?? null;
+    const names = Array.isArray(files) ? files.map((f) => (typeof f === 'string' ? f : f?.filename)).filter(Boolean) : [];
+    return names.length ? scopeBounded(names.join(' · ')) : null;
+  }
+  const byName = cards?.get(String(row.name ?? '').toLowerCase());
+  if (byName) return byName;
+  return (store && cards?.get(String(store).toLowerCase())) || null;
+}
+
+function scopeRow(row, { generations, gistSources, installedStores, cards }) {
+  const isGist = row.kind === 'gist';
+  const store = row.artifact?.store ?? null;
+  const ledger = store ? (generations?.stores?.[store] ?? null) : null;
+  const gistId = isGist ? String(row.key ?? '').replace(/^gist:/, '') : null;
+  const upstreamSha = row.upstream?.sha ?? null;
+  const desc = scopeDesc(row, { isGist, store, gistId, gistSources, cards });
+
+  let brainSha = row.artifact?.sourceCommit ?? null;
+  if (brainSha == null) brainSha = isGist ? (gistSources?.gists?.[gistId]?.versionSha ?? null) : (ledger?.sourceCommit ?? null);
+
+  const ruvChangedAt = (isGist ? row.upstream?.updatedAt : row.upstream?.committedAt) ?? null;
+  const brainReadAt = row.artifact?.ingestedAt ?? ledger?.builtUtc ?? null;
+
+  let installed = Boolean(store) && installedStores.has(store);
+  // With a gist receipt set present, a gist the set does not enumerate is not in the store.
+  if (installed && isGist && gistSources?.gists && !(gistId in gistSources.gists)) installed = false;
+
+  let bucket;
+  if (!installed) bucket = 'not-in-brain';
+  else if (brainSha && upstreamSha) bucket = brainSha === upstreamSha ? 'current' : 'behind';
+  else bucket = 'unverified';
+
+  let behindDays = null;
+  if (bucket === 'behind' && ruvChangedAt && brainReadAt) {
+    const d = (Date.parse(ruvChangedAt) - Date.parse(brainReadAt)) / SCOPE_DAY_MS;
+    behindDays = Number.isFinite(d) ? Math.max(0, Math.round(d)) : null;
+  }
+  return { kind: row.kind, name: row.name, url: row.url ?? null, store, desc, bucket, ruvChangedAt, brainReadAt, behindDays, brainSha, upstreamSha };
+}
+
+const scopeNewestFirst = (a, b) => {
+  if (a.ruvChangedAt == null && b.ruvChangedAt == null) return String(a.name).localeCompare(String(b.name));
+  if (a.ruvChangedAt == null) return 1;
+  if (b.ruvChangedAt == null) return -1;
+  return a.ruvChangedAt < b.ruvChangedAt ? 1 : a.ruvChangedAt > b.ruvChangedAt ? -1 : String(a.name).localeCompare(String(b.name));
+};
+
+/** Pure: coverage + ledger + gist receipts + the set of installed store names → the page's payload. */
+function computeScope({ coverage, generations, gistSources, installedStores, root, cards = new Map(), now = Date.now() }) {
+  const empty = () => ({ total: 0, current: 0, behind: 0, unverified: 0, notInBrain: 0, ineligible: 0 });
+  const counts = { repos: empty(), gists: empty() };
+  const out = { repos: [], gists: [] };
+  const covered = new Set();
+  for (const row of coverage.rows ?? []) {
+    const kind = row.kind === 'gist' ? 'gists' : 'repos';
+    if (row.artifact?.store) covered.add(row.artifact.store);
+    counts[kind].total += 1;
+    if (row.disposition !== 'eligible') { counts[kind].ineligible += 1; continue; }
+    const r = scopeRow(row, { generations, gistSources, installedStores, cards });
+    counts[kind][r.bucket === 'not-in-brain' ? 'notInBrain' : r.bucket] += 1;
+    out[kind].push(r);
+  }
+  out.repos.sort(scopeNewestFirst);
+  out.gists.sort(scopeNewestFirst);
+  const observedAt = typeof coverage.observedAt === 'string' ? coverage.observedAt : null;
+  const ageMs = observedAt ? now - Date.parse(observedAt) : NaN;
+  const ageDays = Number.isFinite(ageMs) ? Math.round((ageMs / SCOPE_DAY_MS) * 10) / 10 : null;
+  return {
+    available: true,
+    root,
+    observedAt,
+    ageDays,
+    stale: ageDays == null || ageDays > SCOPE_STALE_DAYS,
+    brainVersion: generations?.brainVersion ?? null,
+    releaseTag: generations?.releaseTag ?? null,
+    sentence: SCOPE_SENTENCE,
+    counts,
+    repos: out.repos,
+    gists: out.gists,
+    installedStoreCount: installedStores.size,
+    installedOutsideCoverage: [...installedStores].filter((s) => !covered.has(s)).sort(),
+  };
+}
+
+/** Read the installed root and compute. Read-only; no network; returns `available: false` rather than a guess. */
+function gatherScope() {
+  const readJson = (rel) => { try { return JSON.parse(fs.readFileSync(path.join(INSTALLED_KB, rel), 'utf8')); } catch { return null; } };
+  const coverage = readJson('COVERAGE.json');
+  if (!coverage || !Array.isArray(coverage.rows)) {
+    return { available: false, reason: `no readable COVERAGE.json at ${INSTALLED_KB}`, root: INSTALLED_KB, sentence: SCOPE_SENTENCE, repos: [], gists: [], counts: {}, installedOutsideCoverage: [], installedStoreCount: 0 };
+  }
+  let installedStores = new Set();
+  try { installedStores = new Set(fs.readdirSync(INSTALLED_KB).filter((f) => f.endsWith('.big.rvf')).map((f) => f.slice(0, -'.big.rvf'.length))); }
+  catch { /* unreadable root reads as nothing installed — every row then says "not in the brain" */ }
+  let cardsText = null;
+  try { cardsText = fs.readFileSync(path.join(INSTALLED_KB, 'capability-cards.md'), 'utf8'); } catch { /* no cards → every desc is null, never invented */ }
+  return computeScope({ coverage, generations: readJson('RVF-GENERATIONS.json'), gistSources: readJson('ruv-gists.sources.json'),
+    installedStores, root: INSTALLED_KB, cards: parseCapabilityCards(cardsText) });
 }
 
 export {
+  gatherScope,
+  computeScope,
+  parseCapabilityCards,
   gatherState,
   gatherStack,
   gatherTrust,
@@ -2742,8 +3548,15 @@ export {
   saveBrainPower,
   gatherBrainProfile,
   saveBrainProfile,
+  setLesson,
+  gatherLessons,
+  gatherRouterEngine,
   autoEligibleIds,
+  gatherConfig,
+  gatherSavings,
+  observeLearning,
 };
 // Exported for the cross-project cache-isolation test (console-cache-scope.test.mjs). serveCached's
 // scopeKey is the guard that stops one project's cached state being served for another.
 export { serveCached, writeCache, kickRefresh };
+export { inspectConsoleRuntime, launchConsole, runtimeReceiptPath, startServer };

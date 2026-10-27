@@ -1,42 +1,70 @@
 name: integration-linux
-# The brain-DEPENDENT suite, run on a real Linux runner on demand.
-#
-# WHY IT EXISTS. tests/integration/* passed on macOS and failed on ubuntu, and we could not
-# reproduce the divergence locally even with a sanitized HOME and PATH. Guessing at a platform bug
-# is how you "fix" the wrong thing. This job gives the actual Linux output.
-#
-# It is NOT part of the required `ci` workflow: several of these tests want the 512MB brain, which a
-# runner does not have. They are expected to SKIP when their prerequisite is absent — and a test that
-# skips must say so loudly, never pass silently. This job surfaces exactly which do which.
-#
-#   gh workflow run integration-linux.yml
-
-# Runs on every push now (ADR-0011 Phase 0): a broken integration test reached main on 2026-07-09
-# and nothing stopped it, because this suite was dispatch-only. The tests skip LOUDLY when the brain
-# is absent; what remains is brain-independent and must hold on Linux.
+# Release PRs consume producer evidence; ordinary main changes execute reviewed acceptance.
 on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
-  workflow_dispatch: {}
+  workflow_call:
+    inputs:
+      candidate_sha:
+        description: Exact candidate SHA when called by the release transaction
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: ruvnet-brain-integration-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   integration:
     runs-on: ubuntu-latest
+    # A blocked child process must fail the workflow instead of consuming GitHub's six-hour default.
+    # The full suite normally completes in under two minutes; fifteen minutes leaves room for cold
+    # dependency/model setup while keeping a runner wedge observable.
+    timeout-minutes: 125
+    env:
+      RUVNET_REQUIRE_CODEX_DISCOVERY: '1'
+      QUALIFICATION_CONSUMER: ${{ !inputs.candidate_sha && github.event_name == 'pull_request' && startsWith(github.head_ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_sha || github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Install root deps
-        run: npm i --no-audit --no-fund --loglevel=error
+        if: env.QUALIFICATION_CONSUMER != 'true'
+        run: npm ci --no-audit --no-fund --loglevel=error
 
       - name: Install kb deps (@ruvector/rvf lives here, not the root)
+        if: env.QUALIFICATION_CONSUMER != 'true'
         run: cd kb && npm ci --no-audit --no-fund
 
+      - name: Install the global Ruflo required by canonical-memory acceptance
+        if: env.QUALIFICATION_CONSUMER != 'true'
+        run: |
+          npm install -g --prefix "$HOME/.npm-global" ruflo@latest --no-audit --no-fund
+          "$HOME/.npm-global/bin/ruflo" --version
+          echo "$HOME/.npm-global/bin" >> "$GITHUB_PATH"
+
+      - name: Install and verify the required native Codex CLI
+        if: env.QUALIFICATION_CONSUMER != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global --prefix "$HOME/.npm-global" @openai/codex@latest
+          "$HOME/.npm-global/bin/codex" --version
+          echo "$HOME/.npm-global/bin" >> "$GITHUB_PATH"
+
       - name: Environment facts (so a failure is diagnosable from the log alone)
+        if: env.QUALIFICATION_CONSUMER != 'true'
         run: |
           echo "shell:  $(readlink -f /bin/sh)"
           echo "bash:   $(bash --version | head -1)"
@@ -44,18 +72,78 @@ jobs:
           echo "sed:    $(sed --version | head -1)"
           echo "jq:     $(jq --version 2>/dev/null || echo MISSING)"
           echo "gh:     $(gh --version 2>/dev/null | head -1 || echo MISSING)"
-          echo "rvf stores present: $(ls kb/*.rvf 2>/dev/null | wc -l)"
+          node --input-type=module -e 'import fs from "node:fs"; console.log("rvf stores present:", fs.readdirSync("kb").filter(name => name.endsWith(".rvf") && fs.statSync("kb/" + name).isFile()).length)'
 
-      - name: Integration suite (continue on failure so we see EVERY error, not just the first)
-        id: run
-        continue-on-error: true
-        run: npx vitest run tests/integration --reporter=verbose 2>&1 | tee /tmp/integration.log
-
-      - name: Summarize
+      - name: Prepare native sandbox namespaces on the disposable hosted runner
+        if: env.QUALIFICATION_CONSUMER != 'true' && runner.environment == 'github-hosted'
+        shell: bash
         run: |
-          echo "### Linux integration results" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          grep -E "✓|×|↓|Test Files|Tests " /tmp/integration.log | tail -40 >> "$GITHUB_STEP_SUMMARY" || true
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          # Fail the job if anything actually failed, now that the log is captured.
-          ! grep -qE "^\s*×|Failed Tests" /tmp/integration.log
+          set -euo pipefail
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$RUNNER_OS" = Linux
+          key=kernel.apparmor_restrict_unprivileged_userns
+          value=$(sysctl -n "$key")
+          test "$value" = 0 || test "$value" = 1
+          printf '%s\n' "$value" > "$RUNNER_TEMP/integration-userns-original"
+          sudo sysctl -w "$key=0"
+          test "$(sysctl -n "$key")" = 0
+      - name: Reviewed release integration acceptance
+        if: env.QUALIFICATION_CONSUMER != 'true'
+        run: node scripts/release-qualification.mjs --suite integration --platform linux --report /tmp/integration.json
+      - name: Preserve integration acceptance diagnostics
+        if: always() && env.QUALIFICATION_CONSUMER != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-acceptance-${{ inputs.candidate_sha || github.event.pull_request.head.sha || github.sha }}
+          path: /tmp/integration.json
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Restore and verify the hosted runner namespace setting
+        if: always() && env.QUALIFICATION_CONSUMER != 'true' && runner.environment == 'github-hosted'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$RUNNER_OS" = Linux
+          original="$RUNNER_TEMP/integration-userns-original"
+          if test -f "$original"; then
+            value=$(cat "$original")
+            test "$value" = 0 || test "$value" = 1
+            sudo sysctl -w "kernel.apparmor_restrict_unprivileged_userns=$value"
+            test "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = "$value"
+            printf 'Verified restored namespace setting: %s\n' "$value"
+          fi
+      - name: Run experience-level integration scenarios explicitly
+        if: env.QUALIFICATION_CONSUMER != 'true'
+        run: |
+          node --test tests/experience/report.test.mjs
+          node --test tests/integration/install-smoke.mjs
+          node tests/integration/require-brain-lane.mjs
+          node_modules/vitest/vitest.mjs run \
+            tests/integration/stale-install-trap.test.mjs \
+            --maxWorkers=1
+      - name: Bind integration evidence to the exact source
+        if: env.QUALIFICATION_CONSUMER != 'true' && inputs.candidate_sha != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/integration-evidence.mjs --qualified \
+            --report /tmp/integration.json \
+            --out integration-evidence.json \
+            --sha "${{ inputs.candidate_sha || github.event.pull_request.head.sha || github.sha }}" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "${{ github.run_attempt }}"
+      - name: Persist typed integration evidence
+        if: env.QUALIFICATION_CONSUMER != 'true' && inputs.candidate_sha != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-evidence-${{ inputs.candidate_sha || github.event.pull_request.head.sha || github.sha }}
+          path: integration-evidence.json
+          if-no-files-found: error
+          retention-days: 90
+      - name: Verify already-qualified release source
+        if: env.QUALIFICATION_CONSUMER == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: node scripts/qualified-candidate-check.mjs --sha "$CANDIDATE_SHA" --required-check integration --timeout-ms 7200000 --poll-ms 30000

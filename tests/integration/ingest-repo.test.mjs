@@ -24,6 +24,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+process.env.RUVNET_BRAIN_IMPORT_ONLY = '1';
+const { serverDependencies } = await import(new URL('../../bin/install.mjs', import.meta.url).href);
+
 const REPO_ROOT = path.resolve(import.meta.dirname, '../..');
 
 let tmp;
@@ -36,11 +39,17 @@ beforeEach(() => {
   tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ingest-repo-')));
   fs.mkdirSync(path.join(tmp, 'scripts'), { recursive: true });
   fs.mkdirSync(path.join(tmp, 'kb'), { recursive: true });
-  fs.copyFileSync(path.join(REPO_ROOT, 'scripts/ingest-repo.mjs'), path.join(tmp, 'scripts/ingest-repo.mjs'));
-  // ingest-repo.mjs statically imports the SHARED depth config (scripts/full-hints.mjs — the
-  // one map both it and self-update.mjs read, so --full/--keep hints can never drift between
-  // entrypoints again). The isolated ROOT must carry the script's real dependency set.
-  fs.copyFileSync(path.join(REPO_ROOT, 'scripts/full-hints.mjs'), path.join(tmp, 'scripts/full-hints.mjs'));
+  // The isolated ROOT must carry the script's real dependency set — DERIVED, not named. This block
+  // already knew the rule and still hand-listed `full-hints.mjs`, which is how the same class broke
+  // three other fixtures on 2026-08-12 (the Codex host, the mesh mutant, the build-bundle fence).
+  // A list of a file's imports, written anywhere but that file, drifts the moment an import lands.
+  const ingestSrc = path.join(REPO_ROOT, 'scripts/ingest-repo.mjs');
+  fs.copyFileSync(ingestSrc, path.join(tmp, 'scripts/ingest-repo.mjs'));
+  for (const dep of serverDependencies(ingestSrc)) {
+    const target = path.resolve(path.join(tmp, 'scripts'), dep.spec);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.copyFileSync(dep.from, target);
+  }
 
   binDir = path.join(tmp, 'stub-bin');
   fs.mkdirSync(binDir);
@@ -116,10 +125,25 @@ onPosix('ingest-repo.mjs — clone vs. update branch selection', () => {
 });
 
 onPosix('ingest-repo.mjs — refresh pipeline invocation + cwd', () => {
-  it('runs one transactional forge-refresh.mjs call from the kb/ cwd', () => {
+  it('runs one transactional forge-refresh.mjs call, writing to the root RETRIEVAL reads', async () => {
+    // SUPERSEDED CONTRACT (2026-08-19). This required `--out \.` — the tool's own cwd, i.e. the
+    // repo's kb/. That was the reader/writer split: ingest wrote to the checkout while
+    // kb/forge-mcp-all.mjs reads storeRoot() (~/.cache/ruvnet-brain/kb by default). It is why on
+    // 2026-08-12 three repos ingested cleanly, each printed "roundtrip 3/3 PASS · searchable now",
+    // and NONE could be found by search. The fix pointed `--out` at storeRoot(); `cwd` stays the
+    // tools directory because that is where forge-refresh.mjs LIVES — one name, `KB`, had been
+    // doing both jobs.
+    //
+    // So the assertion is now the RELATIONSHIP, not a literal: whatever `--out` receives must be
+    // the same root the reader resolves. Pinning `\.` again would re-pin the bug — a test that
+    // defends a hardcode defends the defect, the same correction issue #139 forced on the
+    // learner-scope test.
+    const { storeRoot } = await import('../../kb/store-root.mjs');
     const r = runIngest(['--name', 'zzz-fixture']);
     const nodeCalls = r.calls.filter((c) => c.startsWith('node '));
-    expect(nodeCalls[0]).toMatch(/forge-refresh\.mjs --repo .* --out \. --name zzz-fixture --canonical-url/);
+    expect(nodeCalls[0]).toMatch(/forge-refresh\.mjs --repo .* --out \S+ --name zzz-fixture --canonical-url/);
+    const out = nodeCalls[0].match(/--out (\S+)/)?.[1];
+    expect(out, '--out must be the root retrieval reads, never the tool directory').toBe(storeRoot());
     expect(nodeCalls.filter((c) => /forge-(build|big)\.mjs/.test(c))).toEqual([]);
     expect(r.stdout).toMatch(/\[refresh bge-768\] zzz-fixture/);
   });
@@ -184,4 +208,71 @@ onPosix('ingest-repo.mjs — final store-existence check', () => {
   });
 
   it.todo('exits 0 and reports success when <name>.big.rvf plus canonical sidecars exist after refresh (covered by the real tiny-repo refresh proof)');
+});
+
+// A stub `node` that, unlike the shared beforeEach stub, actually materializes the three files the
+// final existence check looks for — so the DARK/routable branch (unreachable while `ok` is always
+// false) can be exercised at all.
+function stubNodeThatBuildsStores() {
+  fs.writeFileSync(path.join(binDir, 'node'), `#!/bin/sh
+echo "node $*" >> "$LOGFILE"
+case "$*" in
+  *forge-refresh.mjs*)
+    out="" name="" prev=""
+    for arg in "$@"; do
+      case "$prev" in
+        --out) out="$arg" ;;
+        --name) name="$arg" ;;
+      esac
+      prev="$arg"
+    done
+    if [ -n "$out" ] && [ -n "$name" ]; then
+      mkdir -p "$out"
+      : > "$out/$name.big.rvf"
+      : > "$out/$name.passages.jsonl"
+      : > "$out/$name.meta.json"
+    fi
+    ;;
+esac
+exit 0
+`);
+  fs.chmodSync(path.join(binDir, 'node'), 0o755);
+}
+
+onPosix('ingest-repo.mjs — DARK/routable report is alias-aware', () => {
+  // Reproduces the exact false positive kb/store-root.mjs's darkStores() documents: a store built
+  // under its own name but described only under an alias card must NOT be reported DARK, because
+  // the router (kb/card-lane.mjs's repositoryNames(), the same resolver darkStores() uses) reaches
+  // it fine. Getting this wrong once caused a duplicate, routing-breaking card to be hand-added —
+  // this is the CLI message that would prompt someone to do that again.
+  let installedKb;
+
+  beforeEach(() => {
+    stubNodeThatBuildsStores();
+    installedKb = path.join(tmp, 'installed-kb');
+    fs.mkdirSync(installedKb, { recursive: true });
+  });
+
+  it('reports routable (not DARK) for a store reachable only through a repo-aliases.json alias card', () => {
+    fs.writeFileSync(path.join(installedKb, 'capability-cards.md'), '## agent-harness-generator\nDescribes the harness generator.\n');
+    fs.writeFileSync(path.join(installedKb, 'repo-aliases.json'), JSON.stringify({ 'agent-harness-generator': ['metaharness'] }));
+    const r = runIngest(['--name', 'metaharness'], { KB_DIR: installedKb });
+    expect(r.code).toBe(0);
+    expect(r.stdout).toMatch(/ingested AND routable/);
+    expect(r.stdout).not.toMatch(/DARK/);
+  });
+
+  it('still reports DARK for a store with no card and no alias (regression guard)', () => {
+    fs.writeFileSync(path.join(installedKb, 'capability-cards.md'), '## some-other-repo\nUnrelated.\n');
+    const r = runIngest(['--name', 'zzz-fixture'], { KB_DIR: installedKb });
+    expect(r.code).toBe(0);
+    expect(r.stdout).toMatch(/DARK: no '## zzz-fixture' section/);
+  });
+
+  it('still reports routable for a direct, non-aliased, case-insensitive heading match (regression guard)', () => {
+    fs.writeFileSync(path.join(installedKb, 'capability-cards.md'), '## ZZZ-Fixture\nDirect match.\n');
+    const r = runIngest(['--name', 'zzz-fixture'], { KB_DIR: installedKb });
+    expect(r.code).toBe(0);
+    expect(r.stdout).toMatch(/ingested AND routable/);
+  });
 });

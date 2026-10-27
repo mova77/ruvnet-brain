@@ -42,8 +42,8 @@ afterEach(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catc
 
 /** Fire the runtime exactly as hook-shim.mjs dispatches it: `node runtime <CCEvent>`, JSON on stdin,
  *  the three harness-observed channels (code, stdout, stderr) kept strictly apart. */
-function fireRuntime(event, { producers, env = {}, payload } = {}) {
-  const r = spawnSync('node', [RUNTIME, event], {
+function fireRuntime(event, { producers, env = {}, payload, runtime = RUNTIME } = {}) {
+  const r = spawnSync('node', [runtime, event], {
     input: JSON.stringify(payload ?? { prompt: 'a prompt long enough to look like a real goal statement', session_id: 's1' }),
     encoding: 'utf8',
     // TIMEOUT ORDERING (2026-07-27): the OUTER spawn timeout must exceed the INNER producer
@@ -169,10 +169,46 @@ describe('closed world: the real hooks.json routes every unprompted producer thr
       es.flatMap((m) => (m.hooks || []).map((h) => h.command))
         .filter((c) => c.includes('unprompted-speech'))
         .map((c) => `${event}::${c.split('unprompted-speech')[1].trim()}`));
-    // UserPromptSubmit (anticipate + lesson), PreToolUse-write (lesson), PreToolUse-bash (lesson).
+    // UserPromptSubmit is the ONE unprompted route registered in hooks.json, and this assertion is
+    // the whole point of this file: without it the runtime is wired to nothing and every producer
+    // behind it — anticipate, the recommendation route, the lesson gate — is dead code that tests
+    // green through the RUVNET_UNPROMPTED_PRODUCERS seam.
     expect(routes).toContain('UserPromptSubmit::UserPromptSubmit');
-    expect(routes).toContain('PreToolUse::PreToolUse-write');
-    expect(routes).toContain('PreToolUse::PreToolUse-bash');
+
+    // THE PreToolUse EXPECTATION, AND WHY IT IS NOT A hooks.json ROUTE.
+    //
+    // Two separate things happened to PreToolUse and it is easy to read them as one. ADR-067 moved
+    // the two PreToolUse speech routes BEHIND decision-gate, which spawns unprompted-runtime.mjs
+    // with the same sub-event tokens. Then 4.3.17 retired the whole legacy interceptor collection —
+    // roughly 34 hooks — after they were measured colliding with one another, leaving exactly two
+    // permitted automatic handlers (SessionStart restore, guarded Stop) plus this UserPromptSubmit
+    // route; plugin/scripts/continuity-hook-policy.mjs is that allowlist, and bin/install.mjs fails
+    // the build on anything outside it.
+    //
+    // So there is deliberately NO `PreToolUse::PreToolUse-*` entry to assert here, and adding one
+    // would fail hooks:check. What survives the retirement is the ROUTE INSIDE decision-gate, and
+    // that is what the three assertions below pin: if someone deletes the gate's call into the
+    // runtime, PreToolUse speech would silently escape the chokepoint rather than stop existing.
+    const gate = fs.readFileSync(path.join(ROOT, 'plugin/scripts/decision-gate.mjs'), 'utf8');
+    expect(gate, 'the gate must still route PreToolUse speech through the runtime')
+      .toMatch(/unprompted-runtime\.mjs/);
+    expect(gate).toMatch(/PreToolUse-bash/);
+    expect(gate).toMatch(/PreToolUse-write/);
+    // CORRECTED 2026-09-12: this pinned `PreToolUse` undefined, true only through 4.3.17. Since
+    // ADR-0012/067 (decision-gate's write route, registered on Claude+Codex today), PreToolUse is
+    // legitimately populated — that registration is the ONE process allowed to block a write, and it
+    // is unrelated to unprompted speech. The real intent this line protects — no stray
+    // speech-shaped hook reappears on PreToolUse — survives by pinning the registration to exactly
+    // decision-gate's known-safe write matcher, not to emptiness.
+    const preToolUse = realHooks().hooks.PreToolUse;
+    // Only decision-gate's write route is registered here; no speech-shaped hook may reappear.
+    expect(preToolUse).toHaveLength(1);
+    const writeGate = preToolUse.find((entry) => entry.matcher === '^(Write|Edit|MultiEdit|NotebookEdit|apply_patch)$');
+    expect(writeGate).toBeDefined();
+    for (const entry of preToolUse) for (const hook of entry.hooks) {
+      expect(hook.command, 'only the gate and observational capture may run here')
+        .toMatch(/hook-shim\.mjs.*(?:decision-gate write|session-snapshot PreToolUse)/);
+    }
   });
 
   it('BREAK IT: a bare `bash rogue-emitter.sh || true` unprompted line MUST fail the validator', () => {
@@ -412,6 +448,123 @@ describe('closed world, functionally: the built-in registry reaches the real pro
     expect(r.stdout).not.toBe('');
     expect(JSON.parse(r.stdout).hookSpecificOutput.additionalContext).toContain('built-in registry');
   });
+
+  // ── THE RECOMMENDATION ROUTE, THROUGH THE REAL REGISTRY ───────────────────────────────────────
+  // advocacy-route.mjs is a producer like any other: it is reached ONLY through BUILTIN_REGISTRY and
+  // it writes ZERO bytes of its own. These two cases are the ones the 2026-09-10 host test measured
+  // and the two negative controls that must stay silent — asserted here at the PROCESS boundary,
+  // because "which bytes reached which stream" cannot be observed by importing a module.
+  //
+  // The candidate's `copy` is an INSTRUCTION TO THE MODEL, not a user-facing sentence: a
+  // UserPromptSubmit hook's stdout becomes `additionalContext` in the model's window. So what this
+  // proves is CANDIDATE EMITTED AND DELIVERED. Whether the user ever sees a sentence is the model's
+  // behaviour and is measured separately, in a real-host run.
+  const routeEnv = (dir) => ({
+    RUVNET_SETTINGS_FILE: null,           // filled by the caller — writeSettings needs `dir`
+    RUVNET_ADVOCACY_ROUTE_STATE: path.join(dir, 'route-state.json'),
+    RUVNET_ADVOCACY_OUTCOMES: path.join(dir, 'route-outcomes.jsonl'),
+    RUVNET_LESSON_STORE: path.join(dir, 'no-lessons.json'),
+    RUVNET_LESSON_OPTIN: path.join(dir, 'no-optin.json'),
+    RUVNET_LESSON_GATE_STATE: path.join(dir, 'route-gate.json'),
+  });
+
+  it('an ordinary quality-gates request → the real registry delivers a fitting recommendation', () => {
+    const env = { ...routeEnv(dir), RUVNET_SETTINGS_FILE: writeSettings('all') };
+    const r = fireRuntime('UserPromptSubmit', {
+      // NO `producers` → BUILTIN_REGISTRY drives it, so this exercises the SHIPPED wiring.
+      env,
+      payload: {
+        prompt: 'tests are flaky and we don\'t know what\'s untested — trustworthy coverage and real quality gates',
+        session_id: 'reco-sess',
+      },
+    });
+    expect(r.code).toBe(0);
+    expect(r.stdout, 'the recommendation route emitted nothing through the real registry').not.toBe('');
+    const ctx = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
+    expect(ctx).toContain('agentic-qe fits here');
+    expect(ctx).toMatch(/aqe coverage --gaps --risk/);          // a verified next action, not a guess
+    expect(ctx).toMatch(/state it in ONE sentence/);        // addressed to the model, as designed
+    // Delivered ⇒ the runtime recorded the OFFERED denominator centrally, under the namespaced id.
+    const rows = ledgerRows(path.join(dir, 'route-outcomes.jsonl'), 'recommend:agentic-qe');
+    expect(rows.some((x) => x.action === 'offered')).toBe(true);
+  });
+
+  it('BREAK IT: a negative control (an off-by-one bug fix) → byte-EXACT silence from the same wiring', () => {
+    const env = { ...routeEnv(dir), RUVNET_SETTINGS_FILE: writeSettings('all') };
+    const r = fireRuntime('UserPromptSubmit', {
+      env,
+      payload: { prompt: 'range(1,5) should include 5 — find the bug and the exact fix', session_id: 'neg-sess' },
+    });
+    expect(r.code).toBe(0);
+    expect(r.stdout).toBe('');   // magnitude: zero bytes. A recommender that pushes here is the nag.
+    expect(r.stderr).toBe('');
+    expect(fs.existsSync(path.join(dir, 'route-outcomes.jsonl'))).toBe(false);
+  });
+
+  it('advocacy=off silences the recommendation route entirely, through the real registry', () => {
+    const env = { ...routeEnv(dir), RUVNET_SETTINGS_FILE: writeSettings('off') };
+    const r = fireRuntime('UserPromptSubmit', {
+      env,
+      payload: {
+        prompt: 'tests are flaky and we don\'t know what\'s untested — trustworthy coverage and real quality gates',
+        session_id: 'off-sess',
+      },
+    });
+    expect(r.code).toBe(0);
+    expect(r.stdout).toBe('');
+    // And nothing was ledgered — off drops before the denominator is ever touched.
+    expect(ledgerRows(path.join(dir, 'route-outcomes.jsonl'), 'recommend:agentic-qe')).toEqual([]);
+  });
+
+  it('a relevant advocacy candidate is withheld when the OFFERED receipt cannot persist', () => {
+    const outcomes = path.join(dir, 'outcomes-directory');
+    fs.mkdirSync(outcomes);
+    const env = { ...routeEnv(dir), RUVNET_SETTINGS_FILE: writeSettings('all'), RUVNET_ADVOCACY_OUTCOMES: outcomes };
+    const r = fireRuntime('UserPromptSubmit', {
+      producers: seam('persistence-failure.sh'),
+      env: { ...env, CANDIDATE_LINE: advocacyCandidate() },
+      payload: { prompt: 'a relevant quality gates request', session_id: 'receipt-failure' },
+    });
+    expect(r.code).toBe(0);
+    expect(r.stdout).toBe('');
+    expect(r.stderr).toBe('');
+  });
+
+  it('a standalone copied plugin payload applies an actionable lesson without a marketplace fallback', () => {
+    const payloadRoot = path.join(dir, 'standalone-plugin');
+    fs.cpSync(path.join(ROOT, 'plugin'), payloadRoot, { recursive: true });
+
+    const store = path.join(dir, 'standalone-lessons.json');
+    fs.writeFileSync(store, JSON.stringify({
+      version: 1,
+      lessons: [{
+        id: 'ADV-standalone-action',
+        statement: 'Pass a memory-search query with its required query flag, not through help discovery.',
+        trigger: 'assert-fact', enforcement: 'checklist', origin: 'user-stated', status: 'ratified',
+        evidence: [{ observed: 'the corrected command form was independently learned twice' }],
+        projects: ['alpha', 'beta'], repeatCount: 4,
+      }],
+    }));
+
+    const r = fireRuntime('UserPromptSubmit', {
+      runtime: path.join(payloadRoot, 'scripts', 'unprompted-runtime.mjs'),
+      env: {
+        RUVNET_CONFIG_ROOT: path.join(dir, 'standalone-config'),
+        RUVNET_LESSON_STORE: store,
+        RUVNET_LESSON_OPTIN: path.join(dir, 'standalone-no-optin.json'),
+        RUVNET_LESSON_GATE_STATE: path.join(dir, 'standalone-gate.json'),
+        RUVNET_SETTINGS_FILE: writeSettings('off'),
+        RUVNET_ADVOCACY_OUTCOMES: path.join(dir, 'standalone-outcomes.jsonl'),
+      },
+      payload: { prompt: 'recall the known memory note with the CLI now', session_id: 'standalone-sess' },
+    });
+
+    expect(r.code).toBe(0);
+    const ctx = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
+    expect(ctx).toContain('required query flag');
+    expect(ctx).toMatch(/apply .*correction directly to the .*requested action/i);
+    expect(ctx).toMatch(/do not replace .*requested action with .*help.*discovery/i);
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════
@@ -487,6 +640,28 @@ describe('GPT-5.6-Sol REJECT → hardened: channel binding, fail-closed producer
     expect(r.stdout).toBe('');   // nonzero exit → untrustworthy output → discarded, never a fragment
   });
 
+  it('BREAK IT: a producer that HANGS past the deadline is killed, and the turn survives as silence', () => {
+    // The failure this pins is not "slow" — it is a wedged producer taking the TURN with it. The
+    // runtime gives all producers ONE global deadline and fails closed on a signalled child, so a
+    // hang must resolve to exit 0 with byte-empty stdout, not to a timeout the host has to break.
+    // Deliberately a REAL hang (sleep 30) against a short deadline, measured at the process
+    // boundary: a mocked timer would prove the mock, not the kill.
+    const cand = JSON.stringify({ channel: 'alarm', effect: 'advisory', copy: 'FROM A WEDGED PRODUCER', hookEventName: 'UserPromptSubmit' });
+    const p = path.join(dir, 'hang.sh');
+    fs.writeFileSync(p, `#!/bin/bash\nprintf '%s\\n' '${cand}'\nsleep 30\n`);
+    fs.chmodSync(p, 0o755);
+    const started = Date.now();
+    const r = fireRuntime('UserPromptSubmit', {
+      producers: [{ argv: ['/bin/bash', p], feedStdin: true, channels: ['alarm'] }],
+      env: { RUVNET_UNPROMPTED_TIMEOUT_MS: '1500' },   // deliberately BELOW the 45s outer spawn timeout
+    });
+    const elapsed = Date.now() - started;
+    expect(r.code).toBe(0);
+    expect(r.stdout).toBe('');     // a signalled child's output is untrustworthy → discarded whole
+    // MAGNITUDE, not direction: the runtime's own deadline fired, not the harness's kill 45s later.
+    expect(elapsed).toBeLessThan(15000);
+  });
+
   it('BREAK IT: a 900KB copy is CAPPED to 8192 and delivered WHOLE (size cap + synchronous write)', () => {
     const cand = JSON.stringify({ channel: 'alarm', effect: 'advisory', copy: 'X'.repeat(900000), hookEventName: 'UserPromptSubmit' });
     const candFile = path.join(dir, 'big.json');
@@ -520,5 +695,114 @@ describe('the harness cannot kill the runtime before the runtime can answer', ()
       expect(inner.length, `${f}: no inner timeout found`).toBeGreaterThan(0);
       expect(Math.min(...outer), `${f}: outer must exceed inner`).toBeGreaterThan(Math.max(...inner));
     }
+  });
+
+  // 2026-09-27, found live on a real Windows host: the test above only checks test-suite-declared
+  // timeouts against each other. It says nothing about the REAL default PRODUCER_TIMEOUT_MS against
+  // this hook's REAL declared timeout in hooks.json/codex-hooks.json — and those two drifted apart
+  // (a stale comment assumed a 5s hook budget; the actual registration is 3s), leaving no real
+  // margin once selfcheck.mjs's 80%-margin rule and real per-producer spawnSync overhead are counted.
+  // This is that missing check, against the actual production values, not a test's own fixtures.
+  it('the runtime\'s own default producer budget leaves real margin under its DECLARED hook timeout', () => {
+    const runtimeSrc = fs.readFileSync(RUNTIME, 'utf8');
+    const defaultMs = Number(runtimeSrc.match(/PRODUCER_TIMEOUT_MS\s*=\s*Number\([^)]*\)\s*\|\|\s*(\d+)/)?.[1]);
+    expect(defaultMs, 'could not find the default PRODUCER_TIMEOUT_MS in the runtime source').toBeGreaterThan(0);
+    for (const hooksFile of [HOOKS_JSON, path.join(ROOT, 'plugin', 'hooks', 'codex-hooks.json')]) {
+      const hooks = JSON.parse(fs.readFileSync(hooksFile, 'utf8'));
+      const declaredTimeouts = (hooks.hooks?.UserPromptSubmit || [])
+        .flatMap((r) => r.hooks || [])
+        .filter((h) => /unprompted-speech/.test(h.command))
+        .map((h) => h.timeout)
+        .filter((t) => typeof t === 'number');
+      if (!declaredTimeouts.length) continue; // this host file may not register it — fine
+      const declaredMs = Math.min(...declaredTimeouts) * 1000;
+      const TIMEOUT_MARGIN = 0.8; // selfcheck.mjs's own rule — kept in sync here, not re-derived
+      expect(defaultMs, `${path.basename(hooksFile)}: default producer budget (${defaultMs}ms) leaves `
+        + `no real margin under the declared ${declaredMs}ms hook timeout at the ${TIMEOUT_MARGIN * 100}% mark, `
+        + 'even before Node startup or per-producer spawn overhead')
+        .toBeLessThan(declaredMs * TIMEOUT_MARGIN * 0.9); // 10% extra headroom for startup/spawn cost
+    }
+  });
+});
+
+
+describe('unavailable preferences cannot authorize optional speech', () => {
+  for (const shape of ['malformed', 'future', 'unreadable']) {
+    it(shape, () => {
+      const settings = path.join(dir, 'unknown-settings');
+      if (shape === 'unreadable') fs.mkdirSync(settings);
+      else fs.writeFileSync(settings, shape === 'malformed' ? '{' : JSON.stringify({ version: 999, settings: { advocacy: 5 } }));
+      const r = fireRuntime('UserPromptSubmit', {
+        producers: seam('unknown-consent.sh'),
+        env: { RUVNET_SETTINGS_FILE: settings, RUVNET_ADVOCACY_OUTCOMES: path.join(dir, 'fresh-outcomes'), CANDIDATE_LINE: advocacyCandidate({ copy: 'UNAUTHORIZED OFFER', findingId: 'unknown-consent' }) },
+      });
+      expect(r.code).toBe(0);
+      expect(r.stdout).toBe('');
+    });
+  }
+});
+
+
+it('unreadable dismissal history cannot authorize another offer', () => {
+  const outcomes = path.join(dir, 'unreadable-outcomes');
+  fs.mkdirSync(outcomes);
+  const r = fireRuntime('UserPromptSubmit', {
+    producers: seam('unknown-ledger.sh'),
+    env: { RUVNET_SETTINGS_FILE: writeSettings('all'), RUVNET_ADVOCACY_OUTCOMES: outcomes, CANDIDATE_LINE: advocacyCandidate() },
+  });
+  expect(r.code).toBe(0);
+  expect(r.stdout).toBe('');
+});
+
+
+it('lesson diagnostic reports degraded context without exposing raw private bytes', () => {
+  const script = path.join(dir, 'lesson-error.sh');
+  fs.writeFileSync(script, '#!/bin/bash\nprintf "PRIVATE_RAW_SECRET_PATH" >&2\n');
+  const r = fireRuntime('UserPromptSubmit', { producers: [{ argv: ['/bin/bash', script], channels: ['lesson'] }] });
+  expect(r.code).toBe(0);
+  const context = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
+  expect(context).toContain('Learning context is incomplete');
+  expect(r.stdout + r.stderr).not.toContain('PRIVATE_RAW_SECRET_PATH');
+});
+
+
+describe('unsupported suppression records cannot authorize an offer', () => {
+  for (const row of [null, [], { id: 'fixture-vector-cache', action: 'dismissed', v: 999 }, { id: 'fixture-vector-cache', action: 'unsupported' }]) {
+    it(JSON.stringify(row), () => {
+      const outcomes = path.join(dir, 'corrupt-outcomes');
+      fs.writeFileSync(outcomes, JSON.stringify(row) + '\n');
+      const r = fireRuntime('UserPromptSubmit', { producers: seam('invalid-history.sh'),
+        env: { RUVNET_SETTINGS_FILE: writeSettings('all'), RUVNET_ADVOCACY_OUTCOMES: outcomes, CANDIDATE_LINE: advocacyCandidate() } });
+      expect(r.code).toBe(0);
+      expect(r.stdout).toBe('');
+    });
+  }
+});
+
+
+it('a malformed reset cannot erase a permanent dismissal', () => {
+  const outcomes = writeLedger([
+    { id: 'fixture-vector-cache', action: 'dismissed', scope: 'forever' },
+    { id: 'fixture-vector-cache', action: 'reset', scope: 'forever' },
+  ]);
+  const r = fireRuntime('UserPromptSubmit', { producers: seam('bad-reset.sh'),
+    env: { RUVNET_SETTINGS_FILE: writeSettings('all'), RUVNET_ADVOCACY_OUTCOMES: outcomes, CANDIDATE_LINE: advocacyCandidate() } });
+  expect(r.code).toBe(0);
+  expect(r.stdout).toBe('');
+});
+
+
+describe('typed whole-block advisory admission', () => {
+  it('an oversized deferred offer is not recorded OFFERED and emits no budget notice to the model', () => {
+    const outcomes=path.join(dir,'byte-budget-offers.jsonl');
+    const candidate=JSON.parse(advocacyCandidate());candidate.copy='完整建议'.repeat(1000);
+    const r=fireRuntime('UserPromptSubmit',{producers:seam(),env:{HOME:dir,XDG_CACHE_HOME:path.join(dir,'cache'),RUVNET_HOOK_CONTEXT_BUDGET:'1',RUVNET_BRAIN_METER:'0',CANDIDATE_LINE:JSON.stringify(candidate),RUVNET_SETTINGS_FILE:writeSettings('all'),RUVNET_ADVOCACY_OUTCOMES:outcomes}});
+    expect(r.code).toBe(0);expect(r.stdout).toBe('');expect(r.stderr).toBe('');
+    expect(ledgerRows(outcomes,'fixture-vector-cache')).toEqual([]);
+  });
+  it('an explicitly typed alarm remains whole despite the routine advisory cap', () => {
+    const copy='Mandatory safety information. '.repeat(1000);
+    const r=fireRuntime('UserPromptSubmit',{producers:seam(),env:{HOME:dir,XDG_CACHE_HOME:path.join(dir,'cache'),RUVNET_HOOK_CONTEXT_BUDGET:'1',RUVNET_BRAIN_METER:'0',CANDIDATE_LINE:JSON.stringify({channel:'alarm',effect:'advisory',copy})}});
+    expect(r.code).toBe(0);expect(JSON.parse(r.stdout).hookSpecificOutput.additionalContext).toBe(copy.trim());
   });
 });

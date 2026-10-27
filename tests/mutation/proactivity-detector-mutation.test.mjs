@@ -7,9 +7,11 @@
 // something (mutant !== original), so a refactor that relocates the target string fails LOUDLY rather
 // than silently running an unmutated copy.
 //
-// The mutant is written INTO scripts/ (its relative sibling imports resolve there) with a name that ends
-// in "capability-registry.mjs" (so its own invokedDirectly CLI guard fires — registry.mjs:687), and is
-// removed in a finally + afterEach.
+// The mutant is written INTO plugin/scripts/ (its relative sibling imports resolve there) with a name that
+// ends in "capability-registry.mjs" (so its own invokedDirectly CLI guard fires — registry.mjs:687), and is
+// removed in a finally + afterEach. It moved from scripts/ to plugin/scripts/ with the registry itself
+// (ADR-065): the mutant must sit beside the REAL nightly-controller/hook-registry/memory-doctor it
+// statically and lazily imports, not beside the re-export shims that now stand at the old path.
 
 import { describe, it, expect, afterEach } from 'vitest';
 import fs from 'node:fs';
@@ -18,7 +20,7 @@ import { fileURLToPath } from 'node:url';
 import { measure, REAL_REGISTRY } from '../../scripts/proactivity-metrics.mjs';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const MUTANT = path.join(REPO, 'scripts', '_mutant-capability-registry.mjs');
+const MUTANT = path.join(REPO, 'plugin', 'scripts', '_mutant-capability-registry.mjs');
 
 function withMutant(mutate, fn) {
   const src = fs.readFileSync(REAL_REGISTRY, 'utf8');
@@ -35,20 +37,21 @@ afterEach(() => { try { fs.rmSync(MUTANT, { force: true }); } catch { /* best ef
 describe('ADR-041 mutation — the harness must fall on a broken detector', () => {
   it('baseline: the TRUE detector scores recall 1.00, false-alarm 0', () => {
     const m = measure();
+    expect(m.dormantSeen['session-capture']).toBe('unknown');
     expect(m.recall).toBe(1);
     expect(m.falseAlarmCount).toBe(0);
   });
 
-  // capability-registry.mjs:571 — the no-hook branch that reports a dormant session-capture as OFF.
-  it('FALSE-NEGATIVE mutant (session-capture OFF -> UNKNOWN) drops recall below the 0.80 bar', () => {
+  // Workflow IDLE is observable from counters and age; unchecked capture absence is UNKNOWN.
+  it('FALSE-NEGATIVE mutant (workflow learning IDLE -> UNKNOWN) drops recall below the 0.80 bar', () => {
     withMutant(
-      (s) => s.replace(
-        "return row(STATE.OFF, 'no hook that saves session state is registered at either boundary",
-        "return row(STATE.UNKNOWN, 'no hook that saves session state is registered at either boundary"),
+      (s) => s.replace('return row(STATE.IDLE, `${traj} work sessions and ${pat} patterns were recorded',
+        'return row(STATE.UNKNOWN, `${traj} work sessions and ${pat} patterns were recorded'),
       () => {
         const m = measure({ registryPath: MUTANT });
-        expect(m.dormantSeen['session-capture']).not.toBe('off');   // detector now blind to this dormancy
-        expect(m.recall).toBeLessThan(0.80);                        // 1/2 = 0.50 — acceptance test would REJECT
+        expect(m.dormantSeen['workflow-pattern-learning']).toBe('unknown');
+        expect(m.dormantSeen['session-capture']).toBe('unknown');
+        expect(m.recall).toBeLessThan(0.80); // one of two known dormant capabilities is missed
       });
   });
 

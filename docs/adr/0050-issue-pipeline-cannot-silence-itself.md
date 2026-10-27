@@ -3,8 +3,14 @@ id: ADR-050
 title: The issue pipeline may never manufacture its own acknowledgment — awareness, escalation, and a fixer that knows when to stop
 status: Accepted
 date: 2026-07-24
-updated: 2026-07-31
+updated: 2026-10-25
+
+# PINNED: this records the incident cutoff, not the last edit. Asserted by
+# tests/unit/fix-workstream-guidance.test.mjs. Do not let a currency stamp move it.
+updated_pinned: true
 impl: wired
+reviewed_digest: 0479f7f2da2d
+version: 1.0.4
 authors: [Stuart Kerr, Claude Code]
 tags: [issues, automation, alerting, sla, security, circuit-breaker]
 supersedes: []
@@ -12,10 +18,42 @@ relates: [ADR-049]
 governs:
   - scripts/issue-watch.mjs
   - scripts/issue-fix.mjs
-  - plugin/scripts/session-start.sh
+  - plugin/scripts/session-start-core.mjs
+  - plugin/skills/ruvnet-brain/SKILL.md
+  - plugin/skills/release-proof/SKILL.md
 ---
 
 # ADR-050 — The issue pipeline may never manufacture its own acknowledgment
+
+## Current source review — 2026-10-05
+
+Reviewed candidate source `1ccc1e633772c549e4a23596a1ce3c743e797315`; no GitHub comments,
+pages, unattended fixer, or account configuration were executed for this review. The incident
+cutoff and its 40/100 apparatus verdict below remain historical, not a current product grade.
+
+`scripts/issue-watch.mjs::judgeIssue` still excludes owner-authored bot-marked comments from
+human acknowledgment. `scripts/issue-fix.mjs` preserves prior fields through
+`attemptStartRecord`, defaults its consecutive-failure breaker to one, and its unattended
+execution policy prohibits public comments. These are source boundaries, not evidence that a
+current scheduled watcher delivered a page. The marker convention is still weaker than a
+separate GitHub App identity; that durable identity follow-up remains open.
+
+The previous source review reproduced a delivery-state defect: acknowledgment success could
+suppress retry of a failed first-sighting page. The later source repair, integrated as
+`2c2469c4`, now retries missing `newAlertAt` and `ackAt` independently, preserves prior state,
+and uses neutral acknowledgment wording that does not claim a page was delivered. The focused
+two-run regressions cover both failure directions, missing-topic recovery, delivered-channel
+deduplication, and dry-run behavior with mocked external calls. This repairs the source contract;
+it does not prove the owner's real notification service delivered a current scheduled page.
+
+The hook's issue pointer is independently constrained by
+`plugin/scripts/session-start-issue-alert.mjs`: a bounded cached observation, private owner-only
+repo entitlement, matching current repository, and freshness/future-time checks. It emits a
+count and pointer, not the full issue report, and has no network lookup in that stage. Windows
+entitlement currently fails closed. The source review does not prove installed provider delivery
+or privacy changes not yet integrated at this SHA. The `updated_pinned` date continues to identify
+the incident cutoff; this section records the new review date without rewriting that cutoff.
+
 
 **Status**: Accepted (implemented)
 
@@ -56,11 +94,18 @@ follow-up: run automation under a dedicated GitHub App/bot identity so the separ
 enforced by GitHub itself rather than by a string convention. Requires an owner-side setup
 action; the marker exclusion is the complete now-fix.)
 
-**I2. Awareness is immediate and unconditional; escalation is the second page, not the first.**
+**I2. Maintainer awareness is immediate and unconditional; escalation is the second page, not the first.**
 The watcher pages ONCE the first time it sees any open issue (delivery-derived state, retried
 until the push actually goes out), independent of SLA math. The 4h SLA breach page remains as
-escalation. The session banner always shows the open count; breaches only change its urgency.
-Awareness latency is now bounded by the watcher cadence (≤1h), not by 4h-plus-never.
+escalation. The session banner shows the open count only when an explicit, owner-only (`0600`),
+repo-scoped local entitlement exists at `~/.config/ruvnet-brain/maintainer-issues.json`; a normal
+installation is silent even if an `open-issues.json` file is present. The installer never creates
+or copies this entitlement. POSIX requires a regular, non-symlink file owned by the current uid with
+no group/world permissions; Windows fails closed because this dependency-free hook does not inspect
+ACL ownership. Invalid, stale, or implausibly future-dated observations are silent. Breaches only
+change urgency for the entitled maintainer. Awareness
+latency remains bounded by the watcher cadence (≤1h), not by 4h-plus-never, without leaking the
+maintainer's operational queue into an end user's terminal.
 
 **I3. A failing fixer is silent in public and loud in private.** (Amended same day by the
 owner's direct order, which also completed duel Phase 1 item 4 ahead of schedule: *"don't spew
@@ -175,9 +220,31 @@ The four parallel agents working tonight support this distinction. They show tha
   regressions (8 of 12 assertions fail on the pre-fix code, proven by stash-mutation).
 
 ## Currency log
+| 2026-10-25 | Review `0479f7f2da2d` (4.7.21): decision unchanged; the pipeline still cannot silence itself. `scripts/issue-watch.mjs`, `scripts/issue-fix.mjs` and `plugin/scripts/session-start-core.mjs` changed only by the entry-point sweep (each file's own main-module check replaced by `isDirectInvocation` from `plugin/scripts/entrypoint.mjs`). `plugin/skills/ruvnet-brain/SKILL.md` rewords the optional-recommendation line as a statement, never a question or approval dialog (#489); acknowledgment, escalation, paging and the fixer's stop conditions are untouched. | Reviewed diffs 320b778b..63ca7c0d for `scripts/issue-watch.mjs`, `scripts/issue-fix.mjs`, `plugin/scripts/session-start-core.mjs` and `plugin/skills/ruvnet-brain/SKILL.md`. |
+| 2026-10-25 | Review `30b953c3e054` (4.7.20): decision unchanged; the pipeline still cannot silence itself. `scripts/issue-watch.mjs` now pages a person's issue once at the 4 h SLA (never the owner's or a bot's), adds one 9 a.m. ET summary, and leaves the arrival page to `.github/workflows/ntfy-alerts.yml` (which retries delivery and fails visibly); the acknowledgment comment and SLA tracking are unchanged. `plugin/scripts/session-start-core.mjs` admits one new counts-only NTFY status line. | Reviewed `scripts/issue-watch.mjs` and `plugin/scripts/session-start-core.mjs` diffs 5b1f5c59..HEAD; tests issue-watch-paging, issue-watch-retry, session-start-core-parity. Owner-reported cause: 10,747 notifications on one topic (2026-10-25). |
+| 2026-10-05 | Reviewed current source and recorded remaining limitations; no verification or implementation-status promotion. | reviewed_digest 217aeebc7672; inspected `scripts/issue-watch.mjs` and all expanded governs against source 5d9ea4df. Independent review preserved incident dates, Proposed/expired states and historical evidence; notification and oldest-runtime limits are explicit. |
+| 2026-09-27 | Currency review: decision unchanged. Motion: session-start-core's corpus-currency verdict consolidation and a silent-exit-0 guard closure; a release-proof SKILL.md diagnostics alignment. The issue-pipeline's own self-silencing guard is untouched. | Reviewed `scripts/issue-watch.mjs`, `scripts/issue-fix.mjs`, `plugin/scripts/session-start-core.mjs`, `plugin/skills/ruvnet-brain/SKILL.md`, `plugin/skills/release-proof/SKILL.md` against the commits listed above; reviewed_digest 51940a548841. |
+| 2026-09-11 | Currency review at commit 7296c984: decision unchanged — I1–I3 live in `scripts/issue-watch.mjs` / `issue-fix.mjs`, which did not move. `plugin/scripts/session-start-core.mjs` received ADR-076 scaffolding today (`da7f28c0`, `a90c674b`, `11c79110`) and was then restored byte-for-byte to 85f584b2 (`1de708e3`; `git diff 85f584b2 HEAD` is empty), so the file is exactly what the previous row reviewed at 2eef2024 — `e917fa25`'s version-comparison helper is an ancestor of 85f584b2 and is present. `plugin/skills/ruvnet-brain/SKILL.md` `60f269ad` is pre-session worktree work merged at 85f584b2 (recommend-first contract) and does not touch the issue-thread voice rules; `plugin/skills/release-proof/SKILL.md` did not move. | Reviewed `scripts/issue-watch.mjs`, `scripts/issue-fix.mjs`, `plugin/scripts/session-start-core.mjs`. reviewed_digest 580842da1f9a. |
+| 2026-09-11 | Currency review at commit 2eef2024: decision unchanged. `plugin/scripts/session-start-core.mjs` (`e917fa25`) added a version-comparison helper for the boot-declaration restart notice; `plugin/skills/ruvnet-brain/SKILL.md` (`7cfd9e17`) added dual-host deliberation memory-persistence guidance; `plugin/skills/release-proof/SKILL.md` (`c0234b69`, `7cf26dea`, `9b3e1d3f`, `af544ec6`) refined release-qualification handoff wording. None touch issue awareness, acknowledgment, escalation, or fixer stop-condition logic; `scripts/issue-watch.mjs` and `scripts/issue-fix.mjs` were not touched at all in this range. | Reviewed all six drift commits against the five governed paths (`git show --name-only` per commit; content diffs on the two touching `session-start-core.mjs` and `ruvnet-brain/SKILL.md`). reviewed_digest cc7d85186f27. |
+| 2026-08-31 | Reconciled after the SessionStart production caller gained an explicit heartbeat opt-out used only by the deterministic progression integration fixture. | `plugin/scripts/session-start-core.mjs` still preserves the issue-pipeline visibility and acknowledgment/escalation semantics governed here; the seam prevents detached heartbeat work from racing fixture teardown and does not silence or alter issue handling. |
+
+| 2026-08-30 | SessionStart issue surfacing remains enabled while response-script prose is filtered from host context. | `plugin/scripts/session-start-core.mjs` preserves the issue count and maintainer alarm required by this ADR while removing non-factual instructions. |
+
+| date | why |
+|---|---|
+| 2026-08-30 | Rechecked plugin/scripts/session-start-core.mjs in 05cabf0: SessionStart output is now opt-in diagnostics, so unsolicited issue/workflow prose cannot enter a host session. |
 
 | Date | What changed | Why (with referents) |
 |---|---|---|
+| 2026-08-22 | Re-read every governed issue-pipeline and host-start surface at convergence tip `ddae606`; the issue watcher still derives awareness from external issue state, and the fixer still cannot manufacture acknowledgment or bypass its stop conditions. | `adeba05` extends `plugin/scripts/session-start-core.mjs` with fail-closed project-progression restoration; it does not write issue acknowledgments or change `scripts/issue-watch.mjs` / `scripts/issue-fix.mjs`. The two governed skills continue to require evidence-backed issue handling. This currency review records compatibility only; it does not claim the intentionally held paid auto-fixer is scheduled. |
+| 2026-08-19 | **Issue #140 resolved through the pipeline as designed — reported, verified line-by-line, swept, fixed, tested, closed.** | @sparkling reported that the Brain's own playbook and skill instructed agents to inspect a Ruflo-managed store with raw SQLite and to trust a DB mtime. Both citations confirmed verbatim; the mtime line additionally contradicted this project's own standing lesson. The sweep found a THIRD surface the report did not name — `ground-ruvnet.sh`'s per-turn MEMORY DIAGNOSIS prompt — which is the highest-traffic instruction surface in the product. The pipeline's value here was not the fix but the refusal to stop at the two cited files. |
+| 2026-08-10 | **Re-read after the #130/#131 update-rail fixes and the new census writer; no contract change.** | `kb/forge-update.mjs` (per-run rollback snapshot, per-caller symlink policy) and the public surfaces moved. This ADR decides that the issue pipeline may never manufacture its own acknowledgment — untouched by how backups are inventoried or how corpus counts reach a README. |
+| 2026-08-07 | **The continuation gate gained two real SOURCES — open PRs and GitHub security alerts — and issue-watch grew the matching reporting path.** No change to this ADR's contract. | PR #121 (`f5e8995`) adds 93 lines to `plugin/scripts/continuation-gate.mjs` and 108 to `scripts/issue-watch.mjs`. This ADR's rule is that the issue pipeline cannot silence itself; adding SOURCES the gate can see strengthens that rule rather than altering it — the 2026-07-24 incident was one poisoned predicate treating every channel as satisfied, so more independent evidence channels is the direction this decision already points. The owner-only, repo-scoped entitlement for the SessionStart banner (row below) is untouched; no default or wrong-repo install gains a new signal. Re-read the diff rather than the file list before writing this row. |
+| 2026-08-06 | **Re-read against the governed code; NO change required.** | Flagged `presumed-stale` by the 4.0.19→4.0.20-dev version move. The only governed path touched is the plugin manifest's `version` field, rewritten by `scripts/sync-version.mjs` on every bump; no issue-watch, issue-fix, SessionStart banner, or entitlement code moved. This ADR's subject — that the issue pipeline cannot silence itself — is untouched by a version string. Same structural false positive recorded today against ADR-051: several ADRs `govern:` files that `sync-version.mjs` rewrites on EVERY release, so every bump marks them stale regardless of whether anything they decide changed. A gate that fires on every bump is how blanket date-stamping starts, which this repo has already done once across 61 ADRs. The durable fix is narrowing `governs:` to exclude version-only fields. Commits `3c064c6`, `c5cef3c`. |
+| 2026-08-02 | Restricted the SessionStart open-issue banner to an explicit owner-only, repo-scoped local entitlement; default and wrong-repo installations emit zero issue-count bytes. Hardened that boundary to reject symlinks, foreign uid/mode, malformed or future observations, and all Windows visibility until ACL ownership can be verified. | The prior unconditional `surfaceIssues()` call fulfilled maintainer awareness but could expose the maintainer repository's operational queue to any installation carrying a fresh status file. `plugin/scripts/session-start-core.mjs` now fails silent without the local entitlement, and parity tests prove normal-user silence plus Stuart-only visibility. |
+| 2026-08-01 | Re-read the issue-pipeline boundary after the publication-receipt skill changed; the accepted supervised fixer, human acknowledgment, escalation, and no-autopublish decisions remain unchanged. | `plugin/skills/release-proof/SKILL.md` now requires a post-publication receipt produced from exact public npm/GitHub bytes and installed-host probes. It does not call `scripts/issue-fix.mjs`, post issue comments, or weaken ADR-050's prohibition on automated public mutations. Issue closure remains downstream of a verified release. |
+| 2026-08-01 | Reconciled the executable fixer boundary with the accepted supervised-worktree decision: scheduled `unattended` mode is now read-only triage, while explicit `supervised` mode may prepare a tested local candidate but cannot push, comment, merge, commit, or promote. Removed the test-only observer from `governs:` so implementation status is derived from production surfaces rather than whether a unit test has a runtime caller. | `scripts/issue-fix.mjs` exposes `executionPolicy()`, defaults to `unattended`, removes git/gh from the worker allowlist, preserves dirty candidate worktrees as recovery evidence, and reports local candidate state to the integration owner. `tests/unit/fix-workstream-guidance.test.mjs` verifies the Brain guidance but is intentionally not a production caller; governing it caused `doc-currency` to downgrade an otherwise wired decision to `built` for the wrong reason. Public automation remains prohibited pending the GitHub App identity follow-up. |
+| 2026-08-01 | Connected the accepted session-supervised worktree decision to the Brain's always-on fix behavior and the existing fail-closed release authority. Every non-trivial writing lane now receives one isolated worktree; focused evidence hands off to one clean integration owner; dirty lanes are retained for recovery; immutable candidate and publication seals govern promotion language. | The decision already required stable worktrees and human-controlled integration, while `plugin/skills/release-proof/SKILL.md` already rejected dirty/unbound release candidates. The missing seam was `plugin/skills/ruvnet-brain/SKILL.md`: it orchestrated fixes without requiring that delivery rail. `tests/unit/fix-workstream-guidance.test.mjs` now makes the connection executable and prevents a future guidance edit from removing it silently. |
 | 2026-07-31 | Re-read the issue surfacer after first-session seed and update maintenance were serialized into one detached worker; I1-I3 are unchanged. | Commit `0f68737` changes only the Stable-Spine seed/heartbeat block in `plugin/scripts/session-start.sh` and adds `plugin/scripts/first-session-worker.mjs`. The open-issue count, human-acknowledgment predicate, SLA escalation, and fixer circuit breaker are untouched. |
 | 2026-07-30 | Removed the default-off project-preference Node launch from SessionStart without changing the issue surfacer. | `plugin/scripts/session-start.sh` now calls the authoritative seed helper only when the settings file explicitly opts into new-project defaults. Issue counting, acknowledgment, escalation, and repair logic are untouched. |
 | 2026-07-30 | Re-read the issue pipeline after project-default seeding and host-convergence messaging landed in SessionStart; I1–I3 are unchanged. | `plugin/scripts/session-start.sh` adds one-time nonsecret preference seeding and restart guidance. The open-count, acknowledgment, escalation, and fixer circuit-breaker logic in `scripts/issue-watch.mjs` and `scripts/issue-fix.mjs` is unchanged; GitHub App follow-up remains open. |

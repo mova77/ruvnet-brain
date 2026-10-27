@@ -26,9 +26,10 @@ import path from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { storeRoot, storesAt } from './store-root.mjs';
+import { isDirectInvocation } from '../plugin/scripts/entrypoint.mjs';
 
 const KB_DIR = path.dirname(fileURLToPath(import.meta.url));
-const SOURCE_PATH = path.join(KB_DIR, 'SOURCE.json');
 const HOME = os.homedir();
 
 const argv = process.argv.slice(2);
@@ -53,15 +54,13 @@ function run(bin, args, { timeout = 25000, cwd } = {}) {
 const git = (dir, args, opts) => run('git', ['-C', dir, ...args], opts);
 
 // ---------- the brain's KNOWN set (authoritative: the .rvf files it actually loads) ----------
-function brainKnownSet() {
+export function brainKnownSet(root = storeRoot()) {
   const known = new Set();
-  for (const f of fs.readdirSync(KB_DIR)) {
-    if (!f.endsWith('.rvf')) continue;
-    known.add(f.replace(/\.big\.rvf$/, '').replace(/\.rvf$/, '').toLowerCase());
-  }
-  if (fs.existsSync(SOURCE_PATH)) {
+  for (const s of storesAt(root)) known.add(s.toLowerCase());
+  const sourcePath = path.join(root, 'SOURCE.json');
+  if (fs.existsSync(sourcePath)) {
     try {
-      const src = JSON.parse(fs.readFileSync(SOURCE_PATH, 'utf8'));
+      const src = JSON.parse(fs.readFileSync(sourcePath, 'utf8'));
       const stores = Array.isArray(src.stores) ? src.stores
         : (src.stores && typeof src.stores === 'object') ? Object.values(src.stores) : [];
       for (const s of stores) {
@@ -223,7 +222,7 @@ function brainCheck() {
   if (res.out) console.log(res.out);
   if (res.err && res.code !== 0 && res.code !== 10) console.log(res.err);
   // forge-update exits 0 = current, 10 = behind, other = error/not-configured.
-  if (res.code === 10) console.log(`\nThe brain bundle is BEHIND. To update:  node forge-update.mjs --apply`);
+  if (res.code === 10) console.log(`\nThe brain bundle is BEHIND. To update:  npx ruvnet-brain@latest --update`);
   else if (res.code === 0) console.log(`\nThe brain bundle is current.`);
   else console.log(`\n(forge-update reported: exit ${res.code} — likely "self-update not configured" for this build; see message above.)`);
 }
@@ -244,4 +243,6 @@ async function main() {
   }
 }
 
-main().catch((e) => die(`unexpected: ${e.message}`));
+if (isDirectInvocation(import.meta.url)) {
+  main().catch((e) => die(`unexpected: ${e.message}`));
+}

@@ -3,7 +3,8 @@ id: ADR-030
 title: Latent knowledge is not knowledge — few gates, many lessons, retrieved at the decision point
 status: Proposed
 date: 2026-07-22
-updated: 2026-07-23
+updated: 2026-10-07
+version: 1.1.1
 authors: [Stuart Kerr, Claude Code]
 tags: [learning, enforcement, gates, context-budget, compounding, 4.0]
 supersedes: []
@@ -257,3 +258,62 @@ pieces; nothing turned a promoted lesson into an interruption, so nothing change
    the surface is a CLI rather than part of the console. Both remain open.
 5. ❌ Adversarial cross-model review recorded, per ADR-027 principle 6 — still outstanding for
    ADR-027, 028, 029 and this one.
+
+### Implementation note (2026-09-19)
+
+The hook lesson gate now emits a given non-blocking lesson once per session by default. This limits
+identical correction prose across repeated matching edits; `RUVNET_LESSON_MAX_SHOWS` remains an
+explicit cadence override. Opted-in user-stated blocking lessons remain uncapped and continue to
+refuse at each matching decision point. The session key comes from the host hook payload's
+`session_id`; missing IDs use the existing bounded project/day fallback.
+
+### Implementation note (2026-09-30) — decision point #1 enforced; #2 and #3 in shadow
+
+Decision point #1 now blocks, deterministically and without a model (rUv ADR-G004), through the two
+existing grounding registrations — no new hook. `grounding-turn-mark` (UserPromptSubmit) arms a turn
+only when the prompt asks a capability, feasibility or architecture question about a named subject
+(any platform; vocabulary = Gate-1 terms, platform nouns, repo aliases, installed store names, and
+code-like identifiers in the prompt). `grounding-turn-gate` (Stop) reads the turn's sources from the
+Claude transcript and requires each capability claim in the final answer — extracted by
+`capability-claim-evidence.mjs`'s own extractor, widened with that vocabulary — to be bound to a
+STRONG source (file read, command, `search_ruvnet` hit, MCP read) whose path, command, query or
+output names the subject and that was read after the last WEAK source about it (a WebFetch body is a
+small model's summary; a WebSearch snippet list and a subagent's report are relayed). Otherwise ONE
+correction: the claim, the subject, what was read, "check the source or restate as UNVERIFIED".
+Claims in continuation-gate's RUVNET_TOOL class are left to it. On Codex (rollout not parsed) only
+rUv-term claims are judged from native-turn-bound successful-search receipts; the rest are UNKNOWN and never blocked.
+
+The same change fixed the gate's false "no successful search_ruvnet call was recorded": of 7 real
+occurrences, 3 were a queued mid-turn prompt re-dating the marker (now merged without moving its
+mtime), 3 were pre-H1 vocabulary misses, 1 was a search whose stamp never minted — Gate 1 now reads
+the transcript on Claude.
+
+Measured by `node scripts/grounding-turn-replay.mjs` on the 15 retained top-level transcripts
+(1,036 Stop points): arm rate 6.7%, block rate 0.39% (4), p99 audit 76 ms at load ~580 on 16 CPUs; the 2026-09-30 incident
+("No hook can change the model of the current turn", from a WebFetch summary) blocks. Hand-labelled:
+11 distinct blocked claims across armed, unarmed and subagent replays, 9 correct — fewer than the 25
+wanted, because the retained history does not contain more. Gates #2 (architecture recommendation
+with < 3 options) and #3 (a number relayed from a subagent without a re-check) are computed at the
+same Stop and only appended to `assertion-gate-shadow.jsonl`; replay: 2 and 0 would-blocks.
+
+### 2026-10-06 — Session and native-turn evidence isolation
+
+A deterministic two-session counterexample at source `b4590d46` showed the Codex Stop gate
+passing session A's capability claim after only session B searched: global product stamp mtimes
+were mistaken for current-turn proof. The existing marker and stamp handlers now bind successful
+search evidence to trusted host, native identity kind, native session ID, real project-path
+digest and a marker nonce. Claude uses the documented `prompt_id`; Codex uses `turn_id`.
+The other host field is not a fallback, and equal strings cannot cross host identities.
+Receipts retain queried product terms and query/answer hashes, never prompt, query or source text.
+The canonical parsed-answer predicate still rejects refusals and query-injected success headers.
+Claude's complete current-turn transcript remains the primary source; shared 24h write-gate stamps
+cannot satisfy a Stop obligation. Missing native identity, unavailable history or missing relevant
+bound evidence is UNKNOWN, with one correction to check or restate the claim as UNVERIFIED.
+
+The same complete host-native identity preserves the marker nonce and evidence. A new
+identity/project, or a new prompt without a valid canonical ID, rotates the episode;
+interruption retires it. An unbound Stop cannot consume a bound marker. An old Stop cannot consume a
+successor marker. Receipt publication and consumption use the existing marker lock. Captured Codex
+fixtures provide `session_id`, `turn_id` and `cwd`; the unparsed Codex rollout remains an unknown
+source rather than a fabricated transcript proof. This change does not raise the upstream hook
+wrapper's existing 1 MiB input cap or claim native event-delivery verification.

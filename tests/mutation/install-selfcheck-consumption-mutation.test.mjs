@@ -8,8 +8,8 @@
 // verdicts that were called as bare statements and thrown away, so a broken install still exited 0
 // (the exact "40/100" finding scripts/selfcheck.mjs's own header documents). This file proves the
 // consumption line is load-bearing by reverting it to that historical shape — "a bare statement" —
-// and showing a genuinely broken install now exits 0 again. House rule: "a test that cannot fail on
-// broken code is not a test."
+// and showing an install with missing plugin registration now exits 0 again. House rule:
+// "a test that cannot fail on broken code is not a test."
 //
 // WHY A REAL PACKED-AND-RUN INSTALL, NOT AN IN-PROCESS IMPORT: bin/install.mjs's main() is a
 // top-level IIFE with real side effects (network, plugin wiring, a real npm install) — importing it
@@ -37,6 +37,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { CONSOLE_RUNTIME_SURFACE } from '../../scripts/console-runtime-identity.mjs';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const REAL_INSTALLER = path.join(REPO, 'bin/install.mjs');
@@ -62,13 +63,12 @@ function safePath() {
  * Staging is delegated to scripts/ci/build-fixture-kb.mjs — the SAME script the stranger-matrix
  * workflow uses, so this test and the CI matrix can never drift onto two different fixture shapes.
  */
-function buildFixtureDir({ includeRvf }) {
+function buildFixtureDir() {
   const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'mutant-kb-stage-'));
   scratchDirs.push(stage);
   const root = path.join(stage, 'ruvnet-brain');
   execFileSync(process.execPath, [
     path.join(REPO, 'scripts/ci/build-fixture-kb.mjs'), '--out', root,
-    ...(includeRvf ? [] : ['--no-rvf']),
   ]);
   return root;
 }
@@ -78,10 +78,10 @@ function buildFixtureDir({ includeRvf }) {
  * `--local` bundle lookup resolve for real. `mutateTo`, when given, replaces the ONE anchor line;
  * omit it to run the REAL, unmutated file (the baseline).
  */
-function buildScratchRoot({ mutateTo, includeRvf }) {
+function buildScratchRoot({ mutateTo } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mutant-installer-'));
   scratchDirs.push(root);
-  for (const d of ['bin', 'scripts', 'kb', 'dist', 'console', 'plugin']) fs.mkdirSync(path.join(root, d), { recursive: true });
+  for (const d of ['bin', 'kb', 'dist', 'plugin', 'data']) fs.mkdirSync(path.join(root, d), { recursive: true });
 
   const source = fs.readFileSync(REAL_INSTALLER, 'utf8');
   expect(source.includes(ANCHOR), 'mutation anchor not found in bin/install.mjs — the target moved').toBe(true);
@@ -89,22 +89,26 @@ function buildScratchRoot({ mutateTo, includeRvf }) {
   if (mutateTo !== undefined) expect(written, 'mutation changed nothing — it would silently run the unmutated file').not.toBe(source);
   fs.writeFileSync(path.join(root, 'bin', 'install.mjs'), written);
 
-  // The sibling modules bin/install.mjs's OWN dynamic imports need — scripts/selfcheck.mjs above all,
-  // since it owns the exact `.exitCode` verdict the mutated line does or doesn't consume.
-  for (const rel of ['scripts/selfcheck.mjs', 'scripts/hook-registry.mjs', 'scripts/install-scope.mjs', 'scripts/upgrade-notice.mjs', 'scripts/user-settings.mjs']) {
-    fs.copyFileSync(path.join(REPO, rel), path.join(root, rel));
-  }
+  // Use the real runtime directory instead of maintaining a second, partial import list.
+  // Only bin/install.mjs is mutated; every dependency remains byte-identical to the candidate.
+  fs.cpSync(path.join(REPO, 'scripts'), path.join(root, 'scripts'), { recursive: true });
+  // The installer also reads native boot manifests, outside the Console runtime's source list.
+  fs.cpSync(path.join(REPO, 'plugin'), path.join(root, 'plugin'), { recursive: true });
   for (const rel of ['kb/verify-citation.mjs', 'kb/brain-profile.mjs', 'kb/model-requirements.mjs']) {
     fs.copyFileSync(path.join(REPO, rel), path.join(root, rel));
   }
-  // installConsoleRuntime() is now part of the real installer contract. Mirror its
-  // required source surface so this mutation still reaches the self-check verdict
-  // it is designed to test instead of failing earlier on an incomplete fake package.
-  fs.cpSync(path.join(REPO, 'console'), path.join(root, 'console'), { recursive: true });
-  fs.cpSync(path.join(REPO, 'plugin', 'scripts'), path.join(root, 'plugin', 'scripts'), { recursive: true });
-  fs.copyFileSync(path.join(REPO, 'package.json'), path.join(root, 'package.json'));
+  // installConsoleRuntime() is part of the real installer contract, so this fake package must carry
+  // the runtime surface or the mutation fails earlier than the self-check verdict it targets. Taken
+  // from the shipped list rather than copied into a fourth private enumeration of it — bin/install.mjs
+  // is the only file this fixture is allowed to differ on.
+  for (const relative of CONSOLE_RUNTIME_SURFACE) {
+    if (relative === 'bin/install.mjs') continue;   // the mutant, already written above
+    const target = path.join(root, relative);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.cpSync(path.join(REPO, relative), target, { recursive: true });
+  }
 
-  fs.cpSync(buildFixtureDir({ includeRvf }), path.join(root, 'dist', 'ruvnet-brain'), {
+  fs.cpSync(buildFixtureDir(), path.join(root, 'dist', 'ruvnet-brain'), {
     recursive: true,
   });
   return root;
@@ -114,8 +118,8 @@ function buildScratchRoot({ mutateTo, includeRvf }) {
  * Seed a marketplace-clone-shaped plugin surface with ZERO registrations directly under the
  * isolated HOME — `claude` is unreachable (safePath()), so wirePlugin() never installs a real one,
  * and scripts/selfcheck.mjs's resolveInstalledSurface() otherwise reports `no-plugin` for EVERY
- * machine without a wired plugin, which is not what M-D8b is about. An empty hooks.json is a
- * legitimate "installed, nothing registered" surface — the battery runs, finds nothing to fire, and
+ * machine without a wired plugin. M-D8b uses that absence as its broken-install scenario; this
+ * helper supplies the healthy control. An empty hooks.json is a legitimate "installed, nothing registered" surface — the battery runs, finds nothing to fire, and
  * reports zero violations, exactly like the `healthy` fixtures in tests/unit/selfcheck-battery.test.mjs.
  */
 function seedEmptyPluginSurface(home) {
@@ -126,15 +130,22 @@ function seedEmptyPluginSurface(home) {
   fs.writeFileSync(path.join(root, 'scripts', 'hook-shim.mjs'), 'const TABLE = {};\nprocess.exit(0);\n');
 }
 
-function runFullInstall(scratchRoot) {
+function runFullInstall(scratchRoot, { includePlugin = true, inheritedEnv = process.env } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'mutant-home-'));
   scratchDirs.push(home);
-  seedEmptyPluginSurface(home);
+  if (includePlugin) seedEmptyPluginSurface(home);
+  // Outer npm invocations export global-only options (notably allow-scripts). This is a
+  // project reader install, so inherited selectors must not change its location or policy.
+  const env = Object.fromEntries(Object.entries(inheritedEnv).filter(([key]) => !/^npm_config_/i.test(key)));
+  const userConfig = path.join(home, 'user.npmrc'), globalConfig = path.join(home, 'global.npmrc');
+  fs.writeFileSync(userConfig, ''); fs.writeFileSync(globalConfig, '');
   const r = spawnSync(process.execPath, [
     path.join(scratchRoot, 'bin', 'install.mjs'), '--local',
     '--no-stack', '--no-enhance', '--no-statusline', '--no-telemetry', '--no-nightly-prompt',
   ], {
-    env: { ...process.env, PATH: safePath(), HOME: home, USERPROFILE: home, RUVNET_BRAIN_TEST: '1' },
+    env: { ...env, PATH: safePath(), HOME: home, USERPROFILE: home, CODEX_HOME: path.join(home, '.codex'),
+      npm_config_cache: path.join(home, '.npm'), npm_config_userconfig: userConfig, npm_config_globalconfig: globalConfig,
+      RUVNET_BRAIN_HOME: path.join(home, '.cache/ruvnet-brain'), RUVNET_BRAIN_TEST: '1' },
     input: '',
     encoding: 'utf8',
     timeout: 60_000,
@@ -149,26 +160,30 @@ describe.skipIf(!canRun)('mutation M-D8b — process.exitCode = selfcheck.exitCo
   const realInstalled = path.join(os.homedir(), '.claude', 'plugins', 'ruvnet-brain');
   const before = { marketplace: fs.existsSync(realMarketplace), installed: fs.existsSync(realInstalled) };
 
-  it('baseline (REAL code): a broken install (no .rvf store) exits NON-ZERO', () => {
-    const root = buildScratchRoot({ includeRvf: false });
-    const r = runFullInstall(root);
+  it('baseline (REAL code): a broken install (no installed plugin surface) exits NON-ZERO', () => {
+    const root = buildScratchRoot();
+    const r = runFullInstall(root, { includePlugin: false });
     expect(r.error, `spawn failed: ${r.error && r.error.message}`).toBeUndefined();
+    expect(r.stdout, 'baseline must reach the closing self-check').toContain('Self-check FAILED');
     expect(r.status, `expected non-zero on a broken install; stdout:\n${r.stdout}\nstderr:\n${r.stderr}`).not.toBe(0);
   }, 60_000);
 
-  it('baseline (REAL code): a HEALTHY install (an .rvf store present) exits ZERO — the mutation target is not a hardcoded fail', () => {
-    const root = buildScratchRoot({ includeRvf: true });
-    const r = runFullInstall(root);
+  it('baseline (REAL code): a HEALTHY install (installed plugin surface present) exits ZERO — the mutation target is not a hardcoded fail', () => {
+    const root = buildScratchRoot();
+    const r = runFullInstall(root, { inheritedEnv: { ...process.env, npm_config_allow_scripts: 'ruflo',
+      NPM_CONFIG_PREFIX: path.join(root, 'must-not-replace-original-reader-owner') } });
     expect(r.error, `spawn failed: ${r.error && r.error.message}`).toBeUndefined();
     expect(r.status, `expected zero on a healthy install; stdout:\n${r.stdout}\nstderr:\n${r.stderr}`).toBe(0);
   }, 60_000);
 
   it('MUTANT: revert the consumption line to a bare statement → the SAME broken install now exits ZERO (the historical defect, reproduced)', () => {
-    const root = buildScratchRoot({ includeRvf: false, mutateTo: 'selfcheck.exitCode;' });
-    const r = runFullInstall(root);
+    const root = buildScratchRoot({ mutateTo: 'selfcheck.exitCode;' });
+    const r = runFullInstall(root, { includePlugin: false });
     expect(r.error, `spawn failed: ${r.error && r.error.message}`).toBeUndefined();
     // The defect this whole file exists to catch: "Needs attention" prose can still print, but the
     // exit code — the one thing a script or CI job actually reads — lies and says success.
+    expect(r.stdout).toContain('Self-check FAILED');
+    expect(r.stdout).toContain('no-plugin');
     expect(r.status, `mutant should have regressed to exit 0; stdout:\n${r.stdout}\nstderr:\n${r.stderr}`).toBe(0);
   }, 60_000);
 

@@ -1,0 +1,149 @@
+import { describe, expect, it } from 'vitest';
+import { spawn, spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { continuityRegistrations } from '../../plugin/scripts/continuity-hook-policy.mjs';
+
+const REPO = path.resolve(import.meta.dirname, '../..');
+const HOOKS_PATH = path.join(REPO, 'plugin/hooks/hooks.json');
+// The lifecycle events hooks.json may carry, derived from the policy module — a literal here
+// (`['SessionStart','Stop']`, the Sep-7 two-event plane) kept this file red across a plane change.
+const PLANE_EVENTS = [...new Set(continuityRegistrations('claude').map((s) => s.event))].sort();
+const ROUTE_DISPATCH = path.join(REPO, 'plugin/scripts/route-dispatch.sh');
+const RECEIPT_DIR = ['meta', 'harness'].join('');
+
+function optedInHome() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'route-timing-'));
+  fs.mkdirSync(path.join(home, '.claude/model-router'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.claude/model-router/profile.json'), '{"harnesses":{}}');
+  return home;
+}
+
+function missingModelPayload() {
+  return JSON.stringify({
+    hook_event_name: 'PreToolUse',
+    tool_name: 'Agent',
+    tool_use_id: 'toolu_issue_84',
+    session_id: 'session_issue_84',
+    tool_input: { description: 'bounded timing probe', subagent_type: 'general-purpose' },
+  });
+}
+
+function registeredRouteHook() {
+  const hooks = JSON.parse(fs.readFileSync(HOOKS_PATH, 'utf8')).hooks.PreToolUse;
+  const matches = hooks.flatMap((group, groupIndex) =>
+    (group.hooks || []).map((hook, hookIndex) => ({ group, hook, groupIndex, hookIndex })),
+  ).filter(({ hook }) => hook.command.includes('hook-shim.mjs\" route-dispatch'));
+  expect(matches).toHaveLength(1);
+  return matches[0];
+}
+
+function hookEnv(home) {
+  return {
+    ...process.env,
+    HOME: home,
+    CLAUDE_PLUGIN_ROOT: path.join(REPO, 'plugin'),
+    RUVNET_BRAIN_HOME: path.join(home, '.cache/ruvnet-brain'),
+  };
+}
+
+function runRegistered(input, home) {
+  return spawnSync('bash', [ROUTE_DISPATCH], {
+    cwd: REPO,
+    input,
+    encoding: 'utf8',
+    timeout: 5_000,
+    env: hookEnv(home),
+  });
+}
+
+function spawnRegistered(input, home, { closeInput = true } = {}) {
+  const child = spawn('bash', [ROUTE_DISPATCH], {
+    cwd: REPO,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: hookEnv(home),
+  });
+  if (closeInput) child.stdin.end(input);
+  else child.stdin.write(input);
+  return child;
+}
+
+function waitFor(child) {
+  return new Promise((resolve, reject) => {
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('error', reject);
+    child.on('close', (status, signal) => resolve({ status, signal, stdout, stderr }));
+  });
+}
+
+describe.skipIf(process.platform === 'win32')('issue #84 — explicit Agent/Task routing timing contract', () => {
+  it('retains route-dispatch as a dormant explicit evaluator with no host registration', () => {
+    const hooks = JSON.parse(fs.readFileSync(HOOKS_PATH, 'utf8')).hooks;
+    expect(Object.keys(hooks).sort()).toEqual(PLANE_EVENTS);
+    expect(JSON.stringify(hooks)).not.toContain('route-dispatch');
+    expect(fs.existsSync(ROUTE_DISPATCH)).toBe(true);
+  });
+
+  it('returns before its declared timeout and never claims a late block', () => {
+    const home = optedInHome();
+    const started = performance.now();
+    const result = runRegistered(missingModelPayload(), home);
+    const elapsedMs = performance.now() - started;
+
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toBe('');
+    expect(elapsedMs).toBeLessThan(1_000);
+
+    const receipt = JSON.parse(fs.readFileSync(
+      path.join(home, '.claude', RECEIPT_DIR, 'dispatch-log.jsonl'),
+      'utf8',
+    ).trim());
+    expect(receipt).toMatchObject({
+      event: 'dispatch',
+      model: 'inherited',
+      enforcement: 'advisory-host-timing',
+      toolUseId: 'toolu_issue_84',
+      sessionId: 'session_issue_84',
+    });
+  });
+
+  it('cannot delay tool completion or consume foreign hook processes', async () => {
+    const home = optedInHome();
+    const foreign = spawn(process.execPath, ['-e', 'setTimeout(() => process.stdout.write("foreign-ok"), 80)']);
+    const ours = spawnRegistered(missingModelPayload(), home);
+    const tool = spawn(process.execPath, ['-e', 'setTimeout(() => process.stdout.write("tool-complete"), 20)']);
+
+    // Attach every close listener immediately. Short-lived siblings may exit while the
+    // tool promise is awaited; attaching later loses their close event and creates a false timeout.
+    const foreignDone = waitFor(foreign);
+    const oursDone = waitFor(ours);
+    const toolResult = await waitFor(tool);
+    const toolEndedAt = performance.now();
+    const [ourResult, foreignResult] = await Promise.all([oursDone, foreignDone]);
+    const hooksCheckedAt = performance.now();
+
+    expect(toolResult).toMatchObject({ status: 0, stdout: 'tool-complete', stderr: '' });
+    expect(ourResult).toMatchObject({ status: 0, stdout: '', stderr: '' });
+    expect(foreignResult).toMatchObject({ status: 0, stdout: 'foreign-ok', stderr: '' });
+    expect(toolEndedAt).toBeLessThan(hooksCheckedAt);
+  });
+
+  it('the script itself is advisory when invoked without the shim', () => {
+    const home = optedInHome();
+    const result = spawnSync('bash', [ROUTE_DISPATCH], {
+      input: missingModelPayload(),
+      encoding: 'utf8',
+      timeout: 5_000,
+      env: { ...process.env, HOME: home },
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toBe('');
+  });
+});

@@ -37,8 +37,8 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const CODEX_DIR = path.join(ROOT, '.codex');
 
-let mergeCodexConfig, removeCodexManagedBlock, wireCodexHost, codexStatus, codexMarketplaceRows, classifyCodexLifecycle;
-let wireCodexPlugin, codexPluginStatus, codexLifecycleGuidance;
+let mergeCodexConfig, removeCodexManagedBlock, wireCodexHost, codexStatus, codexMcpGuidance, codexMarketplaceRows, classifyCodexLifecycle;
+let wireCodexPlugin, codexPluginStatus, codexLifecycleGuidance, codexSessionSafety;
 beforeAll(async () => {
   // Same import-only contract the other installer tests use, so main() never runs on import.
   process.env.RUVNET_BRAIN_IMPORT_ONLY = '1';
@@ -47,11 +47,13 @@ beforeAll(async () => {
     removeCodexManagedBlock,
     wireCodexHost,
     codexStatus,
+    codexMcpGuidance,
     codexMarketplaceRows,
     classifyCodexLifecycle,
     wireCodexPlugin,
     codexPluginStatus,
     codexLifecycleGuidance,
+    codexSessionSafety,
   } = await import('../../bin/install.mjs'));
 });
 
@@ -72,6 +74,8 @@ describe('mergeCodexConfig — the three outcomes, and only three', () => {
     expect(text).toContain('[mcp_servers.ruvnet-brain]');
     expect(text).toContain('command = "node"');
     expect(text).toContain(`args = [${JSON.stringify(SERVER)}]`);
+    expect(text).toContain('startup_timeout_sec = 30');
+    expect(text).toContain('env = { RUVNET_HOOK_HOST = "codex" }');
     expect(text.startsWith(START)).toBe(true);
     expect(text.trimEnd().endsWith(END)).toBe(true);
   });
@@ -79,6 +83,16 @@ describe('mergeCodexConfig — the three outcomes, and only three', () => {
   it('treats a non-string (never-read file) as empty rather than throwing', () => {
     expect(mergeCodexConfig(undefined, SERVER).action).toBe('added');
     expect(mergeCodexConfig(null, SERVER).action).toBe('added');
+  });
+
+  it('repairs the pre-381 managed registration while preserving private config around it', () => {
+    const legacy = mergeCodexConfig(REAL_CONFIG, SERVER).text
+      .replace('env = { RUVNET_HOOK_HOST = "codex" }\n', '');
+    const tail = '\n[mcp_servers.private]\ncommand = "private-server"\n';
+    const repaired = mergeCodexConfig(legacy + tail, SERVER);
+    expect(repaired.action).toBe('rewritten');
+    expect(repaired.text).toBe(mergeCodexConfig(REAL_CONFIG, SERVER).text + tail);
+    expect(mergeCodexConfig(repaired.text, SERVER).text).toBe(repaired.text);
   });
 
   it('appends after existing content, separated by a blank line', () => {
@@ -217,6 +231,9 @@ describe('wireCodexHost — the filesystem round trip', () => {
     expect(fs.existsSync(r.serverPath)).toBe(true);
     // It is the real supervisor, not a stub.
     expect(fs.readFileSync(r.serverPath, 'utf8')).toContain('search_ruvnet');
+    const installedManifest = path.join(serverDir, '..', '.claude-plugin', 'plugin.json');
+    expect(fs.readFileSync(installedManifest, 'utf8'))
+      .toBe(fs.readFileSync(path.join(ROOT, 'plugin/.claude-plugin/plugin.json'), 'utf8'));
 
     const written = fs.readFileSync(path.join(codexDir, 'config.toml'), 'utf8');
     expect(written).toContain('[mcp_servers.ruvnet-brain]');
@@ -224,16 +241,81 @@ describe('wireCodexHost — the filesystem round trip', () => {
     expect(written).toContain('RUFLO_HARNESS_LOOP = "1"'); // theirs, untouched
   });
 
-  it('keeps every default write under the supplied Codex home instead of the real user home', () => {
+  it('installs the durable hook wrapper without writing outside the supplied Codex home', () => {
     const home = tmpdir();
     const codexDir = path.join(home, '.codex');
     const serverDir = path.join(home, '.claude', 'ruvnet-brain', 'mcp');
     fs.mkdirSync(codexDir, { recursive: true });
 
+    const wrapper = path.join(home, '.cache', 'ruvnet-brain', 'codex-hook.mjs');
+    fs.mkdirSync(path.dirname(wrapper), { recursive: true });
     const r = wireCodexHost({ codexDir, serverDir, announce: false });
 
-    expect(r.hookWrapperPath).toBe(path.join(home, '.cache', 'ruvnet-brain', 'codex-hook.mjs'));
-    expect(fs.existsSync(r.hookWrapperPath)).toBe(true);
+    expect(r.hookWrapperInstalled).toBe(true);
+    expect(r.hookWrapperPath).toBe(wrapper);
+    expect(fs.readFileSync(wrapper, 'utf8'))
+      .toBe(fs.readFileSync(path.join(ROOT, 'plugin/scripts/codex-hook-wrapper.mjs'), 'utf8'));
+  });
+
+  it('refuses to overwrite a user-owned wrapper symlink', (ctx) => {
+    const home = tmpdir();
+    const codexDir = path.join(home, '.codex');
+    const wrapper = path.join(home, '.cache', 'ruvnet-brain', 'codex-hook.mjs');
+    const target = path.join(home, 'user-owned-target.mjs');
+    fs.mkdirSync(path.dirname(wrapper), { recursive: true });
+    fs.mkdirSync(codexDir, { recursive: true });
+    fs.writeFileSync(target, 'preserve me');
+    try { fs.symlinkSync(target, wrapper); } catch { return ctx.skip(); }
+
+    const result = wireCodexHost({ codexDir, hookWrapperPath: wrapper, serverDir: path.join(home, 'srv'), announce: false });
+
+    expect(result.action).toBe('hook-wrapper-ownership-conflict');
+    expect(result.hookWrapperInstalled).toBe(false);
+    expect(fs.existsSync(path.join(home, 'srv'))).toBe(false);
+    expect(fs.existsSync(path.join(codexDir, 'config.toml'))).toBe(false);
+    expect(fs.readFileSync(wrapper, 'utf8')).toBe('preserve me');
+    expect(fs.readFileSync(target, 'utf8')).toBe('preserve me');
+  });
+
+  it('fails convergence when the legacy wrapper path is an unexpected directory', () => {
+    const home = tmpdir();
+    const codexDir = path.join(home, '.codex');
+    const wrapper = path.join(home, '.cache', 'ruvnet-brain', 'codex-hook.mjs');
+    fs.mkdirSync(wrapper, { recursive: true });
+    fs.mkdirSync(codexDir, { recursive: true });
+
+    const result = wireCodexHost({ codexDir, hookWrapperPath: wrapper, serverDir: path.join(home, 'srv'), announce: false });
+
+    expect(result.action).toBe('hook-wrapper-ownership-conflict');
+    expect(result.hookWrapperInstalled).toBe(false);
+    expect(fs.existsSync(path.join(home, 'srv'))).toBe(false);
+    expect(fs.existsSync(path.join(codexDir, 'config.toml'))).toBe(false);
+    expect(fs.statSync(wrapper).isDirectory()).toBe(true);
+  });
+
+  it('preserves a customized regular wrapper before any host wiring', () => {
+    const home = tmpdir(), codexDir = path.join(home, '.codex');
+    const wrapper = path.join(home, '.cache', 'ruvnet-brain', 'codex-hook.mjs');
+    fs.mkdirSync(codexDir, { recursive: true });
+    fs.mkdirSync(path.dirname(wrapper), { recursive: true });
+    fs.writeFileSync(wrapper, 'legacy hook bridge'); // Unknown bytes do not establish installer ownership.
+    const result = wireCodexHost({ codexDir, serverDir: path.join(home, 'srv'), announce: false });
+    expect(result.action).toBe('hook-wrapper-ownership-conflict');
+    expect(fs.readFileSync(wrapper, 'utf8')).toBe('legacy hook bridge');
+    expect(fs.existsSync(path.join(home, 'srv'))).toBe(false);
+    expect(fs.existsSync(path.join(codexDir, 'config.toml'))).toBe(false);
+  });
+
+  it('refuses a wrapper target outside the supplied home without changing its bytes', () => {
+    const home = tmpdir(), outside = tmpdir(), codexDir = path.join(home, '.codex');
+    const wrapper = path.join(outside, 'user-hook.mjs');
+    fs.mkdirSync(codexDir, { recursive: true });
+    fs.writeFileSync(wrapper, 'outside home owner');
+    const result = wireCodexHost({ codexDir, hookWrapperPath: wrapper, serverDir: path.join(home, 'srv'), announce: false });
+    expect(result.action).toBe('hook-wrapper-ownership-conflict');
+    expect(fs.readFileSync(wrapper, 'utf8')).toBe('outside home owner');
+    expect(fs.existsSync(path.join(home, 'srv'))).toBe(false);
+    expect(fs.existsSync(path.join(codexDir, 'config.toml'))).toBe(false);
   });
 
   it('creates config.toml when the host exists but has none yet', () => {
@@ -339,7 +421,43 @@ describe('codexStatus — the three doctor states, each derived from disk', () =
     fs.mkdirSync(codexDir, { recursive: true });
     wireCodexHost({ codexDir, serverDir, announce: false });
     const s = codexStatus({ codexDir, configPath: path.join(codexDir, 'config.toml') });
-    expect(s).toMatchObject({ host: true, wired: true, serverExists: true });
+    expect(s).toMatchObject({
+      host: true, wired: true, serverExists: true,
+      startupTimeoutSec: 30, readiness: 'registered', live: false,
+    });
+  });
+
+  it('distinguishes a live ready receipt from a degraded startup receipt', () => {
+    const home = tmpdir();
+    const codexDir = path.join(home, '.codex');
+    const serverDir = path.join(home, '.claude', 'ruvnet-brain', 'mcp');
+    const brainHome = path.join(home, '.cache', 'ruvnet-brain');
+    fs.mkdirSync(codexDir, { recursive: true });
+    fs.mkdirSync(brainHome, { recursive: true });
+    wireCodexHost({ codexDir, serverDir, announce: false });
+    const configPath = path.join(codexDir, 'config.toml');
+
+    fs.writeFileSync(path.join(brainHome, 'mcp-readiness.json'), JSON.stringify({
+      state: 'ready', phase: 'warmup', pid: process.pid, workerPid: process.pid, elapsedMs: 12,
+    }));
+    const ready = codexStatus({ codexDir, configPath, brainHome });
+    expect(ready).toMatchObject({ readiness: 'ready', live: true });
+    expect(codexMcpGuidance(ready)).toMatchObject({ healthy: true, blocking: false });
+
+    fs.writeFileSync(path.join(brainHome, 'mcp-readiness.json'), JSON.stringify({
+      state: 'ready', phase: 'warmup', pid: process.pid, workerPid: 999999, elapsedMs: 12,
+    }));
+    expect(codexStatus({ codexDir, configPath, brainHome })).toMatchObject({
+      readiness: 'registered', live: false,
+    });
+
+    fs.writeFileSync(path.join(brainHome, 'mcp-readiness.json'), JSON.stringify({
+      state: 'degraded', phase: 'warmup', error: 'model failed', pid: 999999,
+    }));
+    const degraded = codexStatus({ codexDir, configPath, brainHome });
+    expect(degraded).toMatchObject({ readiness: 'degraded', live: false });
+    expect(codexMcpGuidance(degraded)).toMatchObject({ healthy: false, blocking: true });
+    expect(codexMcpGuidance(degraded).detail).toContain('model failed');
   });
 
   it('the probe can FAIL on a broken config — deleting the server flips wired to false', () => {
@@ -367,7 +485,7 @@ describe('Codex plugin/lifecycle state — live CLI shapes become one actionable
     expect(codexMarketplaceRows(null)).toEqual([]);
   });
 
-  it('reports active only when every discovered Brain hook is enabled and trusted', () => {
+  it('rejects trusted Brain hooks because any runtime registration is stale', () => {
     const plugin = { available: true, installed: true, enabled: true };
     const listed = {
       ok: true,
@@ -382,10 +500,10 @@ describe('Codex plugin/lifecycle state — live CLI shapes become one actionable
         }],
       },
     };
-    expect(classifyCodexLifecycle(plugin, listed)).toMatchObject({ state: 'active' });
+    expect(classifyCodexLifecycle(plugin, listed)).toMatchObject({ state: 'unexpected-runtime-hooks' });
   });
 
-  it('makes pending trust explicit instead of printing generic install-success instructions', () => {
+  it('rejects untrusted Brain hooks too instead of asking the user to trust them', () => {
     const plugin = { available: true, installed: true, enabled: true };
     const listed = {
       ok: true,
@@ -397,12 +515,12 @@ describe('Codex plugin/lifecycle state — live CLI shapes become one actionable
       },
     };
     expect(classifyCodexLifecycle(plugin, listed)).toMatchObject({
-      state: 'pending-trust',
+      state: 'unexpected-runtime-hooks',
       hooks: [{ trustStatus: 'untrusted' }],
     });
   });
 
-  it('distinguishes a user-disabled plugin from missing runtime hooks and probe failure', () => {
+  it('distinguishes intentional zero hooks from a malformed registry and probe failure', () => {
     expect(classifyCodexLifecycle(
       { available: true, installed: true, enabled: false },
       { ok: true, value: { data: [] } },
@@ -410,6 +528,10 @@ describe('Codex plugin/lifecycle state — live CLI shapes become one actionable
     expect(classifyCodexLifecycle(
       { available: true, installed: true, enabled: true },
       { ok: true, value: { data: [{ hooks: [], errors: [] }] } },
+    ).state).toBe('inactive-by-design');
+    expect(classifyCodexLifecycle(
+      { available: true, installed: true, enabled: true },
+      { ok: true, value: { data: [{ hooks: [], errors: ['manifest parse failed'] }] } },
     ).state).toBe('missing-runtime-hooks');
     expect(classifyCodexLifecycle(
       { available: true, installed: true, enabled: true },
@@ -417,14 +539,15 @@ describe('Codex plugin/lifecycle state — live CLI shapes become one actionable
     )).toMatchObject({ state: 'probe-failed', error: 'app-server unavailable' });
   });
 
-  it('turns each lifecycle state into one concise user action and no false action when active', () => {
-    expect(codexLifecycleGuidance({ state: 'active', hooks: [{}, {}] })).toMatchObject({
-      healthy: true,
-      action: null,
-    });
-    expect(codexLifecycleGuidance({ state: 'pending-trust', hooks: [{}] })).toMatchObject({
+  it('turns each lifecycle state into one concise user action', () => {
+    expect(codexLifecycleGuidance({ state: 'unexpected-runtime-hooks', hooks: [{}, {}] })).toMatchObject({
       healthy: false,
-      action: expect.stringContaining('/hooks'),
+      action: expect.stringContaining('Upgrade'),
+    });
+    expect(codexLifecycleGuidance({ state: 'inactive-by-design', hooks: [] })).toMatchObject({
+      healthy: true,
+      intentional: true,
+      action: null,
     });
     expect(codexLifecycleGuidance({ state: 'not-installed', hooks: [] })).toMatchObject({
       healthy: false,
@@ -486,7 +609,10 @@ describe('wireCodexPlugin — install is idempotent, state-driven, and disable-p
       expectedVersion: '1.2.3',
       runJson,
       announce: false,
-    })).toMatchObject({ action: 'installed', installed: true, enabled: true });
+    })).toMatchObject({
+      action: 'installed', installed: true, enabled: true,
+      restartRequired: false,
+    });
     expect(calls.map((args) => args.join(' '))).toEqual([
       'plugin list --json',
       'plugin marketplace list --json',
@@ -494,6 +620,123 @@ describe('wireCodexPlugin — install is idempotent, state-driven, and disable-p
       'plugin add ruvnet-brain@ruvnet-brain --json',
       'plugin list --json',
     ]);
+  });
+
+  it('updates a body-only payload without manufacturing a restart requirement', () => {
+    const home = tmpdir();
+    const codexDir = path.join(home, '.codex');
+    fs.mkdirSync(codexDir, { recursive: true });
+    const installedRoot = path.join(codexDir, 'plugins', 'cache', 'ruvnet-brain', 'ruvnet-brain', '1.2.2');
+    fs.mkdirSync(path.dirname(installedRoot), { recursive: true });
+    fs.cpSync(path.join(ROOT, 'plugin'), installedRoot, { recursive: true });
+    const manifest = path.join(installedRoot, '.codex-plugin', 'plugin.json');
+    fs.writeFileSync(manifest, fs.readFileSync(manifest, 'utf8').replace(/("version"\s*:\s*)"[^"]+"/, '$1"1.2.2"'));
+    let listedVersion = '1.2.2';
+    const runJson = (args) => {
+      const command = args.join(' ');
+      if (command === 'plugin list --json') return { ok: true, value: { installed: [{
+        pluginId: 'ruvnet-brain@ruvnet-brain', version: listedVersion, installed: true, enabled: true,
+      }] } };
+      if (command === 'plugin marketplace list --json') return { ok: true, value: { marketplaces: [{ name: 'ruvnet-brain' }] } };
+      if (command === 'plugin marketplace upgrade ruvnet-brain --json') return { ok: true, value: {} };
+      if (command === 'plugin add ruvnet-brain@ruvnet-brain --json') { listedVersion = '1.2.3'; return { ok: true, value: {} }; }
+      return { ok: false, error: `unexpected ${command}` };
+    };
+
+    expect(wireCodexPlugin({ codexDir, codexHome: codexDir, expectedVersion: '1.2.3', runJson, announce: false })).toMatchObject({
+      action: 'updated', version: '1.2.3', restartRequired: false, shellChanged: false, shellChangedPaths: [],
+      hooksNeedingReview: [],   // identical Codex hook definitions: nothing for the user to re-review
+    });
+  });
+
+  // #492 (a): on Codex 0.164+ the same body-only update DOES hold every Brain hook back (the approval pins the
+  // plugin's bytes), so without automatic trust the update must say so instead of reporting nothing to review.
+  it('on Codex 0.164+ a body-only update names every Brain hook as needing review', () => {
+    const home = tmpdir();
+    const codexDir = path.join(home, '.codex');
+    fs.mkdirSync(codexDir, { recursive: true });
+    const installedRoot = path.join(codexDir, 'plugins', 'cache', 'ruvnet-brain', 'ruvnet-brain', '1.2.2');
+    fs.mkdirSync(path.dirname(installedRoot), { recursive: true });
+    fs.cpSync(path.join(ROOT, 'plugin'), installedRoot, { recursive: true });
+    const manifest = path.join(installedRoot, '.codex-plugin', 'plugin.json');
+    fs.writeFileSync(manifest, fs.readFileSync(manifest, 'utf8').replace(/("version"\s*:\s*)"[^"]+"/, '$1"1.2.2"'));
+    let listedVersion = '1.2.2';
+    const runJson = (args) => {
+      const command = args.join(' ');
+      if (command === 'plugin list --json') return { ok: true, value: { installed: [{
+        pluginId: 'ruvnet-brain@ruvnet-brain', version: listedVersion, installed: true, enabled: true,
+      }] } };
+      if (command === 'plugin marketplace list --json') return { ok: true, value: { marketplaces: [{ name: 'ruvnet-brain' }] } };
+      if (command === 'plugin marketplace upgrade ruvnet-brain --json') return { ok: true, value: {} };
+      if (command === 'plugin add ruvnet-brain@ruvnet-brain --json') { listedVersion = '1.2.3'; return { ok: true, value: {} }; }
+      return { ok: false, error: `unexpected ${command}` };
+    };
+    const hookCount = Object.values(JSON.parse(fs.readFileSync(path.join(ROOT, 'plugin', 'hooks', 'codex-hooks.json'), 'utf8')).hooks)
+      .flat().reduce((n, group) => n + group.hooks.length, 0);
+    const result = wireCodexPlugin({ codexDir, codexHome: codexDir, expectedVersion: '1.2.3', runJson, announce: false, contentTrust: true });
+    expect(result.action).toBe('updated');
+    expect(result.hooksNeedingReview).toHaveLength(hookCount);
+    expect(result.hooksNeedingReview.every((h) => h.status === 'modified' && h.reason === 'plugin-content')).toBe(true);
+  });
+
+  it('requests one restart when a boot-level declaration actually changes', () => {
+    const home = tmpdir();
+    const codexDir = path.join(home, '.codex');
+    fs.mkdirSync(codexDir, { recursive: true });
+    const installedRoot = path.join(codexDir, 'plugins', 'cache', 'ruvnet-brain', 'ruvnet-brain', '1.2.2');
+    fs.mkdirSync(path.dirname(installedRoot), { recursive: true });
+    fs.cpSync(path.join(ROOT, 'plugin'), installedRoot, { recursive: true });
+    const manifest = path.join(installedRoot, '.codex-plugin', 'plugin.json');
+    fs.writeFileSync(manifest, fs.readFileSync(manifest, 'utf8').replace(/("version"\s*:\s*)"[^"]+"/, '$1"1.2.2"'));
+    fs.writeFileSync(path.join(installedRoot, 'hooks', 'hooks.json'), '{"hooks":{"changed":true}}');
+    let listedVersion = '1.2.2';
+    const runJson = (args) => {
+      const command = args.join(' ');
+      if (command === 'plugin list --json') return { ok: true, value: { installed: [{
+        pluginId: 'ruvnet-brain@ruvnet-brain', version: listedVersion, installed: true, enabled: true,
+      }] } };
+      if (command === 'plugin marketplace list --json') return { ok: true, value: { marketplaces: [{ name: 'ruvnet-brain' }] } };
+      if (command === 'plugin marketplace upgrade ruvnet-brain --json') return { ok: true, value: {} };
+      if (command === 'plugin add ruvnet-brain@ruvnet-brain --json') { listedVersion = '1.2.3'; return { ok: true, value: {} }; }
+      return { ok: false, error: `unexpected ${command}` };
+    };
+
+    expect(wireCodexPlugin({ codexDir, codexHome: codexDir, expectedVersion: '1.2.3', runJson, announce: false })).toMatchObject({
+      action: 'updated', version: '1.2.3', restartRequired: true, sessionSafety: 'restart-required',
+      restartScope: 'unproven', shellChanged: true, shellChangedPaths: ['hooks/hooks.json'],
+    });
+  });
+
+  // 4.5 (review-4.3.39 #7): codex-hooks.json is not a boot-surface path, so the shell boundary cannot see a
+  // changed Codex hook — but Codex will skip it until re-reviewed. The update must name exactly those hooks.
+  it('an update that changes one Codex hook command names exactly that hook as needing review', () => {
+    const home = tmpdir();
+    const codexDir = path.join(home, '.codex');
+    fs.mkdirSync(codexDir, { recursive: true });
+    const installedRoot = path.join(codexDir, 'plugins', 'cache', 'ruvnet-brain', 'ruvnet-brain', '1.2.2');
+    fs.mkdirSync(path.dirname(installedRoot), { recursive: true });
+    fs.cpSync(path.join(ROOT, 'plugin'), installedRoot, { recursive: true });
+    const manifest = path.join(installedRoot, '.codex-plugin', 'plugin.json');
+    fs.writeFileSync(manifest, fs.readFileSync(manifest, 'utf8').replace(/("version"\s*:\s*)"[^"]+"/, '$1"1.2.2"'));
+    const hooksFile = path.join(installedRoot, 'hooks', 'codex-hooks.json');
+    const old = JSON.parse(fs.readFileSync(hooksFile, 'utf8'));
+    old.hooks.SessionEnd[0].hooks[0].command += ' ';    // the installed (older) definition differs from this checkout's
+    fs.writeFileSync(hooksFile, JSON.stringify(old));
+    let listedVersion = '1.2.2';
+    const runJson = (args) => {
+      const command = args.join(' ');
+      if (command === 'plugin list --json') return { ok: true, value: { installed: [{
+        pluginId: 'ruvnet-brain@ruvnet-brain', version: listedVersion, installed: true, enabled: true,
+      }] } };
+      if (command === 'plugin marketplace list --json') return { ok: true, value: { marketplaces: [{ name: 'ruvnet-brain' }] } };
+      if (command === 'plugin marketplace upgrade ruvnet-brain --json') return { ok: true, value: {} };
+      if (command === 'plugin add ruvnet-brain@ruvnet-brain --json') { listedVersion = '1.2.3'; return { ok: true, value: {} }; }
+      return { ok: false, error: `unexpected ${command}` };
+    };
+    expect(wireCodexPlugin({ codexDir, codexHome: codexDir, expectedVersion: '1.2.3', runJson, announce: false })).toMatchObject({
+      action: 'updated', shellChanged: false,
+      hooksNeedingReview: [{ key: 'ruvnet-brain@ruvnet-brain:hooks/codex-hooks.json:session_end:0:0', status: 'modified' }],
+    });
   });
 
   it('leaves a user-disabled installation untouched', () => {
@@ -563,6 +806,18 @@ describe('wireCodexPlugin — install is idempotent, state-driven, and disable-p
     });
   });
 
+  it('makes the host API boundary explicit after a native update', () => {
+    const status = { action: 'updated', restartRequired: true, sessionSafety: 'restart-required' };
+    expect(codexSessionSafety(status)).toMatchObject({
+      sessionSafety: 'restart-required',
+      restartRequired: true,
+    });
+    expect(codexSessionSafety({ action: 'unchanged' })).toMatchObject({
+      sessionSafety: 'unknown',
+      restartRequired: false,
+    });
+  });
+
   it('refuses to call a stale Codex snapshot successfully installed', () => {
     const home = tmpdir();
     const codexDir = path.join(home, '.codex');
@@ -610,7 +865,7 @@ describe('wireCodexPlugin — install is idempotent, state-driven, and disable-p
 
 // ── native plugin skills: the actual current Codex surface ───────────────────────────────────────
 describe('plugin/skills/*/SKILL.md — native, self-contained Codex skills', () => {
-  const native = ['brain-console', 'rvbc', 'whats-new'];
+  const native = ['brain-console', 'rnbc', 'rvbc', 'whats-new'];
 
   for (const name of native) {
     it(`${name} has matching frontmatter and no absent sibling dependency`, () => {
@@ -690,6 +945,6 @@ describe('no shipped file leaks a developer path', () => {
     expect(Object.keys(parsed.hooks)).toHaveLength(0);
     // Assert on the STRUCTURE, not the prose. What must be absent is a duplicate runnable command.
     expect(JSON.stringify(parsed.hooks)).not.toMatch(/command|\/bin\//);
-    expect(parsed.description).toMatch(/plugin owns lifecycle integration/i);
+    expect(parsed.description).toMatch(/no automatic lifecycle handlers/i);
   });
 });

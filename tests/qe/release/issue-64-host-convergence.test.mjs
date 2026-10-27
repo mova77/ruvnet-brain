@@ -6,12 +6,13 @@ import { spawnSync } from 'node:child_process';
 
 const ROOT = path.resolve(import.meta.dirname, '../../..');
 const ENGINE = path.join(ROOT, 'plugin/scripts/update-apply.mjs');
-const SESSION = path.join(ROOT, 'plugin/scripts/session-start-core.mjs');
 const EXPECTED = '9.9.1-issue64';
 const OTHER = '9.9.2-issue64';
+const CURRENT = '9.9.2-issue420';
+const OLD = '9.9.0-issue420';
 const previousImportOnly = process.env.RUVNET_BRAIN_IMPORT_ONLY;
 process.env.RUVNET_BRAIN_IMPORT_ONLY = '1';
-const { claudePluginStatus } = await import('../../../bin/install.mjs');
+const { claudePluginStatus, claudeProjectInstalls, projectInstallsCheck } = await import('../../../bin/install.mjs');
 afterAll(() => {
   if (previousImportOnly === undefined) delete process.env.RUVNET_BRAIN_IMPORT_ONLY;
   else process.env.RUVNET_BRAIN_IMPORT_ONLY = previousImportOnly;
@@ -23,6 +24,14 @@ const temporary = (prefix) => {
   cleanup.push(dir);
   return dir;
 };
+const isolatedEnv = (home, brain, ambient = process.env) => ({
+  ...Object.fromEntries(Object.entries(ambient).filter(([key]) =>
+    !/^(?:RUVNET_|CLAUDE_|CODEX_|XDG_)/i.test(key))),
+  HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
+  CODEX_HOME: path.join(home, '.codex'), RUVNET_BRAIN_HOME: brain,
+  RUVNET_BRAIN_KB: path.join(brain, 'kb'), XDG_CONFIG_HOME: path.join(home, '.config'),
+  XDG_CACHE_HOME: path.join(home, '.cache'),
+});
 afterAll(() => cleanup.forEach((item) => fs.rmSync(item, { recursive: true, force: true })));
 
 function stagedPayload(home, host, version) {
@@ -101,10 +110,29 @@ describe('issue #64 — exact dual-host convergence', () => {
     stagedPayload(home, 'codex', OTHER);
     const result = spawnSync(process.execPath, [ENGINE, '--auto', '--expected-version', EXPECTED], {
       encoding: 'utf8',
-      env: { ...process.env, HOME: home, CODEX_HOME: path.join(home, '.codex'), RUVNET_BRAIN_HOME: brain },
+      env: isolatedEnv(home, brain),
     });
     expect(result.status).toBe(0);
     expect(JSON.parse(fs.readFileSync(path.join(brain, 'active.json'), 'utf8')).version).toBe(EXPECTED);
+  });
+
+  it('ignores an ambient Claude cache containing the otherwise missing requested version', () => {
+    const home = temporary('rvb-issue64-isolated-');
+    const owner = temporary('rvb-issue64-owner-');
+    const brain = temporary('rvb-issue64-brain-');
+    const foreignPayload = stagedPayload(owner, 'claude', EXPECTED);
+    stagedPayload(home, 'codex', OTHER);
+    const result = spawnSync(process.execPath, [ENGINE, '--auto', '--expected-version', EXPECTED], {
+      encoding: 'utf8', timeout: 30_000,
+      env: isolatedEnv(home, brain, { ...process.env, CLAUDE_CONFIG_DIR: path.join(owner, '.claude') }),
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.signal).toBeNull();
+    expect(result.status).toBe(1);
+    expect(result.stderr + result.stdout).toContain(`exactly matches expected version ${EXPECTED}`);
+    expect(fs.existsSync(path.join(brain, 'active.json'))).toBe(false);
+    expect(fs.readFileSync(path.join(foreignPayload, 'scripts', 'body.mjs'), 'utf8'))
+      .toBe(`export default ${JSON.stringify(EXPECTED)};\n`);
   });
 
   it('fails closed when the exact requested candidate is absent', () => {
@@ -113,41 +141,65 @@ describe('issue #64 — exact dual-host convergence', () => {
     stagedPayload(home, 'codex', OTHER);
     const result = spawnSync(process.execPath, [ENGINE, '--auto', '--expected-version', EXPECTED], {
       encoding: 'utf8',
-      env: { ...process.env, HOME: home, CODEX_HOME: path.join(home, '.codex'), RUVNET_BRAIN_HOME: brain },
+      env: isolatedEnv(home, brain),
     });
     expect(result.status).not.toBe(0);
     expect(result.stderr + result.stdout).toContain(`exactly matches expected version ${EXPECTED}`);
     expect(fs.existsSync(path.join(brain, 'active.json'))).toBe(false);
   });
 
-  it('emits host-aware restart guidance and preserves Codex hook trust review', () => {
-    const source = fs.readFileSync(SESSION, 'utf8');
-    expect(source).toContain("env.RUVNET_HOOK_HOST || 'claude'");
-    expect(source).toContain('already installed and verified for Codex');
-    expect(source).toContain('restart Codex');
-    expect(source).toContain('run /hooks and trust only ruvnet-brain@ruvnet-brain');
-    expect(source).toContain('already installed and verified for Claude Code');
-    expect(source).toContain('claude --continue');
-    expect(source).toContain('host-convergence.json');
-    expect(source).toContain('do not restart for this update yet');
+
+  // #420 item 4: --update moves only the user row; per-project rows must be reported with their own command, never edited.
+  it('reports a lagging per-project install with its exact command and leaves the registry and project untouched', () => {
+    const home = temporary('rvb-issue420-projects-');
+    const project = temporary('rvb-issue420-repo-');
+    const userPath = stagedPayload(home, 'claude', CURRENT);
+    const oldPath = stagedPayload(home, 'claude', OLD);
+    const gone = path.join(project, 'deleted-repo');
+    const registry = path.join(home, '.claude', 'plugins', 'installed_plugins.json');
+    fs.mkdirSync(path.dirname(registry), { recursive: true });
+    fs.writeFileSync(registry, JSON.stringify({ plugins: { 'ruvnet-brain@ruvnet-brain': [
+      { scope: 'user', version: CURRENT, installPath: userPath },
+      { scope: 'local', projectPath: project, version: 'stale-metadata', installPath: oldPath },
+      { scope: 'project', projectPath: gone, version: OLD, installPath: oldPath },
+    ] } }));
+    const before = fs.readFileSync(registry, 'utf8');
+    expect(claudePluginStatus({ home })).toMatchObject({ installed: true, version: CURRENT });
+    const rows = claudeProjectInstalls({ home, referenceVersion: CURRENT });
+    expect(rows).toEqual([
+      { scope: 'local', projectPath: project, version: OLD, exists: true, behind: true,
+        command: `cd '${project}' && claude plugin update ruvnet-brain@ruvnet-brain --scope local` },
+      { scope: 'project', projectPath: gone, version: OLD, exists: false, behind: false, command: null },
+    ]);
+    const line = projectInstallsCheck(rows, CURRENT);
+    expect(line).toMatchObject({ id: 'project-installs', state: 'warn', fix: rows[0].command });
+    expect(line.detail).toContain(`1 per-project Claude Code install(s) behind ${CURRENT}: ${project} (local, ${OLD})`);
+    expect(line.detail).toContain(`1 registered for a folder that no longer exists: ${gone} (project, ${OLD})`);
+    expect(fs.readFileSync(registry, 'utf8')).toBe(before);
+    expect(fs.readdirSync(project)).toEqual([]);
+    expect(fs.existsSync(gone)).toBe(false);
   });
 
-  it('does not launch the update heartbeat in the same SessionStart that seeds the Stable Spine', () => {
-    const source = fs.readFileSync(SESSION, 'utf8');
-    expect(source).toContain('let seedDispatched = false');
-    expect(source).toContain('seedDispatched = dispatchDetached');
-    expect(source).toContain('first-session-worker.mjs');
-    expect(source).toMatch(/if\s*\(seedDispatched\s*\|\|/);
+  it('is silent with no per-project rows and green when every project is current', () => {
+    const home = temporary('rvb-issue420-current-');
+    const project = temporary('rvb-issue420-repo-');
+    const installPath = stagedPayload(home, 'claude', CURRENT);
+    const registry = path.join(home, '.claude', 'plugins', 'installed_plugins.json');
+    fs.mkdirSync(path.dirname(registry), { recursive: true });
+    fs.writeFileSync(registry, JSON.stringify({ plugins: { 'ruvnet-brain@ruvnet-brain': [{ scope: 'user', installPath }] } }));
+    expect(projectInstallsCheck(claudeProjectInstalls({ home, referenceVersion: CURRENT }), CURRENT)).toBeNull();
+    fs.writeFileSync(registry, JSON.stringify({ plugins: { 'ruvnet-brain@ruvnet-brain': [
+      { scope: 'user', installPath }, { scope: 'local', projectPath: project, installPath },
+    ] } }));
+    expect(projectInstallsCheck(claudeProjectInstalls({ home, referenceVersion: CURRENT }), CURRENT))
+      .toMatchObject({ state: 'ok', fix: null, detail: `1 per-project Claude Code install(s) at ${CURRENT} or newer` });
+    expect(claudeProjectInstalls({ home: temporary('rvb-issue420-empty-'), referenceVersion: CURRENT })).toEqual([]);
   });
 
-  it('the installer binds host sync and Spine activation to one exact package version', () => {
-    const source = fs.readFileSync(path.join(ROOT, 'bin/install.mjs'), 'utf8');
-    expect(source).toContain('wirePlugin({ expectedVersion: PACKAGE_VERSION, requireManaged: true })');
-    expect(source).toContain("'--auto', '--expected-version', PACKAGE_VERSION");
-    expect(source).toContain('if (results.claude.host && !results.claude.wired)');
-    expect(source).toContain("['plugin', 'update', 'ruvnet-brain@ruvnet-brain', '--scope', 'user']");
-    expect(source).toContain("['plugin', 'marketplace', 'update', 'ruvnet-brain']");
-    expect(source).toContain('host-convergence.json');
-    expect(fs.readFileSync(path.join(ROOT, 'plugin/scripts/host-update.mjs'), 'utf8')).toContain("'--host-sync-only'");
+  it('wires the per-project report into --update and the --doctor verdict', () => {
+    const source = fs.readFileSync(path.join(ROOT, 'bin', 'install.mjs'), 'utf8');
+    expect(source).toContain('claudeProjectInstalls({ referenceVersion: installed.version }).filter((p) => p.behind)');
+    expect(source).toContain('projectInstallsCheck(claudeProjectInstalls({ referenceVersion: projectReference }), projectReference)');
+    expect(source).toContain('...(projectLine ? [projectLine] : []),');
   });
 });

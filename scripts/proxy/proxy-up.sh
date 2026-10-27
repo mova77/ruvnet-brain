@@ -6,6 +6,13 @@
 # It adds no logic of its own except the macOS workaround documented below.
 set -uo pipefail
 
+# Every `ruflo` invocation auto-starts a project background daemon unless this is set (verified
+# live: ~/.npm-global/lib/node_modules/ruflo/node_modules/@claude-flow/cli/dist/src/services/
+# daemon-autostart.js:85). Installing/starting the proxy has no business leaving a swarm daemon
+# running as a side effect.
+export RUFLO_DAEMON_AUTOSTART=0
+export CLAUDE_FLOW_AUTO_UPDATE=false
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 # --- macOS workaround: upstream bug in @claude-flow/security's PathValidator --

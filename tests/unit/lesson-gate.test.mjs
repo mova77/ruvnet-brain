@@ -27,6 +27,8 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const GATE = path.join(ROOT, 'scripts', 'lesson-gate.mjs');
 const DISPATCH = path.join(ROOT, 'plugin', 'scripts', 'lesson-hooks.sh');
+import { resolveBash } from '../../plugin/scripts/hook-shim-bash.mjs';
+const resolveBashForTest = () => resolveBash();
 
 let dir, storePath, optInPath, gateStatePath;
 
@@ -46,6 +48,15 @@ const blockLesson = (over = {}) => ({
   ...over,
 });
 
+/** A ratified SHIP lesson, advisory so it must be DELIVERED rather than refuse the push. */
+const shipLesson = () => blockLesson({
+  id: 'T02-version-is-the-update-signal',
+  statement: 'Any behaviour-changing push bumps the version IN THE SAME COMMIT.',
+  trigger: 'ship',
+  enforcement: 'checklist',
+  check: 'the version field moved in the same commit as the behaviour change',
+});
+
 function writeStore(lessons) {
   fs.writeFileSync(storePath, JSON.stringify({ version: 1, lessons }, null, 2));
 }
@@ -54,13 +65,22 @@ function writeOptIn(ids) {
 }
 
 /** Run the gate as a real process. Returns the full truth: code AND both streams, never one. */
-function runGate(args, env = {}) {
+function runGate(args, env = {}, cwd = undefined) {
   const r = spawnSync(process.execPath, [GATE, ...args], {
     encoding: 'utf8',
+    cwd,
     env: { ...process.env, RUVNET_LESSON_STORE: storePath, RUVNET_LESSON_OPTIN: optInPath,
       RUVNET_LESSON_GATE_STATE: gateStatePath, ...env },
   });
   return { code: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
+}
+
+/** Make a directory the gate's HERE-detection will resolve to `name`: it walks up from cwd looking
+ *  for a directory that directly contains `.git`, then takes that directory's basename. */
+function fakeProjectDir(root, name) {
+  const p = path.join(root, name);
+  fs.mkdirSync(path.join(p, '.git'), { recursive: true });
+  return p;
 }
 
 /** Run the dispatcher the way hooks.json runs it — bash, one event argument. */
@@ -81,7 +101,25 @@ beforeEach(() => {
 });
 afterEach(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ } });
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────────
+describe('canonical lesson runtime module boundaries', () => {
+  test('every self-contained plugin source stays below the repository 500-line ceiling', () => {
+    const files = [
+      'lesson-gate.mjs',
+      'lesson-command-scope.mjs',
+      'lesson-presentation.mjs',
+      'lesson-store.mjs',
+      'lesson-bridge.mjs',
+      'decision-gate.mjs',
+      'decision-outcomes.mjs',
+    ];
+    for (const file of files) {
+      const source = fs.readFileSync(path.join(ROOT, 'plugin', 'scripts', file), 'utf8');
+      expect(source.split('\n').length, `${file} must remain under 500 lines`).toBeLessThan(500);
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────
 describe('a NUDGE informs and never refuses', () => {
   test('exits 0 — the action is allowed', () => {
     writeStore([blockLesson()]);
@@ -105,6 +143,36 @@ describe('a NUDGE informs and never refuses', () => {
     writeStore([blockLesson()]);
     const { stdout } = runGate(['--event', 'Stop', '--trigger', 'claim-done']);
     expect(JSON.parse(stdout).hookSpecificOutput.additionalContext).toMatch(/advisory/i);
+  });
+
+  test('applies an actionable correction instead of replacing the requested action with help discovery', () => {
+    writeStore([blockLesson({
+      id: 'T02-apply-known-command-form',
+      statement: 'Pass a memory-search query with the required query flag, not as a positional phrase.',
+      trigger: 'assert-fact',
+      enforcement: 'checklist',
+      check: 'the requested memory search runs with its query flag',
+    })]);
+    const { stdout } = runGate(['--event', 'UserPromptSubmit', '--trigger', 'assert-fact']);
+    const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+    expect(ctx).toMatch(/apply .*correction directly to the .*requested action/i);
+    expect(ctx).toMatch(/do not replace .*requested action with .*help.*discovery/i);
+  });
+
+  test('an exact corrective Ruflo command reaches the hook boundary as the first-and-only action', () => {
+    const exact = 'ruflo memory search -q "caching strategy" --path .swarm/memory.db';
+    writeStore([blockLesson({
+      id: 'T02-run-exact-ruflo-command',
+      statement: `Run ${exact}.`,
+      trigger: 'assert-fact',
+      enforcement: 'checklist',
+      check: 'the exact memory search runs without discovery calls',
+    })]);
+    const { stdout } = runGate(['--event', 'UserPromptSubmit', '--trigger', 'assert-fact']);
+    const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+    expect(ctx).toContain(exact);
+    expect(ctx).toMatch(/FIRST and ONLY Ruflo invocation/);
+    expect(ctx).toMatch(/must not prefix .*--help.*--version.*status/i);
   });
 
   test('truncates long evidence at a WORD boundary, never mid-word', () => {
@@ -157,7 +225,7 @@ describe('a NUDGE informs and never refuses', () => {
   });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────────────────
 describe('CONSENT: a ratified block lesson is a nudge until the user says otherwise', () => {
   test('a ratified enforcement:block lesson does NOT block without opt-in', () => {
     // The reframe, in one assertion. The owner: "Nudging somebody is very fair. Forcing them through
@@ -216,7 +284,7 @@ describe('CONSENT: a ratified block lesson is a nudge until the user says otherw
   });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────────────────
 describe('an opted-in BLOCK actually refuses', () => {
   beforeEach(() => { writeStore([blockLesson()]); writeOptIn(['T01-verify-with-a-capable-channel']); });
 
@@ -237,7 +305,7 @@ describe('an opted-in BLOCK actually refuses', () => {
   });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────────────────
 describe('the dispatcher propagates faithfully in BOTH directions', () => {
   test('propagates a block: exit 2 with the reason on stderr', () => {
     // `|| true` plus `exit 0` used to erase this. The dispatcher printed the word BLOCKED and
@@ -285,7 +353,7 @@ describe('the dispatcher propagates faithfully in BOTH directions', () => {
   });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────────────────
 describe('FAILS OPEN on malfunction — but never on a decision', () => {
   test('a corrupt store allows the action', () => {
     fs.writeFileSync(storePath, '{ not json at all');
@@ -314,8 +382,8 @@ describe('FAILS OPEN on malfunction — but never on a decision', () => {
   });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────────
-// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────────────────
 describe('mutate-machine: narrowed to commands that PLAUSIBLY mutate outside this repo', () => {
   /**
    * WHY THIS DESCRIBE BLOCK EXISTS. An independent grader reading real session transcripts (2026-07-
@@ -431,7 +499,74 @@ describe('mutate-machine: narrowed to commands that PLAUSIBLY mutate outside thi
   });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────────────────
+describe('PROJECT SCOPE: isHome() must not leak across unrelated projects that merely share a suffix', () => {
+  /**
+   * WHY THIS DESCRIBE BLOCK EXISTS. isHome()'s fallback match — `HERE.endsWith(n) || n.endsWith(HERE)`
+   * — was added to tolerate a `Code-` prefix (already stripped one line above) and directory-naming
+   * variations. It was never given a boundary check, so it also matches any project name that happens
+   * to be a plain suffix of another, unrelated one: a lesson scoped to project "Sentry" fires inside
+   * "WhitSentry" for no reason but four shared trailing letters. This is exactly the class of bug the
+   * 2026-07-22 project-scope fix (this same file, `isHome`'s own header comment) was written to close
+   * — "I've got other repos that are using this thing, and they're breaking" — reintroduced by the
+   * escape hatch meant to make that fix tolerant of naming variance.
+   */
+  const sentryLesson = () => blockLesson({
+    id: 'T09-unrelated-sentry-lesson',
+    trigger: 'write-code',
+    enforcement: 'inject',
+    check: null,
+    status: 'ratified',
+    origin: 'model-inferred',
+    statement: 'This lesson belongs to a project named "Sentry" and nothing else.',
+    projects: ['Sentry'],
+  });
+
+  function classifyIn(cwd) {
+    const { stdout, code } = runGate(['--trigger', 'write-code', '--json'], {}, cwd);
+    expect(code).toBe(0);
+    return JSON.parse(stdout);
+  }
+
+  describe('TEETH: the pre-fix matcher leaked on a bare suffix — this assertion is the guard', () => {
+    test('project "Sentry" must NOT fire inside an unrelated project "WhitSentry"', () => {
+      writeStore([sentryLesson()]);
+      const home = fakeProjectDir(dir, 'WhitSentry');
+      expect(classifyIn(home).inForce.map((l) => l.id)).not.toContain('T09-unrelated-sentry-lesson');
+    });
+  });
+
+  describe('the fix must not silence the legitimate case it was added for', () => {
+    test('a lesson scoped to "brain" still fires inside "ruvnet-brain" — a delimiter-bounded suffix', () => {
+      writeStore([{ ...sentryLesson(), id: 'T10-brain-lesson', projects: ['brain'] }]);
+      const home = fakeProjectDir(dir, 'ruvnet-brain');
+      expect(classifyIn(home).inForce.map((l) => l.id)).toContain('T10-brain-lesson');
+    });
+
+    test('an EXACT project match always fires, regardless of the boundary rule', () => {
+      writeStore([{ ...sentryLesson(), id: 'T11-exact', projects: ['WhitSentry'] }]);
+      const home = fakeProjectDir(dir, 'WhitSentry');
+      expect(classifyIn(home).inForce.map((l) => l.id)).toContain('T11-exact');
+    });
+  });
+
+  test('foreign high-ranked lessons cannot crowd out the applicable project lesson', () => {
+    writeStore([
+      ...['one', 'two', 'three'].map((name) => ({ ...sentryLesson(), id: `foreign-${name}`, projects: [name], repeatCount: 99 })),
+      { ...sentryLesson(), id: 'applicable', projects: ['WhitSentry'], repeatCount: 1 },
+    ]);
+    const home = fakeProjectDir(dir, 'WhitSentry');
+    expect(classifyIn(home).inForce.map((l) => l.id)).toContain('applicable');
+  });
+
+  test('an unrelated project with NO suffix relationship at all stays silent (sanity check)', () => {
+    writeStore([sentryLesson()]);
+    const home = fakeProjectDir(dir, 'totally-different-project');
+    expect(classifyIn(home).inForce.map((l) => l.id)).not.toContain('T09-unrelated-sentry-lesson');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────
 describe('CLI mode stays backward compatible', () => {
   test('plain text on stdout, because version-bump-gate.sh embeds it verbatim', () => {
     // plugin/scripts/version-bump-gate.sh:78 captures this stdout and appends it under
@@ -460,7 +595,7 @@ describe('CLI mode stays backward compatible', () => {
   });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────────────────
 describe('PER-SESSION FREQUENCY CAP: a reminder stops repeating; a refusal never does', () => {
   /** A pure-advisory (cappable) lesson — enforcement:checklist, like the T03/T05/T06 fixtures above.
    *  Neither block nor block-capable, so the frequency cap governs it. Carries a unique marker so the
@@ -481,7 +616,7 @@ describe('PER-SESSION FREQUENCY CAP: a reminder stops repeating; a refusal never
     // the block would be suppressed after MAX_SHOWS and this loop's later iterations would exit 0.
     writeStore([blockLesson()]);                             // enforcement:block, user-stated, ratified
     writeOptIn(['T01-verify-with-a-capable-channel']);       // opted in → it actually refuses
-    for (let i = 0; i < 6; i += 1) {                          // 6 >> MAX_SHOWS (default 3)
+    for (let i = 0; i < 6; i += 1) {                          // 6 >> MAX_SHOWS
       const r = runGate(['--event', 'PreToolUse', '--trigger', 'claim-done', '--session', 'blk'],
         { RUVNET_LESSON_MAX_SHOWS: '2' });
       expect(r.code).toBe(2);                                // refuses, every single time
@@ -516,6 +651,18 @@ describe('PER-SESSION FREQUENCY CAP: a reminder stops repeating; a refusal never
     expect(ctxOf(fireAdvisory('s', env))).not.toContain('ADVMARKA'); // stays silent
   });
 
+  test('identical advisory is emitted once by default across consecutive writes in one session', () => {
+    writeStore([advisory('DEFAULT')]);
+    const first = fireAdvisory('same-session');
+    expect(first.code).toBe(0);
+    expect(ctxOf(first)).toContain('ADVMARKDEFAULT');
+    for (let i = 0; i < 3; i += 1) {
+      const repeated = fireAdvisory('same-session');
+      expect(repeated.code).toBe(0);
+      expect(ctxOf(repeated)).not.toContain('ADVMARKDEFAULT');
+    }
+  });
+
   test('the cap is PER-SESSION — a different session_id starts fresh', () => {
     writeStore([advisory('B')]);
     const env = { RUVNET_LESSON_MAX_SHOWS: '1' };
@@ -545,4 +692,196 @@ describe('PER-SESSION FREQUENCY CAP: a reminder stops repeating; a refusal never
       expect(r.stdout).toContain('ADVMARKD');
     }
   });
+
+  test('an advisory trimmed into the COMPACT overflow list is still capped by MAX_SHOWS', () => {
+    // Two concurrent decision points (a real event carries several) mean lesson-presentation.mjs
+    // seeds one lesson per trigger, then the nudge-budget loop admits the first into `inForce`
+    // unconditionally and pushes the rest into `compactExtras` ("Also live at this moment") once the
+    // budget is spent. lesson-gate.mjs's frequency-cap persist loop only walks `inForce` — a lesson
+    // that always lands in `compactExtras` (e.g. because an opted-in BLOCK lesson — cap-exempt by
+    // design, so it never stops out-competing it for budget — always wins the tiny budget) is shown,
+    // in compact form, on EVERY qualifying event and never once counted, so it nags forever regardless
+    // of RUVNET_LESSON_MAX_SHOWS. That is exactly the unbounded-nag failure mode the cap exists to
+    // prevent (see the file's own "PER-SESSION FREQUENCY CAP" comment above). The winner is an
+    // opted-in BLOCK (not just a high-repeatCount advisory) so it stays undefeated across many calls —
+    // an advisory winner would itself hit the cap and stop competing, letting `overflow` win the
+    // freed-up budget and masking the bug behind an unrelated one.
+    const winner = blockLesson();                              // enforcement:block, cap-exempt once opted in
+    writeOptIn([winner.id]);
+    const overflow = blockLesson({
+      id: 'OVF-always-trimmed-to-compact', trigger: 'report-status', enforcement: 'checklist', check: null,
+      statement: 'State progress only from a channel capable of observing it, COMPACTMARK.',
+      repeatCount: 1,
+    });
+    writeStore([winner, overflow]);
+    // A budget that fits `winner` alone but nothing more — the first candidate is admitted
+    // unconditionally, so `overflow` is guaranteed to be trimmed into compactExtras every time.
+    // `winner` blocks (exit 2, reason on stderr), and the block's own rendered body carries the same
+    // compact section — so stderr is where to look, same content, different stream.
+    const env = { RUVNET_LESSON_MAX_SHOWS: '2', RUVNET_NUDGE_BUDGET: '1' };
+    const fire = (sid) => runGate(
+      ['--event', 'PreToolUse', '--trigger', 'claim-done', '--trigger', 'report-status', '--session', sid],
+      env,
+    );
+    const r1 = fire('ovf'); expect(r1.code).toBe(2); expect(r1.stderr).toContain('COMPACTMARK'); // 1 of 2
+    const r2 = fire('ovf'); expect(r2.code).toBe(2); expect(r2.stderr).toContain('COMPACTMARK'); // 2 of 2
+    const r3 = fire('ovf'); expect(r3.code).toBe(2);
+    expect(r3.stderr).not.toContain('COMPACTMARK'); // capped — the nag stops, same as any advisory
+  });
+});
+
+/**
+ * THE `ship` TRIGGER FIRES ON A REAL `git push` — because for months it fired on nothing.
+ *
+ * Measured 2026-08-13. `lesson-hooks.sh` carried `PreToolUse-push) TRIGGERS="ship"`, and NOTHING
+ * ever sends that token: hooks.json emits only `unprompted-speech UserPromptSubmit`, and
+ * decision-gate.mjs maps every PreToolUse to exactly `PreToolUse-bash` or `PreToolUse-write`. So
+ * `git push` always arrived as `mutate-machine`, and FIVE ratified ship lessons in the live store
+ * had never fired once — including `G-remote-ci-gates-shipping` and
+ * `G-test-the-artifact-not-the-checkout`, the two that would have spoken up before I shipped a test
+ * that broke windows-unit and red-lit a dependabot PR that had nothing to do with it.
+ *
+ * The audit missed it for the same reason it existed: wired-check's Check C greps this file's own
+ * case labels to decide what is wired, so it read "ship" off the dead branch and stayed green — an
+ * audit that could not fail on the exact class it was built for. A case label nobody sends is not a
+ * wire; the DISPATCHER is the truth-maker for what fires.
+ */
+describe('ship lessons reach a real push', () => {
+  const bash = resolveBashForTest();
+  const gated = bash ? test : test.skip;
+
+  // A ship lesson's own words — asserted on the STATEMENT rather than an id, because the id never
+  // appears in what actually reaches the model.
+  const SHIP_TEXT = /bumps the version IN THE SAME COMMIT/;
+
+  /**
+   * SEED THE STORE. THIS TEST USED TO MEASURE THE DEVELOPER'S MACHINE.
+   *
+   * `fireBash` passed no `RUVNET_LESSON_STORE`, unlike its sibling `runDispatch` twenty lines up, so
+   * the dispatcher read the REAL `~/.config/ruvnet-brain/lessons.json`. That file is user-accumulated
+   * — `bin/install.mjs` deliberately never creates it — so it exists on the machine where this test
+   * was written and on no fresh host. Green here, red on every clean runner.
+   *
+   * windows-unit proved it: the diagnostic added the same day reported `exit: 0, stderr: "",
+   * stdout: ""` — the dispatcher ran fine and had nothing to say, because there were no lessons to
+   * say it with. Not a crash, an empty store.
+   *
+   * This is the same shape as the both-hosts conformance gap: a test that runs where it was written
+   * proves the machine, not the product. Seeding a ratified ship lesson tests what this file claims
+   * to test — that a `git push` PULLS ship lessons through the dispatcher — on any host.
+   */
+  const fireBash = (command) => {
+    writeStore([shipLesson()]);
+    return spawnSync(bash, [DISPATCH, 'PreToolUse-bash'], {
+      encoding: 'utf8',
+      timeout: 30_000,
+      env: {
+        ...process.env,
+        RUVNET_LESSON_STORE: storePath,
+        RUVNET_LESSON_OPTIN: optInPath,
+        RUVNET_LESSON_GATE_STATE: gateStatePath,
+      },
+      input: JSON.stringify({ session_id: `ship-${Math.random().toString(16).slice(2)}`, tool_name: 'Bash', tool_input: { command } }),
+    });
+  };
+
+  /**
+   * A FAILING ASSERTION MUST NAME ITS CAUSE, NOT JUST SAY `false`.
+   *
+   * These two were red on windows-unit and the CI log carried only "expected false to be true" —
+   * no stderr, no exit code, no stdout. Undiagnosable from the log, on a host nobody can reproduce
+   * locally, which is how they stayed red. That is the same defect that cost eleven days this week
+   * one layer up: `INVALID_LINEAGE` named neither of the two states it covered, and the moment the
+   * seal was made to name the dirty path, the cause was obvious in one run.
+   */
+  const shipDiagnostic = (command, r) => [
+    `\`${command}\` delivered no ship lesson.`,
+    `  exit   : ${r.status}${r.signal ? ` (signal ${r.signal})` : ''}`,
+    r.error ? `  spawn  : ${r.error.message}` : '',
+    `  stderr : ${JSON.stringify(String(r.stderr || '').slice(0, 400))}`,
+    `  stdout : ${JSON.stringify(String(r.stdout || '').slice(0, 400))}`,
+  ].filter(Boolean).join('\n');
+
+  gated('TEETH: `git push` delivers ship lessons — the case that fired on nothing for months', () => {
+    const r = fireBash('git push origin main');
+    expect(SHIP_TEXT.test(r.stdout || ''), shipDiagnostic('git push origin main', r)).toBe(true);
+  }, 40_000);
+
+  gated('npm publish counts as shipping too', () => {
+    const r = fireBash('npm publish');
+    expect(SHIP_TEXT.test(r.stdout || ''), shipDiagnostic('npm publish', r)).toBe(true);
+  }, 40_000);
+
+  gated('TEETH: an ordinary command does NOT — or the fix is just a new nag', () => {
+    // Without this, "always request ship" would pass the case above while making every `ls` noisy.
+    // The mutate-machine false-positive nag is a defect this dispatcher already paid for once.
+    for (const cmd of ['ls -la', 'git status', 'grep -r foo .']) {
+      expect(SHIP_TEXT.test(fireBash(cmd).stdout || ''), `${cmd} must not pull ship lessons`).toBe(false);
+    }
+  }, 60_000);
+});
+
+/**
+ * ONE DEFINITION OF "IS THIS A SHIP?", NOT TWO.
+ *
+ * `degradation-watch.mjs` (DEPENDENT_COMMANDS) and `lesson-hooks.sh` each decide whether a command
+ * ships. They were written hours apart on 2026-08-13 and, as two independent adversarial audits both
+ * noted, SHIPPED ALREADY DISAGREEING — `gh release` was in one and not the other. One fact restated
+ * in two files, drifted on day one: the exact defect that produced `orgTotalApprox: 248` in two
+ * producers and seven store-root expressions across 29 call sites.
+ *
+ * They cannot share code across the JS/bash boundary, so the parity is asserted instead — including
+ * both directions the original globs got wrong: `git -C <abs> push` (the form an agent with absolute
+ * paths writes, and which this environment's instructions mandate) matched NOTHING, while
+ * `grep -n "npm publish" docs/…` matched, so reading ABOUT shipping counted as shipping.
+ */
+describe('the two ship definitions agree', () => {
+  const bash2 = resolveBashForTest();
+  const gated2 = bash2 ? test : test.skip;
+  const SHIP_TEXT2 = /bumps the version IN THE SAME COMMIT/;
+  // Seeded for the same reason `fireBash` is: reading the real ~/.config store made this assert the
+  // developer's machine. windows-unit was red here with an EMPTY store, so `git push` — a genuine
+  // ship — came back false, and the two definitions "disagreed" when only one of them had any data.
+  const viaBash = (command) => {
+    writeStore([shipLesson()]);
+    return SHIP_TEXT2.test(spawnSync(bash2, [DISPATCH, 'PreToolUse-bash'], {
+      encoding: 'utf8', timeout: 30_000,
+      env: {
+        ...process.env,
+        RUVNET_LESSON_STORE: storePath,
+        RUVNET_LESSON_OPTIN: optInPath,
+        RUVNET_LESSON_GATE_STATE: gateStatePath,
+      },
+      input: JSON.stringify({ session_id: `par-${Math.random().toString(16).slice(2)}`, tool_name: 'Bash', tool_input: { command } }),
+    }).stdout || '');
+  };
+
+  gated2('TEETH: both agree on every case the audits raised, in both directions', async () => {
+    const { dependentEvent } = await import('../../plugin/scripts/degradation-watch.mjs');
+    const cases = [
+      ['git push origin main', true],
+      ['git -C /abs/path push', true],          // matched NOTHING before
+      ['npm publish', true],
+      ['gh release create v1.0.0', true],
+      ['grep -n "npm publish" docs/adr/0050.md', false],  // matched BEFORE — reading ≠ shipping
+      ['git commit -m "ready to git push"', false],
+      ['ls -la', false],
+      ['git status', false],
+      // 2026-08-27: irregular whitespace — templated/wrapped commands a real agent can emit.
+      // The JS side already tolerates it (`\s+`); the bash side required a literal single space,
+      // so this whole matrix passed 6/8 while missing the exact shape that would actually drift.
+      ['npm  publish', true],
+      ['npm\tpublish', true],
+      ['yarn\npublish', true],
+      ['gh  release   create v1.0.0', true],
+      // TEETH (adversarial-critic-caught regression in this same diff's first cut): a quoted
+      // string that legitimately SPANS a real newline — a multi-line commit message — must still
+      // be stripped before matching, not leak "npm"/"publish" into CMD_EXEC as unquoted text.
+      ['git commit -m "release notes\nnpm\npublish is unaffected by this change"', false],
+    ];
+    for (const [cmd, wantShip] of cases) {
+      expect(dependentEvent(cmd) === 'ship', `degradation-watch: ${cmd}`).toBe(wantShip);
+      expect(viaBash(cmd), `lesson-hooks.sh: ${cmd}`).toBe(wantShip);
+    }
+  }, 120_000);
 });

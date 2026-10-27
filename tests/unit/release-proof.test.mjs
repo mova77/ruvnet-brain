@@ -3,15 +3,36 @@ import { createRequire } from 'node:module';
 import {
   REQUIRED_CHECKS,
   evaluateCandidateReceipt,
+  evaluateStabilizationCandidateReceipt,
   evaluateLivePreflight,
   evaluatePublicationReceipt,
-  latestRunsByWorkflow,
+  resolveRequiredChecks,
 } from '../../scripts/release-proof.mjs';
 
 const require = createRequire(import.meta.url);
 const VERSION = require('../../package.json').version;
 const SHA = 'a'.repeat(40);
 const DIGEST = `sha256:${'b'.repeat(64)}`;
+
+function stabilizationCandidate(overrides = {}) {
+  return {
+    schemaVersion: 1,
+    phase: 'stabilization-candidate',
+    mode: 'stabilization',
+    targetScore: 95,
+    scoreClaimed: false,
+    sha: SHA,
+    tree: 'c'.repeat(40),
+    dirty: false,
+    version: VERSION,
+    tag: `v${VERSION}`,
+    sourceVersions: { package: VERSION, claudePlugin: VERSION, codexPlugin: VERSION },
+    artifact: { path: 'release-evidence/ruvnet-brain.tgz', sha256: DIGEST.slice(7), sourceSha: SHA, version: VERSION },
+    security: { status: 'PASS', critical: 0, high: 0 },
+    qe: { status: 'PASS', total: 34, passed: 34, failed: 0, skipped: 0 },
+    ...overrides,
+  };
+}
 
 function greenCandidate(overrides = {}) {
   return {
@@ -20,7 +41,20 @@ function greenCandidate(overrides = {}) {
     sha: SHA,
     tree: 'c'.repeat(40),
     dirty: false,
-    artifact: { path: '/tmp/ruvnet-brain.tgz', sha256: DIGEST.slice(7), sourceSha: SHA },
+    version: VERSION,
+    tag: `v${VERSION}`,
+    sourceVersions: {
+      package: VERSION,
+      claudePlugin: VERSION,
+      codexPlugin: VERSION,
+    },
+    artifact: {
+      path: '/tmp/ruvnet-brain.tgz',
+      sha256: DIGEST.slice(7),
+      sourceSha: SHA,
+      version: VERSION,
+      bundle: { brainVersion: VERSION, releaseTag: `v${VERSION}` },
+    },
     releaseVector: { verdict: 'PASS', sha: SHA, unknown: 0, skipped: 0 },
     tests: { total: 2800, passed: 2800, failed: 0, skipped: 0, todo: 0 },
     coverage: { status: 'PASS', lines: 85, requiredLines: 80 },
@@ -31,8 +65,8 @@ function greenCandidate(overrides = {}) {
       checks: REQUIRED_CHECKS.map((name) => ({ name, status: 'completed', conclusion: 'success' })),
     },
     hosts: {
-      claude: { status: 'PASS', version: `${VERSION}-candidate`, artifactSha256: DIGEST.slice(7) },
-      codex: { status: 'PASS', version: `${VERSION}-candidate`, artifactSha256: DIGEST.slice(7) },
+      claude: { status: 'PASS', version: VERSION, artifactSha256: DIGEST.slice(7) },
+      codex: { status: 'PASS', version: VERSION, artifactSha256: DIGEST.slice(7) },
     },
     brain: {
       status: 'PASS',
@@ -93,21 +127,61 @@ describe('release-proof candidate authority', () => {
     expect(codes).toContain('GRADER_BINDING_MISMATCH');
     expect(codes).toContain('HOST_ARTIFACT_MISMATCH');
   });
+
+  it.each([
+    ['candidate tag', (receipt) => { receipt.tag = `v${VERSION}-split`; }],
+    ['npm package source', (receipt) => { receipt.sourceVersions.package = `${VERSION}-split`; }],
+    ['Claude plugin source', (receipt) => { receipt.sourceVersions.claudePlugin = `${VERSION}-split`; }],
+    ['Codex plugin source', (receipt) => { receipt.sourceVersions.codexPlugin = `${VERSION}-split`; }],
+    ['packed npm artifact', (receipt) => { receipt.artifact.version = `${VERSION}-split`; }],
+    ['bundle brainVersion', (receipt) => { receipt.artifact.bundle.brainVersion = `${VERSION}-split`; }],
+    ['bundle releaseTag', (receipt) => { receipt.artifact.bundle.releaseTag = `v${VERSION}-split`; }],
+    ['installed Claude host', (receipt) => { receipt.hosts.claude.version = `${VERSION}-split`; }],
+    ['installed Codex host', (receipt) => { receipt.hosts.codex.version = `${VERSION}-split`; }],
+  ])('rejects a split version identity at %s', (_name, mutate) => {
+    const receipt = greenCandidate();
+    mutate(receipt);
+    expect(evaluateCandidateReceipt(receipt).failures.map((failure) => failure.code))
+      .toContain('VERSION_IDENTITY_MISMATCH');
+  });
+});
+
+describe('release-proof stabilization authority', () => {
+  it('accepts a transparent stabilization receipt without claiming 95', () => {
+    expect(evaluateStabilizationCandidateReceipt(stabilizationCandidate())).toMatchObject({ verdict: 'PASS', failures: [] });
+    expect(evaluateCandidateReceipt(stabilizationCandidate()).verdict).toBe('PASS');
+  });
+
+  it.each([
+    ['fake 95 claim', { scoreClaimed: true }, 'STABILIZATION_SCORE_MISREPRESENTED'],
+    ['missing score declaration', { scoreClaimed: undefined }, 'STABILIZATION_SCORE_MISREPRESENTED'],
+    ['red QE', { qe: { status: 'FAIL', total: 34, passed: 33, failed: 1, skipped: 0 } }, 'QE_NOT_PASS'],
+    ['inconsistent QE total', { qe: { status: 'PASS', total: 34, passed: 33, failed: 0, skipped: 0 } }, 'QE_NOT_PASS'],
+    ['red security', { security: { status: 'FAIL', critical: 0, high: 1 } }, 'SECURITY_NOT_PASS'],
+  ])('fails closed on %s', (_name, override, code) => {
+    expect(evaluateStabilizationCandidateReceipt(stabilizationCandidate(override)).failures.map((item) => item.code)).toContain(code);
+  });
+
 });
 
 describe('release-proof publication authority', () => {
   it('requires public bytes, installed hosts, active self-RVF, and post-publication checks to match the seal', () => {
     const candidate = greenCandidate();
     const publication = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       phase: 'publication',
       sha: SHA,
       artifactSha256: DIGEST.slice(7),
+      payloadId: 'e'.repeat(64),
+      bundleArtifactSha256: 'f'.repeat(64),
+      version: VERSION,
       npm: { version: VERSION, sha: SHA, artifactSha256: DIGEST.slice(7) },
       githubRelease: { tag: `v${VERSION}`, sha: SHA, artifactSha256: DIGEST.slice(7) },
+      bundle: { brainVersion: VERSION, releaseTag: `v${VERSION}` },
       installed: {
-        claude: { version: VERSION, artifactSha256: DIGEST.slice(7), status: 'PASS' },
-        codex: { version: VERSION, artifactSha256: DIGEST.slice(7), status: 'PASS' },
+        claudeOnly: { version: VERSION, artifactSha256: DIGEST.slice(7), status: 'PASS', doctorExit: 0, functionalSearch: true, searchMs: 100 },
+        codexOnly: { version: VERSION, artifactSha256: DIGEST.slice(7), status: 'PASS', doctorExit: 0, functionalSearch: true, searchMs: 100 },
+        dual: { version: VERSION, artifactSha256: DIGEST.slice(7), status: 'PASS', doctorExit: 0, functionalSearch: true, searchMs: 100 },
       },
       brain: { status: 'PASS', selfStore: true, broadMs: 4000, deadlineMs: 30_000 },
       postPublicationChecks: [
@@ -116,31 +190,77 @@ describe('release-proof publication authority', () => {
     };
     expect(evaluatePublicationReceipt(candidate, publication).verdict).toBe('PASS');
 
+    const slower = structuredClone(publication);
+    slower.installed.claudeOnly.searchMs = 25_000;
+    slower.brain.broadMs = 25_000;
+    expect(evaluatePublicationReceipt(candidate, slower).verdict).toBe('FAIL');
+    slower.acceptancePolicy = 'stabilization-public-deadline-v1';
+    expect(evaluatePublicationReceipt(candidate, slower).verdict).toBe('PASS');
+    for (const bad of [30_001, NaN, Infinity, -1, undefined, '25000']) {
+      const invalid = structuredClone(slower);
+      invalid.installed.claudeOnly.searchMs = bad;
+      expect(evaluatePublicationReceipt(candidate, invalid).verdict).toBe('FAIL');
+      invalid.installed.claudeOnly.searchMs = 25_000;
+      invalid.brain.broadMs = bad;
+      expect(evaluatePublicationReceipt(candidate, invalid).verdict).toBe('FAIL');
+    }
+    slower.brain.deadlineMs = 40_000;
+    expect(evaluatePublicationReceipt(candidate, slower).verdict).toBe('FAIL');
+    slower.brain.deadlineMs = 30_000;
+    slower.acceptancePolicy = 'invented-policy';
+    expect(evaluatePublicationReceipt(candidate, slower).verdict).toBe('FAIL');
+
     publication.npm.artifactSha256 = 'f'.repeat(64);
     expect(evaluatePublicationReceipt(candidate, publication).failures.map((f) => f.code))
       .toContain('PUBLIC_ARTIFACT_MISMATCH');
   });
+
+  it.each([
+    ['publication version', (receipt) => { receipt.version = `${VERSION}-split`; }],
+    ['npm version', (receipt) => { receipt.npm.version = `${VERSION}-split`; }],
+    ['GitHub tag', (receipt) => { receipt.githubRelease.tag = `v${VERSION}-split`; }],
+    ['bundle brainVersion', (receipt) => { receipt.bundle.brainVersion = `${VERSION}-split`; }],
+    ['bundle releaseTag', (receipt) => { receipt.bundle.releaseTag = `v${VERSION}-split`; }],
+    ['Claude-only installed version', (receipt) => { receipt.installed.claudeOnly.version = `${VERSION}-split`; }],
+    ['Codex-only installed version', (receipt) => { receipt.installed.codexOnly.version = `${VERSION}-split`; }],
+    ['dual installed version', (receipt) => { receipt.installed.dual.version = `${VERSION}-split`; }],
+  ])('rejects public split identity at %s', (_name, mutate) => {
+    const candidate = greenCandidate();
+    const publication = {
+      schemaVersion: 2,
+      phase: 'publication',
+      sha: SHA,
+      artifactSha256: DIGEST.slice(7),
+      payloadId: 'e'.repeat(64),
+      bundleArtifactSha256: 'f'.repeat(64),
+      version: VERSION,
+      npm: { version: VERSION, sha: SHA, artifactSha256: DIGEST.slice(7) },
+      githubRelease: { tag: `v${VERSION}`, sha: SHA, artifactSha256: DIGEST.slice(7) },
+      bundle: { brainVersion: VERSION, releaseTag: `v${VERSION}` },
+      installed: {
+        claudeOnly: { version: VERSION, artifactSha256: DIGEST.slice(7), status: 'PASS', doctorExit: 0, functionalSearch: true, searchMs: 100 },
+        codexOnly: { version: VERSION, artifactSha256: DIGEST.slice(7), status: 'PASS', doctorExit: 0, functionalSearch: true, searchMs: 100 },
+        dual: { version: VERSION, artifactSha256: DIGEST.slice(7), status: 'PASS', doctorExit: 0, functionalSearch: true, searchMs: 100 },
+      },
+      brain: { status: 'PASS', selfStore: true, broadMs: 4000, deadlineMs: 30_000 },
+      postPublicationChecks: [
+        { name: 'published-surface-probe', status: 'completed', conclusion: 'success', sha: SHA },
+      ],
+    };
+    mutate(publication);
+    expect(evaluatePublicationReceipt(candidate, publication).failures.map((failure) => failure.code))
+      .toContain('PUBLIC_VERSION_IDENTITY_MISMATCH');
+  });
 });
 
 describe('release-proof live preflight', () => {
-  it('uses only the newest exact-SHA result per workflow', () => {
-    expect(latestRunsByWorkflow([
-      { workflowName: 'ci', databaseId: 2, conclusion: 'success' },
-      { workflowName: 'ci', databaseId: 1, conclusion: 'failure' },
-      { workflowName: 'ux-qe', databaseId: 3, conclusion: 'failure' },
-    ])).toEqual([
-      { workflowName: 'ci', databaseId: 2, conclusion: 'success' },
-      { workflowName: 'ux-qe', databaseId: 3, conclusion: 'failure' },
-    ]);
-  });
-
   it('shows the current class of bypass and delivery blockers instead of claiming readiness', () => {
     const result = evaluateLivePreflight({
       localSha: SHA,
       remoteSha: 'd'.repeat(40),
       dirty: true,
-      openIssues: [{ number: 54 }],
-      failedRuns: [{ workflowName: 'ci', conclusion: 'failure' }],
+      releaseBlockers: [{ number: 54 }],
+      requiredChecks: [{ context: 'integration', status: 'FAIL' }],
       activeSelfStore: false,
       branchEnforceAdmins: false,
       productionProtected: false,
@@ -150,12 +270,74 @@ describe('release-proof live preflight', () => {
     expect(result.failures.map((failure) => failure.code)).toEqual(expect.arrayContaining([
       'DIRTY_WORKTREE',
       'REMOTE_SHA_MISMATCH',
-      'OPEN_ISSUES',
-      'GITHUB_FAILURES',
+      'RELEASE_BLOCKERS_OPEN',
+      'REQUIRED_CHECK_NOT_GREEN',
       'BRAIN_SELF_STORE_MISSING',
       'ADMIN_BYPASS_ENABLED',
       'PRODUCTION_ENV_UNPROTECTED',
       'RELEASE_VECTOR_NOT_PASS',
     ]));
+  });
+
+  it('marks intentionally skipped vector evidence incomplete, never as a product failure or release pass', () => {
+    const result = evaluateLivePreflight({
+      localSha: SHA,
+      remoteSha: SHA,
+      dirty: false,
+      releaseBlockers: [],
+      requiredChecks: [{ context: 'integration', status: 'PASS' }, { context: 'canonical-qa', status: 'PASS' }],
+      activeSelfStore: true,
+      branchEnforceAdmins: true,
+      productionProtected: true,
+      releaseVector: 'NOT_EVALUATED',
+    });
+    expect(result.verdict).toBe('INCOMPLETE');
+    expect(result.failures).toEqual([]);
+    expect(result.incomplete.map((item) => item.code)).toContain('RELEASE_VECTOR_NOT_EVALUATED');
+  });
+
+  it('does not block on unlabelled issue backlog but fails closed when blocker evidence is unavailable', () => {
+    const readyExceptIssueEvidence = {
+      localSha: SHA,
+      remoteSha: SHA,
+      dirty: false,
+      requiredChecks: [{ context: 'integration', status: 'PASS' }],
+      activeSelfStore: true,
+      branchEnforceAdmins: true,
+      productionProtected: true,
+      releaseVector: 'PASS',
+    };
+    expect(evaluateLivePreflight({ ...readyExceptIssueEvidence, releaseBlockers: [] }).verdict).toBe('PASS');
+    expect(evaluateLivePreflight({ ...readyExceptIssueEvidence, releaseBlockers: null }).failures.map((item) => item.code))
+      .toContain('RELEASE_BLOCKERS_UNKNOWN');
+  });
+
+  it('fails closed when a required check is missing instead of inferring success from no red workflows', () => {
+    const result = evaluateLivePreflight({
+      localSha: SHA,
+      remoteSha: SHA,
+      dirty: false,
+      releaseBlockers: [],
+      requiredChecks: [{ context: 'canonical-qa', status: 'MISSING' }],
+      activeSelfStore: true,
+      branchEnforceAdmins: true,
+      productionProtected: true,
+      releaseVector: 'PASS',
+    });
+    expect(result.verdict).toBe('FAIL');
+    expect(result.failures.map((item) => item.detail)).toContain('canonical-qa is MISSING on the exact remote SHA');
+  });
+
+  it('binds each required status context to its configured GitHub Actions app', () => {
+    expect(resolveRequiredChecks(
+      [{ context: 'integration', app_id: 15368 }],
+      [{ name: 'integration', status: 'completed', conclusion: 'success', app: { id: 15368 } }],
+      [{ context: 'integration', state: 'success' }],
+    )).toEqual([{ context: 'integration', appId: 15368, status: 'PASS' }]);
+    expect(resolveRequiredChecks(
+      [{ context: 'integration', app_id: 15368 }],
+      [{ name: 'integration', status: 'completed', conclusion: 'success', app: { id: 7 } }],
+      [{ context: 'integration', state: 'success' }],
+    )).toEqual([{ context: 'integration', appId: 15368, status: 'MISSING' }]);
   });
 });

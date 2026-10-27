@@ -31,6 +31,33 @@
 // 98-109) are left as an integration-style test (spawn `node scripts/sync-version.mjs --check` in a
 // tmp copy of the repo) rather than unit-extracted, since their value is in walking REAL files.
 import { describe, it, expect } from 'vitest';
+import { readExplainerBadgeVersion, writeExplainerBadgeVersion, hasSplitVersionLabel } from '../../scripts/sync-version.mjs';
+
+describe('sync-version.mjs explainer status label', () => {
+  it('reads and rewrites the single product-version label', () => {
+    const label = '&middot; v4.3.27</p>';
+    expect(readExplainerBadgeVersion(label)).toBe('4.3.27'); // sync-version-ignore: arbitrary fixture input for a regex parser, not the repo's actual shipped version
+    expect(writeExplainerBadgeVersion(label, '4.3.28')).toBe('&middot; v4.3.28</p>'); // sync-version-ignore: arbitrary fixture input for a regex parser, not the repo's actual shipped version
+  });
+
+  it('recognizes the product version when a public npm version follows it', () => {
+    const label = '&middot; v4.3.27 &middot; public npm v4.3.26';
+    expect(readExplainerBadgeVersion(label)).toBe('4.3.27'); // sync-version-ignore: arbitrary fixture input for a regex parser, not the repo's actual shipped version
+    expect(writeExplainerBadgeVersion(label, '4.3.28'))
+      .toBe('&middot; v4.3.28 &middot; public npm v4.3.26');
+  });
+
+  // Regression coverage for the 2026-09-26 fix (single-source-check.mjs B10): the explainer used
+  // to show a second, competing version next to the product version ("candidate preview" ...
+  // "public npm vX.Y.Z"). hasSplitVersionLabel() is the drift guard that keeps it from
+  // silently coming back.
+  it('flags a reintroduced candidate/public-npm version split', () => {
+    expect(hasSplitVersionLabel(
+      'STATUS <code>candidate preview</code> &middot; v4.3.28 &middot; public npm v4.3.26',
+    )).toBe(true);
+    expect(hasSplitVersionLabel('STATUS <code>live</code> &middot; v4.3.28')).toBe(false);
+  });
+});
 
 describe.todo('sync-version.mjs — readBadgeVersion(readmeText) / writeBadgeVersion(readmeText, version) (requires export, see file header)', () => {
   it.todo('reads "0.5.0-dev" out of a badge URL token "version_0.5.0--dev-updated_2026--07--08" (hyphens shields.io-escaped as `--`)');

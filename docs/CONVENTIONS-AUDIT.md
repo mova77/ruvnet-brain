@@ -1,7 +1,7 @@
 # The Conventions Audit — every rule in this repo, and whether anything enforces it
 
 Created: 2026-07-22
-Updated: 2026-07-28 — issue #48 structured CLI boundary and raw-shell demotion
+Updated: 2026-08-02 — issue #84 truthful Agent/Task hook timing semantics
 Why: The owner, 2026-07-22 — *"There are dozens of things like this that are the difference between
 you acting as a smart learning partner and somebody that needs to constantly be reminded of
 everything all the time."* This document is the enumeration of "things like this." It exists because
@@ -96,8 +96,8 @@ Eight enforcement surfaces exist. This is the honest denominator for everything 
 | 2 | **CI `ci.yml` / windows-unit** | full `tests/unit` on win32 | hard red | cross-platform regressions |
 | 3 | **`scripts/git-hooks/pre-push`** | secret scan + `verify-channels --pre-push` | refuses push | live API keys, channel drift |
 | 4 | **`.claude/settings.json` PreToolUse:Bash** | `version-bump-gate.sh` | exit 2 | every push carries a version bump |
-| 5 | **`~/.claude/settings.json` PreToolUse** | `route-dispatch.sh`, `ground-before-write.sh`; `verify-interface.sh` advisory | exit 2 only from the two walls | un-routed subagent fan-out and ungrounded rUv-domain writes; legacy raw-shell CLI calls receive migration guidance only |
-| 6 | **`plugin/hooks/hooks.json`** | hooks via `hook-shim.mjs` | 4 blocking | `route-dispatch`, `design-wall`, `unprompted-speech`, and `protect-state`; interface guidance is advisory |
+| 5 | **`~/.claude/settings.json` PreToolUse** | `ground-before-write.sh`; `verify-interface.sh` advisory | exit 2 only from the grounding wall | ungrounded rUv-domain writes; legacy raw-shell CLI calls receive migration guidance only |
+| 6 | **`plugin/hooks/hooks.json`** | hooks via `hook-shim.mjs` | 3 blocking | `design-wall`, `unprompted-speech`, and `protect-state`; route-dispatch and interface guidance are advisory |
 | 7 | **`scripts/release.mjs`** | gates A–E | aborts ship | both suites, narrative version, clean tree, live channel walk |
 | 8 | **`Stop` hook** | `continuation-gate.mjs` | advisory (exit 0) | unfinished authorized work |
 
@@ -203,7 +203,7 @@ path, or surface but not the stated rule · **PROSE ONLY** = nothing mechanical.
 | Re-score 8 dimensions at end of every session, ≥95 | `feedback_rescore_every_session_target_95.md` | nothing | **PROSE ONLY** | Med — SessionEnd hook |
 | Recall memory before non-trivial decisions | Rule 19 | `agentdb-ensure.sh` surfaces `project-state-current` at SessionStart | **PARTIAL** | Low |
 | Append-only `project-state-current-<epochms>` | Rule 19 (corrected 2026-07-12) | `agentdb-ensure.sh` reads latest by LIKE | **PARTIAL** | Low |
-| Store lessons after meaningful work | Rule 19 | `learn-capture` / `learn-flush` hooks | **GATED** | done |
+| Store lessons after meaningful work | Rule 19 | `learn-capture` / `the former learning flusher (deleted 2026-10-12)` hooks | **GATED** | done |
 | Know the datetime; never guess | `feedback_always_know_the_datetime.md` | `date-awareness-fast.sh` (SessionStart) | **GATED** | done |
 | Persist "always do X" the moment it is uttered | `feedback_realtime_project_track.md` | `correction-detect.mjs` + `lesson-seed.mjs` | **PARTIAL** | Low |
 | No architecture thrashing | `feedback_no_thrashing.md` | nothing | **PROSE ONLY** | High |

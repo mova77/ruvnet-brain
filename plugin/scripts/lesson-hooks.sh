@@ -156,7 +156,7 @@ case "$EVENT" in
   # UserPromptSubmit is the right event: relaying happens while composing a reply, and this is the last
   # observable moment before that. It cannot BLOCK there (surface `text`), which matches its
   # `checklist` enforcement exactly — advisory delivered beats enforcing never.
-  UserPromptSubmit) TRIGGERS="assert-fact recommend-architecture report-status claim-done choose-work relay-number"; CLAUDE_EVENT="UserPromptSubmit" ;;
+  UserPromptSubmit) TRIGGERS="assert-fact recommend-architecture report-status claim-done choose-work relay-number finish"; CLAUDE_EVENT="UserPromptSubmit" ;;
   *) exit 0 ;;
 esac
 
@@ -183,6 +183,47 @@ fi
 if [ "$EVENT" = "PreToolUse-bash" ] && [ -f "$HOOK_INPUT_JS" ]; then
   CMD=$(printf '%s' "$INPUT" | node "$HOOK_INPUT_JS" command 2>/dev/null) || CMD=""
   ARGS+=(--command "$CMD")
+
+  # SHIP RIDES ON THE BASH PAYLOAD, BECAUSE NOTHING EVER SENDS "PreToolUse-push".
+  #
+  # The `PreToolUse-push) TRIGGERS="ship"` branch above has never executed. hooks.json emits only
+  # `unprompted-speech UserPromptSubmit`, and decision-gate.mjs maps EVERY PreToolUse to exactly
+  # `PreToolUse-bash` or `PreToolUse-write` — so `git push` has always arrived here as
+  # `mutate-machine`, never as `ship`. Measured 2026-08-13: FIVE ratified ship lessons in the live
+  # store had therefore never fired once, among them `G-remote-ci-gates-shipping` and
+  # `G-test-the-artifact-not-the-checkout` — the two that would have spoken up before I shipped a
+  # test that broke windows-unit and red-lit someone else's dependabot PR.
+  #
+  # Worse, wired-check's Check C greps THIS FILE's case labels to decide which triggers are wired, so
+  # it read "ship" off the dead branch and reported it green — an audit that cannot fail on the exact
+  # defect class it was written for. The dispatcher is the truth-maker for what fires; a case label
+  # nobody sends is not a wire.
+  # THE SAME PATTERNS AS degradation-watch.mjs DEPENDENT_COMMANDS, and a test asserts they agree.
+  # Two audits noted these two definitions of "is this a ship?" shipped already disagreeing on day
+  # one — one fact restated in two files, which is the defect this repo keeps paying for. They also
+  # caught both directions of the original glob being wrong: `git -C <abs> push` (the form an agent
+  # with absolute paths writes) matched NOTHING, while `grep -n "npm publish" docs/` matched, so
+  # reading ABOUT shipping counted as shipping. Quoted regions are stripped first because the
+  # truth-maker is what will EXECUTE — a commit message is not a command.
+  # tr runs BEFORE sed, not after: sed matches one line at a time, so a double/single-quoted string
+  # that legitimately SPANS a real newline (a multi-line commit message, a heredoc body) would
+  # otherwise never get stripped — its opening quote sits on one sed-internal line with no closer,
+  # its closing quote on another with no opener — leaking whatever words it quotes (e.g. "npm" and
+  # "publish" mentioned in prose) into CMD_EXEC as if they were unquoted. Collapsing newlines/tabs to
+  # spaces FIRST makes the whole command one logical line, so the existing quote-stripping regexes
+  # then span it correctly, same as they already do for a single-line quoted string. Caught live by
+  # an adversarial critic pass on the first cut of this fix (which ran tr after sed): a multi-line
+  # `git commit -m "...npm\npublish is unaffected..."` false-positived as a ship command on this side
+  # while degradation-watch.mjs's `dependentEvent()` (unmodified, not line-oriented) correctly said no
+  # — the exact "two ship definitions disagree" defect this diff exists to close, reopened in a new
+  # shape. [[:space:]]+ (not a literal space) then matches degradation-watch.mjs's `\s+` on what's
+  # left. 2026-08-27: the two definitions also disagreed on a tab/doubled-space/wrapped-newline
+  # `npm publish`/`gh release create`, which the JS side (already `\s+`-tolerant on a plain string)
+  # caught and this side missed silently.
+  CMD_EXEC=$(printf '%s' "$CMD" | tr '\n\t' '  ' | sed -e 's/"[^"]*"/ /g' -e "s/'[^']*'/ /g")
+  if printf '%s' "$CMD_EXEC" | grep -qE '\bgit\b[^|;&]*\bpush\b|\b(npm|yarn|pnpm)[[:space:]]+publish\b|\bgh[[:space:]]+release[[:space:]]+create\b|release\.mjs'; then
+    ARGS+=(--trigger ship)
+  fi
 fi
 
 # A hard timeout, because this runs on every matching event and must never add perceptible latency.

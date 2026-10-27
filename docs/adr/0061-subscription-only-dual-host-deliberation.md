@@ -1,9 +1,12 @@
 ---
 id: ADR-061
 title: Subscription-only dual-host deliberation for hard problems
-status: Proposed
+status: Superseded
+superseded_by: ADR-105
 date: 2026-07-28
-updated: 2026-07-28
+updated: 2026-10-10 22:01:00 EDT
+updated_source: derived-from-git
+reviewed_digest: 962ea30fdbcf
 authors: [Stuart Kerr, GPT-5.6-Sol]
 tags: [claude-code, codex, subscriptions, adr, ddd, agentic-qe, deliberation]
 supersedes: []
@@ -12,13 +15,17 @@ governs:
   - scripts/subscription-hosts.mjs
   - scripts/dual-host-deliberation.mjs
   - scripts/dual-host-suggest.mjs
+  - plugin/skills/ruvnet-brain/SKILL.md
   - tests/unit/subscription-hosts.test.mjs
   - tests/unit/dual-host-deliberation.test.mjs
+  - tests/unit/subscription-routing-guidance.test.mjs
 ---
 
 # ADR-061: Subscription-only dual-host deliberation
 
-**Status**: Proposed
+**Status**: Superseded (in part by ADR-105 on 2026-10-10)
+
+Prior status: Proposed. Superseded in part by [ADR-105](0105-one-agentdb-integration-standard.md): §7 "an MCP-aware caller owns the write" (project history is written only through global `ruflo memory --path`, never MCP `memory_*`/`agentdb_*`); the rest of this proposal is unchanged and still Proposed.
 
 Codex review is complete; Claude review is still required before acceptance.
 **Date**: 2026-07-28
@@ -41,8 +48,10 @@ capacity: runs consume each plan's allowance or credits. A valid login can still
 
 ### 1. One thin Node coordinator over the two installed CLIs
 
-`dual-host-deliberation.mjs` invokes `claude` and `codex` directly with argv arrays. It reuses the
-existing per-user subscription profile and does not route through OpenRouter, an SDK or an API.
+`dual-host-deliberation.mjs` invokes `claude` and `codex` directly with fixed argv arrays and sends
+the complete stage prompt over stdin. It reuses the existing per-user subscription profile and does
+not route through OpenRouter, an SDK or an API. The prompt is never placed in argv, so large
+cross-critiques cannot hit per-argument limits or leak into process listings.
 
 ### 2. Public auth probes, then a real capacity result
 
@@ -109,8 +118,22 @@ allowance, strips API keys and cannot edit the repository. Dismissal is durable.
 The project `.swarm/memory.db` is the only structured store. Append-only AgentDB rows record task
 hash, evidence hash, host/model categories, accepted decision identifiers, unresolved findings, QE
 plan identifiers and later independently verified outcomes. Raw prompts, source, host account
-identity and full transcripts are not stored by default. Host completion remains
-`verified: false`; only later adjudication may train routing.
+identity and full transcripts are not stored by default. Host completion remains `verified: false`;
+only later adjudication may train routing. The coordinator returns a transport-neutral
+`memory_store` request. An MCP-aware caller owns the write and exact-key read-back; when no
+structured callback is available, the duel remains complete but reports `learningPersisted: false`
+with the pending request instead of opening a second Ruflo memory driver.
+
+### 8. Ruflo coordinates; native subscription agents execute
+
+For ordinary swarm work, Ruflo's `swarm_init` and `agent_spawn` establish coordination and tracked
+roles. They do not authorize a provider-billed executor. Actual work runs through the active host's
+native subscription execution surface: Claude Code's Task tool or Codex collaboration agents.
+
+Provider-backed execution, including `agent_execute`, an SDK/API call, or OpenRouter, requires the
+user's explicit opt-in for that task. It is never an automatic fallback when a subscription is
+missing, logged out, quota-limited or temporarily unavailable, and routine swarm setup never asks
+the user for a provider API key.
 
 ## Failure contract
 
@@ -143,3 +166,29 @@ ChatGPT subscription with provider API-key variables removed. Claude Code 2.1.22
 Max `claude.ai` subscription, but the real model call hit its weekly limit. That is evidence for the
 degraded-mode requirement, not a two-sided acceptance. This ADR stays Proposed until Claude
 completes the missing side.
+
+On 2026-08-01, the shipped RuvNet Brain skill's executor guidance was reconciled with this ADR:
+Ruflo coordination now leads to native Claude Code or Codex subscription execution by default,
+while every provider-backed path is explicit opt-in only. A structural regression test protects
+that boundary. This documentation repair does not satisfy the outstanding two-host acceptance
+requirements, so the ADR remains Proposed.
+
+On 2026-08-07, the governed code was re-read after `scripts/subscription-hosts.mjs` moved; the
+decision is unchanged and the ADR stays **Proposed**. The change is two lines in the Codex
+subscription probe: auth status is now read from `stdout` AND `stderr` combined, and the match
+anchors on line boundaries rather than the whole string. Codex prints `Logged in using ChatGPT`
+to stderr, so the previous stdout-only, whole-string test reported a genuinely subscribed host as
+unsubscribed — which would silently route a subscription-only deliberation onto a provider-backed
+path, the exact outcome this ADR forbids. Detecting the subscription correctly strengthens the
+boundary rather than relaxing it: no provider-backed path became implicit, and opt-in remains
+explicit. The outstanding two-host acceptance requirement is untouched by this repair.
+
+On 2026-08-10, **Re-read after #130/#131; subscription routing is unchanged.** Governed files moved for update-rail reasons only — rollback cardinality and symlink-guard scope. No provider path became implicit and opt-in remains explicit.
+
+## Currency log
+| 2026-09-27 | Currency review: decision unchanged. Motion: a security fix stripping signing keys from native hosts, exit-0 guard closures, and a brain-census regeneration. The subscription-only deliberation logic is untouched; the security fix strengthens it. | Reviewed `scripts/subscription-hosts.mjs`, `scripts/dual-host-deliberation.mjs`, `scripts/dual-host-suggest.mjs`, `plugin/skills/ruvnet-brain/SKILL.md`, `tests/unit/subscription-hosts.test.mjs`, `tests/unit/dual-host-deliberation.test.mjs` against the commits listed above; reviewed_digest 962ea30fdbcf. |
+
+| Date | What changed | Why (with referents) |
+|---|---|---|
+| 2026-09-11 | Currency review at commit 7296c984: decision unchanged and re-pinned — subscription-only, two native CLIs. `scripts/dual-host-deliberation.mjs` +8/−1 since 7cfd9e17 (`32b7b7ca`, the pre-session worktree merge): the host models moved to an explicit `TOP_SUBSCRIPTION_MODELS` map (`claude-code` → `claude-fable-5-1`, `codex` → `gpt-6-astra`, replacing the literal `gpt-5.6-sol`), verified on the native hosts 2026-09-10; no API key, fetch or OpenRouter path was added. `tests/unit/dual-host-deliberation.test.mjs` +1. `plugin/skills/ruvnet-brain/SKILL.md` `60f269ad` (recommend-first contract). The TriSmart skill merged the same day (`tri-smart-skill/`, `scripts/trismart.mjs`) wraps this coordinator (`trismart.mjs:8` imports `dual-host-deliberation.mjs`); it does not replace it. `scripts/subscription-hosts.mjs`, `scripts/dual-host-suggest.mjs` did not move. | Reviewed `scripts/dual-host-deliberation.mjs`, `scripts/subscription-hosts.mjs`, `tests/unit/dual-host-deliberation.test.mjs`. reviewed_digest 6df53471296d. |
+| 2026-08-19 | Codex wiring changed under this decision (gate routing + wrapper budget); the subscription-only posture is UNCHANGED — no host gained a metered path. Reinforced rather than eroded: `spend-guard` now refuses an agent fleet that would inherit ANTHROPIC_API_KEY / OPENAI_API_KEY on either host, after agentic-qe#557 billed $1,600 across ~374 headless agents while the Max subscription sat unused. `claude` and `codex` are the seats and are never blocked. |

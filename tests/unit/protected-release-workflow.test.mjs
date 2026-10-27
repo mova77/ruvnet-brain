@@ -1,0 +1,216 @@
+import { describe, expect, it } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
+
+const ROOT = path.resolve(process.env.RUVNET_RELEASE_CONTRACT_ROOT || path.resolve(import.meta.dirname, '../..'));
+const read = (file) => fs.readFileSync(path.join(ROOT, file), 'utf8');
+const workflow = () => read('.github/workflows/protected-release.yml');
+
+function dispatchInputNames(source) {
+  const block = source.match(/workflow_dispatch:\s*\n\s{4}inputs:\s*\n([\s\S]*?)(?=\n\s{2}[a-zA-Z_-]+:|\npermissions:)/)?.[1] || '';
+  return [...block.matchAll(/^\s{6}([a-zA-Z0-9_-]+):\s*$/gm)].map(([, name]) => name);
+}
+
+describe('protected release rail', () => {
+  it('passes sealed retrieval inputs to both prepublication producer and consumer', () => {
+    for (const [file, script] of [['ci.yml', 'candidate-host-evidence'], ['release-candidate-preflight.yml', 'prepublication-evidence']]) {
+      const source = read(`.github/workflows/${file}`);
+      const command = source.split(`node scripts/${script}.mjs`)[1]?.split(/\n\s{0,6}- /)[0];
+      expect(command, `${script} must execute`).toBeTruthy();
+      expect(command).toMatch(/--plan\s+[^\n]*release-evidence\/retrieval-canary-plan\.json/);
+      expect(command).toMatch(/--coverage\s+[^\n]*release-evidence\/COVERAGE\.json/);
+      if (script === 'candidate-host-evidence') expect(command).toMatch(/--sequential-searches/);
+    }
+  });
+
+  it('retains failed Mac timing diagnostics without treating them as a promotable receipt', () => {
+    const source = read('.github/workflows/release-candidate-preflight.yml');
+    const upload = source.slice(source.indexOf('name: macos-candidate-search-${{ github.sha }}'));
+    expect(upload).toContain('if: always()');
+    expect(upload).toContain('candidate-host-evidence-macos.json.failure.json');
+    expect(upload).toContain('if-no-files-found: warn');
+    expect(source).toContain('needs: [candidate-preflight, ci, integration, ux, stranger, early-public-linux, early-public-macos, early-public-windows, macos-candidate-search]');
+  });
+  it('installs both host CLIs before the exact Mac candidate matrix uses them', () => {
+    const source = read('.github/workflows/release-candidate-preflight.yml');
+    const macJob = source.split('  macos-candidate-search:')[1]?.split('\n  aggregate:')[0] || '';
+    expect(macJob).toContain('@anthropic-ai/claude-code@latest');
+    expect(macJob).toContain('@openai/codex@latest');
+    expect(macJob).toContain('echo "$RUNNER_TEMP/host-clis/bin" >> "$GITHUB_PATH"');
+    expect(macJob.indexOf('Install current hosts')).toBeLessThan(macJob.indexOf('Run three installed host searches'));
+  });
+  it('is the sole human release dispatch and accepts source identity plus one mode selector', () => {
+    const releaseWorkflows = [
+      'protected-release.yml',
+      'release-cycle.yml',
+      'release-aggregate.yml',
+      'product-integrity-review.yml',
+      'ci.yml',
+      'integration-linux.yml',
+      'ux-qe.yml',
+      'stranger-matrix.yml',
+    ];
+    const dispatchers = releaseWorkflows
+      .filter((file) => fs.existsSync(path.join(ROOT, '.github/workflows', file)))
+      .filter((file) => /\n\s{2}workflow_dispatch:/.test(read(`.github/workflows/${file}`)));
+    expect(dispatchers).toEqual(['protected-release.yml']);
+    // `mode` is a SELECTOR, not an authority grant (ADR-086 step 17): it chooses between the
+    // machine-gated code chain and the corpus-only chain, and the corpus chain re-proves corpus-only
+    // routing in its own jobs. The input list stays closed — a fourth input here would be a new,
+    // unreviewed way to steer the only workflow permitted to sign and publish.
+    expect(dispatchInputNames(workflow())).toEqual(['mode', 'candidate_sha', 'version', 'corpus_dispatch_id']);
+    const source = workflow();
+    expect(source).toMatch(/mode:\s*\n\s+description:[^\n]*\n\s+required: false\n\s+default: code\n\s+type: choice\n\s+options:\n\s+- code\n\s+- corpus\n/);
+  });
+
+  it('runs every expensive lane once in the exact-SHA preflight before publication', () => {
+    const source = read('.github/workflows/release-candidate-preflight.yml');
+    for (const file of ['ci.yml', 'integration-linux.yml', 'ux-qe.yml', 'stranger-matrix.yml']) {
+      expect(read(`.github/workflows/${file}`), `${file} must be reusable`).toMatch(/\n\s{2}workflow_call:/);
+      expect(source, `${file} must be called by release-candidate-preflight`).toContain(`uses: ./.github/workflows/${file}`);
+      expect(workflow(), `${file} must not rerun during publication`).not.toContain(`uses: ./.github/workflows/${file}`);
+    }
+  });
+
+  it('derives artifact identity from produced bytes instead of accepting a human digest', () => {
+    const source = workflow();
+    expect(dispatchInputNames(source)).not.toContain('artifact_sha256');
+    expect(source).toContain("crypto.createHash('sha256').update(fs.readFileSync(artifact)).digest('hex')");
+    expect(source).toContain('artifact_sha256=${digest}');
+  });
+
+  it('binds the dispatch to a clean current-main candidate and governed blockers', () => {
+    const source = workflow();
+    expect(source).toContain('test "$(git rev-parse origin/main)" = "$EXPECTED_SHA"');
+    expect(source).toContain('test -z "$(git status --porcelain)"');
+    expect(source).toContain('issues: read');
+    expect(source).toContain('--state open --label release-blocker');
+    expect(source).toContain('test "$blockers" -eq 0');
+  });
+
+  it('has no prior-run lookup, polling, or caller-supplied run identity', () => {
+    const source = workflow();
+    expect(source).not.toMatch(/\bgh run (?:list|view|watch)\b/);
+    expect(source).not.toMatch(/^\s+run-id:/m);
+    expect(source).not.toMatch(/(?:release_qe|aggregate|review)_run_id/);
+  });
+
+  it('invokes the sole publisher once while keeping environment-scoped signing secrets', () => {
+    const source = workflow();
+    expect(source).toContain('group: ruvnet-brain-release');
+    expect(source).toContain('cancel-in-progress: false');
+    // Only the npm-carrying publish job binds the npm-scoped environment (no human pause there).
+    expect(source.match(/environment: Production – ruvnet-brain/g)).toHaveLength(1);
+    expect(source.match(/node scripts\/release\.mjs --publish/g)).toHaveLength(1);
+    expect(source).toContain('RUVNET_RELEASE_MODE: stabilization');
+    expect(source).not.toContain('continue-on-error: true');
+  });
+
+  it('stops channel publication at signed PUBLISHED_NOT_VERIFIED before public install proof', () => {
+    const source = workflow();
+    expect(source).toContain('RUVNET_RELEASE_IDENTITY: release-evidence/release-identity.json');
+    expect(source).toContain('RUVNET_CHANNEL_RECEIPT: release-evidence/channels-converged-receipt.json');
+    expect(source).toContain("receipt.state !== 'channels-converged'");
+    expect(source).toContain("receipt.observation?.verdict !== 'PUBLISHED_NOT_VERIFIED'");
+  });
+
+  it('completes the public three-OS by three-loader proof before install-verified', () => {
+    const source = workflow();
+    for (const lane of [
+      'ubuntu-latest, os_name: linux',
+      'macos-latest, os_name: macos',
+      'windows-latest, os_name: windows',
+    ]) expect(source).toContain(lane);
+    expect(read('scripts/public-verification-lane.mjs')).toContain('for (const mode of PUBLIC_VERIFICATION_MODES)');
+    const lane = source.indexOf('node scripts/public-verification-lane.mjs');
+    const aggregate = source.indexOf('node scripts/public-verification-aggregate.mjs', lane);
+    const finalize = source.indexOf('node scripts/public-verification-finalizer.mjs', aggregate);
+    const terminal = source.indexOf('--out release-evidence/install-verified-receipt.json', finalize);
+    expect(lane).toBeGreaterThan(-1);
+    expect(source.indexOf('if: always()', lane)).toBeGreaterThan(lane);
+    expect(source.indexOf('if-no-files-found: warn', lane)).toBeGreaterThan(lane);
+    expect(source).toContain('host_cli_prefix="$RUNNER_TEMP/ruvnet-host-clis"');
+    expect(source).toContain('npm install --prefix "$host_cli_prefix"');
+    expect(source).toContain('cygpath -w "$host_cli_prefix/node_modules/.bin"');
+    expect(source).not.toContain('cygpath -w "$PWD/node_modules/.bin"');
+    expect(source).toContain('RUVNET_CLAUDE_MARKETPLACE_SOURCE: ${{ github.workspace }}');
+    expect(source).toContain('GITHUB_TOKEN: ${{ github.token }}');
+    expect(aggregate).toBeGreaterThan(lane);
+    expect(finalize).toBeGreaterThan(aggregate);
+    expect(terminal).toBeGreaterThan(finalize);
+  });
+
+  it('derives baseline and candidate retrieval inputs before sealing the payload', () => {
+    const source = read('.github/workflows/ci.yml');
+    // The observe-baseline half now runs inside scripts/code-release-corpus.mjs on BOTH assembly paths
+    // (ADR-0091 D6); the candidate-input derivation stays in the workflow.
+    expect(source.match(/node scripts\/public-verification-inputs\.mjs/g)?.length || 0).toBeGreaterThanOrEqual(1);
+    expect(read('scripts/code-release-corpus.mjs')).toContain("script('public-verification-inputs.mjs'), 'observe-baseline'");
+    expect(source.indexOf('Build the immutable knowledge bundle exactly once'))
+      .toBeLessThan(source.indexOf('node scripts/public-verification-inputs.mjs'));
+    expect(source.indexOf('node scripts/public-verification-inputs.mjs'))
+      .toBeLessThan(source.indexOf('Persist the canonical candidate payload manifest'));
+    for (const argument of [
+      '--baseline-bundle "$RUVNET_SEED_BUNDLE"',
+      '--candidate-bundle "$RUNNER_TEMP/release-evidence/ruvnet-brain.zip"',
+      '--candidate-package "$RUVNET_SEALED_PACKAGE"',
+      '--oracle data/retrieval-query-evidence.json',
+      '--observed-baseline',
+    ]) expect(source).toContain(argument);
+  });
+
+  it('selects a real RVF rather than macOS ZIP metadata', () => {
+    const source = read('.github/workflows/ci.yml');
+    expect(source).toContain("-type f -name '*.big.rvf'");
+    expect(source).toContain("! -path '*/__MACOSX/*' ! -name '._*'");
+    expect(source).toContain("LC_ALL=C sort -u");
+    // The index repair now runs inside the legacy (bootstrap-only) branch of the orchestrator, on the
+    // directory this selection found (ADR-0091 D6).
+    expect(source).toContain('--assets "${asset_dirs[0]}"');
+    expect(read('scripts/code-release-corpus.mjs')).toContain("script('rvf-index-audit.mjs'), '--dir', assets, '--repair'");
+  });
+
+  it('MACHINE GATES replace the human approval: the publish path is reachable only through every one of them', () => {
+    const source = workflow();
+    const blocks = Object.fromEntries(source.split(/\n(?=  [a-z][a-z-]*:\n)/)
+      .filter((block) => /^  [a-z][a-z-]*:\n/.test(block))
+      .map((block) => [block.slice(2, block.indexOf(':')), block]));
+    // Exact candidate: dispatched SHA == main == the run's SHA, version matches, clean tree.
+    for (const check of ['test "$GITHUB_SHA" = "$EXPECTED_SHA"', 'test "$(git rev-parse origin/main)" = "$EXPECTED_SHA"',
+      'test "$(node -p "require(\'./package.json\').version")" = "$EXPECTED_VERSION"', 'test -z "$(git status --porcelain)"']) {
+      expect(blocks.identity, check).toContain(check);
+    }
+    // Preflight green on that exact SHA, from a release/* push in this repository, exactly one artifact.
+    for (const check of ["run.conclusion === 'success'", "run.event === 'push'", 'run.head_sha === sha', '/^release\\/.+/',
+      'artifacts.length !== 1', "aggregate.verdict !== 'PASS'", '--label release-blocker']) {
+      expect(blocks['verified-candidate'], check).toContain(check);
+    }
+    // The publisher re-proves main == verified SHA itself, and cannot start without both upstream jobs.
+    expect(blocks.publish).toContain('test "$(git rev-parse origin/main)" = "$RUVNET_EXPECTED_SHA"');
+    expect(blocks.publish).toContain('needs: [verified-candidate, seal-payload]');
+    // Nothing is terminal until three OS lanes verify the public bytes; no job pauses for a person.
+    expect(blocks['public-verification']).toContain('needs: [verified-candidate, publish]');
+    expect(blocks['finalize-public-verification']).toContain('needs: [verified-candidate, public-verification]');
+    // No step in the YAML waits on a person. (A required REVIEWER lives in GitHub's environment
+    // settings, not in this file — that is single-source C3's job: tests/unit/release-environment-policy.test.mjs.)
+    expect(source).not.toMatch(/pending_deployments|environment approval/i);
+  });
+
+  it('binds the npm environment in exactly one job, and a failed publish can be re-run in place', () => {
+    const source = workflow();
+    // Job blocks: split ONLY at two-space job headers ("\n  name:\n"), never at deeper indentation.
+    const blocks = Object.fromEntries(source.split(/\n(?=  [a-z][a-z-]*:\n)/)
+      .filter((block) => /^  [a-z][a-z-]*:\n/.test(block))
+      .map((block) => [block.slice(2, block.indexOf(':')), block]));
+    const npmScoped = Object.keys(blocks).filter((job) => blocks[job].includes('environment: Production – ruvnet-brain'));
+    expect(npmScoped).toEqual(['publish']);
+    for (const job of ['seal-payload', 'finalize-public-verification']) {
+      expect(blocks[job], job).toContain('environment: Production – corpus');
+      const executable = blocks[job].split('\n').filter((line) => !/^\s*#/.test(line)).join('\n');
+      expect(executable, job).not.toContain('NPM_TOKEN');
+    }
+    expect(source).not.toMatch(/publisher-payload-[^\n]*run_attempt/);
+    expect(source.match(/name: publisher-payload-\$\{\{ github\.run_id \}\}\n/g)).toHaveLength(2);
+  });
+});
+

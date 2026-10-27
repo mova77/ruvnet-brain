@@ -2,10 +2,90 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 
-const brainHome = process.env.RUVNET_BRAIN_HOME || path.join(os.homedir(), '.cache', 'ruvnet-brain');
+// New installs colocate the helper. Older standalone fixtures/installations can omit it;
+// they retain their prior behavior until the installer upgrades both files.
+let developmentHooksSuspended = () => false;
+try { ({ developmentHooksSuspended } = await import('./development-maintenance.mjs')); }
+catch (error) { if (error.code !== 'ERR_MODULE_NOT_FOUND') throw error; }
+if (developmentHooksSuspended()) process.exit(0);
+
+const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+const brainHome = process.env.RUVNET_BRAIN_HOME
+  || path.join(path.dirname(codexHome), '.cache', 'ruvnet-brain');
 const versions = path.join(brainHome, 'versions');
+const blockingHooks = new Set([
+  // decision-gate composes every refusal policy into ONE verdict and speaks the same exit-2 +
+  // stderr contract Codex documents ("PreToolUse hook exited with code 2 but did not write a
+  // blocking reason to stderr"). Absent from this set it would be wired and toothless: the exit 2
+  // would be swallowed here and every refusal would silently become an allow.
+  'decision-gate',
+  // NOT 'route-dispatch' (removed Dream Cycle 2026-09-05, MEASURED drift): hook-shim.mjs's own
+  // TABLE has declared it `mode: 'advisory'` since issue #84 — Claude Code consumes its
+  // PreToolUse:Agent/Task result ~140ms after tool_dispatch_end, so a refusal there would arrive
+  // too late to be enforcement (hook-shim.mjs's own comment, in the past tense, about this exact
+  // membership: "This comment used to cite 'route-dispatch's exit-2 wall' as the example. That was
+  // FALSE and had to go"). hook-shim.mjs's own dispatch already coerces its exit code to 0
+  // unconditionally, so this membership could never fire — harmless today, but exactly the
+  // false-confidence gap tests/unit/codex-blocking-hooks-parity.test.mjs now holds closed: this
+  // Set must name only ids hook-shim.mjs's TABLE actually calls 'blocking'.
+  'hijack-ruvnet',   // ADR-063: opt-in managed-memory refusal; exits 0 at the default
+  'ground-before-write',
+  'protect-state',
+  'design-wall',
+  'unprompted-speech',
+]);
+
+/**
+ * HOOKS WHOSE WORK OUTLIVES ANY BUDGET THE HOST WILL GRANT, so waiting for them is not an option.
+ *
+ * MEASURED 2026-08-14 on a live Codex 0.147.0 session — the host prints it itself:
+ *
+ *     warning: clamping SessionEnd hook timeout to 3s in .../hooks.json
+ *
+ * SessionEnd is HARD-CAPPED at 3 seconds and no registration can ask for more. The former learning
+ * flusher needed 18s: measured with a real 10-entry queue and the real `ruflo`, 18342 / 18347 / 18384 ms, because
+ * one `ruflo hooks` call alone costs seconds and it self-bounds at LEARN_FLUSH_DEADLINE_MS.
+ *
+ * So the arithmetic never closes, and what shipped was the worst version of that: this wrapper
+ * budgeted 2250ms, SIGKILLed the flush, and exited 0 with `status === null` — measured end to end,
+ * exit 0, 2760ms, ZERO bytes of stdout, ZERO bytes of stderr, and a 10-line queue still 10 lines
+ * afterwards. Codex lessons never flushed, on every session, and nothing on any surface said so.
+ *
+ * The host caps how long it will WAIT, not how long work may take. Detaching honours the cap
+ * exactly — the hook returns immediately — while the flush runs to its own deadline and does its
+ * own write-back. Raising the number instead would have been a fiction the host silently clamps.
+ */
+// Empty since the learning flusher was deleted (2026-10-12): learning writes directly through ruflo.
+const DETACHED_HOOKS = new Set([]);
+
+/** THE BUDGET IS DERIVED FROM WHAT THE HOOK MEASURABLY COSTS, never from what looks tidy. */
+function timeoutFor(hookId, event = '', sessionBudgetMs = 0) {
+  const override = Number(process.env.RUVNET_CODEX_HOOK_TIMEOUT_MS);
+  if (hookId === 'session-start') return Math.floor(Math.min(sessionBudgetMs,
+    Number.isFinite(override) && override > 0 ? override : Infinity));
+  if (Number.isFinite(override) && override > 0) return override;
+  // decision-gate's own internal budget is 4000ms (RUVNET_DECISION_BUDGET_MS) and it is allowed to
+  // spend all of it: measured 986–4015ms across ten runs in a project this plugin does not own. A
+  // budget at or below the gate's own would make the gate's slowest legitimate refusal indis-
+  // tinguishable from a crash; 6000ms covers the gate's cap plus this chain's spawn overhead
+  // (measured 773–1145ms end-to-end warm, so ~150–400ms of that is the wrapper/adapter/shim).
+  if (hookId === 'decision-gate') return 6_000;
+  // Advisory capacity hook: 4 of 8 runs were killed at the old 2s host timeout on a loaded machine (measured
+  // 2026-09-30). Keep the wrapper's budget below the registration's own 5.5s so the wrapper, not the host, ends it.
+  if (hookId === 'capacity-aware-parallel-work') return 5_000;
+  if (hookId === 'ground-ruvnet' || hookId === 'unprompted-speech' || hookId === 'continuation-gate') {
+    return 8_500;
+  }
+  // SessionEnd is hard-capped at 3s by the host (see DETACHED_HOOKS above) and the codex-hooks.json
+  // launcher kills this wrapper at 2500ms. A 4000ms budget here was a number nobody would ever reach:
+  // the body planned for 8s and was SIGKILLed mid-write. 2200ms leaves the launcher its margin, and the
+  // body receives it as RUVNET_CODEX_BUDGET_MS (below) so it can save the new snapshot first.
+  if (event === 'SessionEnd') return 2_200;
+  return 4_000;
+}
 
 function activeRoot() {
   try {
@@ -22,16 +102,153 @@ function activeRoot() {
   }
 }
 
-const input = fs.readFileSync(0);
+function readHookInput(limit = 1024 * 1024) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    let bytes = 0;
+    let settled = false;
+    let idle;
+    let hardDeadline;
+    let poll;
+
+    const cleanup = () => {
+      clearTimeout(idle);
+      clearTimeout(hardDeadline);
+      clearInterval(poll);
+      process.stdin.off('data', onData);
+      process.stdin.off('readable', onReadable);
+      process.stdin.off('end', finish);
+      process.stdin.off('close', finish);
+      process.stdin.off('error', finish);
+      process.stdin.pause();
+    };
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(Buffer.concat(chunks));
+    };
+    const armIdle = () => {
+      clearTimeout(idle);
+      idle = setTimeout(finish, 100);
+    };
+    const onData = (chunk) => {
+      if (bytes < limit) {
+        const kept = chunk.subarray(0, limit - bytes);
+        chunks.push(kept);
+        bytes += kept.length;
+      }
+      if (bytes >= limit) return finish();
+      try {
+        JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        return finish();
+      } catch {
+        armIdle();
+      }
+    };
+    // Windows inherited pipes can expose the first value through the readable interface without
+    // emitting a data event until the writer closes. Drain both interfaces; POSIX keeps the fast
+    // data path and Windows gets the same complete-value contract without waiting for EOF.
+    const onReadable = () => {
+      let chunk;
+      while ((chunk = process.stdin.read()) !== null) onData(chunk);
+    };
+
+    process.stdin.on('data', onData);
+    process.stdin.on('readable', onReadable);
+    process.stdin.once('end', finish);
+    process.stdin.once('close', finish);
+    process.stdin.once('error', finish);
+    // Some Windows pipe handles can deliver repeated readable notifications while the writer
+    // remains open, continually resetting an idle timer. The host contract is one JSON value, not
+    // EOF; an absolute cap makes the wrapper deterministic under that regime without weakening
+    // the normal complete-value fast path.
+    // Some Windows inherited pipes do not emit a readable/data notification until the writer
+    // closes. Poll the non-blocking stream read instead of using fs.readSync, which can block the
+    // event loop before the first pipe chunk is surfaced.
+    poll = setInterval(onReadable, 10);
+    hardDeadline = setTimeout(finish, 250);
+    armIdle();
+    process.stdin.resume();
+  });
+}
+
+const input = await readHookInput();
+let projectCwd;
+try { projectCwd = JSON.parse(input.toString('utf8')).cwd; } catch { /* malformed host payload */ }
+if (typeof projectCwd === 'string' && developmentHooksSuspended(projectCwd)) process.exit(0);
 const root = activeRoot();
 const adapter = root && path.join(root, 'scripts', 'codex-hook-adapter.mjs');
 if (!adapter || !fs.existsSync(adapter)) process.exit(0);
 
+const hookId = process.argv[2] || '';
+
+if (DETACHED_HOOKS.has(hookId)) {
+  // stdio ignored on purpose: a detached child outlives this process, so anything it wrote would
+  // arrive at a host that has already moved on — and stderr from a hook is what a host renders as a
+  // hook error. It reports through its own channels or not at all.
+  const child = spawn(process.execPath, [adapter, ...process.argv.slice(2)], {
+    detached: true, stdio: ['pipe', 'ignore', 'ignore'], env: process.env,
+  });
+  child.unref();
+  child.stdin.on('error', () => { /* a dead optional child must never surface to the host */ });
+  // AWAIT THE FLUSH, don't assume it. `process.exit()` on the line after `end()` truncates the pipe
+  // and the detached child reads an empty payload — which is the same silent no-op this whole change
+  // exists to remove, reintroduced one layer down. Bounded so a stuck pipe cannot hold the host.
+  await new Promise((resolve) => {
+    try { child.stdin.end(input, resolve); } catch { resolve(); }
+    setTimeout(resolve, 250);
+  });
+  process.exit(0);
+}
+
+let sessionDeadlineAt;
+if (hookId === 'session-start') {
+  try {
+    const { sessionStartDeadlineAt } = await import(path.join(root, 'scripts', 'session-start-budget.mjs'));
+    sessionDeadlineAt = sessionStartDeadlineAt({ host: 'codex', env: process.env, startedAt: performance.timeOrigin });
+  } catch {
+    process.stderr.write('[RuvNet Brain — PROJECT CONTINUITY UNKNOWN] SessionStart host budget unavailable; restoration was not attempted.\n');
+    process.exit(0);
+  }
+}
+const budgetMs = timeoutFor(hookId, process.argv[3] || '', Math.max(0, (sessionDeadlineAt || 0) - Date.now()));
+if (hookId === 'session-start' && budgetMs < 1) {
+  process.stderr.write('[RuvNet Brain — PROJECT CONTINUITY UNKNOWN] SessionStart deadline exhausted before restoration.\n');
+  process.exit(0);
+}
 const result = spawnSync(process.execPath, [adapter, ...process.argv.slice(2)], {
   input,
   encoding: 'utf8',
-  env: process.env,
+  // The adapter may fan one multi-file patch out into several body runs, and only this process knows
+  // when the axe falls. Hand the budget down so it can stop and fail open instead of being killed
+  // mid-loop with nothing written — a SIGKILL here is invisible to the host and to the user.
+  env: { ...process.env, RUVNET_CODEX_BUDGET_MS: String(budgetMs),
+    ...(sessionDeadlineAt ? { RUVNET_SESSION_START_DEADLINE_AT: String(Math.min(sessionDeadlineAt, Date.now() + budgetMs)) } : {}) },
+  timeout: budgetMs,
+  killSignal: 'SIGKILL',
 });
-if (result.stdout) process.stdout.write(result.stdout);
-if (result.stderr) process.stderr.write(result.stderr);
-process.exit(result.status ?? 0);
+// Review N5: Codex has no shim watchdog in front of the body, so a kill here was silent. One ledger row,
+// read by the next SessionStart (same writer and file as the shim's own rows). Never throws.
+if (result.error?.code === 'ETIMEDOUT' || result.signal === 'SIGKILL') {
+  try {
+    const { recordHookFailure } = await import(pathToFileURL(path.join(root, 'scripts', 'hook-failures.mjs')).href);
+    recordHookFailure({ hook: hookId, event: process.argv[3] || '', error: 'killed-by-codex-wrapper', limitMs: budgetMs }, { brainHome });
+  } catch { /* an unrecordable failure must not become a second one */ }
+}
+if (hookId === 'session-start' && result.status !== 0) {
+  process.stderr.write('[RuvNet Brain — PROJECT CONTINUITY UNKNOWN] SessionStart did not complete inside its host deadline; no restoration success is claimed.\n');
+}
+
+// A broken optional Brain hook must never degrade the host. The only non-zero status that carries
+// product meaning is an intentional exit-2 refusal from a hook whose contract is blocking.
+if (result.status === 2 && blockingHooks.has(hookId)) {
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+  process.exit(2);
+}
+if (result.status === 0) {
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+}
+process.exit(0);

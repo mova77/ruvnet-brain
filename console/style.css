@@ -229,6 +229,12 @@ p:last-child { margin-bottom: 0; }
 }
 
 .head-right { display: inline-flex; align-items: center; gap: 10px; }
+/* The header is full at desktop widths. When the update gong appears it needs ~155px; the host chip
+   (also shown in the intro's host line) gives way so the gong never slides under the header links
+   (RNBC QA 2026-10-01: it did, and clicking it opened the scope page). The brand text truncates. */
+.brand > * { flex: none; }
+.brand > .brand-text { flex: 0 1 auto; min-width: 0; }
+.head-inner:has(#brain-update:not([hidden])) .host-chip { display: none; }
 .host-chip {
   font-size: 12.5px; color: var(--ink-2);
   border: 1px solid var(--hair); border-radius: 100px; padding: 4px 11px;
@@ -247,6 +253,9 @@ p:last-child { margin-bottom: 0; }
   color: #7c3f00; background: rgba(217, 119, 6, .14);
   border: 1px solid rgba(217, 119, 6, .55); border-radius: 100px; padding: 3px 10px;
   margin-left: 6px; animation: gong-pulse 2.2s ease-in-out infinite;
+  /* Kept short in app.js and never squeezed: the brand text truncates before the gong does. A long
+     gong once overflowed under the header links, so clicking it opened the scope page. */
+  flex: none;
 }
 :root[data-theme="dark"] .update-gong { color: #fbbf24; background: rgba(217, 119, 6, .18); }
 .update-gong:hover { animation-play-state: paused; }
@@ -1137,6 +1146,10 @@ details.sub .sub-body > *:first-child { margin-top: 4px; }
      page-wide horizontal scrollbar. Cap + ellipsis keeps the click target and the full text in the
      title tooltip; nothing about the update claim is hidden, only its overflow. */
   .update-gong { max-width: 46vw; overflow: hidden; text-overflow: ellipsis; }
+  /* RNBC QA 2026-10-01, measured at 390px: the header did not fit one row — the version chip sat
+     under the scope link and the theme button was pushed off-screen. Let it wrap to two rows. */
+  .head-inner { flex-wrap: wrap; height: auto; min-height: 58px; row-gap: 6px; padding-block: 8px; }
+  .head-right { flex-wrap: wrap; justify-content: flex-end; row-gap: 6px; margin-left: auto; }
   .fact { grid-template-columns: minmax(0, 1fr); gap: 3px; }
   .dim { grid-template-columns: auto minmax(0, 1fr); }
   .dim-ded { grid-row: auto; grid-column: 2; }
@@ -1236,6 +1249,11 @@ details.sub .sub-body > *:first-child { margin-top: 4px; }
 .plan-key-mark { font-weight: 700; }
 .plan-key.yes .plan-key-mark { color: var(--green-text); }
 .plan-key.no, .plan-key.no .plan-key-mark { color: var(--faint); }
+/* Not checked (issue #86): visually distinct from "no key found" so a degraded catalog never reads
+   as a finding about the user's machine. */
+.plan-key.unknown { color: var(--muted); }
+.plan-key.unknown .plan-key-mark { color: var(--amber); }
+.plan-keys-note { flex-basis: 100%; color: var(--muted); font-size: 11.5px; line-height: 1.5; }
 
 /* WP2b — first-run empty state: confident, designed, not an apology */
 .mh-empty {
@@ -2141,4 +2159,30 @@ details.sub .sub-body > *:first-child { margin-top: 4px; }
 #body-brain .fineprint { margin-top: 14px; color: var(--muted); }
 #body-brain .fn-path {
   font-family: var(--mono); font-size: 0.86em; color: var(--faint); overflow-wrap: anywhere;
+}
+
+/* ------------------------------------------------------------ inventory card
+   The repository list, by name. Same row language as .cap-row (hairline separators, quiet meta),
+   with a type-to-filter above it because 200+ names need a way in. Long upstream URLs wrap rather
+   than overflow the card. */
+.inv-tools { display: flex; align-items: center; gap: 12px; margin: 10px 0 8px; flex-wrap: wrap; }
+.inv-filter {
+  flex: 1 1 220px; min-width: 0; padding: 7px 10px; font: inherit; font-size: 13.5px;
+  color: var(--ink); background: var(--panel-2, transparent);
+  border: 1px solid var(--hair-strong); border-radius: 8px;
+}
+.inv-filter:focus { outline: 2px solid var(--cyan); outline-offset: 1px; }
+.inv-count { font-size: 12.5px; }
+.inv-list { list-style: none; margin: 0; padding: 0; max-height: 28rem; overflow: auto; border-top: 1px solid var(--hair); }
+.inv-row {
+  display: grid; grid-template-columns: minmax(10ch, 16ch) auto 1fr auto; align-items: baseline; gap: 6px 12px;
+  padding: 7px 4px; border-bottom: 1px solid var(--hair); font-size: 13.5px;
+}
+.inv-row[hidden] { display: none; }
+.inv-name { font-size: 13px; overflow-wrap: anywhere; }
+.inv-src { min-width: 0; overflow-wrap: anywhere; font-size: 12.5px; }
+.inv-meta { font-size: 12px; white-space: nowrap; }
+@media (max-width: 640px) {
+  .inv-row { grid-template-columns: 1fr auto; }
+  .inv-src, .inv-meta { grid-column: 1 / -1; white-space: normal; }
 }

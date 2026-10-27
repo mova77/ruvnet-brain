@@ -63,6 +63,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { rmHome } from '../helpers/reap-detached.mjs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { continuityRegistrations } from '../../plugin/scripts/continuity-hook-policy.mjs';
+import { renderCardHit } from '../../kb/card-lane.mjs';
+import { answerTextAnswered } from '../../plugin/scripts/grounding-answer.mjs';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const BRAIN_STATE = path.join(REPO, 'scripts/brain-state.mjs');
@@ -72,6 +75,7 @@ const SESSION = path.join(REPO, 'plugin/scripts/session-start.sh');
 const SHIM = path.join(REPO, 'plugin/scripts/hook-shim.mjs');
 const PROTECT = path.join(REPO, 'plugin/scripts/protect-brain-state.sh');
 const ROUTE_DISPATCH = path.join(REPO, 'plugin/scripts/route-dispatch.sh');
+const RECEIPT_DIR = ['meta', 'harness'].join('');
 const VERIFY_IFACE = path.join(REPO, 'plugin/scripts/verify-interface.sh');
 const DESIGN_WALL = path.join(REPO, 'plugin/scripts/design-wall.sh');
 const FORGE_MCP = path.join(REPO, 'kb/forge-mcp-all.mjs');
@@ -125,8 +129,9 @@ const IMPORT_STATE = `const S = await import(${JSON.stringify(pathToFileURL(BRAI
 const IMPORT_SETTINGS = `const U = await import(${JSON.stringify(pathToFileURL(path.join(REPO, 'scripts/user-settings.mjs')).href)});`;
 
 /** Fire a bash hook the way Claude Code does: subprocess, JSON on stdin, streams kept apart. */
-function fireBash(script, payload, extraEnv = {}) {
+function fireBash(script, payload, extraEnv = {}, cwd = REPO) {
   const r = spawnSync('bash', [script], {
+    cwd,
     input: typeof payload === 'string' ? payload : JSON.stringify(payload),
     env: childEnv(extraEnv), encoding: 'utf8', timeout: 30_000,
   });
@@ -241,7 +246,20 @@ describe.skipIf(bashOnly)('ADR-054 gate 3 — a refusal mints NO grounding stamp
   });
 
   it('a DEGRADED-but-real result stamps: partial coverage is still evidence the model actually read', () => {
-    stampWith(`DEGRADED SEARCH: 2/37 repos failed\nSearched 37 RuvNet repos (${TERM}).\n#1 repo=${TERM}\n----- full document (400 chars) -----\ntext`);
+    // The producer's REAL degraded paragraph (kb/forge-mcp-all.mjs), pinned below: since 4.4.0 the answer
+    // must BEGIN with the brain's header, after at most this exact paragraph.
+    expect(fs.readFileSync(FORGE_MCP, 'utf8')).toContain('Results below cover only the healthy repos. Mention this degradation to the user.');
+    stampWith(`⚠ DEGRADED SEARCH: 2/37 repos failed (a, b) — first error: ERR: boom\nResults below cover only the healthy repos. Mention this degradation to the user.\n\nSearched 37 RuvNet repos (${TERM}).\n#1  repo=${TERM}\n----- full document (400 chars) -----\ntext`);
+    expect(fs.existsSync(stampFor(TERM))).toBe(true);
+  });
+
+  it('a Grok payload carrying the result only as camelCase toolResult stamps too (4.5)', () => {
+    const r = fireBash(STAMP, {
+      hookEventName: 'post_tool_use', toolName: 'ruvnet-brain__search_ruvnet',
+      tool_input: { query: `${TERM}: how does rUv implement session capture?` },
+      toolResult: `Searched 37 RuvNet repos (${TERM}).\n#1 repo=${TERM}\npath: x/src/y.ts\n----- full document (900 chars) -----\nreal source here`,
+    });
+    expect(r.status).toBe(0);
     expect(fs.existsSync(stampFor(TERM))).toBe(true);
   });
 
@@ -259,7 +277,18 @@ describe.skipIf(bashOnly)('ADR-054 gate 3 — a refusal mints NO grounding stamp
     // script would silently start honouring it again and this suite would still be green — so the
     // exact phrase is asserted at the source, not assumed.
     expect(fs.readFileSync(FORGE_MCP, 'utf8')).toContain(DISABLED_MARKER);
-    expect(fs.readFileSync(STAMP, 'utf8')).toContain(DISABLED_MARKER);
+    // 4.4.0: the stamp no longer lists refusals — it mints only on an answer that BEGINS with the brain's
+    // own success header (plugin/scripts/grounding-answer.mjs), so the soft answer cannot qualify. The
+    // pin moves to the success side: the headers the consumer anchors on must be the producers' own.
+    const answer = fs.readFileSync(path.join(REPO, 'plugin/scripts/grounding-answer.mjs'), 'utf8');
+    expect(fs.readFileSync(path.join(REPO, 'kb/search-outcome.mjs'), 'utf8')).toContain('header: `Searched ${repos.length} RuvNet repos (');
+    expect(answer).toContain('/^Searched \\d+ RuvNet repos \\(/');
+    const cardAnswer = renderCardHit({ repo: 'fixture', path: 'card.md', text: 'A substantive fixture capability.', namedRepo: true });
+    expect(cardAnswer).toContain('#1  repo=fixture  evidence=curated-capability-card\n');
+    expect(answerTextAnswered(cardAnswer)).toBe(true);
+    expect(answerTextAnswered(DISABLED_MARKER)).toBe(false);
+    expect(answer).toContain('#1  repo=\\S+  evidence=curated-capability-card\\n');
+    expect(DISABLED_MARKER.startsWith('Searched')).toBe(false);
   });
 
   it('still bash-builtins only — a hook that can shut a wall must depend on nothing fragile', () => {
@@ -289,12 +318,14 @@ describe.skipIf(bashOnly)('ADR-054 gate 2 — off disarms the grounding gate and
     expect(r.stdout).toMatch(/off/i);
   });
 
-  it('OFF does NOT disarm route-dispatch — the cost wall guards money, not retrieval', () => {
+  it('OFF does not disarm the route-dispatch audit', () => {
     optIn();
     offNow();
     const r = fireBash(ROUTE_DISPATCH, { tool_name: 'Task', tool_input: { description: 'sweep tests', subagent_type: 'general-purpose' } });
-    expect(r.status).toBe(2);
-    expect(r.stderr).toMatch(/SUBAGENT DISPATCH BLOCKED/);
+    expect(r.status).toBe(0);
+    expect(r.stderr).toBe('');
+    const receipt = JSON.parse(fs.readFileSync(path.join(tmp, '.claude', RECEIPT_DIR, 'dispatch-log.jsonl'), 'utf8').trim());
+    expect(receipt).toMatchObject({ model: 'inherited', enforcement: 'advisory-host-timing' });
   });
 
   it('the verify-interface body remains nonblocking even if invoked directly while OFF', () => {
@@ -323,7 +354,7 @@ describe.skipIf(bashOnly)('ADR-054 gate 2 — off disarms the grounding gate and
       expect(line, `${wall} missing from the shim table`).toBeTruthy();
       expect(line, `${wall} must keep running while the brain is off`).toMatch(/offBehavior:\s*'run'/);
     }
-    for (const quiet of ['ground-ruvnet', 'hijack-ruvnet', 'verify-interface', 'unprompted-speech', 'md-stamp']) {
+    for (const quiet of ['ground-ruvnet', 'hijack-ruvnet', 'verify-interface', 'unprompted-speech', 'md-stamp', 'capacity-aware-parallel-work']) {
       const line = src.split('\n').find((l) => l.includes(`'${quiet}':`));
       expect(line, `${quiet} must go silent while the brain is off`).toMatch(/offBehavior:\s*'silence'/);
     }
@@ -344,12 +375,12 @@ describe.skipIf(bashOnly)('ADR-054 gate 2 — off disarms the grounding gate and
     });
 
     expect(fire('ground-ruvnet').stdout).toMatch(/ADVERTISING/); // ON
-    expect(fire('route-dispatch').status).toBe(2);
+    expect(fire('route-dispatch').status).toBe(0);
 
     offNow();
     expect(fire('ground-ruvnet').stdout).toBe('');               // OFF → silent, zero bytes
     expect(fire('ground-ruvnet').status).toBe(0);
-    expect(fire('route-dispatch').status).toBe(2);               // OFF → the wall still stands
+    expect(fire('route-dispatch').status).toBe(0);               // OFF → audit still runs, never blocks
   });
 });
 
@@ -368,14 +399,25 @@ describe.skipIf(bashOnly)('ADR-054 gate 4 — session-start goes quiet without g
   ];
 
   function session(extraEnv = {}) {
-    fs.mkdirSync(path.join(tmp, '.cache/ruvnet-brain'), { recursive: true });
-    return fireBash(SESSION, '', { RUVNET_BRAIN_METER: '0', CLAUDE_PLUGIN_ROOT: path.join(REPO, 'plugin'), ...extraEnv });
+    const brainHome = path.join(tmp, '.cache/ruvnet-brain');
+    const project = path.join(tmp, 'project');
+    fs.mkdirSync(brainHome, { recursive: true });
+    fs.mkdirSync(project, { recursive: true });
+    // SessionStart restores the current project's store before its Brain-off split. HOME alone
+    // does not isolate that restore: an inherited checkout cwd reaches the owner's project.
+    const result = fireBash(SESSION, '', {
+      RUVNET_BRAIN_METER: '0', RUVNET_BRAIN_HOME: brainHome,
+      XDG_CACHE_HOME: path.join(tmp, '.cache'), CLAUDE_PROJECT_DIR: project,
+      CLAUDE_PLUGIN_ROOT: path.join(REPO, 'plugin'), ...extraEnv,
+    }, project);
+    expect(result.status, `SessionStart failed: ${result.stderr}`).toBe(0);
+    return result;
   }
 
   it('ON: the advertising is there (the control — otherwise "zero bytes" proves nothing)', () => {
     const out = session().stdout;
     expect(out).toContain('RuvNet Brain active');
-    expect(out).toContain('standing build playbook');
+    expect(out).not.toContain('standing build playbook');
   }, 30_000);
 
   it('OFF: ZERO advertising bytes, and exactly ONE state line naming the date', () => {
@@ -602,6 +644,14 @@ describe.skipIf(bashOnly)('ADR-054 — the PreToolUse guard on the consent recor
     expect(r.stderr).toMatch(/BLOCKED/);
   });
 
+  it('BLOCKS the same Write under every host spelling of the tool (Grok sends `write` / `search_replace`)', () => {
+    for (const t of ['write', 'WRITE', 'search_replace', 'notebookedit']) {
+      const r = fireBash(PROTECT, { tool_name: t, tool_input: { file_path: sentinel, content: 'x' } });
+      expect(r.status, `${t} walked past the consent guard`).toBe(2);
+    }
+    expect(fireBash(PROTECT, { tool_name: 'read_file', tool_input: { file_path: sentinel } }).status).toBe(0);
+  });
+
   it('BLOCKS an agent Edit to the settings mirror, and to its backups and lock', () => {
     for (const p of [settingsFile, `${settingsFile}.bak-2026-01-01`, `${settingsFile}.lock`]) {
       const r = fireBash(PROTECT, { tool_name: 'Edit', tool_input: { file_path: p, old_string: 'a', new_string: 'b' } });
@@ -617,6 +667,38 @@ describe.skipIf(bashOnly)('ADR-054 — the PreToolUse guard on the consent recor
       encoding: 'utf8',
     });
     expect(r.status).toBe(2);
+  });
+
+  it('BLOCKS a WINDOWS-style path — the separator is not the protection', () => {
+    // windows-unit went red on exactly this (2026-08-10). Claude Code sends `C:\Users\me\.config\…`,
+    // the payload is JSON, and field() does no unescaping — so the script receives DOUBLED
+    // backslashes. Every glob in the case block is written with `/`, so nothing matched and the
+    // guard exited 0: the consent boundary failed OPEN for every Windows user. The bug is in the
+    // payload SHAPE, not the host, so this reproduces on POSIX and needs no Windows runner.
+    for (const p of [
+      'C:\\Users\\someone\\.config\\ruvnet-brain\\settings.json',
+      'C:\\Users\\someone\\.config\\ruvnet-brain\\brain-off',
+      'C:\\Users\\someone\\.config\\ruvnet-brain\\settings.json.bak-2026-01-01',
+    ]) {
+      const r = spawnSync('bash', [PROTECT], {
+        input: JSON.stringify(write(p)),
+        env: { ...process.env, HOME: 'C:\\Users\\someone', RUVNET_BRAIN_STATE_DIR: '', RUVNET_SETTINGS_FILE: '' },
+        encoding: 'utf8',
+      });
+      expect(r.status, `${p} was not protected`).toBe(2);
+    }
+  });
+
+  it('TEETH: normalising separators does not turn the guard into a blanket refusal', () => {
+    // Without this, "block everything with a backslash" would pass the test above.
+    for (const p of ['C:\\Users\\someone\\code\\app.mjs', 'C:\\Users\\someone\\.claude\\settings.json']) {
+      const r = spawnSync('bash', [PROTECT], {
+        input: JSON.stringify(write(p)),
+        env: { ...process.env, HOME: 'C:\\Users\\someone', RUVNET_BRAIN_STATE_DIR: '', RUVNET_SETTINGS_FILE: '' },
+        encoding: 'utf8',
+      });
+      expect(r.status, `${p} must pass untouched`).toBe(0);
+    }
   });
 
   it('never teaches the model the lever it just refused', () => {
@@ -635,16 +717,18 @@ describe.skipIf(bashOnly)('ADR-054 — the PreToolUse guard on the consent recor
     expect(fireBash(PROTECT, 'not json at all').status).toBe(0);
   });
 
-  it('is registered on PreToolUse writes, through the shim, with an explicit ≤5s timeout', () => {
+  it('remains the first explicit decision policy; every automatic registration is in the declared plane', () => {
     const reg = JSON.parse(fs.readFileSync(path.join(REPO, 'plugin/hooks/hooks.json'), 'utf8'));
-    const entries = (reg.hooks.PreToolUse || []).flatMap((m) => (m.hooks || []).map((h) => ({ m: m.matcher, ...h })));
-    const guard = entries.find((h) => h.command.includes('protect-state'));
-    expect(guard, 'the guard is not wired into hooks.json at all').toBeTruthy();
-    expect(guard.command).toContain('hook-shim.mjs');
-    expect(guard.command).not.toContain('|| true');   // it is a wall; a failsafe would disarm it
-    expect(typeof guard.timeout).toBe('number');
-    expect(guard.timeout).toBeLessThanOrEqual(5);
-    expect(guard.m).toMatch(/Write/);
+    // DERIVED from continuity-hook-policy.mjs, the one file that defines the plane. Restating
+    // ['SessionStart','Stop'] kept this red for two days after the five-event plane landed (2026-09-11).
+    const planeEvents = [...new Set(continuityRegistrations('claude').map((s) => s.event))].sort();
+    expect(Object.keys(reg.hooks).sort()).toEqual(planeEvents);
+    expect(JSON.stringify(reg.hooks)).toContain('session-start');
+    expect(JSON.stringify(reg.hooks)).toContain('continuation-gate');
+    const gateSrc = fs.readFileSync(path.join(REPO, 'plugin/scripts/decision-gate.mjs'), 'utf8');
+    expect(gateSrc, 'protect-state must be a consulted policy').toMatch(/protect-brain-state\.sh/);
+    const order = [...gateSrc.matchAll(/POLICY\('([a-z-]+)'/g)].map((m) => m[1]);
+    expect(order[0], 'the consent guard outranks every other policy').toBe('protect-state');
   });
 });
 

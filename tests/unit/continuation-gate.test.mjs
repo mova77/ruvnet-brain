@@ -14,27 +14,47 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { continuationProjectIdentity } from '../../plugin/scripts/continuation-objective.mjs';
 
 const GATE = path.resolve(import.meta.dirname, '../../plugin/scripts/continuation-gate.mjs');
+function preferences(items, cwd, sessionId = 's-test') {
+  const item = items.find((row) => !row.done);
+  const identity = continuationProjectIdentity(cwd);
+  return item ? { schemaVersion: 1, kind: 'continuation-preferences', authoritative: false,
+    id: 'fixture-objective', text: item.text, at: item.at, state: 'active',
+    projectId: identity.projectId, worktreeIds: [identity.worktreeId], sessionIds: [sessionId],
+    authorization: { kind: 'user', reference: 'fixture-explicit-user-request' } } : null;
+}
 
 /** Run the gate with an isolated ledger, returning {out, forced, items}. Never touches the real one. */
 function runGate(items, hookInput = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cont-gate-'));
   const ledger = path.join(dir, 'ledger.json');
-  fs.writeFileSync(ledger, JSON.stringify({ items }));
-  const payload = JSON.stringify({ session_id: 's-test', stop_hook_active: false, cwd: dir, ...hookInput });
+  fs.writeFileSync(ledger, JSON.stringify({ items, objective: preferences(items, dir) }));
+  const payload = JSON.stringify({ hook_event_name: 'Stop', session_id: 's-test', stop_hook_active: false, cwd: dir, ...hookInput });
   let out = '';
   try {
     out = execFileSync(process.execPath, [GATE], {
       input: payload,
       encoding: 'utf8',
-      env: { ...process.env, RUVNET_WORK_LEDGER: ledger, RUVNET_CONTINUATION_COOLDOWN_MS: '0' },
+      env: {
+        ...process.env,
+        RUVNET_WORK_LEDGER: ledger,
+        RUVNET_CONTINUATION_COOLDOWN_MS: '0',
+        // The sandbox is the ledger AND the artifact source. The gate now also derives open
+        // work from open-issues.json (a file the issue-watch pipeline writes, so the guard is
+        // not armed solely by the model remembering to arm it). Without pinning it here these
+        // cases read the DEVELOPER's real SLA breaches and a "must stay silent" assertion
+        // fails for a true reason — the same incomplete-sandbox shape as HOME-without-PATH.
+        // Artifact-derived behaviour has its own file: continuation-gate-artifact-derived.
+        RUVNET_OPEN_ISSUES_FILE: path.join(dir, 'no-such-open-issues.json'),
+      },
     });
   } catch (e) { out = e.stdout || ''; }
   finally { fs.rmSync(dir, { recursive: true, force: true }); }
 
   let ctx = null;
-  try { ctx = JSON.parse(out).hookSpecificOutput?.additionalContext ?? null; } catch { /* no envelope */ }
+  try { ctx = JSON.parse(out).reason ?? null; } catch { /* no envelope */ }
   return { out, forced: ctx != null, ctx };
 }
 
@@ -87,18 +107,53 @@ describe('continuation-gate — forces the turn to continue while work is open',
     expect(r.forced).toBe(false);
   });
 
+  it('FORCES on an item committed via the REAL --commit-to CLI, with no objective ever written — the exact gap that let a stop through in production', () => {
+    // THE BUG THIS CATCHES. Every test above writes `objective: preferences(items, dir)` directly
+    // into the ledger file — that field is what the gate actually reads, and no code path outside
+    // this test file ever constructed it. `--commit-to` (the ONLY CLI a model can actually run) only
+    // ever appends to `led.items`. Measured live 2026-09-12: 8 real `--commit-to` calls sat in a
+    // real ledger with zero effect — the Stop hook exited silently every time. This test uses the
+    // CLI exactly as a model would, with no test-only shortcut, so it fails on the real defect.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cont-gate-cli-'));
+    const ledger = path.join(dir, 'ledger.json');
+    const env = { ...process.env, RUVNET_WORK_LEDGER: ledger, RUVNET_CONTINUATION_COOLDOWN_MS: '0',
+      RUVNET_OPEN_ISSUES_FILE: path.join(dir, 'no-such-open-issues.json') };
+    execFileSync(process.execPath, [GATE, '--commit-to', 'ship the thing'], { cwd: dir, env, encoding: 'utf8' });
+    const payload = JSON.stringify({ hook_event_name: 'Stop', session_id: 's-cli', stop_hook_active: false, cwd: dir });
+    let out = '';
+    try { out = execFileSync(process.execPath, [GATE], { input: payload, encoding: 'utf8', cwd: dir, env }); }
+    catch (e) { out = e.stdout || ''; }
+    finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    let ctx = null;
+    try { ctx = JSON.parse(out).reason ?? null; } catch { /* no envelope */ }
+    expect(ctx, 'a real --commit-to item must force the turn to continue').not.toBeNull();
+    expect(ctx).toMatch(/ship the thing/);
+  });
+
   it('names the event so the envelope is not discarded', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cont-gate-ev-'));
     const ledger = path.join(dir, 'l.json');
-    fs.writeFileSync(ledger, JSON.stringify({ items: [{ text: 'x', at: hoursAgo(1), done: false }] }));
+    const items = [{ text: 'x', at: hoursAgo(1), done: false }];
+    fs.writeFileSync(ledger, JSON.stringify({ items, objective: preferences(items, dir, 's') }));
     let out = '';
     try {
       out = execFileSync(process.execPath, [GATE], {
-        input: JSON.stringify({ session_id: 's', stop_hook_active: false, cwd: dir }),
+        input: JSON.stringify({ hook_event_name: 'Stop', session_id: 's', stop_hook_active: false, cwd: dir }),
         encoding: 'utf8',
-        env: { ...process.env, RUVNET_WORK_LEDGER: ledger, RUVNET_CONTINUATION_COOLDOWN_MS: '0' },
+        env: {
+        ...process.env,
+        RUVNET_WORK_LEDGER: ledger,
+        RUVNET_CONTINUATION_COOLDOWN_MS: '0',
+        // The sandbox is the ledger AND the artifact source. The gate now also derives open
+        // work from open-issues.json (a file the issue-watch pipeline writes, so the guard is
+        // not armed solely by the model remembering to arm it). Without pinning it here these
+        // cases read the DEVELOPER's real SLA breaches and a "must stay silent" assertion
+        // fails for a true reason — the same incomplete-sandbox shape as HOME-without-PATH.
+        // Artifact-derived behaviour has its own file: continuation-gate-artifact-derived.
+        RUVNET_OPEN_ISSUES_FILE: path.join(dir, 'no-such-open-issues.json'),
+      },
       });
     } catch (e) { out = e.stdout || ''; } finally { fs.rmSync(dir, { recursive: true, force: true }); }
-    expect(JSON.parse(out).hookSpecificOutput.hookEventName).toBe('Stop');
+    expect(JSON.parse(out).decision).toBe('block');
   });
 });

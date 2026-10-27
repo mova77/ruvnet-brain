@@ -48,6 +48,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { continuityRegistrations } from '../../plugin/scripts/continuity-hook-policy.mjs';
 
 import {
   fireHook, assertContract, runBattery, resolveInstalledSurface, readInstalledRegistrations,
@@ -251,20 +252,14 @@ describe('the shell invocation — how a hook command reaches a shell on each pl
     expect(cmdSlashS(inv.args[3])).toBe(quotedInterp);
   });
 
-  it('win32: every command the REAL shipped hooks.json registers is invoked the fixed way', () => {
-    // Not a fixture string — the actual registrations, so a future hook whose command form breaks
-    // Windows is caught here rather than by a stranger. The plugin root is substituted with a
-    // Windows path containing a space, because that is the case that failed.
+  it('win32: the REAL shipped hooks.json has only bounded continuity commands to invoke', () => {
     const regs = readInstalledRegistrations(path.join(REPO_ROOT, 'plugin', 'hooks', 'hooks.json'));
-    expect(regs.length).toBeGreaterThan(0);
-    for (const r of regs) {
-      const command = r.command.replaceAll('${CLAUDE_PLUGIN_ROOT}', 'C:\\Users\\Jane Smith\\.claude\\plugins\\cache\\rb');
-      const inv = shellInvocation(command, 'win32', WIN_COMSPEC);
-      expect(inv.windowsVerbatimArguments, `libuv would escape: ${command}`).toBe(true);
-      expect(inv.args[3], `not quote-wrapped: ${command}`).toBe(`"${command}"`);
-      // And what cmd actually executes is the registration, unchanged.
-      expect(cmdSlashS(inv.args[3]), `mangled on win32: ${command}`).toBe(command);
-    }
+    // The count is the plane's, DERIVED from continuity-hook-policy.mjs — never restated. Restating "2"
+    // is how this stayed red for two days after 56420430 restored the five-event plane (measured 2026-09-11).
+    expect(regs).toHaveLength(continuityRegistrations('claude').length);
+    expect(regs.map((r) => r.command)).toEqual(expect.arrayContaining([
+      expect.stringContaining('session-start'), expect.stringContaining('continuation-gate'),
+    ]));
   });
 
   it('a COMSPEC that is not cmd takes the POSIX-shaped branch, never cmd syntax', () => {
@@ -381,20 +376,12 @@ describe('contract source — shim TABLE + hook-contracts.json, parsed from the 
 
 // ── §4 THE REAL SHIPPED SURFACE — the real shim, the real hooks.json ────────────────────────────
 describe('the real shipped plugin surface', () => {
-  it('every registration in the real hooks.json resolves to a declared mode + explicit timeout', async () => {
-    const { shimTable, shimIdIn, loadContracts, contractMatches } = await import('../../scripts/hook-registry.mjs');
+  it('the real hooks.json contains exactly the continuity plane\'s registrations — derived from the policy, never restated', async () => {
     const root = path.join(REPO_ROOT, 'plugin');
     const regs = readInstalledRegistrations(path.join(root, 'hooks', 'hooks.json'));
-    const table = shimTable(root);
-    const { contracts } = loadContracts(root);
-    expect(regs.length).toBeGreaterThan(0);
-    for (const r of regs) {
-      const id = shimIdIn(r.command);
-      const mode = (id && table[id]?.mode) ?? contracts.find((c) => contractMatches(c, { layer: 'plugin', event: r.event, matcher: r.matcher, command: r.command }))?.mode ?? null;
-      expect(mode, `no declared mode for ${r.event} ${r.matcher} :: ${r.command}`).not.toBeNull();
-      expect(typeof r.timeout, `no explicit timeout for ${r.event} ${r.matcher}`).toBe('number');
-      expect(r.timeout, `timeout ${r.timeout} > 60 is a milliseconds value in a seconds field`).toBeLessThanOrEqual(60);
-    }
+    const plane = continuityRegistrations('claude');
+    expect(regs).toHaveLength(plane.length);
+    expect(regs.map((r) => r.event).sort()).toEqual(plane.map((s) => s.event).sort());
   });
 
   it('resolveInstalledSurface prefers the packed install and names which copy it chose', () => {
@@ -434,6 +421,29 @@ describe('coexistence — enumerate the user\'s hooks, never execute them', () =
     expect(c.foreign.some((f) => f.layer === 'user')).toBe(true);
     // THE POINT: a foreign hook is data to be reported, never a process to be run.
     expect(fs.existsSync(canary)).toBe(false);
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  // Dream Cycle 2026-08-20 (cross-host-conformance): `ours` omitted the 'codex' layer, so
+  // checkCoexistence() silently undercounted `ourCount` and dropped every codex-hooks.json
+  // registration from both buckets the moment hook-registry.mjs's mesh learned to read it — caught
+  // by an independent critique, not by this file, before it shipped. Pinned here with an exact
+  // count (not `toBeGreaterThan(0)`) specifically because a vacuous-but-truthy assertion is what
+  // let the original gap through unnoticed.
+  it('classifies codex-hooks.json registrations as OURS, not foreign or invisible', async () => {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'selfcheck-coex-codex-')));
+    const declaredIn = (rel) => {
+      const doc = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8'));
+      return Object.values(doc.hooks)
+        .reduce((total, groups) => total + groups.reduce((n, g) => n + (g.hooks?.length ?? 0), 0), 0);
+    };
+    // EXACT, not >= : an >= assertion here is the vacuous shape that let the original gap through —
+    // plugin/hooks/hooks.json alone already declares more registrations than codex-hooks.json does,
+    // so a >= bound stays green whether or not codex's 16 are actually counted.
+    const expectedOurCount = declaredIn('plugin/hooks/hooks.json') + declaredIn('plugin/hooks/codex-hooks.json');
+    const c = await checkCoexistence({ home, repo: REPO_ROOT });
+    expect(c.ourCount, 'ourCount must include codex-hooks.json\'s registrations').toBe(expectedOurCount);
+    expect(c.foreign.some((f) => f.layer === 'codex'), 'codex misclassified as foreign').toBe(false);
     fs.rmSync(home, { recursive: true, force: true });
   });
 
@@ -525,21 +535,40 @@ describe('verdict — exit codes are the point', () => {
     }
   });
 
-  it('a healthy install + healthy hooks = exit 0 and ONE calm confirming line, no nagging', async () => {
-    const s = surface([{ id: 'healthy', file: 'healthy.mjs', event: 'SessionStart', mode: 'advisory' }]);
+  it('a healthy install + continuity-only hooks = exit 0 and ONE calm confirming line', async () => {
+    const s = surface([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'selfcheck-retired-home-'));
+    const installed = path.join(home, '.claude/plugins/cache/ruvnet-brain/ruvnet-brain/9.9.9');
+    fs.mkdirSync(path.dirname(installed), { recursive: true });
+    fs.cpSync(s.root, installed, { recursive: true });
     const r = await selfCheck({
-      home: os.tmpdir(), regimes: STDIN_REGIMES, security: false,
+      home, regimes: STDIN_REGIMES, security: false,
       installState: { repos: 12, reader: true, mcp: true },
     });
-    // The fixture surface is not discoverable from os.tmpdir() as a HOME, so the battery reports no
-    // plugin — assert on the install-state half here and on the battery half in §2's healthy case.
-    const installViolations = r.violations.filter((v) => ['no-stores', 'no-reader', 'no-mcp'].includes(v.kind));
-    expect(installViolations).toHaveLength(0);
-    const clean = { ...r, violations: [] };
-    const out = formatVerdict(clean);
+    expect(r.exitCode).toBe(0);
+    expect(r.violations).toEqual([]);
+    const out = formatVerdict(r);
     expect(out).toMatch(/Self-check passed/);
     expect(out.split('\n').filter((l) => /✓|✗|•/.test(l))).toHaveLength(1); // exactly one verdict line
-    expect(s.ok).toBe(true);
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  it('an otherwise healthy install fails when one retired automatic registration remains', async () => {
+    const s = surface([{ id: 'healthy', file: 'healthy.mjs', event: 'SessionStart', mode: 'advisory' }]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'selfcheck-stale-hook-home-'));
+    const installed = path.join(home, '.claude/plugins/cache/ruvnet-brain/ruvnet-brain/9.9.9');
+    fs.mkdirSync(path.dirname(installed), { recursive: true });
+    fs.cpSync(s.root, installed, { recursive: true });
+
+    const r = await selfCheck({
+      home, regimes: ['valid'], security: false,
+      installState: { repos: 12, reader: true, mcp: true },
+    });
+
+    expect(r.exitCode).toBe(1);
+    expect(r.violations.map((item) => item.kind)).toContain('automatic-registration');
+    expect(r.battery.results).toEqual([]);
+    fs.rmSync(home, { recursive: true, force: true });
   });
 
   it('the battery result feeds the verdict: a hanging hook alone makes exit non-zero', { timeout: 60_000 }, async () => {
@@ -584,6 +613,16 @@ describe('mutation proof — every assertion is load-bearing', () => {
     const file = path.join(dir, 'mutant.mjs');
     fs.writeFileSync(file, source
       .replace(find, replace)
+      // selfcheck.mjs imports THE canonical continuity policy by relative path. This mutant is
+      // written to a temp dir, so that specifier has to be re-pointed at the real module — the same
+      // absolute-path rewrite this fixture already does for `here` on the line below. Staging a
+      // COPY of the policy here would recreate the exact defect this import was added to remove:
+      // two copies of one policy, drifting apart (2026-09-15 — the stale local duplicate classified
+      // 9 of 11 shipped hook registrations as legacy and failed every real user's install).
+      .replace("from '../plugin/scripts/continuity-hook-policy.mjs'",
+        `from ${JSON.stringify(pathToFileURL(path.join(REPO_ROOT, 'plugin/scripts/continuity-hook-policy.mjs')).href)}`)
+      .replace("from '../plugin/scripts/entrypoint.mjs'",
+        `from ${JSON.stringify(pathToFileURL(path.join(REPO_ROOT, 'plugin/scripts/entrypoint.mjs')).href)}`)
       .replace(ANCHOR, `const here = ${JSON.stringify(path.join(REPO_ROOT, 'scripts'))};`));
     return { mod: await import(pathToFileURL(file).href), file, dir };
   }

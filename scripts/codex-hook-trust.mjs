@@ -1,0 +1,178 @@
+// codex-hook-trust.mjs — which Brain hooks will Codex refuse to run after this update until the user
+// re-reviews them? Answered OFFLINE, from the two hooks files, with Codex's own trust identity.
+//
+// THE MECHANISM (source, not inference — openai/codex at tag rust-v0.159.3, the installed codex-cli):
+//   codex-rs/hooks/src/engine/discovery.rs
+//     · key  = hook_key("<plugin_id>:<relative hooks file>", event, group_index, handler_index)
+//              e.g. "ruvnet-brain@ruvnet-brain:hooks/codex-hooks.json:user_prompt_submit:0:1"
+//     · hash = hook_hash(): sha256 over the canonical JSON of the NORMALISED identity
+//              { event_name, matcher (tool/session events only), hooks: [normalised handler] } —
+//              command, timeout (normalised), async, statusMessage; "so equivalent hooks from config
+//              TOML and hooks.json converge on the same trust identity".
+//     · hook_trust_status(): trusted_hash == current hash -> Trusted; a different stored hash ->
+//              Modified; none -> Untrusted. Only Managed|Trusted handlers are pushed to run (unless
+//              bypass_hook_trust). So a release that edits a command's text, its timeout or its
+//              matcher, or that shifts a hook to another group/handler index, silently stops that
+//              hook on every machine until the user trusts it again.
+//   codex-rs/config/src/fingerprint.rs version_for_toml(): "sha256:" + hex(sha256(serde_json::to_vec(
+//              canonical_json(value)))) — keys sorted recursively, compact.
+//   codex-rs/tui/src/startup_hooks_review.rs: the interactive prompt "Hooks need review" offers
+//              "Review hooks" / "Trust all and continue" / "Continue without trusting (hooks won't run)".
+// MEASURED 2026-10-01 in an isolated CODEX_HOME (codex-cli 0.159.3, no credentials): fresh install ->
+// all 11 Brain hooks `untrusted`; trusted_hash written -> `trusted`; one command's text changed ->
+// that one hook `modified`, the other ten still `trusted`. currentHash from `hooks/list` equals
+// codexHookHash() below for every hook (tests/unit/codex-hook-trust.test.mjs pins the real values).
+import crypto from 'node:crypto';
+import nodeFs from 'node:fs';
+
+const EVENT_LABEL = Object.freeze({
+  PreToolUse: 'pre_tool_use', PermissionRequest: 'permission_request', PostToolUse: 'post_tool_use',
+  PreCompact: 'pre_compact', PostCompact: 'post_compact', SessionStart: 'session_start', SessionEnd: 'session_end',
+  UserPromptSubmit: 'user_prompt_submit', SubagentStart: 'subagent_start', SubagentStop: 'subagent_stop',
+  Stop: 'stop', Interrupt: 'interrupt',
+});
+const NO_MATCHER = new Set(['UserPromptSubmit', 'Stop', 'Interrupt']);
+const CONTEXT_EVENTS = new Set(['PreToolUse', 'PostToolUse', 'SessionStart', 'UserPromptSubmit', 'SubagentStart']);
+const DEFAULT_CONTEXT_LIMIT = 2500;
+
+function canonical(v) {
+  if (Array.isArray(v)) return v.map(canonical);
+  if (v && typeof v === 'object') return Object.fromEntries(Object.keys(v).sort().map((k) => [k, canonical(v[k])]));
+  return v;
+}
+
+/** discovery.rs normalize_command_hook(): SessionEnd/Interrupt default 1s, clamped 1..3; others default 600, min 1. */
+function normalisedTimeout(event, t) {
+  const n = Number.isInteger(t) && t >= 0 ? t : null;
+  if (event === 'SessionEnd' || event === 'Interrupt') return Math.min(3, Math.max(1, n ?? 1));
+  return Math.max(1, n ?? 600);
+}
+
+/** The exact `currentHash` Codex computes for one command handler, or null for a handler Codex would skip. */
+export function codexHookHash(event, group, handler) {
+  if (!EVENT_LABEL[event] || handler?.type !== 'command' || typeof handler.command !== 'string' || !handler.command.trim()) return null;
+  const h = { type: 'command', command: handler.command, timeout: normalisedTimeout(event, handler.timeout), async: handler.async === true };
+  if (typeof handler.statusMessage === 'string') h.statusMessage = handler.statusMessage;
+  const limit = handler.additionalContextLimit;
+  if (CONTEXT_EVENTS.has(event) && Number.isInteger(limit) && limit !== DEFAULT_CONTEXT_LIMIT) h.additionalContextLimit = limit;
+  const identity = { event_name: EVENT_LABEL[event], hooks: [h] };
+  if (!NO_MATCHER.has(event) && typeof group?.matcher === 'string') identity.matcher = group.matcher;
+  return `sha256:${crypto.createHash('sha256').update(JSON.stringify(canonical(identity))).digest('hex')}`;
+}
+
+/** key -> hash for every handler in a Codex hooks file ({ hooks: { Event: [groups] } }). */
+export function codexHookIdentities(hooksFile, keySource = 'ruvnet-brain@ruvnet-brain:hooks/codex-hooks.json') {
+  const out = new Map();
+  for (const [event, groups] of Object.entries(hooksFile?.hooks || {})) {
+    if (!EVENT_LABEL[event] || !Array.isArray(groups)) continue;
+    groups.forEach((group, gi) => (group?.hooks || []).forEach((handler, hi) => {
+      const hash = codexHookHash(event, group, handler);
+      if (hash) out.set(`${keySource}:${EVENT_LABEL[event]}:${gi}:${hi}`, hash);
+    }));
+  }
+  return out;
+}
+
+/**
+ * The Brain hooks an update leaves needing review: every key of the NEW file whose hash differs from the
+ * OLD file's hash at the same key ('modified') or that did not exist before ('untrusted'). A hook the user
+ * had already trusted at the old hash stops running until reviewed; that is the whole point of the list.
+ */
+export function codexTrustChanges(prevHooksFile, nextHooksFile, keySource, { contentChanged = false } = {}) {
+  const prev = codexHookIdentities(prevHooksFile, keySource);
+  const next = codexHookIdentities(nextHooksFile, keySource);
+  const changes = [];
+  for (const [key, hash] of next) {
+    if (!prev.has(key)) changes.push({ key, status: 'untrusted' });
+    else if (prev.get(key) !== hash) changes.push({ key, status: 'modified' });
+    // Codex 0.164+: an unchanged declaration is still "modified" once the plugin's bytes change, because the approval
+    // also pins trusted_content_hash (plugin_trust.rs matches_hash; legacy approvals pin a baseline the same way).
+    else if (contentChanged) changes.push({ key, status: 'modified', reason: 'plugin-content' });
+  }
+  return changes;
+}
+
+/**
+ * Does this Codex approve plugin hooks by content as well as declaration? True from codex-cli 0.164.0, where
+ * discovery.rs reports currentHash "<declaration>/<content>" and plugin_trust.rs checks trusted_content_hash.
+ * Unknown or unparseable versions answer null so a caller can fail toward asking for review.
+ */
+export function codexUsesContentTrust(versionText) {
+  const m = /(\d+)\.(\d+)\.(\d+)/.exec(String(versionText || ''));
+  if (!m) return null;
+  const [major, minor] = [Number(m[1]), Number(m[2])];
+  return major > 0 || minor >= 164;
+}
+
+// Codex writes this under the installed plugin itself (codex-rs/core-plugins/src/command_migration.rs); a candidate
+// release never carries it, so it says nothing about whether the release's bytes changed.
+const CODEX_GENERATED_PREFIX = '.codex-plugin/migrated-command-skills/';
+
+/**
+ * Would Codex see different plugin contents after replacing `installedRoot` with `candidateRoot`? Compares exactly
+ * the files codexPluginContentHash() fingerprints (Codex's own generated migrations aside). Anything unreadable
+ * counts as changed: the answer is used to warn, so it fails toward asking the user to review.
+ */
+export function codexPluginContentChanged(installedRoot, candidateRoot, options = {}) {
+  if (!installedRoot || !candidateRoot) return true;
+  const files = (root) => {
+    const out = new Map();
+    codexPluginContentHash(root, { ...options, onFile: (rel, bytes) => {
+      if (!rel.startsWith(CODEX_GENERATED_PREFIX)) out.set(rel, crypto.createHash('sha256').update(bytes).digest('hex'));
+    } });
+    return out;
+  };
+  try {
+    const a = files(installedRoot); const b = files(candidateRoot);
+    return a.size !== b.size || [...b].some(([rel, h]) => a.get(rel) !== h);
+  } catch { return true; }
+}
+
+/** The exact instruction for a user whose Brain hooks Codex is holding back. */
+export const CODEX_TRUST_ACTION = 'Start Codex (interactive, in any project). At the "Hooks need review" prompt choose'
+  + ' "Trust all and continue" — or type /hooks and trust each RuvNet Brain hook. Until then Codex skips them'
+  + ' (codex exec never asks). Then re-run npx ruvnet-brain --doctor.';
+
+/**
+ * Codex's plugin bundle fingerprint, ported byte for byte from openai/codex rust-v0.164.0
+ * codex-rs/hooks/src/engine/plugin_fingerprint.rs plugin_content_hash(). Since 0.164 a plugin hook's
+ * `currentHash` is "<declaration hash>/<this hash>" and its approval stores the two separately
+ * (`trusted_hash` + `trusted_content_hash`, plugin_trust.rs matches_hash). Measured 2026-10-24: every Brain update
+ * left all 13 Codex hooks "modified" because the Brain wrote only the declaration hash.
+ * Walk: depth-first, entries sorted by file name (bytes), skipping __pycache__, .venv, *.pyc, *.egg-info; each entry
+ * hashes its root-relative path (u64 LE length + bytes), then "directory", or "file" + u64 LE size + contents.
+ * Anything that is neither (a symlink) throws, as it does in Codex.
+ */
+export function codexPluginContentHash(root, { fsImpl = null, onFile = null, platform = process.platform } = {}) {
+  const fs = fsImpl || nodeFs;
+  const u64 = (n) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); return b; };
+  if (!fs.lstatSync(root).isDirectory()) throw new Error('plugin root is not a directory');
+  const hash = crypto.createHash('sha256').update('codex-plugin-bundle-v1');
+  // Rust hashes the OS-native relative path bytes: '\\' separators on Windows (review 2026-10-24).
+  const sep = platform === 'win32' ? '\\' : '/';
+  const pending = [''];
+  while (pending.length) {
+    const rel = pending.pop();
+    const base = rel.split('/').pop();
+    if (rel && (base === '__pycache__' || base === '.venv' || base.endsWith('.pyc') || base.endsWith('.egg-info'))) continue;
+    const name = Buffer.from(rel.split('/').join(sep));
+    hash.update(u64(name.length)).update(name);
+    const full = rel ? `${root}/${rel}` : root;
+    const st = fs.lstatSync(full);
+    if (st.isDirectory()) {
+      hash.update('directory');
+      const entries = fs.readdirSync(full).sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
+      for (const entry of entries.reverse()) pending.push(rel ? `${rel}/${entry}` : entry);
+    } else if (st.isFile()) {
+      const bytes = fs.readFileSync(full);
+      if (bytes.length !== st.size) throw new Error('plugin file changed while fingerprinting');
+      // The caller sees exactly the bytes that enter the fingerprint: one read, so nothing can change between a check
+      // and the hash it approves (review 2026-10-24: a separate verification pass was a swap window).
+      onFile?.(rel, bytes);
+      hash.update('file').update(u64(st.size)).update(bytes);
+    } else {
+      throw new Error(`unsupported plugin entry type: ${full}`);
+    }
+  }
+  return `sha256:${hash.digest('hex')}`;
+}

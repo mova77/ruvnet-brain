@@ -3,9 +3,9 @@
 // GROUND TRUTH rather than by a model's opinion of them. (ADR-0011 Phase 0.)
 //
 // FIVE STRATA, because a gate that only asks easy questions cannot fail:
-//   named       — the repo is named in the question           pass = grounded AND routed
-//   described   — capability described, no names              pass = grounded AND routed
-//   scenario    — a real-world situation, no names            pass = grounded AND routed
+//   named       — the repo is named in the question           pass = grounded AND routed AND not abstained
+//   described   — capability described, no names              pass = grounded AND routed AND not abstained
+//   scenario    — a real-world situation, no names            pass = grounded AND routed AND not abstained
 //   adversarial — the correct answer is NOT in this corpus    pass = ABSTAINED (top ce < 0, or no hits)
 //   provenance  — gist-shaped content                          pass = grounded AND (if the top hit IS a
 //                 gist chunk, it must carry its GIST STATUS banner — better repo grounding also passes)
@@ -32,6 +32,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { isDirectInvocation } from '../plugin/scripts/entrypoint.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const KB = process.env.RUVNET_BRAIN_KB || path.join(os.homedir(), '.cache', 'ruvnet-brain', 'kb');
@@ -70,21 +71,47 @@ export function wilson(k, n, z = 1.96) {
 /**
  * Grade one answered question by its stratum's rule. Pure — takes the verifier verdict, the top
  * citation (with its ce score), and whether the raw output carried the gist provenance banner.
+ *
+ * `receipt` (verifyGrounding's `receipt.repo`, from kb/verify-citation.mjs) names the citation that
+ * ACTUALLY resolved on disk — not necessarily citations[0]. citationResolves walks citations in rank
+ * order and accepts the first that resolves, so when the top-ranked citation is unverified/fabricated
+ * but a lower-ranked one grounds the answer, `citations[0].repo` is the WRONG repo to credit or debit
+ * "routed" against: it can under-count a correctly-routed answer (top fabricated, real hit lower) or
+ * over-count a wrong one (top coincidentally names the expected repo but never resolved). `routed`
+ * answers "does the query reach the store that actually holds the answer" (brain-score.mjs's own
+ * wording for this metric) — that store is the one named in `receipt`, when one was verified.
  */
-export function gradeQuestion(q, { grounded, citations, bannerPresent }) {
+export function gradeQuestion(q, { grounded, citations, bannerPresent, receipt, repoAliases = {} }) {
   const top = citations?.[0] ?? null;
-  const routed = !!(grounded && q.expectRepo?.length && top && q.expectRepo.includes(top.repo));
+  const routedRepo = receipt?.repo ?? top?.repo ?? null;
+  const routed = !!(grounded && q.expectRepo?.length && routedRepo
+    && repoMatchesExpected(routedRepo, q.expectRepo, repoAliases));
   const abstained = !top || (typeof top.ce === 'number' && top.ce < ABSTAIN_CE);
   switch (q.stratum) {
     case 'adversarial':
       return { grounded, routed: null, abstained, pass: abstained };
     case 'provenance':
       // The mechanism under test: IF a gist chunk wins, it must carry its own status banner.
-      // A better hit from the real repo is not a failure — it is better grounding.
-      return { grounded, routed: null, abstained, pass: !!grounded && (top?.repo !== 'ruv-gists' || bannerPresent) };
+      // A better hit from the real repo is not a failure — it is better grounding. "Wins" means
+      // the citation verify-citation.mjs actually resolved (`routedRepo`, the same signal `routed`
+      // uses below) — not merely the raw top-ranked citation, which citationResolves() can walk
+      // past when it is unverified/fabricated (the sibling gap already closed for `routed`).
+      return { grounded, routed: null, abstained, pass: !!grounded && !abstained && (routedRepo !== 'ruv-gists' || bannerPresent) };
     default:
-      return { grounded, routed, abstained, pass: !!grounded && routed };
+      // Abstention is correct only for the adversarial stratum. A negative cross-encoder score on
+      // an answerable question is an answer miss, even when an unrelated existing path resolves.
+      return { grounded, routed, abstained, pass: !!grounded && routed && !abstained };
   }
+}
+
+// Ground truth names the logical repository, while the deployed corpus may use a documented
+// store alias (for example agent-harness-generator -> metaharness).  Credit only aliases present
+// in the shipped registry; never turn an arbitrary similarly named store into a pass.
+export function repoMatchesExpected(actual, expected, aliases = {}) {
+  if (!actual || !Array.isArray(expected)) return false;
+  if (expected.includes(actual)) return true;
+  return expected.some((canonical) => Array.isArray(aliases?.[canonical])
+    && aliases[canonical].includes(actual));
 }
 
 /** Aggregate graded rows into the four gated metrics, each with its Wilson interval. */
@@ -135,6 +162,11 @@ async function main() {
   const die = (msg) => { console.error(`eval-brain: ${msg}`); process.exit(2); };
 
   if (!fs.existsSync(path.join(KB, 'forge-ask-all.mjs'))) die(`no brain at ${KB} — run: npx ruvnet-brain`);
+  let repoAliases = {};
+  try {
+    const aliasesFile = path.join(KB, 'repo-aliases.json');
+    if (fs.existsSync(aliasesFile)) repoAliases = JSON.parse(fs.readFileSync(aliasesFile, 'utf8'));
+  } catch { /* a legacy bundle simply has no alias normalization to apply */ }
   const verifierPath = path.join(KB, 'verify-citation.mjs');
   if (!fs.existsSync(verifierPath)) die('this bundle predates verify-citation.mjs — refusing to score grounding without a way to check it');
   const { verifyGrounding } = await import(pathToFileURL(verifierPath).href);
@@ -151,7 +183,13 @@ async function main() {
   // serial cost was ~13.5s/question ≈ 27 min for 120; at concurrency 6 the wall drops ~6×.
   const { execFile } = await import('node:child_process');
   const ask = (query) => new Promise((resolve) => {
-    execFile('node', ['forge-ask-all.mjs', '--dir', KB, '--q', query, '--k', '3'],
+    // The evaluator must exercise the same bounded source-routing path used by the production
+    // MCP host.  The old CLI default widened every routed miss to the entire corpus, which turned
+    // a 120-question quality check into a multi-hour cross-encoder run and measured a path no user
+    // actually takes.  Set EVAL_FULL_CORPUS=1 only for an explicit historical fan-out experiment.
+    const args = ['forge-ask-all.mjs', '--dir', KB, '--q', query, '--k', '3'];
+    if (process.env.EVAL_FULL_CORPUS !== '1') args.push('--bounded');
+    execFile('node', args,
       { cwd: KB, timeout: 240000, env: process.env, maxBuffer: 64 * 1024 * 1024 },
       (err, stdout) => resolve(err ? '' : String(stdout || '')));
   });
@@ -180,7 +218,13 @@ async function main() {
         continue;
       }
       const v = await verifyGrounding(out, KB);
-      const graded = gradeQuestion(q, { grounded: v.grounded, citations: v.citations, bannerPresent: /GIST STATUS/.test(out) });
+      const graded = gradeQuestion(q, {
+        grounded: v.grounded,
+        citations: v.citations,
+        receipt: v.receipt,
+        bannerPresent: /GIST STATUS/.test(out),
+        repoAliases,
+      });
       const top = v.citations?.[0] ?? null;
       rows[i] = {
         id: q.id, stratum: q.stratum, query: q.query,
@@ -239,6 +283,6 @@ async function main() {
   }
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (isDirectInvocation(import.meta.url)) {
   await main();
 }

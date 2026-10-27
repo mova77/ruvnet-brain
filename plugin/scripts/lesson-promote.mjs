@@ -1,0 +1,373 @@
+#!/usr/bin/env node
+/**
+ * lesson-promote.mjs — mine project-scoped lessons, find the UNIVERSAL ones, promote them.
+ *
+ * THE PROBLEM, MEASURED (2026-07-22, on the owner's own machine — this is not hypothetical):
+ *
+ *     736 lessons across 48 project memory stores.
+ *     284 of them are `type: feedback` — "how I want you to WORK", which is almost never
+ *     project-specific — and they are scattered across 33 separate stores.
+ *
+ *     "Test before claiming done"      taught 87 times across 19 projects
+ *     "Versioning / release discipline" taught 52 times across 14 projects
+ *     "Never fabricate / be honest"     taught 37 times across 14 projects
+ *
+ * The owner did not repeat himself because he forgot. He repeated himself because a lesson learned
+ * in project A physically cannot reach project B: Claude Code scopes memory to
+ * ~/.claude/projects/<project>/memory/, and nothing promotes upward. His words: "I shouldn't ever
+ * have to tell you twice." He has had to tell us 87 times.
+ *
+ * THE PROMOTION RULE IS NOT OURS. It is rUv's, from ruflo ADR-G008 ("Win Twice to Promote",
+ * Accepted/implemented): a rule may not enter the constitution on one good result, because one
+ * result is noise. We apply the same test with the strongest evidence available here — INDEPENDENT
+ * REDISCOVERY. A lesson the user taught in two or more separate projects has already won twice, in
+ * the only arena that matters: he needed it more than once, in places that could not see each other.
+ *
+ * That is deliberately NOT a similarity score or an LLM judgment call. It is a count of how many
+ * times a human independently arrived at the same instruction. Cheap, explainable, and impossible
+ * to fudge — which matters, because a promotion engine that guesses will pollute the global rules
+ * that govern every project, and a bad global rule is far more expensive than a missing one.
+ *
+ * READ-ONLY BY DEFAULT. Promotion writes to the user's global instructions, which is the highest
+ * blast-radius write this project performs. It requires --apply, backs up first, and is reversible.
+ *
+ * Usage:
+ *   node scripts/lesson-promote.mjs                 # report only — what WOULD be promoted, and why
+ *   node scripts/lesson-promote.mjs --json          # machine-readable, for the console
+ *   node scripts/lesson-promote.mjs --apply         # write the promotion block (backs up first)
+ *   node scripts/lesson-promote.mjs --min-projects 3
+ *   node scripts/lesson-promote.mjs --demote-theme <key>   # reject a theme — sticky, never re-proposed
+ *   node scripts/lesson-promote.mjs --restore-theme <key>  # undo a demotion
+ */
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+// Read the global store through the bridge's own reader, and the moment vocabulary through the
+// store's own enum — the firing status must be DERIVED from the same code the bridge acts on, or it
+// becomes a second opinion about the same fact.
+import { readGlobalRows } from './lesson-bridge.mjs';
+import { TRIGGERS } from './lesson-store.mjs';
+
+const HOME = os.homedir();
+const PROJECTS = path.join(HOME, '.claude', 'projects');
+const argv = process.argv.slice(2);
+const has = (f) => argv.includes(f);
+const arg = (f, d) => { const i = argv.indexOf(f); return i >= 0 && argv[i + 1] ? argv[i + 1] : d; };
+
+// A lesson must have been independently learned in at least this many DISTINCT projects to be
+// considered universal. 2 is ADR-G008's "win twice"; the flag exists so a cautious user can demand
+// more evidence, never less — the floor is enforced below.
+const MIN_PROJECTS = Math.max(2, parseInt(arg('--min-projects', '2'), 10) || 2);
+
+/**
+ * Themes are the unit of promotion, not individual files.
+ *
+ * Promoting 87 near-identical "test first" lessons verbatim would be worse than promoting none —
+ * it would bury the global instructions under duplicates and make them unreadable, which is how a
+ * constitution stops being read. We cluster to the PROCESS, then promote one canonical statement of
+ * it, citing the projects that independently discovered it as the evidence.
+ *
+ * Deliberately keyword-based rather than embedding-based. An embedding cluster is a black box the
+ * user cannot audit, and this writes to the file that governs every project he owns. He must be able
+ * to read the rule that decided, disagree with it, and edit it. Legibility beats cleverness here.
+ */
+const THEMES = [
+  { key: 'release-discipline', label: 'Versioning and release discipline',
+    match: /version|semver|bump|release|ship|deploy|publish|rollback/i },
+  { key: 'proof-before-done', label: 'Prove it works before calling it done',
+    match: /test|verify|prove|validat|\bqa\b|gate|green|passes/i },
+  { key: 'honesty', label: 'Never fabricate, never assume, never inflate',
+    match: /honest|lie|fabricat|assum|guess|placeholder|inflat|real data|made up/i },
+  { key: 'docs-upkeep', label: 'Keep docs and README current with the code',
+    match: /readme|document|changelog|\bdocs?\b|narrative/i },
+  { key: 'people', label: 'How to communicate with people',
+    match: /thank|contributor|personal|tone|nudge|deferential|communicat/i },
+  { key: 'tooling-discipline', label: 'Use the real tool; never hand-roll a substitute',
+    match: /hand-roll|impersonat|substitut|reinvent|use the tool|existing tool|ruvnet wins/i },
+  { key: 'cost-routing', label: 'Route work to the cheapest capable model',
+    match: /cheap|cost|route|routing|model selection|budget|spend/i },
+];
+
+/** Every lesson file on this machine, with its project, type, and text. */
+export function collectLessons(root = PROJECTS) {
+  const out = [];
+  let dirs = [];
+  try { dirs = fs.readdirSync(root); } catch { return out; }
+  for (const p of dirs) {
+    const md = path.join(root, p, 'memory');
+    if (!fs.existsSync(md)) continue;
+    let files = [];
+    try { files = fs.readdirSync(md); } catch { continue; }
+    for (const f of files) {
+      if (!f.endsWith('.md') || f === 'MEMORY.md') continue;
+      let s = '';
+      try { s = fs.readFileSync(path.join(md, f), 'utf8'); } catch { continue; }
+      const type = (s.match(/^\s*type:\s*(\w+)/m) || [])[1] || 'unknown';
+      const desc = (s.match(/^description:\s*"?(.*?)"?\s*$/m) || [])[1] || '';
+      out.push({
+        project: p.replace(/^-Users-[^-]+-/, ''),
+        file: f.replace(/\.md$/, ''),
+        type, desc,
+        // name + description only — never the body. The body can hold project specifics (paths,
+        // client names, URLs); the identity of a PROCESS lives in its title. Classifying on the body
+        // would drag project facts into a global rule, which is the one thing promotion must not do.
+        text: `${f} ${desc}`,
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * Cluster lessons into themes and decide which have won often enough to be universal.
+ *
+ * Only `feedback` lessons are eligible. `project` lessons are, by their own declared type, about one
+ * codebase; promoting them would be a category error and would leak one client's details into every
+ * other project's context.
+ */
+/**
+ * THE DEMOTED-THEMES FILE — where "reject this theme, permanently" is recorded, and why it is not a
+ * field on a lesson row.
+ *
+ * The original design (2026-07-22) stored a `themeKey` on a demoted lesson inside `lessons.json` and
+ * read it back here. It never worked, and could not have: `makeLesson()` (`lesson-store.mjs`)
+ * destructures a FIXED field set and freezes the result, so an unknown key — `themeKey` included — is
+ * silently dropped the moment a row passes through it. Verified 2026-09-07 by construction: a
+ * hand-edited row carrying `themeKey` survives only until the very next legitimate write ANYWHERE in
+ * the store (`lesson-ratify.mjs --demote`, `updateLessons()`, any `loadLessons()` → `saveLessons()`
+ * round trip) — at that point every row, not just the one touched, has been re-serialized through
+ * `makeLesson()` and the field is gone. There was also no writer at all: `lesson-ratify.mjs --demote`
+ * only ever demotes by lesson `id`, never by theme. `demotedThemeKeys()` therefore always returned an
+ * empty set in every real invocation, and the sticky-demotion guard in `analyze()` below could never
+ * fire — the exact "demotion is theatre" failure ADR-030 §5 names, just for a different reason than
+ * the 2026-07-22 comment this replaces described.
+ *
+ * `lesson-gate.mjs`'s `OPTIN_PATH` documents the identical failure shape for a different field
+ * (`userOptedIntoBlocking`) and moved that consent to its own file for exactly this reason. That
+ * precedent was never applied here; it is now. Theme demotion gets its own small file, written only
+ * by `--demote-theme` / `--restore-theme` below, and never touched by the mining or lesson-store
+ * write paths — so no future lesson-store write can silently erase it.
+ */
+export const DEMOTED_THEMES_PATH = process.env.RUVNET_DEMOTED_THEMES
+  || path.join(HOME, '.config', 'ruvnet-brain', 'demoted-themes.json');
+
+function demotedThemeKeys(file = DEMOTED_THEMES_PATH) {
+  try {
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+    // Tolerant of both shapes, same reasoning as OPTIN_PATH: this file is expected to be hand-edited.
+    const list = Array.isArray(raw) ? raw : Array.isArray(raw?.demoted) ? raw.demoted : [];
+    return new Set(list.filter((x) => typeof x === 'string' && x.length));
+  } catch { return new Set(); }   // absent or unparseable → nothing demoted. Never fail INTO hiding a theme.
+}
+
+/** The only writer of DEMOTED_THEMES_PATH. Demotes or restores one theme key. */
+export function setThemeDemoted(key, demoted, file = DEMOTED_THEMES_PATH) {
+  const current = demotedThemeKeys(file);
+  if (demoted) current.add(key); else current.delete(key);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ demoted: [...current].sort() }, null, 2) + '\n');
+  return current;
+}
+
+export function analyze(lessons, { minProjects = MIN_PROJECTS, rejected = null, demotedThemesFile } = {}) {
+  // `rejected` is a pre-built Set, injectable for pure clustering tests.
+  // `demotedThemesFile` redirects the REAL disk reader (`demotedThemeKeys()`) to a fixture path — for
+  // tests that must exercise the actual read/write round trip, not a Set built by hand. Neither
+  // option is used by the CLI, which always takes the real default file for a real process.
+  const demoted = rejected instanceof Set ? rejected : demotedThemeKeys(demotedThemesFile);
+  const eligible = lessons.filter((l) => l.type === 'feedback');
+  const themes = [];
+  for (const t of THEMES) {
+    const hits = eligible.filter((l) => t.match.test(l.text));
+    if (!hits.length) continue;
+    const projects = [...new Set(hits.map((h) => h.project))].sort();
+    // A theme the user has demoted is NEVER re-proposed. Sticky across every future run.
+    if (demoted.has(t.key)) continue;
+    themes.push({
+      key: t.key,
+      label: t.label,
+      lessons: hits.length,
+      projects,
+      projectCount: projects.length,
+      // The whole verdict, in one line anyone can check by hand.
+      universal: projects.length >= minProjects,
+      evidence: `taught ${hits.length} time${hits.length === 1 ? '' : 's'} across ${projects.length} independent project${projects.length === 1 ? '' : 's'}`,
+      examples: hits.slice(0, 4).map((h) => `${h.project}: ${h.file}`),
+    });
+  }
+  themes.sort((a, b) => b.projectCount - a.projectCount || b.lessons - a.lessons);
+
+  const promotable = themes.filter((t) => t.universal);
+  return {
+    scanned: { projects: new Set(lessons.map((l) => l.project)).size, lessons: lessons.length, feedback: eligible.length },
+    minProjects,
+    themes,
+    promotable,
+    // The headline the console should say out loud, computed rather than written.
+    headline: promotable.length
+      ? `${promotable.length} process${promotable.length === 1 ? '' : 'es'} you have taught in ${minProjects}+ separate projects are still trapped at project level`
+      : 'no cross-project process has met the promotion bar yet',
+  };
+}
+
+/** Render the promotion block. Idempotent, fenced, and safe to regenerate. */
+export function renderBlock(result, now) {
+  const lines = [];
+  lines.push(BEGIN);
+  lines.push('<!-- Generated by scripts/lesson-promote.mjs. Regeneration REPLACES this fenced block');
+  lines.push('     wholesale on the next --apply — do NOT hand-edit between the markers, those changes');
+  lines.push('     are overwritten. Everything OUTSIDE the markers is left untouched. -->');
+  lines.push('');
+  lines.push(`## Cross-project lessons (promoted ${now})`);
+  lines.push('');
+  lines.push('These processes were learned independently in multiple projects. Per ruflo ADR-G008');
+  lines.push('("win twice to promote"), independent rediscovery IS the evidence — each one below was');
+  lines.push('needed more than once, in places that could not see each other.');
+  lines.push('');
+  for (const t of result.promotable) {
+    lines.push(`- **${t.label}** — ${t.evidence}.`);
+    lines.push(`  <sub>projects: ${t.projects.slice(0, 6).join(', ')}${t.projects.length > 6 ? `, +${t.projects.length - 6} more` : ''}</sub>`);
+  }
+  lines.push('');
+  lines.push(END);
+  return lines.join('\n');
+}
+
+const BEGIN = '<!-- BEGIN ruvnet-brain: promoted-lessons -->';
+const END = '<!-- END ruvnet-brain: promoted-lessons -->';
+
+/** Write the block into the user's global CLAUDE.md, backing up first. Reversible by design. */
+export function applyPromotion(result, { file, now }) {
+  if (!result.promotable.length) return { ok: true, noop: true, log: 'nothing met the promotion bar — nothing written' };
+  let existing = '';
+  try { existing = fs.readFileSync(file, 'utf8'); } catch { return { ok: false, log: `cannot read ${file}` }; }
+
+  const backup = `${file}.bak-promote-${now.replace(/[:.]/g, '-')}`;
+  try { fs.copyFileSync(file, backup); } catch (e) { return { ok: false, log: `refusing to write — backup failed: ${e.message}` }; }
+
+  const block = renderBlock(result, now);
+  const next = existing.includes(BEGIN)
+    ? existing.replace(new RegExp(`${BEGIN}[\\s\\S]*?${END}`), block)   // replace ONLY our fence
+    : `${existing.trimEnd()}\n\n${block}\n`;                            // first run: append
+
+  // ATOMIC write — temp sibling then rename, never in place. The same discipline bin/install.mjs's
+  // offerClaudeMd() already applies to this exact file (ADR-063 lineage): an in-place writeFileSync
+  // leaves the real file truncated if the process dies mid-write (disk full, SIGKILL, power loss).
+  // A rename within the same directory is atomic on every OS this project ships to, so CLAUDE.md is
+  // always either fully the old content or fully the new content, never a torn hybrid.
+  const tmp = `${file}.ruvnet-tmp`;
+  try {
+    fs.writeFileSync(tmp, next);
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* best effort — the real file is untouched either way */ }
+    return { ok: false, log: `write failed: ${e.message}; backup at ${backup}` };
+  }
+
+  // ROUND-TRIP PROOF, not an inferred success: a successful rename proves the bytes landed at
+  // `file`'s path, but not that they are the bytes this call intended — read the real path back
+  // and compare, the same discipline degradation-watch.mjs's proveMemoryDurable() applies to every
+  // other durable write in this repo.
+  let onDisk = '';
+  try { onDisk = fs.readFileSync(file, 'utf8'); } catch (e) {
+    return { ok: false, log: `wrote ${file.replace(HOME, '~')} but could not read it back to verify (${e.message}); backup at ${backup}` };
+  }
+  if (onDisk !== next) {
+    return { ok: false, log: `wrote ${file.replace(HOME, '~')} but the read-back did not match — refusing to report success; backup at ${backup}` };
+  }
+
+  return { ok: true, backup, promoted: result.promotable.length, log: `promoted ${result.promotable.length} process(es) into ${file.replace(HOME, '~')}` };
+}
+
+// ── CLI ──────────────────────────────────────────────────────────────────────────────────────────
+const invokedDirectly = process.argv[1] && path.resolve(process.argv[1]).endsWith('lesson-promote.mjs');
+if (invokedDirectly && (has('--demote-theme') || has('--restore-theme'))) {
+  const demoting = has('--demote-theme');
+  const key = arg(demoting ? '--demote-theme' : '--restore-theme');
+  if (!THEMES.some((t) => t.key === key)) {
+    console.error(`\n  ✗ unknown theme "${key}". Known keys: ${THEMES.map((t) => t.key).join(', ')}\n`);
+    process.exit(1);
+  }
+  setThemeDemoted(key, demoting);
+  console.log(`\n  ${demoting ? '✓ demoted' : '✓ restored'} theme "${key}" — `
+    + `${demoting ? 'will never be re-proposed by a future scan' : 'eligible again on the next scan'} `
+    + `(${DEMOTED_THEMES_PATH.replace(HOME, '~')})\n`);
+  process.exit(0);
+}
+if (invokedDirectly) {
+  const result = analyze(collectLessons());
+  if (has('--json')) { console.log(JSON.stringify(result, null, 2)); process.exit(0); }
+
+  console.log(`\n  Scanned ${result.scanned.lessons} lessons across ${result.scanned.projects} projects `
+    + `(${result.scanned.feedback} are about how you want work done).\n`);
+  console.log(`  ${result.headline}.\n`);
+  const w = 42;
+  for (const t of result.themes) {
+    const mark = t.universal ? '  ⬆ PROMOTE ' : '  · project ';
+    console.log(`${mark}${t.label.padEnd(w)} ${String(t.lessons).padStart(3)} lessons · ${t.projectCount} projects`);
+  }
+  if (result.promotable.length) {
+    console.log(`\n  Evidence for each (independent rediscovery — ADR-G008 "win twice"):`);
+    for (const t of result.promotable) {
+      console.log(`\n    ${t.label}`);
+      console.log(`      ${t.evidence}`);
+      for (const ex of t.examples) console.log(`        · ${ex}`);
+    }
+  }
+
+  if (has('--apply')) {
+    const file = arg('--file', path.join(HOME, '.claude', 'CLAUDE.md'));
+    const res = applyPromotion(result, { file, now: new Date().toISOString().slice(0, 10) });
+    console.log(`\n  ${res.ok ? '✓' : '✗'} ${res.log}`);
+    if (res.backup) console.log(`     backup: ${res.backup.replace(HOME, '~')}`);
+    reportFiringStatus();
+    process.exit(res.ok ? 0 : 1);
+  } else {
+    console.log(`\n  This was a REPORT — nothing was written.`);
+    console.log(`  To promote these into your global instructions:  node scripts/lesson-promote.mjs --apply\n`);
+  }
+}
+
+/**
+ * PROMOTION IS NOT DONE WHEN THE PROSE IS WRITTEN (ADR-067).
+ *
+ * `--apply` writes a block into ~/.claude/CLAUDE.md and reported success. That block is PROSE, and
+ * this project's founding measurement is what prose is worth:
+ *
+ *     gates that could interrupt:  8 fired,  8 obeyed   (100%)
+ *     prose in CLAUDE.md:          6 chances, 0 obeyed
+ *
+ * So the pipeline built to stop the owner repeating himself 87 times terminated in the one medium
+ * already measured at zero, and called that "promoted".
+ *
+ * THIS DOES NOT AUTO-ASSIGN A TRIGGER, and that restraint is the design. A trigger is the claim
+ * "this lesson belongs at THIS moment"; ADR-066 refuses to guess it because a keyword classifier is
+ * what put a false positive into ADR-065's own numbers. Promotion cannot know the moment.
+ *
+ * What it CAN do is stop reporting a half-finished promotion as a finished one. The firing status is
+ * DERIVED from the global store — how many machine-wide lessons carry a trigger tag and therefore
+ * reach a decision point, versus how many are inert prose — and printed with the one command that
+ * arms one. The gap becomes visible instead of silent, which is the same discipline lesson-bridge
+ * already applies to every untagged row it refuses to carry.
+ */
+function reportFiringStatus() {
+  let rows = [];
+  try { rows = readGlobalRows(); } catch { /* no global store on this machine */ }
+  if (!rows.length) {
+    console.log('\n  FIRING STATUS: no machine-wide lesson store on this machine — nothing promoted here can fire yet.');
+    return;
+  }
+  const firing = rows.filter((r) => /trigger:/.test(String(r.tags || '')));
+  const inert = rows.filter((r) => !/trigger:/.test(String(r.tags || '')));
+  console.log(`\n  FIRING STATUS — ${firing.length} of ${rows.length} machine-wide lesson(s) reach a decision point.`);
+  if (!inert.length) return;
+  console.log(`\n  ${inert.length} are PROSE ONLY. This repo measured prose at 0/6 obeyed against 8/8 for a`);
+  console.log('  gate that can interrupt, so a lesson without a moment is a lesson that does not act:');
+  for (const r of inert.slice(0, 8)) console.log(`      · ${r.key}`);
+  if (inert.length > 8) console.log(`      … and ${inert.length - 8} more (node plugin/scripts/lesson-bridge.mjs lists every one)`);
+  console.log('\n  Name the moment and the bridge does the rest:');
+  console.log('      ruflo memory store --path ~/.claude/global-memory/.swarm/memory.db -n global \\');
+  console.log('        -k "<key>" --value "<its text>" --tags "trigger:<moment>,enforce:checklist"');
+  console.log(`      moments: ${Object.values(TRIGGERS).map((x) => x.key).join(', ')}`);
+}
+

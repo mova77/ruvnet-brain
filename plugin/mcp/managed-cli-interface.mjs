@@ -2,7 +2,12 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { managedGenerationIdentity } from './managed-cli-generation.mjs';
 import { loadRuntimePreferences, runtimeChildEnv } from '../scripts/runtime-preferences.mjs';
+import { resolveRuflo } from '../scripts/ruflo-bin.mjs';
+import { projectDirectory } from '../scripts/project-identity.mjs';
+import { recordManagedCliObservation, recordRegistryLatestObservation } from '../scripts/capability-claim-evidence.mjs';
 
 export const MANAGED_EXECUTABLES = Object.freeze([
   'ruflo',
@@ -15,12 +20,27 @@ export const MANAGED_EXECUTABLES = Object.freeze([
 ]);
 
 const MANAGED = new Set(MANAGED_EXECUTABLES);
+const REGISTRY_PACKAGES = Object.freeze({
+  ruflo: 'ruflo',
+  'claude-flow': '@claude-flow/cli',
+  'agentic-flow': 'agentic-flow',
+  'agentic-qe': 'agentic-qe',
+  ruvector: 'ruvector',
+  'agent-browser': 'agent-browser',
+  'ruv-swarm': 'ruv-swarm',
+});
 const SUBCOMMAND = /^[a-z][a-z0-9-]*$/;
 const MAX_ARGS = 256;
 const MAX_ARG_BYTES = 8192;
 const DEFAULT_FRESH_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_OUTPUT_BYTES = 1024 * 1024;
+// Bind direct calls to the module loaded at process start, too. Missing shell resources do not
+// prevent declarations from loading; the active dispatcher supplies the execution binding.
+const LOCAL_BINDING = (() => {
+  try { return managedGenerationIdentity(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')).binding; }
+  catch { return null; }
+})();
 
 const executableSchema = {
   type: 'string',
@@ -29,6 +49,17 @@ const executableSchema = {
 };
 
 export const MANAGED_CLI_TOOLS = Object.freeze([
+  {
+    name: 'ruvnet_registry_latest',
+    description: 'Read the exact npm registry latest version for a managed RuvNet executable and record a content-bound public-registry receipt.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: { executable: executableSchema },
+      required: ['executable'],
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+  },
   {
     name: 'ruvnet_cli_help',
     description: 'Read a managed CLI interface from the executable itself. Runs only the supplied subcommand path plus --help and records a fresh stamp only after exit 0.',
@@ -115,27 +146,32 @@ function stateDir(env) {
   return env.RUVNET_BRAIN_HELP_READ_DIR || path.join(brainHome, 'help-read');
 }
 
-function freshStamp(executable, argv, env, now = Date.now()) {
+function freshStamp(executable, argv, env, binding, now = Date.now()) {
   const stamp = path.join(stateDir(env), helpKey(executable, argv));
-  let stat;
+  let stat; let readAt;
   try {
-    stat = fs.statSync(stamp);
+    stat = fs.lstatSync(stamp);
+    if (!stat.isFile()) return false;
+    const receipt = JSON.parse(fs.readFileSync(stamp, 'utf8'));
+    if (receipt.schemaVersion !== 1 || receipt.generation !== binding
+      || !Number.isFinite(receipt.readAt) || receipt.readAt > now) return false;
+    readAt = receipt.readAt;
   } catch {
     return false;
   }
   const configured = Number(env.RUVNET_BRAIN_HELP_MAX_AGE_MS);
   const maxAge = Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_FRESH_MS;
-  return now - stat.mtimeMs < maxAge;
+  return now - stat.mtimeMs < maxAge && now - readAt < maxAge;
 }
 
-function writeStamps(executable, argv, env) {
+function writeStamps(executable, argv, env, binding) {
   const dir = stateDir(env);
   fs.mkdirSync(dir, { recursive: true });
   for (const key of stampKeysForHelp(executable, argv)) {
     const stamp = path.join(dir, key);
     const temporary = path.join(dir, `.${key}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`);
     try {
-      fs.writeFileSync(temporary, '', { flag: 'wx', mode: 0o600 });
+      fs.writeFileSync(temporary, JSON.stringify({ schemaVersion: 1, generation: binding, readAt: Date.now() }), { flag: 'wx', mode: 0o600 });
       fs.renameSync(temporary, stamp);
     } finally {
       try { fs.unlinkSync(temporary); } catch { /* renamed or never created */ }
@@ -145,21 +181,51 @@ function writeStamps(executable, argv, env) {
 
 export function resolveManagedExecutable(executable, env = process.env) {
   if (executable !== 'ruflo') return executable;
-  const home = env.HOME || os.homedir();
-  const canonical = path.join(home, '.npm-global', 'bin', 'ruflo');
-  try {
-    fs.accessSync(canonical, fs.constants.X_OK);
-    return canonical;
-  } catch {
-    return executable;
+  // #420 item 5: same rules as every other Brain caller (RUFLO_BIN is authoritative, then ~/.npm-global/bin, then PATH); this used to check ~/.npm-global only and ignored RUFLO_BIN.
+  return resolveRuflo({ env, home: env.HOME || os.homedir() }) || executable;
+}
+
+/**
+ * ruflo (and claude-flow, the same @claude-flow/cli) self-updates at startup by running `npm install` in its
+ * working directory, which here is the user's project: measured 2026-10-22, a 1.3 GB install landed there.
+ * ruflo-bin.mjs promises every Brain spawn sets CLAUDE_FLOW_AUTO_UPDATE=false; this boundary is a Brain spawn
+ * too. RUFLO_DAEMON_AUTOSTART=0 keeps a background daemon from being left behind in that project.
+ */
+export function managedChildEnv(executable, env) {
+  if (executable !== 'ruflo' && executable !== 'claude-flow') return env;
+  return { ...env, CLAUDE_FLOW_AUTO_UPDATE: 'false', RUFLO_DAEMON_AUTOSTART: '0' };
+}
+
+function quoteWindowsCommandArg(value) {
+  // cmd.exe is required for npm's .cmd shims. Keep the child_process call itself shell:false,
+  // and quote every literal token so shell metacharacters remain data rather than syntax.
+  // Delayed expansion is disabled by default; doubling percent signs prevents environment
+  // expansion while cmd parses the /c command line.
+  return `"${value.replace(/%/g, '%%').replace(/"/g, '""')}"`;
+}
+
+function spawnSpec(executable, argv, env) {
+  const resolved = resolveManagedExecutable(executable, env);
+  if (process.platform !== 'win32' || !resolved.toLowerCase().endsWith('.cmd')) {
+    return { file: resolved, args: argv, windowsVerbatimArguments: false };
   }
+  // `/s /c` removes the first and last quote characters from its command string. The outer
+  // envelope therefore preserves the inner quotes around a shim path containing spaces.
+  const command = `"${[resolved, ...argv].map(quoteWindowsCommandArg).join(' ')}"`;
+  return {
+    file: env.ComSpec || env.COMSPEC || 'cmd.exe',
+    args: ['/d', '/s', '/c', command],
+    windowsVerbatimArguments: true,
+  };
 }
 
 function execute(executable, argv, env) {
   return new Promise((resolve) => {
-    const child = spawn(resolveManagedExecutable(executable, env), argv, {
+    const spec = spawnSpec(executable, argv, env);
+    const child = spawn(spec.file, spec.args, {
       env,
       shell: false,
+      windowsVerbatimArguments: spec.windowsVerbatimArguments,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     const stdout = [];
@@ -188,53 +254,98 @@ function execute(executable, argv, env) {
       clearTimeout(timer);
       resolve({ code: null, stdout: '', stderr: '', error: error.message });
     });
-    child.once('close', (code) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve({ code, stdout: Buffer.concat(stdout).toString(), stderr: Buffer.concat(stderr).toString(), error: null });
+      child.once('close', (code, signal) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({ code, signal, stdout: Buffer.concat(stdout).toString(), stderr: Buffer.concat(stderr).toString(), error: null });
     });
   });
 }
 
+/**
+ * Convert the child-process result into the managed boundary's terminal vocabulary. A zero exit
+ * status is necessary but not sufficient: a tool that emits a fatal marker or cannot provide a
+ * terminal status must remain failure/unknown evidence for progression consumers.
+ */
+export function normalizeManagedExecution(execution) {
+  const output = [execution?.stdout, execution?.stderr].filter(Boolean)
+    .join(execution?.stdout && execution?.stderr ? '\n' : '');
+  const contradictoryFailure = /(?:^|\n)\s*(?:❌|\[ERROR\])|invalid pragma command|key not found/i.test(output);
+  if (execution?.error) return { outcome: 'failure', output, contradictoryFailure };
+  if (execution?.signal) return { outcome: 'interrupted', output, signal: execution.signal, contradictoryFailure };
+  if (contradictoryFailure || execution?.code === null || execution?.code === undefined) {
+    return { outcome: contradictoryFailure ? 'failure' : 'unknown', output, contradictoryFailure };
+  }
+  return { outcome: execution.code === 0 ? 'success' : 'failure', output, contradictoryFailure };
+}
+
 function resultOf(executable, argv, result) {
   const output = [result.stdout, result.stderr].filter(Boolean).join(result.stdout && result.stderr ? '\n' : '');
-  const contradictoryFailure = /(?:^|\n)\s*(?:❌|\[ERROR\])|invalid pragma command|key not found/i.test(output);
-  if (result.error || result.code !== 0 || contradictoryFailure) {
-    const reason = result.error || (contradictoryFailure ? 'fatal output despite exit 0' : `exit ${result.code}`);
+  const normalized = normalizeManagedExecution(result);
+  const terminal = { outcome: normalized.outcome, code: result.code ?? null, signal: result.signal ?? null,
+    error: result.error ?? null, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
+  if (normalized.outcome !== 'success') {
+    const reason = result.error || (result.signal ? `signal ${result.signal}` : result.code != null && result.code !== 0 ? `exit ${result.code}` : normalized.contradictoryFailure ? 'fatal output without successful completion' : 'no terminal exit status');
     return {
-      content: [{ type: 'text', text: output || `${executable} ${argv.join(' ')} failed: ${reason}` }],
+      content: [{ type: 'text', text: [output, `${executable} ${argv.join(' ')} failed: ${reason}`].filter(Boolean).join('\n') }],
+      structuredContent: terminal,
       isError: true,
     };
   }
   return {
     content: [{ type: 'text', text: output || `${executable} ${argv.join(' ')} completed successfully` }],
+    structuredContent: terminal,
     isError: false,
   };
 }
 
-export async function callManagedCli(toolName, args, env = process.env) {
+export async function callManagedCli(toolName, args, env = process.env, fetchImpl = globalThis.fetch, lifecycle = {}) {
   try {
+    const binding = lifecycle.generationBinding || LOCAL_BINDING;
+    if (!binding) throw new Error('managed generation identity unavailable');
     const executable = assertExecutable(args?.executable);
-    const argv = literalArgv(args?.argv);
+    const argv = literalArgv(args?.argv ?? []);
+    const projectRoot = env.RUVNET_BRAIN_PROJECT_DIR || projectDirectory({ env });
+
+    if (toolName === 'ruvnet_registry_latest') {
+      const packageName = REGISTRY_PACKAGES[executable];
+      const registryUrl = `https://registry.npmjs.org/${packageName.replace('/', '%2F')}/latest`;
+      const response = await fetchImpl(registryUrl, {
+        headers: { accept: 'application/json' },
+        signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+      });
+      const body = await response.text();
+      if (!response.ok) throw new Error(`registry latest lookup failed with HTTP ${response.status}`);
+      let metadata;
+      try { metadata = JSON.parse(body); } catch { throw new Error('registry latest response was not JSON'); }
+      const receipt = recordRegistryLatestObservation({
+        executable, packageName, version: metadata?.version, registryUrl, responseBody: body, env,
+      });
+      return {
+        content: [{ type: 'text', text: `${packageName} latest version: ${receipt.observedVersion} (registry receipt ${receipt.receiptSha256})` }],
+        isError: false,
+      };
+    }
 
     if (toolName === 'ruvnet_cli_help') {
       stampKeysForHelp(executable, argv);
       const commandArgv = [...argv, '--help'];
-      const execution = await execute(executable, commandArgv, env);
-      if (execution.code === 0 && !execution.error) writeStamps(executable, argv, env);
+      const execution = await execute(executable, commandArgv, managedChildEnv(executable, env));
+      if (normalizeManagedExecution(execution).outcome === 'success') writeStamps(executable, argv, env, binding);
+      recordManagedCliObservation({ toolName, executable, argv: commandArgv, execution, env });
       return resultOf(executable, commandArgv, execution);
     }
 
     if (toolName === 'ruvnet_cli_run') {
-      if (!freshStamp(executable, argv, env)) {
+      if (!freshStamp(executable, argv, env, binding)) {
         const key = helpKey(executable, argv).replaceAll('.', ' ');
         return {
           content: [{ type: 'text', text: `Read the interface first with ruvnet_cli_help for: ${key}` }],
           isError: true,
         };
       }
-      const policy = loadRuntimePreferences({ env, cwd: env.RUVNET_BRAIN_PROJECT_DIR || process.cwd() });
+      const policy = loadRuntimePreferences({ env, cwd: projectRoot });
       if (executable === 'agentic-flow' && policy.values.routing !== 'auto') {
         return {
           content: [{
@@ -260,10 +371,23 @@ export async function callManagedCli(toolName, args, env = process.env) {
           isError: true,
         };
       }
+      // Host identity is process context established by the native adapter, never a tool argument.
+      // A caller can request a CLI command, but must not relabel its continuity record as another
+      // host by supplying an arbitrary `host` property.
       const childEnv = (executable === 'agentic-flow' || executable === 'agentic-qe')
-        ? runtimeChildEnv({ env, cwd: env.RUVNET_BRAIN_PROJECT_DIR || process.cwd() })
-        : env;
-      return resultOf(executable, argv, await execute(executable, argv, childEnv));
+        ? runtimeChildEnv({ env, cwd: projectRoot })
+        : managedChildEnv(executable, env);
+      if (lifecycle && typeof lifecycle.beforeExecute === 'function') {
+        await lifecycle.beforeExecute({ executable, argv, projectRoot, env: childEnv });
+      }
+      const execution = await execute(executable, argv, childEnv);
+      const normalized = normalizeManagedExecution(execution);
+      if (lifecycle && typeof lifecycle.afterExecute === 'function') {
+        await lifecycle.afterExecute({ executable, argv, projectRoot, env: childEnv, execution, normalized });
+      }
+      recordManagedCliObservation({ toolName, executable, argv, execution, env });
+      const result = resultOf(executable, argv, execution);
+      return result;
     }
 
     return {

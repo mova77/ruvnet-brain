@@ -12,6 +12,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import * as wiredCheckModule from '../../scripts/wired-check.mjs';
 import { audit, callerPattern, hookWiringAudit, lessonTriggerAudit } from '../../scripts/wired-check.mjs';
 
 let repo;
@@ -29,6 +30,12 @@ beforeEach(() => {
 afterEach(() => fs.rmSync(repo, { recursive: true, force: true }));
 
 describe('the predicate — a mention is not a caller', () => {
+  it('does not confuse sourcemaps and filename suffixes with executable references', () => {
+    expect(callerPattern('version.mjs').test("import './version.mjs.map'")).toBe(false);
+    expect(callerPattern('version.mjs').test('node scripts/version.mjs.backup')).toBe(false);
+    expect(callerPattern('version.mjs').test("import './set-version.mjs'")).toBe(false);
+    expect(callerPattern('version.mjs').test("import './version.mjs'")).toBe(true);
+  });
   it('FAILS a module referenced only by a comment (the v1 bug that wired 6 of 7 founding failures)', () => {
     w('scripts/widget.mjs', 'export const x = 1;\n');
     w('scripts/other.mjs', '// widget.mjs was written last week and is great\nexport const y = 2;\n');
@@ -50,7 +57,18 @@ describe('the predicate — a mention is not a caller', () => {
   it('an npm script NOBODY runs is MANUAL, not wired (the doc-currency false green)', () => {
     w('scripts/widget.mjs', 'export const x = 1;\n');
     w('package.json', JSON.stringify({ scripts: { go: 'node scripts/widget.mjs' } }));
-    expect(stateOf(audit({ repo, standalone: [], held: {} }), 'scripts/widget.mjs')).toBe('manual');
+    const row = audit({ repo, standalone: [], held: {} }).rows.find((r) => r.rel === 'scripts/widget.mjs');
+    expect(row.state).toBe('manual');
+    expect(row.why).toMatch(/does not establish operational correctness/i);
+    expect(row.why).not.toMatch(/built and correct|works|healthy/i);
+  });
+
+  it('an executable Dream manifest is a real caller', () => {
+    w('scripts/widget.mjs', 'export const x = 1;\n');
+    w('dream.config.json', JSON.stringify({ controlPlaneProbes: ['node scripts/widget.mjs --check'] }));
+    expect(stateOf(audit({ repo, standalone: [], held: {} }), 'scripts/widget.mjs')).toBe('wired');
+    w('dream.config.json', JSON.stringify({ controlPlaneProbes: [] }));
+    expect(stateOf(audit({ repo, standalone: [], held: {} }), 'scripts/widget.mjs')).toBe('unwired');
   });
 
   it('an npm script a WORKFLOW runs is wired', () => {
@@ -125,6 +143,28 @@ describe('the predicate — a mention is not a caller', () => {
     expect(stateOf(audit({ repo, standalone: [], held: {} }), 'scripts/prove.mjs')).toBe('unwired');
   });
 
+  // Live in this repo (2026-09-01): `scripts/gates.mjs` was reported "wired" partly via two PHANTOM
+  // callers whose only real reference was to the unrelated `scripts/corpus-aggregates.mjs` — which
+  // simply happens to END with the characters "gates.mjs" ("aggre-GATES.mjs"). Same shape for
+  // `version.mjs` inside `set-version.mjs`/`sync-version.mjs`. The prior "prove/proven" test above
+  // only proves prose (no quotes) is excluded; it says nothing about one REAL, quoted filename
+  // swallowing another's inside the invocation-shaped branches themselves.
+  it('a quoted reference to a DIFFERENT, longer filename does not wire a module whose name is its trailing substring', () => {
+    w('scripts/gates.mjs', 'export const g = 1;\n');
+    w('scripts/corpus-aggregates.mjs', 'export const rebuildCorpusAggregates = () => {};\n');
+    w('scripts/consumer.mjs', "import { rebuildCorpusAggregates } from './corpus-aggregates.mjs';\n");
+    const res = audit({ repo, standalone: [], held: {} });
+    expect(stateOf(res, 'scripts/gates.mjs')).toBe('unwired');
+    // The unrelated module must still be correctly wired — this is a precision fix, not a new hole.
+    expect(stateOf(res, 'scripts/corpus-aggregates.mjs')).toBe('wired');
+  });
+
+  it('still wires a module reached through a real path-prefixed reference sharing the same tail', () => {
+    w('scripts/gates.mjs', 'export const g = 1;\n');
+    w('scripts/consumer.mjs', "import { g } from './gates.mjs';\n");
+    expect(stateOf(audit({ repo, standalone: [], held: {} }), 'scripts/gates.mjs')).toBe('wired');
+  });
+
   // The regrade (2026-07-23) found correction-detect-measure.mjs "wired" by a `node scripts/…measure.mjs`
   // usage example living in a header comment — the invocation branch of callerPattern matched prose.
   it('an INVOCATION-shaped usage example in a whole-line // comment is NOT a caller', () => {
@@ -150,6 +190,28 @@ describe('the predicate — a mention is not a caller', () => {
       + "execFileSync(NODE, ['scripts/widget.mjs']);\n"
       + 'const z = 1; /* a real block comment */\n');
     expect(stateOf(audit({ repo, standalone: [], held: {} }), 'scripts/widget.mjs')).toBe('wired');
+  });
+});
+
+describe('invocation-scoped source reads', () => {
+  it('reads each caller source once per audit and refreshes after an edit', () => {
+    w('scripts/shared-cache-test.mjs', 'export const shared = true;\n');
+    w('scripts/consumer-cache-test.mjs', "import './shared-cache-test.mjs';\n");
+    const reads = new Map();
+    const readFile = (file, encoding) => {
+      reads.set(file, (reads.get(file) || 0) + 1);
+      return fs.readFileSync(file, encoding);
+    };
+    const runAudit = () => audit({ repo, standalone: [], held: {}, operationalExports: [], readFile });
+    const shared = 'scripts/shared-cache-test.mjs';
+    const consumer = path.join(repo, 'scripts/consumer-cache-test.mjs');
+
+    expect(stateOf(runAudit(), shared)).toBe('wired');
+    expect(reads.get(consumer)).toBe(1);
+
+    w('scripts/consumer-cache-test.mjs', 'export const consumer = true;\n');
+    expect(stateOf(runAudit(), shared)).toBe('unwired');
+    expect(reads.get(consumer)).toBe(2);
   });
 });
 
@@ -226,6 +288,30 @@ describe('callerPattern', () => {
   });
 });
 
+describe('operational export wiring', () => {
+  it('does not count definitions, imports, re-exports, or an unreachable export-to-export bridge as operation', () => {
+    expect(wiredCheckModule.operationalExportAudit).toBeTypeOf('function');
+    w('scripts/receipt.mjs', 'export async function materializeReceipt() { return true; }\n');
+    w('scripts/bridge.mjs', "import { materializeReceipt } from './receipt.mjs';\n"
+      + 'export async function runReceiptStage() { return materializeReceipt(); }\n');
+    w('scripts/facade.mjs', "export { materializeReceipt } from './receipt.mjs';\n");
+    const required = [
+      { rel: 'scripts/receipt.mjs', symbol: 'materializeReceipt' },
+      { rel: 'scripts/bridge.mjs', symbol: 'runReceiptStage' },
+    ];
+
+    let rows = wiredCheckModule.operationalExportAudit({ repo, required }).rows;
+    expect(rows.find((row) => row.symbol === 'materializeReceipt')).toMatchObject({
+      state: 'wired', callers: ['scripts/bridge.mjs'],
+    });
+    expect(rows.find((row) => row.symbol === 'runReceiptStage')).toMatchObject({ state: 'unwired', callers: [] });
+
+    w('scripts/main.mjs', "import { runReceiptStage } from './bridge.mjs';\nawait runReceiptStage();\n");
+    rows = wiredCheckModule.operationalExportAudit({ repo, required }).rows;
+    expect(rows.every((row) => row.state === 'wired')).toBe(true);
+  });
+});
+
 // ── CHECK B: HOOK WIRING — a hook is not a module with an in-repo caller ──────────────────────────
 //
 // route-dispatch.sh already had a REAL caller under the module predicate above (hook-shim.mjs quotes
@@ -268,6 +354,58 @@ describe('hook wiring — reachable from a real hook config, not merely mentione
     const row = res.rows.find((r) => r.file === 'my-gate.sh');
     expect(row.state).toBe('wired');
     expect(row.sources.join(' ')).toMatch(/hook-shim id "my-id"/);
+  });
+
+  // H6 (2026-09-26 dead-code audit): a hook-shim.mjs TABLE entry whose id no manifest ever dispatches
+  // used to read "wired" anyway, because once hook-shim.mjs itself became "reached" (it always is —
+  // every real hooks.json command literally names it), the GENERIC fixed-point pass treated hook-
+  // shim.mjs as an ordinary spawner and matched every quoted filename in its own TABLE, dispatched or
+  // not. This is exactly the shape that let design-wall.sh, route-dispatch.sh, verify-interface.sh,
+  // learn-capture.sh, learn-flush.mjs, md-stamp.mjs, signal-watch.mjs, routing-outcome-capture.mjs
+  // and swarm-slot-recycler.mjs all report "wired · via spawned by plugin/scripts/hook-shim.mjs" in
+  // the real repo while zero manifest dispatched most of their ids.
+  it('H6: a hook-shim.mjs TABLE entry whose id is NEVER dispatched by any manifest is NOT counted wired (RED on pre-fix code)', () => {
+    w('plugin/scripts/my-gate.sh', '#!/bin/bash\n# my-gate.sh — PreToolUse gate on Bash.\necho hi\n');
+    w('plugin/scripts/my-dead-gate.sh', '#!/bin/bash\n# my-dead-gate.sh — PreToolUse gate on Bash.\necho hi\n');
+    // hook-shim.mjs's TABLE lists BOTH ids, exactly like the real dispatch table — one genuinely
+    // dispatched below ("my-id"), one never mentioned by any manifest ("my-dead-id").
+    w('plugin/scripts/hook-shim.mjs', "const TABLE = {\n"
+      + "  'my-id': { file: 'my-gate.sh', interpreter: 'bash', mode: 'blocking' },\n"
+      + "  'my-dead-id': { file: 'my-dead-gate.sh', interpreter: 'bash', mode: 'blocking' },\n};\n");
+    w('plugin/hooks/hooks.json', JSON.stringify({
+      hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command',
+        command: 'node "${CLAUDE_PLUGIN_ROOT}/scripts/hook-shim.mjs" my-id' }] }] },
+    }));
+    const res = hookWiringAudit({ repo, homeSettingsFile: NO_HOME(), held: {} });
+    // The genuinely-dispatched entry must still resolve — this fix must not cost real wiring.
+    expect(res.rows.find((r) => r.file === 'my-gate.sh').state).toBe('wired');
+    // The never-dispatched entry must NOT be reported wired via hook-shim.mjs alone.
+    const dead = res.rows.find((r) => r.file === 'my-dead-gate.sh');
+    expect(dead.state).not.toBe('wired');
+  });
+
+  it('resolves Codex\'s installed Stable Spine wrapper and its adapter spawn', () => {
+    w('plugin/scripts/codex-hook-wrapper.mjs', "import path from 'node:path';\n"
+      + "const adapter = path.join(root, 'scripts', 'codex-hook-adapter.mjs');\n");
+    w('plugin/scripts/codex-hook-adapter.mjs', '#!/usr/bin/env node\n'
+      + '/** codex-hook-adapter — the PostToolUse hook host boundary. */\n');
+    w('plugin/scripts/hook-shim.mjs', "const TABLE = {\n"
+      + "  'my-id': { file: 'my-gate.sh', interpreter: 'bash', mode: 'blocking' },\n};\n");
+    w('plugin/hooks/codex-hooks.json', JSON.stringify({
+      hooks: { SessionStart: [{ hooks: [{ type: 'command',
+        command: 'node -e "const w=p.join(b,\'codex-hook.mjs\')" 4500 my-id' }] }] },
+    }));
+    w('bin/install.mjs', "const codexHookWrapperPath = (codexDir) => path.join(codexDir, 'codex-hook.mjs');\n"
+      + "function wire({ hookWrapperSource = path.join(root, 'plugin', 'scripts', 'codex-hook-wrapper.mjs') }) {\n"
+      + '  atomicReplace(hookWrapperPath, (tmp) => fs.copyFileSync(hookWrapperSource, tmp));\n}\n');
+
+    const res = hookWiringAudit({ repo, homeSettingsFile: NO_HOME(), held: {} });
+    const wrapper = res.rows.find((r) => r.file === 'codex-hook-wrapper.mjs');
+    const adapter = res.rows.find((r) => r.file === 'codex-hook-adapter.mjs');
+    expect(wrapper).toMatchObject({ state: 'wired' });
+    expect(wrapper.sources.join(' ')).toMatch(/codex-hooks\.json.*Stable Spine copy/i);
+    expect(adapter).toMatchObject({ state: 'wired' });
+    expect(adapter.sources).toContain('spawned by plugin/scripts/codex-hook-wrapper.mjs');
   });
 
   it('WIRES a hook found ONLY in ~/.claude/settings.json — the real route-dispatch.sh fix, reproduced', () => {
@@ -366,5 +504,41 @@ describe('lesson-trigger wiring — inert is a trigger no event in lesson-hooks.
     const res = lessonTriggerAudit({ repo, lessonsFile: path.join(repo, 'does-not-exist.json') });
     expect(res.checked).toBe(0);
     expect(res.inert).toEqual([]);
+  });
+
+  it('does NOT flag a trigger requested only dynamically — the real `ship` shape, no dead case label present', () => {
+    // No static `TRIGGERS="ship"` case label anywhere — as if the dead PreToolUse-push branch had
+    // already been cleaned up. `ship` reaches the gate ONLY via the dynamic conditional append, same
+    // as production lesson-hooks.sh really does today.
+    w('plugin/scripts/lesson-hooks.sh', '#!/bin/bash\ncase "$EVENT" in\n'
+      + '  PreToolUse-bash) TRIGGERS="mutate-machine"; CLAUDE_EVENT="X" ;;\n'
+      + '  *) exit 0 ;;\n'
+      + 'esac\n'
+      + 'ARGS=()\n'
+      + 'if printf \'%s\' "$CMD_EXEC" | grep -qE \'\\bgit\\b[^|;&]*\\bpush\\b\'; then\n'
+      + '  ARGS+=(--trigger ship)\n'
+      + 'fi\n');
+    const lessonsFile = path.join(repo, 'lessons-ship.json');
+    w('lessons-ship.json', JSON.stringify({ lessons: [lesson('G-remote-ci-gates-shipping', 'ship')] }));
+    const res = lessonTriggerAudit({ repo, lessonsFile });
+    expect(res.requested).toContain('ship');
+    expect(res.inert.map((l) => l.id)).not.toContain('G-remote-ci-gates-shipping');
+  });
+
+  it('the generic per-trigger dispatch loop (`ARGS+=(--trigger "$t")`) is a variable, not a literal — never pollutes `requested`', () => {
+    // Mirrors production lesson-hooks.sh's actual dispatch loop: `for t in $TRIGGERS; do
+    // ARGS+=(--trigger "$t"); done`. `$t` is a shell variable reference, not a trigger name — the
+    // dynamic-append regex must not capture it as if it were a literal token.
+    w('plugin/scripts/lesson-hooks.sh', '#!/bin/bash\ncase "$EVENT" in\n'
+      + '  *) exit 0 ;;\n'
+      + 'esac\n'
+      + 'ARGS=()\n'
+      + 'for t in $TRIGGERS; do ARGS+=(--trigger "$t"); done\n');
+    const lessonsFile = path.join(repo, 'lessons-none.json');
+    w('lessons-none.json', JSON.stringify({ lessons: [lesson('L-unrelated', 'relay-number')] }));
+    const res = lessonTriggerAudit({ repo, lessonsFile });
+    expect(res.requested).not.toContain('t');
+    expect(res.requested).not.toContain('$t');
+    expect(res.requested).toEqual([]);
   });
 });

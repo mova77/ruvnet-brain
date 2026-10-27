@@ -3,7 +3,10 @@ id: ADR-049
 title: The console rebuild — explain every section, scope every suggestion, and make the safe ones checkable
 status: Accepted
 date: 2026-07-24
-updated: 2026-07-30
+updated: 2026-10-25
+updated_source: derived-from-git
+reviewed_digest: 0e6775d80cee
+version: 1.0.3
 authors: [Stuart Kerr, Claude Code]
 tags: [onboarding, ux, console, advocacy, capability, cache, honesty]
 supersedes: []
@@ -17,10 +20,42 @@ governs:
   - bin/install.mjs
 ---
 
+
+## Current source review — 2026-10-05
+
+Reviewed candidate source `1ccc1e633772c549e4a23596a1ce3c743e797315`; this is a
+source review, not a new browser, published-install, undo, or release verification.
+The original explainer, per-recommendation scope, project-cache isolation, and consent-gated
+Apply decisions remain accepted. `console/app.js` retains `infoBtn`, `jumpToRec`, and the
+server-vouched capability predicate; `scripts/onboarding-console.mjs` retains project-keyed
+`serveCached` and stamps `recId` only for recommendations built by the engine.
+`scripts/console-engine.mjs` still has `CAPABILITY_ELIGIBLE = {}`: **zero capability checkboxes
+currently qualify**, even though the bridge is built. An empty eligibility set is not proof that
+an OFF capability has an available inverse.
+
+The Complete Brain / RuVector Only install profile remains a coarse corpus-install choice.
+It is distinct from the user-scoped `groundingScope` conversational trigger setting and
+`updateSource` tool-source preference introduced in the candidate; neither setting proves a new
+capability undo or broadens retrieval eligibility. Runtime preference and nightly/installer
+wiring were checked for this boundary. The broader granular install checklist remains a design
+follow-up; this review did not validate it in a live installed Console. The historical runtime
+and browser receipts below retain their original source/date bounds. The final integration
+must separately rebind the governed-source review digest after remaining installer changes.
+
 # ADR-049: The console rebuild
 
 **Status**: Accepted
 **Date**: 2026-07-24
+
+> **Reviewed 2026-09-16.** Re-read `console/app.js` and `scripts/onboarding-console.mjs`: refresh state is explicit across server/client, and resolver refusal cannot be scored from a guessed store. The endpoint regression exercises the real server and rendered token path. reviewed_digest bbcfde973786.
+
+
+> **Reviewed 2026-08-04 (4.0.9).** Governed code moved: `bin/install.mjs` now exits non-zero when `--update` lands nothing (issue #106), `kb/forge-update.mjs` releases its rollback on the no-op path and keeps it on the damaged path (#108), and `scripts/health-repair.mjs` no longer reports a hollow "fed 0" (#104). Checked against this decision: these changes implement its honesty requirement — no clause here is contradicted or superseded.
+
+
+> **Reviewed 2026-08-04 (4.0.9).** Governed code moved: `scripts/console-runtime-identity.mjs` now defines `CONSOLE_RUNTIME_SURFACE` as the single enumeration serving BOTH the installer copy list and the runtime digest, and `scripts/onboarding-console.mjs` derives its generation identity from it (issues #76/#79). Checked against this decision: the Console scope and checkbox model are unchanged — this replaces a one-file sha256 proxy with an identity over the real runtime surface. Nothing here is contradicted.
+
+> **Reviewed 2026-08-06 (ADR-063).** Governed code moved for ADR-063 / issue #103: plugin/scripts/hijack-ruvnet.sh can now REFUSE a direct invocation against a Ruflo-managed store, hook-shim.mjs declares it mode:'blocking' and codex-hook-wrapper.mjs adds it to blockingHooks, and runtime-preferences.mjs reads the new managedMemoryBoundary setting. Checked against this decision: the shipped default is `advise`, which reaches none of the enforcement path, so behaviour is byte-identical for anyone who changes nothing; the hook's fail-open posture and its speech channel are unchanged. This raises the CEILING of what the hook may do, not what it does. No clause contradicted.
 
 ## Context
 
@@ -72,9 +107,18 @@ with its evidence, cost, and undo, the one audited apply path; `/api/apply` disp
 `remedy-registry`. **A checkbox appears only where state is exactly OFF, scope isn't machine, the
 turnOn command has no blanks, AND the server vouched a recId.** IDLE, UNKNOWN, ABSENT, and
 machine-scope get honest non-interactive indicators — never a checkbox that turns "we could not
-check" into an unchecked box reading as "off". Today exactly one capability qualifies
-(memory-distillation while OFF, the only one with a proven round-tripped undo, ADR-047's executor);
-that is correct, not a gap.
+check" into an unchecked box reading as "off".
+
+**Corrected 2026-09-11 (currency review, commit 2eef2024).** This section originally said exactly
+one capability qualified (`memory-distillation`, the only one with a proven round-tripped undo).
+Commit `6a6ba72f` (2026-09-07) emptied `CAPABILITY_ELIGIBLE` to `{}` in `scripts/console-engine.mjs`:
+`distill-project --restore` was hardened to refuse unsafe database replacement, which invalidated
+the 2026-07-24 round-trip proof this section relied on. **Zero capabilities currently qualify for a
+checkbox** — the mechanism and its bar (state OFF, scope not machine, turnOn has no blanks, server
+vouches a recId, AND a proven inverse) are unchanged and, if anything, enforced more strictly than
+before; there is simply no capability that currently clears it. This is the mechanism working as
+designed, not a regression in it — but the "today exactly one capability qualifies" sentence was no
+longer true and is corrected here rather than left to mislead a reader checking the live Console.
 
 ### 4. The cache must be about the project you are in
 
@@ -92,8 +136,9 @@ project the data is about. A cross-project isolation test proves it, mutation-ch
 - The Recommendation aggregate now has a `scope` field and a fourth builder
   (`buildCapabilityRecommendations`). ADR-013's schema description is extended, not replaced.
 - The checkbox's honesty rule (present only with a server-vouched recId + proven undo) means the
-  control surface grows only as capabilities earn verified undos — one today. That is the intended
-  rate: a checkbox is a promise that the inverse exists.
+  control surface grows only as capabilities earn verified undos. The historical decision counted
+  one; the current source review above finds zero eligible capability checkboxes. A checkbox
+  remains a promise that the inverse exists.
 - **Partially resolved 2026-07-28:** the console now offers the owner-approved coarse install
   profile — **Complete Brain** or **RuVector Only** — and physically applies it to the installed RVF
   families. The broader granular install checklist (item 4 above) is still open — designed, with
@@ -111,9 +156,28 @@ project the data is about. A cross-project isolation test proves it, mutation-ch
   precisely the failure ADR-055 was written to end, found by the drift check rather than by a reader.
 
 ## Currency log
+| 2026-10-25 | Review `0e6775d80cee` (4.7.21): decision unchanged; explainers, per-card scope and the checkbox safety bar are untouched. `scripts/console-engine.mjs`: the 'learner has gone quiet' card now appears only when distillation status is known and observations have waited more than two days for one, and its evidence names the waiting count (#377). `scripts/onboarding-console.mjs`: the matching Apply progress check (the last distillation must move forward) and the plugin-aware session-hook probe (Dream #322). The `bin/install.mjs` changes (Codex hook trust and app-server reload #492, Grok reporting #301, `--clean --archive` #335, per-project install report #420 item 4, hook-count wording #400, entry-point helper) do not touch the console. | Reviewed diffs 320b778b..63ca7c0d for `scripts/console-engine.mjs`, `scripts/onboarding-console.mjs` and `bin/install.mjs`. |
+| 2026-10-24 | Review `85a5b555b251` (4.7.18): decision unchanged. `bin/install.mjs` moved | The 4.7.18 changes to it are Codex snapshot retry/repair during wiring, a recorded reason on every failed host sync, and an early refusal for a stale source checkout running `--update`. No Console page, explainer or scope control changed. Source: `bin/install.mjs`. |
+| 2026-10-05 | Reviewed current source and recorded remaining limitations; no verification or implementation-status promotion. | reviewed_digest 4555b8c6896d; inspected `console/app.js` and all expanded governs against source 5d9ea4df. Independent review preserved incident dates, Proposed/expired states and historical evidence; notification and oldest-runtime limits are explicit. |
+| 2026-09-27 | Currency review: decision unchanged. Motion: same onboarding-console.mjs learner-scope fix, plus unrelated bin/install.mjs release-pipeline fixes (macOS deadline, serverDependencies parsing, corpus-currency). No explainer/scope/checkbox logic touched. | Reviewed `console/app.js`, `scripts/console-engine.mjs`, `scripts/onboarding-console.mjs`, `plugin/scripts/runtime-preferences.mjs`, `scripts/nightly-controller.mjs`, `bin/install.mjs` against the commits listed above; reviewed_digest 9f5c0ce4d4a0. |
+| 2026-09-12 | Currency review at commit 491ea740: decision unchanged. `40d8c16b` moved the release-provenance card out of the end-user flow into a closed maintainer `<details>` and added Newest/A–Z/Behind-first views + description search to the scope page — both extend this ADR's console-scope decision rather than contradict it. `5f919c52` (`bin/install.mjs`) added `placeTrustedCoverageValidator()`, unrelated to console UI/scope; read in full, no capability-checkbox or explainer logic touched. | Reviewed `console/app.js`, `scripts/console-engine.mjs`, `scripts/onboarding-console.mjs`, `plugin/scripts/runtime-preferences.mjs`, `scripts/nightly-controller.mjs`, `bin/install.mjs` against commits `40d8c16b` and `5f919c52`; both diffs read in full. |
+
+| 2026-09-11 | Currency review at commit 7296c984: decision unchanged. Motion since a5584de3 on this ADR's paths: the seven console card fixes (`c98b64d5` … `ec85ac68`, itemised in ADR-0013's row) and `8747d2f8` in `scripts/onboarding-console.mjs` / `console/app.js` — every card now renders measured state with its section explainer intact; the scope page (ADR-0069, merged `1f956632`) adds `gatherScope` to `onboarding-console.mjs`. `scripts/console-engine.mjs` did not move today (its plain-node test `scripts/console-engine.test.mjs`, not governed here, was updated at `e03454a0` to the stronger invariant the `6a6ba72f` engine already enforced — no recommendation without a currently available inverse — which this ADR's info-bubble decision does not touch). `bin/install.mjs` `dc18fadc` (retention wording) and the pre-session worktree merge `2c24ecd1` are outside this ADR's concern; `plugin/scripts/runtime-preferences.mjs` and `scripts/nightly-controller.mjs` did not move. | Reviewed `console/app.js`, `scripts/console-engine.mjs`, `scripts/onboarding-console.mjs`; cross-checked ADR-0069. reviewed_digest bbcfde973786. |
+| 2026-09-11 | Currency review at commit 2eef2024: code drifted, corrected in the text above (not the status). `scripts/console-engine.mjs` (`6a6ba72f`) emptied `CAPABILITY_ELIGIBLE` to zero entries after `distill-project --restore` was hardened against unsafe replacement, invalidating the one proven round-tripped undo §3 named; the checkbox mechanism and its safety bar are unchanged, but "today exactly one capability qualifies" is no longer true. The other nine drift commits touch only `bin/install.mjs` (installer restart-notice, update-race, and hook-retirement plumbing) and `scripts/onboarding-console.mjs` (a test-only clock injection, `e7a84b71`) — no decision change there. | Reviewed `scripts/console-engine.mjs`, `bin/install.mjs`, `scripts/onboarding-console.mjs` against commits `09079037`, `e917fa25`, `56420430`, `d5c72aba`, `00526b12`, `4823f1aa`, `6a6ba72f`, `e7a84b71`. reviewed_digest bbcfde973786. |
+| 2026-08-30 | The configurator’s ordinary settings are rendered and saved through one validated user-settings endpoint; stale explanatory text was corrected. | `console/app.js` and `scripts/onboarding-console.mjs` now agree with `plugin/scripts/runtime-preferences.mjs` consumers. |
 
 | Date | What changed | Why (with referents) |
 |---|---|---|
+| 2026-08-21 | Re-read after issue #153 changed plugin-cache retirement; Console behavior is unchanged. | `bin/install.mjs` now retains unregistered version roots while an exact process-incarnation lease may still hold them and fails closed on ambiguous liveness. The change protects already-running host sessions; it does not alter Console recommendations, controls, scope, consent, or runtime ownership. `tests/unit/plugin-generation-prune.test.mjs` exercises the frozen A-to-B-to-C path. |
+| 2026-08-13 | **The console's learner probe stopped hardcoding a working directory.** | Per issue #139 (@ObiWanKenobi) the probe now calls `learnerCwd()` rather than pinning `process.cwd()` (or, before #136, `SYSTEM_HOME`). Both were hardcodes; the second was right only because `project` is the default and inverted under `RUVNET_LEARNING_SCOPE=user`. The console now measures whichever store the configured scope actually uses, so its card and the remedy behind it refer to the same learner by construction. A test that had pinned `cwd: process.cwd()` verbatim was updated to require RESOLUTION instead — a test defending a hardcode is a test defending the bug. |
+| 2026-08-10 | **Re-read after the derived Codex dependency walk; the Console contract is unchanged.** | `bin/install.mjs` is governed here. The change is confined to `wireCodexHost`: its dependency copy list is now derived from `plugin/mcp/server.mjs`'s real imports instead of hand-listed, after one added import shipped a Codex server whose sibling was absent. `runtime-preferences.mjs` is now copied because the walk found it, not because a literal named it — the same file, the same destination, arrived at by derivation. Nothing the Console renders, explains, scopes, or offers was touched, and its consent-gated Apply is untouched. |
+| 2026-08-10 | **Re-read after #128/#129; the Console contract is unchanged.** | `bin/install.mjs` is governed here. Two additions: `NIGHTLY_ARGV`/`cronExample`/`enableNightly` now schedule the host-convergent entrypoint (issue #129), and `prunePluginGenerations()` removes plugin-cache generations the registry does not reference (issue #128). Neither touches what this ADR decides. The prune runs in the same `okApplied` branch as `runtimeTransaction.activate()` but deletes only directories under a registered `installPath`'s parent that carry their own `.claude-plugin/plugin.json`; the Console runtime lives under its own receipt dir and is excluded by construction. The explainers, the scoped suggestions, the checkboxes and the consent-gated Apply are untouched. |
+| 2026-08-08 | **Re-read after the #123 convergence fix; the Console contract is unchanged.** | `bin/install.mjs` and `console/app.js` are governed here. The change is confined to how host convergence COMPARES two version strings — `installed === expected` became `installed >= expected`, so a `-dev` build ahead of the published release stops being reported as broken (`--update` exited 1, `--doctor` printed FAILING, and the prescribed repair was a no-op while every check was green). The Console's rebuild, its explainers, its scope checkboxes and its consent-gated Apply are untouched; what moved is a predicate feeding the doctor's verdict, not anything the Console renders or offers. |
+| 2026-08-02 | Re-read the governed installer after the 4.0.8 release-process change; Console scope and user controls are unchanged. | Commit `8608cfd` changes `bin/install.mjs` only so `--doctor --hooks` fails closed when packaged selfcheck is unavailable. It does not change Console actions, defaults, or consent boundaries. |
+| 2026-08-02 | Re-read the final 4.0.7 Console and installer changes; the explainer, scoped recommendations, evidence-backed controls, project cache, and profile decisions remain unchanged. | Commits `3668b1b`, `5a638f6`, and `78e897b` add runtime provenance, owner-only issue inventory, provider availability, and a remotely durable release transaction through `console/app.js`, `scripts/onboarding-console.mjs`, and `bin/install.mjs`. Those changes expose state and protect delivery; they do not broaden recommendation scope, consent, Fix All, undo, cache, or profile semantics. Exact-SHA CI and public-artifact proof remain release gates. |
+| 2026-08-02 | Re-read the Console timing receipt, explicit fixture-root boundary, and dual-host update-test seam. The explainer, per-recommendation scope, evidence-backed checkbox, project-keyed cache, and two-profile decisions remain unchanged. | `scripts/onboarding-console.mjs` now returns aggregate `revalidationMs`, `undoJournalMs`, `childRemedyMs`, and `totalMs` from the existing revalidate → journal → remedy path; it does not change recommendation construction, scope, consent, or undo. Commit `8f06287` adds the absolute, normalized `RUVNET_CONSOLE_ROOT` fixture boundary with the production default still `os.homedir()`; global binaries and credentials remain on the system home. Commit `c1f5b45` makes `bin/install.mjs` host-update collaborators injectable for the dual-host matrix while retaining its production defaults. |
+| 2026-08-01 | Completed issue #79's installer/update transaction for the persistent Console runtime. | `bin/install.mjs` now stages and syntax-checks the exact candidate runtime, records `runtime-identity.json`, activates only after host/Stable-Spine convergence, rolls back on failure, and binds the identity plus `ready` or `pending-console-restart` into `host-convergence.json`. This changes runtime delivery, not the explainer, recommendation-scope, consent, cache, or profile decisions governed here. |
+| 2026-08-01 | Re-read the governed Console and installer changes on the clean integration candidate. The explainer, recommendation-scope, evidence-backed checkbox, and project-keyed cache decisions remain unchanged. | `scripts/onboarding-console.mjs` now identifies a running Console by a private scoped receipt plus `/api/runtime` identity before reuse or owned replacement; it does not alter recommendation rendering, scope, apply, or cache semantics. `bin/install.mjs` now delegates What's New to the installed payload's `plugin/scripts/whats-new.mjs`; it does not change Console controls or install profiles. Focused candidate tests exist for both changes, but exact-SHA cross-platform and published-artifact proof remain outside this currency review. |
 | 2026-07-30 | Kept Fix All fail-closed while removing unrelated full-machine probes from each per-item revalidation. | Each remedy is still re-read immediately before execution, but `scripts/onboarding-console.mjs` now invokes only the recommendation builder capable of issuing that id. Unknown id families fall back to complete validation; `tests/qe/release/console-control-completeness.test.mjs` pins the per-id call. |
 | 2026-07-30 | Reconciled the 4.0.2 Console controls, bounded Fix All, and clean-install runtime with the original capability-checkbox decision. | `console/app.js` renders only evidence-backed recommendations into Fix All; `scripts/onboarding-console.mjs` revalidates each selected id and records per-item undo. Unsupported runtime owners are surfaced instead of presented as dead switches, while `plugin/scripts/runtime-preferences.mjs`, `scripts/nightly-controller.mjs`, and `bin/install.mjs` persist the supported choices. |
 | 2026-07-28 | Recorded the implemented two-profile console selector; kept the broader granular checklist open | The 2026-07-28 owner request approved exactly Complete Brain and RuVector Only; `console/app.js` now exposes that two-choice physical RVF profile. Arbitrary per-capability install checkboxes remain deferred. |

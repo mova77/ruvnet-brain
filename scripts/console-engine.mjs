@@ -99,45 +99,31 @@ export function buildHealthRecommendations({ memory = null, learning = null } = 
     }));
   }
 
-  // 2. A capture queue that fills but does not drain. The depth IS the evidence.
-  const depth = Number(learning?.queueDepth);
-  if (Number.isFinite(depth) && depth > 50) {
-    recs.push(makeRecommendation({
-      id: 'learning:flush',
-      scope: 'user',
-      title: 'Feed your captured work into the learner',
-      rationale: 'Your AI captured this work, but none of it has reached the learner yet — so none of it has taught it anything.',
-      severity: 'IMPORTANT',
-      touchesMachine: true,
-      plainImpact:
-        'Sends events already captured on your own machine into the local learner so it improves from them. '
-        + 'Nothing leaves your computer, and the queue is kept intact if the feed fails.',
-      evidence: [{ observed: `${depth} captured events waiting, undelivered` }],
-      cost: { time: 'under a minute', risk: 'low — local only; queue preserved on failure' },
-      change: { human: 'drain the capture queue into the learner' },
-      undo: { human: 'nothing to reverse — this only adds observations; learned state can be cleared separately' },
-    }));
-  }
 
   // 3. A learner that has not trained in days. Installed-but-dormant is a DEFECT, not a neutral
   //    state — the entire point of shipping a learning system is that it runs.
+  //    #377: "quiet" means observations have WAITED more than two days for a distillation, measured
+  //    from `ruflo memory distill status`. An unknown distillation state, or a learner that is caught
+  //    up (nothing recorded since its last distillation), never shows this card.
   const STALE_TRAIN_SECONDS = 60 * 60 * 24 * 2; // two days
   const age = Number(learning?.lastTrainSeconds);
-  if (Number.isFinite(age) && age > STALE_TRAIN_SECONDS) {
+  const waited = learning?.oldestPendingAt ? (Date.now() - Date.parse(learning.oldestPendingAt)) / 1000 : NaN;
+  if (learning?.enabled !== false && learning?.statusKnown && learning.distillKnown === true
+    && learning.pendingObservations > 0 && Number.isFinite(waited) && waited > STALE_TRAIN_SECONDS) {
     recs.push(makeRecommendation({
       id: 'learning:train',
-      scope: 'user',
+      scope: learning?.scope === 'user' ? 'user' : 'project',
       title: 'Your learner has gone quiet',
-      rationale: 'It is installed and switched on, but it has not learned anything recently — so it is not getting smarter.',
+      rationale: 'Captured observations have no recent structural distillation receipt. Recorded observations and reusable patterns are separate.',
       severity: 'SUGGESTED',
       touchesMachine: true,
       plainImpact:
         'Runs one local training cycle so recent work becomes patterns it can reuse next time. '
-        + 'Runs on your machine only and changes nothing about your projects.',
-      evidence: [{ observed: `last trained ${(age / 86400).toFixed(1)} days ago (${learning?.trajectories ?? 0} trajectories recorded)` }],
-      cost: { time: 'under a minute', risk: 'low — local, and the learned state is resettable' },
+        + 'Uses the same AgentDB, retains a checked local snapshot, and verifies pattern counts separately from recorded observations.',
+      evidence: [{ observed: `last distillation ${Number.isFinite(age) ? (age / 86400).toFixed(1) + " days ago" : "not recorded"}; ${learning.pendingObservations} of ${learning?.observations ?? learning?.trajectories ?? 0} observations waiting, oldest ${(waited / 86400).toFixed(1)} days${learning?.learningDb ? ` in ${learning.learningDb}` : ''}` }],
+      cost: { time: 'under a minute', risk: 'local structural patterns; snapshot retained; automatic exact restore unavailable' },
       change: { human: 'run one training cycle so captured work becomes reusable patterns' },
-      undo: { human: 'the learned state can be reset, returning it to its pre-training condition' },
+      undo: { human: 'retain the WAL-safe snapshot for supervised offline recovery; automatic exact restore is unavailable' },
     }));
   }
 
@@ -216,24 +202,10 @@ export function buildHealthRecommendations({ memory = null, learning = null } = 
 // "here is the gap" to "here is the one-click fix" — the exact gap ADR-027 closed for health/stack/
 // wiring findings, left open for capabilities.
 //
-// THE BAR IS HIGHER THAN "has a turnOn command". capability-registry.mjs's own header states turnOn
-// is null unless the exact command was verified with --help — that proves the command EXISTS, not
-// that its INVERSE has ever been run. Of the registry's rows, only `memory-distillation` clears both:
-// distill-project.mjs's header records a live, round-tripped proof (644 → 648 patterns, restore →
-// 644, re-run → 648, 2026-07-24) — an undo that has actually executed, not merely been promised in a
-// comment (see that file's header for why "promised, never run" was this project's origin sin).
-//
-// So this is a small, explicit map, not "every row with a non-null turnOn". A second and third
-// capability (most likely cross-project-lessons, then workflow-pattern-learning) join this map only
-// once THEIR undo is independently proven the same way — never before (Rule 0: verify, don't assume).
-const CAPABILITY_ELIGIBLE = {
-  'memory-distillation': {
-    title: 'Turn on memory distillation',
-    scope: 'project',
-    cost: { time: '~10s', usd: 0, risk: 'low' },
-    undo: { human: 'restores the pre-distill snapshot exactly (proven 2026-07-24: 644→648 patterns, restore→644, re-run→648)' },
-  },
-};
+// A historical restore demonstration is not proof of a currently available inverse.
+// distill-project --restore now refuses unsafe database replacement, so memory-distillation
+// is not offerable. Keep the allowlist empty until an inverse is available and verified.
+const CAPABILITY_ELIGIBLE = {};
 
 /**
  * @param {{ capabilities?: Array<{key,label,state,scope,turnOn,evidence,whatItBuysYou}> }} input — the

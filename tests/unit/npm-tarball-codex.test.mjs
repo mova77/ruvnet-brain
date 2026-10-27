@@ -6,7 +6,7 @@
 // the file always exists. The wiring worked from a repo/marketplace clone and returned `no-source`
 // on every npm install, which is where the fix was aimed in the first place.
 //
-// So this suite refuses the checkout: it runs `npm pack`, unpacks the real tarball, and exercises
+// So this suite refuses the checkout: it consumes the sealed tarball (or packs locally), and exercises
 // the installer FROM THE UNPACKED ARTIFACT with its default package-relative source resolution.
 // A test that can borrow files from the source tree cannot catch a packaging hole; this one cannot
 // borrow anything.
@@ -26,6 +26,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { extractTarball } from '../helpers/extract-tarball.mjs';
+import { parseNpmPack } from '../helpers/npm-pack-json.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const madeTmp = [];
@@ -38,14 +40,23 @@ let wireCodexHost, codexStatus; // imported from the UNPACKED bin/install.mjs, n
 
 beforeAll(() => {
   const dest = tmpdir();
-  // Windows cannot execFile npm's .cmd shim without a shell (CVE-2024-27980 hardening); the
-  // paths involved are runner-controlled tmp dirs, not user input.
-  const out = execFileSync('npm', ['pack', '--json', '--pack-destination', dest], {
-    cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], shell: process.platform === 'win32',
-  });
-  packed = JSON.parse(out.slice(out.indexOf('[')))[0];
-  // tar ships in System32 on the Windows runners, so this one spawns directly everywhere.
-  execFileSync('tar', ['-xzf', path.join(dest, packed.filename), '-C', dest]);
+  const sealed = process.env.RUVNET_SEALED_PACKAGE;
+  if (sealed) {
+    packed = {
+      filename: path.basename(sealed),
+      files: execFileSync('tar', ['-tzf', path.basename(sealed)], { cwd: path.dirname(sealed), encoding: 'utf8' })
+        .trim().split('\n').map((entry) => ({ path: entry.replace(/^package\//, '').replace(/\/$/, '') })),
+    };
+    extractTarball(sealed, dest);
+  } else {
+    if (process.env.RUVNET_REQUIRE_SEALED_PACKAGE === '1') throw new Error('Release CI requires RUVNET_SEALED_PACKAGE; refusing to repack the checkout');
+    // Windows cannot execFile npm's .cmd shim without a shell; these are local temp paths.
+    const out = execFileSync('npm', ['pack', '--json', '--pack-destination', dest], {
+      cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], shell: process.platform === 'win32',
+    });
+    packed = parseNpmPack(out, { expectName: 'ruvnet-brain' });
+    extractTarball(path.join(dest, packed.filename), dest);
+  }
   unpackedRoot = path.join(dest, 'package');
 }, 180_000);
 
@@ -141,9 +152,12 @@ describe('the installed server completes initialize and tools/list', () => {
     const env = { ...process.env, RUVNET_BRAIN_HOME: tmpdir() };
     delete env.RUVNET_BRAIN_KB;
     delete env.KB_DIR;
-    const proc = spawn(process.execPath, [serverPath], { stdio: ['pipe', 'pipe', 'ignore'], env });
+    const proc = spawn(process.execPath, [serverPath], { stdio: ['pipe', 'pipe', 'pipe'], env });
     const replies = new Map();
     let buf = '';
+    let stderr = '';
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+    proc.on('error', (error) => { stderr += `\nprocess error: ${error.stack || error.message}`; });
     proc.stdout.on('data', (d) => {
       buf += d;
       let nl;
@@ -153,7 +167,7 @@ describe('the installed server completes initialize and tools/list', () => {
       }
     });
     const request = (id, method, params = {}) => new Promise((resolve, reject) => {
-      const t = setTimeout(() => reject(new Error(`no reply to ${method} in 15s`)), 15_000);
+      const t = setTimeout(() => reject(new Error(`no reply to ${method} in 15s (stderr: ${stderr || '(empty)'}; env: ${JSON.stringify({ RUVNET_BRAIN_HOME: env.RUVNET_BRAIN_HOME, RUVNET_BRAIN_KB: env.RUVNET_BRAIN_KB || null })})`)), 15_000);
       replies.set(id, (m) => { clearTimeout(t); resolve(m); });
       proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
     });
@@ -169,8 +183,8 @@ describe('the installed server completes initialize and tools/list', () => {
       expect(tool.inputSchema.required).toEqual(['query']);
       expect(tool.inputSchema.properties.query.type).toBe('string');
       expect(tool.inputSchema.properties.k.type).toBe('integer');
-      // Prove the declaration came from the static fallback, not an accidentally-reached brain.
-      expect(tool.description).toContain('Brain bundle not installed');
+      // The protocol shell owns discovery; worker availability is decided only on call.
+      expect(tool.description).toMatch(/first call may wait/i);
     } finally {
       proc.kill('SIGTERM');
     }

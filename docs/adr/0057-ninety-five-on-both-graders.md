@@ -3,11 +3,14 @@ id: ADR-057
 title: 95 on both graders — closing a 38/53 against a self-reported 83, dimension by dimension
 status: Proposed
 date: 2026-07-27
-updated: 2026-07-30
-impl: verified
+updated: 2026-10-25
+updated_source: derived-from-git
+version: 1.0.3
+impl: verification-expired
 verified: 2026-07-30
 verified_digest: 1c276a7dfbc5
 verified_by: governed-source claim ledger in this ADR plus node scripts/doc-currency.mjs --json
+reviewed_digest: fdd2f802227c
 governs:
   - scripts/behavioral-l1-l4.mjs
   - scripts/no-silent-substitution.mjs
@@ -20,15 +23,57 @@ supersedes: []
 relates: [ADR-028, ADR-052, ADR-053, ADR-055, ADR-056]
 ---
 
+
+## Current source review — 2026-10-05
+
+Reviewed candidate source `1ccc1e633772c549e4a23596a1ce3c743e797315`. This ADR stays
+**Proposed**, with `impl: verification-expired`; no external grader was rerun and no score is
+awarded by this source review. Historical scores, thresholds, and receipts below describe the
+QE apparatus and their own dated artifacts.
+
+The **two-independent-grader ≥95 target here is not the current product North Star rubric**.
+The product rubric is `north-star-product-capability-v1`, frozen as eight categories and forty
+criteria in canonical AgentDB (`.swarm/memory.db`, namespace `ruvnet-brain`, key
+`north-star-product-rubric-v1-1791177098594`), with its readable snapshot in
+`docs/qe/NORTH-STAR-PRODUCT-RUBRIC-v1.md`. QE-apparatus grades, retrieval panel grades, evidence
+coverage, adoption metrics, and that product capability assessment have different subjects.
+Do not substitute one for another, infer a current product grade from an old apparatus score,
+or mint another composite rubric. The original apparatus improvement plan remains design
+history; any future apparatus grading must identify its unchanged subject, criteria, source,
+and independent grader evidence.
+
+The governed source still rejects unknown/zero-check behavioral levels, while L4's `must`
+checks observe emitted instructions rather than downstream obedience.
+`scripts/no-silent-substitution.mjs` still exposes `audit(root = ROOT)` but its CLI calls
+`audit()` without a user-project argument: the downstream audit limitation remains open.
+`tests/mesh/coexistence.test.mjs` supplies fixture-based coexistence evidence, not every live
+host. The installer and owned hook registry have materially evolved since the July build-order
+ledger: source presence, native registration, and focused customer receipts must retain their
+own boundaries and cannot collectively assert both graders awarded 95.
+
+No counterfactual replay, paid panel, or clean-room provider turn was launched for this review.
+The historical learning artifact is not claimed as the latest available learning evidence;
+current portfolio receipts must be checked independently against their source and causal
+controls. Remaining installer/privacy integration and final source-digest binding are not
+certified by this section. CONTRIBUTING.md controls current release authority and verification;
+the dated build-order ledger is not an alternative publisher or promotion procedure.
+
 # ADR-057: 95 on both graders
 
 **Status**: Proposed
-**Date**: 2026-07-27 · **Last updated**: 2026-07-30 · **Why**: governed-source reconciliation after
-the prompt-hook timeout repair; external grades and open proof limits preserved
-**Implementation**: source-wired and currency-verified, not release-verified · **Verified in sync**:
-2026-07-28 against the governed-source ledger below. In this label, `verified` means only that the
-ADR was re-read against its governed source digest; it does **not** mean either external grader
-awarded 95, the candidate package passed on every promised host, or every build-order item is done.
+**Date**: 2026-07-27 · **Last updated**: 2026-08-01 · **Why**: governed-source reconciliation after
+the installed What's New and MCP readiness boundaries moved; external grades and open proof limits
+preserved
+**Implementation**: source-wired, but the stored source verification is expired and is not a release
+verdict. The last digest-backed re-read remains historical evidence only. Neither external grader
+awarded 95, the candidate package has not been proved on every promised host, and every build-order
+item is not done.
+
+
+> **Reviewed 2026-08-04 (4.0.9).** Governed code moved: `bin/install.mjs` now exits non-zero when `--update` lands nothing (issue #106), `kb/forge-update.mjs` releases its rollback on the no-op path and keeps it on the damaged path (#108), and `scripts/health-repair.mjs` no longer reports a hollow "fed 0" (#104). Checked against this decision: these changes implement its honesty requirement — no clause here is contradicted or superseded.
+
+
+> **Reviewed 2026-08-04 (4.0.9).** Governed code moved: `bin/install.mjs` (runUpdate now converges the managed router catalog, #87), `console/app.js` + `console/style.css` (a third not-checked provider state so an unloadable catalog is never rendered as a finding about the user credentials, #86), and `scripts/model-router-catalog.mjs`. Checked against this decision: the host wiring, the grader contract and the 95 thresholds are unchanged — these make an existing claim honest and reach an existing merge from the update path. Console re-graded 96/100 at 1440 and 1920 under the design wall. No clause contradicted or superseded.
 
 ## Context — the owner's sentence, which is the whole problem
 
@@ -53,7 +98,8 @@ contains certain WORDS, and the harness printed `OVERALL: PASS` on a run of ZERO
 all pass" was never evidence of behaviour, on either count.
 
 | Dim | | Fable | GPT | worst |
-|---|---|---|---|---|
+|---|---|---|
+| 2026-08-10 | Re-read after #128/#129; this plan stays Proposed and no score is promoted. | The governed `bin/install.mjs` changes are scheduling convergence (#129) and stale-generation pruning (#128). Neither adds, removes or relaxes a grader, a dimension or an observable, and neither is offered as evidence toward 95. `impl: verification-expired` is unchanged — two independent graders at or above 95 remain outstanding. |---|---|
 | D1 | Works well under real conditions | 50 | 60 | 50 |
 | D2 | Works as the user expects | 55 | 42 | 42 |
 | D3 | Proactive and measured | 69 | 53 | 53 |
@@ -241,9 +287,31 @@ to the five governed paths; it does not adjudicate the product or substitute for
   last independent score recorded here; source reconciliation cannot revise it.
 
 ## Currency log
+| 2026-10-25 | Review `fdd2f802227c` (4.7.21): decision unchanged; no grader input, dimension or threshold moved. `scripts/no-silent-substitution.mjs` changed only by the entry-point sweep. The `bin/install.mjs` changes are Codex hook trust and app-server reload (#492), Grok reporting (#301), `--clean --archive` (#335), the per-project install report (#420 item 4) and real hook counts in help and summary text (#400). | Reviewed diffs 320b778b..63ca7c0d for `scripts/no-silent-substitution.mjs` and `bin/install.mjs`. |
+| 2026-10-24 | Review `616c5fb44079` (4.7.18): decision unchanged. `bin/install.mjs` moved | The 4.7.18 changes to it are Codex snapshot retry/repair during wiring, a recorded reason on every failed host sync, and an early refusal for a stale source checkout running `--update`. No grader, threshold or score surface changed. Source: `bin/install.mjs`. |
+| 2026-10-05 | Reviewed current source and recorded remaining limitations; no verification or implementation-status promotion. | reviewed_digest 39f280b80f15; inspected `scripts/behavioral-l1-l4.mjs` and all expanded governs against source 5d9ea4df. Independent review preserved incident dates, Proposed/expired states and historical evidence; notification and oldest-runtime limits are explicit. |
+| 2026-09-27 | Currency review: decision unchanged. Motion: bin/install.mjs release fixes (macOS deadline, serverDependencies, corpus-currency, capability discovery). No change to the dual-grader 95 threshold or its measurement. | Reviewed `scripts/behavioral-l1-l4.mjs`, `scripts/no-silent-substitution.mjs`, `tests/mesh/coexistence.test.mjs`, `bin/install.mjs`, `plugin/hooks/hooks.json` against the commits listed above; reviewed_digest 9451bb97892a. |
+
+| 2026-09-19 | Reviewed current source and normative claims; the detailed September 19 findings below retain their stated runtime limitations. reviewed_digest 2f8099012566. | `scripts/behavioral-l1-l4.mjs`, `scripts/no-silent-substitution.mjs`, `tests/mesh/coexistence.test.mjs`; source consistency review only, no new deployment or acceptance claim. |
+
+| 2026-09-19 | Source review: installer release/health checks and the hook registry changed. Capacity guidance is advisory and provides no behavioral-grade evidence. Scoring contract and named grader implementation are unchanged; no fresh 95 score or host verification is claimed. Proposed status and dated historical verification remain. | Reviewed current governed-source diffs; this row records source consistency, not renewed runtime acceptance. |
+| 2026-09-12 | Currency review at commit dae83538: decision unchanged — this ADR's grading claims and open build-order items are unaffected. The hook-parity fork added Codex `PreToolUse`/`PostToolUse` registration and the new grounding-turn-mark/gate Stop pair to `plugin/hooks/hooks.json`; `scripts/behavioral-l1-l4.mjs`, `scripts/no-silent-substitution.mjs`, `bin/install.mjs` did not move in this fork's diff. `impl: verification-expired` remains unchanged — no re-grade is claimed. | Reviewed `plugin/hooks/hooks.json`'s diff directly (merge-base `13cfc38b`..`ef2b8e12`); confirmed the other four governed paths untouched. |
+
+| date | why |
+|---|---|
+| 2026-09-11 | Currency review at commit 7296c984: decision unchanged — the observability law is untouched; `scripts/behavioral-l1-l4.mjs`, `scripts/no-silent-substitution.mjs`, `tests/mesh/coexistence.test.mjs` did not move. `plugin/hooks/hooks.json` net vs 85f584b2 is the three gate registrations of `7b8e6e73` after the `76632b15` break and `9c45d408` restore (see ADR-0055's row); `bin/install.mjs` `dc18fadc` plus pre-session `6971f642` / `642e3e5c` / `41bbd5fb`. No review row had been recorded since 2026-08-30; the stored digest predated today's motion. | Reviewed `plugin/hooks/hooks.json`, `bin/install.mjs`, `scripts/behavioral-l1-l4.mjs`. reviewed_digest 20eddda2af93. |
+| 2026-08-30 | Rechecked scripts/behavioral-l1-l4.mjs in 05cabf0: L4 now proves quiet build behavior and still exercises all four real scenarios. |
 
 | Date | What changed | Why (with referents) |
 |---|---|---|
+| 2026-09-11 | Currency review at commit 2eef2024: code drifted from the 2026-08-19 row above, and a real gap found in item #3 ("clean-machine / org hook integrity"). `plugin/hooks/hooks.json` no longer has ANY decision-gate PreToolUse entries — commit `00526b12` (2026-09-07) cut the file from ~210 lines to a 2-hook "continuity plane" (SessionStart + Stop only), then `56420430` restored those same two; there is no longer a "5s ceiling" to check because the entries themselves are gone. Separately: `plugin/hooks/hooks.json` and `.codex/hooks.json`/`plugin/hooks/codex-hooks.json` currently register no `UserPromptSubmit` hook anywhere in this repo (`grep -rl UserPromptSubmit plugin/hooks/ .codex/` returns nothing), so `plugin/scripts/ground-ruvnet.sh` is not live-wired in a real session — yet `scripts/behavioral-l1-l4.mjs`'s L4 test invokes it by hardcoded path (`--hook` default), not through the actual registration, so L4 currently cannot detect this and would still report PASS. This is exactly the "clean-machine / org hook integrity" failure class this ADR names, now on the OPPOSITE cause (hook silently absent, not present-but-loose). The hooks-retirement architecture itself is governed by ADR-075, not here; this row only records that `hooks.json`'s content and this ADR's own L4-coverage claim have moved. | Read the current `plugin/hooks/hooks.json` and `.codex/hooks.json`/`codex-hooks.json` in full; grepped `scripts/behavioral-l1-l4.mjs` for `UserPromptSubmit`/`hooks.json` (no hits — confirms it never reads the registry); `git show --stat` on `00526b12` and `56420430`. |
+| 2026-08-22 | Re-read the moved installer surface; this plan remains Proposed, verification remains expired, and no score is promoted. | `4e68453` changes stale plugin generation cleanup to retain live/ambiguous PID-incarnation leases; `6336c52` adds non-pinned launchd paths for the supported host executables. Both changes are bounded installer correctness work in `bin/install.mjs`; neither changes `scripts/behavioral-l1-l4.mjs`, `scripts/no-silent-substitution.mjs`, `tests/mesh/coexistence.test.mjs`, the grader rubric, or the two-independent-95 acceptance condition. |
+| 2026-08-19 | **Re-read after the hooks.json timeout change; neither grader's contract is touched.** | `plugin/hooks/hooks.json` is the only governed path that moved: the two decision-gate PreToolUse entries returned from 10s to 5s (ADR-067, 2026-08-19). No hook was added, removed, or re-matched, so the behavioural L1-L4 surface both graders score is identical apart from that ceiling. `scripts/behavioral-l1-l4.mjs`, `scripts/no-silent-substitution.mjs`, `bin/install.mjs` and `tests/mesh/coexistence.test.mjs` are unchanged. |
+| 2026-08-10 | Re-read after ADR-067; this plan stays Proposed and no score is promoted. | The governed installer change is the derived Codex dependency walk. It adds no grader, dimension or observable, and is not offered as evidence toward 95. `impl: verification-expired` unchanged — two independent graders at or above 95 remain outstanding. |
+| 2026-08-02 | Re-read the governed 4.0.8 installer and hook changes; this plan remains Proposed and no score is promoted. | ADR-062 adds three-mode packed/public host proof and makes `--doctor --hooks` fail closed when selfcheck is unavailable. GPT-5.6 Sol Medium signed the release design and `claude-fable-5` Medium signed with applied changes, but neither result is represented as a new 95 product score. |
+| 2026-08-02 | Re-read every final 4.0.7 governed change and kept this plan Proposed with `impl: verification-expired`; no external grade is promoted. | Commits `281df57`, `28baa9c`, `3668b1b`, `67b283e`, and `78e897b` change installer recovery, hook timing, packaged provenance, swarm recycling, and protected publication. These changes preserve the two-independent-grader requirement and do not satisfy it by source inspection. Exact-SHA CI, candidate receipts, published bytes, and post-publication clean installs remain authoritative. |
+| 2026-08-01 | Re-read the governed installer after the four-state Claude/Codex transaction matrix. The plan remains Proposed and `impl: verification-expired`; focused host proof does not promote either external grader or the overall score. | `bin/install.mjs` now exposes the minimum injected seams needed to prove Claude-only, Codex-only, both, neither, disabled-host preservation, and rollback on either host failure. The integrated focused suite passed 70/70, while the full unit run recorded 2,726 passes and two version-fixture failures that were corrected and rerun 43/43. Exact-SHA CI, public-artifact clean installs, and two independent scores at or above 95 remain outstanding. |
+| 2026-08-01 | Re-read the governed installer changes and deliberately downgraded `impl:` from `verified` to `verification-expired`. The 95 plan remains Proposed and every external score/proof limitation remains open. | `bin/install.mjs` now delegates What's New to the installed plugin payload and, in #78 integration commit `b606900`, declares a 30-second Codex MCP startup deadline and reports worker readiness separately from registration. Those changes do not alter the five governed claims in the source ledger below. Nevertheless `verified_digest: 1c276a7dfbc5` no longer recomputes, and a source read plus #78's 138/138 focused tests cannot mint a new verification checkpoint. No broad/packed/exact-SHA/public artifact was proved, no external grader reran, and the downstream substitution/clean-room gaps remain open. |
 | 2026-07-30 | Re-read the governed 4.0.2 source and kept this decision Proposed: local packed/focused evidence is not external release proof or a 95 score. | `bin/install.mjs` now persists Console runtime and validates controls; `plugin/hooks/hooks.json` removed parser-invalid metadata and retains valid description/hooks fields. Still OPEN: external exact-SHA matrix, published clean install, both independent graders, WhitSentry clean-room replay, downstream substitution audit, and D4 N=3 promotion threshold. |
 | 2026-07-29 | Re-verified every governed source surface after the 4.0.0 Agentic-QE and release-hardening commit and refreshed the machine-derived digest. This does not promote an external grader score; it proves only governed-source currency. | Commit `e20cdf2`; `scripts/behavioral-l1-l4.mjs`, `scripts/no-silent-substitution.mjs`, `tests/mesh/*.mjs`, `bin/install.mjs`, and `plugin/hooks/hooks.json` were re-read against the stored QE evidence in `docs/qe/AGENTIC-QE-4.0-MASTER-PLAN.md`; computed digest `1f3d77fee84c`. |
 | 2026-07-29 | Re-read all five governed surfaces after the UserPromptSubmit timeout repair; the architecture and open score/proof limits remain unchanged, while the D6 envelope wording now matches the actual split deadlines. | PR #65 / commit `6734597` changes only the two UserPromptSubmit declarations in `plugin/hooks/hooks.json` from 5s to 10s; pre-tool declarations remain 5s and the inner unprompted runtime remains bounded at 4s. The exact candidate passed the GitHub macOS/Ubuntu/Windows stranger matrix, full Windows units, UX/QE, and warm-brain battery; neither external grader re-ran, so no score is promoted. |

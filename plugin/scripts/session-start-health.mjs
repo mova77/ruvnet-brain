@@ -1,0 +1,317 @@
+#!/usr/bin/env node
+// session-start-health.mjs — the three LOCAL installation-health reads SessionStart's banner depends
+// on: is the brain turned off, is the knowledge cache actually usable, and is the MCP worker alive.
+// Extracted 2026-09-11 out of session-start-core.mjs to keep that file under 500 lines; behavior is
+// unchanged from the original inline functions.
+//
+// These are the checks behind the 🚨 HEALTH ALARM and the RETRIEVAL-DOWN banner — LOCAL installation
+// integrity, not maintainer-only content. Per the 2026-09-11 reviewer correction, everything read
+// here is delivered to every user via SessionStart's existing always-shown alarm/banner lines,
+// worded for the user — never gated behind the maintainer entitlement file.
+import fs from 'node:fs';
+import path from 'node:path';
+import { json, exists, mtimeMs, read } from './session-start-fsutil.mjs';
+import { unmountedNotice } from './brain-location.mjs';
+import { assessMoveLeftovers } from './footprint-io.mjs';
+import {
+  describeFailedRefreshRun, developerRunHealth, readNightlyRegistration, refreshHistory, updateOwnedByAgenticKit,
+} from './nightly-scheduler.mjs';
+
+export const brainState = (env, home) => {
+  const stateDir = env.RUVNET_BRAIN_STATE_DIR || path.join(home, '.config', 'ruvnet-brain');
+  const file = path.join(stateDir, 'brain-off');
+  let off = env.RUVNET_BRAIN_OFF === '1';
+  if (!off) {
+    try { fs.statSync(file); off = true; }
+    catch (error) { off = !(error && (error.code === 'ENOENT' || error.code === 'ENOTDIR')); }
+  }
+  let since = '';
+  if (off) {
+    const record = json(file);
+    if (typeof record?.since === 'string') since = record.since.slice(0, 10);
+    if (!since && mtimeMs(file)) since = new Date(mtimeMs(file)).toISOString().slice(0, 10);
+  }
+  return { off, since, stateDir, file };
+};
+
+// An interrupted --move-brain may hold the ONLY Brain at <home>.old-<pid>: "reinstall" there would build a
+// second, public-only Brain beside it (4.5.2). Names only; consulted only when the KB is missing or empty.
+const restoreNotice = (home) => {
+  try {
+    const lo = assessMoveLeftovers({ brainHome: path.join(home, '.cache', 'ruvnet-brain') }).find((l) => l.onlyCopy);
+    return lo ? `the Brain is not at its path — an interrupted move left the ONLY copy at ${lo.path}; restore it, do NOT reinstall: ${lo.fix}` : '';
+  } catch { return ''; }
+};
+
+export const health = (home, off) => {
+  // Moved to another disk that is not plugged in: say exactly that — not "MISSING, reinstall", which
+  // would re-create a fresh brain in ~/.cache over the link. A problem also stands the self-heal down.
+  const unmounted = unmountedNotice({ home });
+  if (unmounted) return { problem: unmounted, absentByChoice: false };
+  const kb = path.join(home, '.cache', 'ruvnet-brain', 'kb');
+  let rvf = false;
+  // `._x.rvf` is macOS AppleDouble from an exFAT/FAT volume, not a store.
+  try { rvf = fs.readdirSync(kb).some((name) => name.endsWith('.rvf') && !name.startsWith('._') && exists(path.join(kb, name))); }
+  catch { /* absent */ }
+  const absentByChoice = off && (!exists(kb) || !rvf);
+  if (absentByChoice) return { problem: '', absentByChoice };
+  if (!exists(kb)) return { problem: restoreNotice(home) || `the brain cache directory is MISSING (${kb}) — reinstall: npx github:stuinfla/ruvnet-brain`, absentByChoice };
+  if (!rvf) return { problem: restoreNotice(home) || `NO vector stores (.rvf) found in ${kb} — the brain is empty; reinstall: npx github:stuinfla/ruvnet-brain --force`, absentByChoice };
+  if (!exists(path.join(kb, 'node_modules', '@xenova', 'transformers', 'package.json'))) {
+    return { problem: `reader dependencies are MISSING (node_modules gone) — every search WILL fail. Fix: cd ${kb} && npm i`, absentByChoice };
+  }
+  const last = json(path.join(home, '.cache', 'ruvnet-brain', 'health.json'));
+  if (last?.status === 'down') {
+    const detail = `"error": ${JSON.stringify(String(last.error || 'unknown error'))}`.slice(0, 180);
+    return { problem: `the last real search FAILED across all repos (${detail}). Fix: cd ${kb} && npm i, then run one search to clear the alarm`, absentByChoice };
+  }
+  return { problem: '', absentByChoice };
+};
+
+/**
+ * KNOWLEDGE CURRENCY — "never silent for 40 days" (owner, 2026-09-30). The installed knowledge base
+ * on the owner's Mac was 35 days old with the nightly refresh failing 22/22 times, and the only
+ * trace was a "Corpus snapshot ages" footnote inside search output. This returns ONE plain line, or
+ * '' when currency is PROVEN. Reuses the existing readers only: refresh receipts
+ * (nightly-scheduler.mjs refreshHistory + describeFailedRefreshRun), the scheduler registration
+ * (readNightlyRegistration), agentic-kit ownership, SOURCE.json builtUtc, and the heartbeat's
+ * recorded --check verdict. Currency is PROVEN only by a successful refresh or a CURRENT verdict
+ * inside 48h; anything unreadable stays UNKNOWN in the words, never "current".
+ */
+export const KNOWLEDGE_LINE_PREFIX = '[RuvNet Brain — KNOWLEDGE ';
+
+// The SessionStart knowledge auto-update's own per-machine state (session-start-update-plane.mjs
+// writes it, host-update.mjs --knowledge records the outcome). Deliberately NOT inside refresh-runs/:
+// kb/lifecycle-evidence-retention.mjs scanRefresh() marks any non-receipt entry there "unsafe" and
+// then refuses to prune, so a sidecar file would silently stop receipt retention.
+export const autoUpdatePaths = (brainHome) => ({
+  attemptFile: path.join(brainHome, 'auto-update.json'),
+  lockFile: path.join(brainHome, 'auto-update.lock'),
+  logFile: path.join(brainHome, '.last-auto-update-knowledge.log'),
+  // The newer-published identity check (2026-10-02): its own throttle + outcome record, never the update
+  // attempt file (a check is not an update; it must not reset the 6h retry or read as an abandoned launch).
+  checkFile: path.join(brainHome, 'corpus-check.json'),
+  checkResultFile: path.join(brainHome, '.last-kb-check-result.json'),
+});
+export const AUTO_UPDATE_LOCK_STALE_MS = 160 * 60_000; // detach TTL (session-start-update-plane ttlSec, 155 min) + slack
+
+/** The inputs every currency decision reads — one reader, shared by the line and the auto-update. */
+export const knowledgeFacts = ({ env = process.env, home, now = Date.now() } = {}) => {
+  const brainHome = env.RUVNET_BRAIN_HOME || path.join(home, '.cache', 'ruvnet-brain');
+  const kbDir = env.RUVNET_BRAIN_KB || path.join(brainHome, 'kb');
+  const hours = (ms) => (now - ms) / 3_600_000;
+  const source = json(path.join(kbDir, 'SOURCE.json'));
+  const builtMs = Date.parse(source?.builtUtc || source?.generatedAt || '');
+  const history = refreshHistory({ brainHome });
+  const check = json(path.join(brainHome, '.last-kb-check-result.json'));
+  const checkMs = Date.parse(check?.recordedAt || '');
+  const auto = autoUpdatePaths(brainHome);
+  const provenWithin = (h) => Boolean((history.lastSuccess && hours(history.lastSuccess.at) <= h)
+    || (check?.currencyVerdict === 'CURRENT' && Number.isFinite(checkMs) && hours(checkMs) <= h));
+  // brain-confirmation.mjs SIGNATURE_RECORD (not imported: that module imports this one).
+  const installedAtMs = Date.parse(json(path.join(brainHome, 'knowledge-signature.json'))?.verifiedAt || '');
+  return { brainHome, kbDir, source, builtMs, history, hours, provenWithin, auto, installedAtMs,
+    attempt: json(auto.attemptFile), corpusCheck: json(auto.checkFile),
+    lockMs: Date.parse(json(auto.lockFile)?.at || '') || mtimeMs(auto.lockFile) };
+};
+
+/**
+ * agentic-kit ownership is a CLAIM in kit.json, not a delivery: on the owner's Mac (2026-09-30)
+ * kit.json said ruvnetBrain:true while agentic-kit scheduled nothing, so the self-heal stood down
+ * forever and the knowledge base aged by hand only. Ownership is honoured only while an update is
+ * PROVEN inside this window (a successful refresh receipt or a CURRENT --check verdict); 36h leaves
+ * the self-heal 12h to land one before the 48h invariant breaks.
+ */
+export const AGENTIC_KIT_PROOF_HOURS = 36;
+/** 'none' | 'delivering' (kit.json claims it AND an update is proven) | 'not-delivering'. */
+export const agenticKitUpdates = ({ home, facts }) => {
+  if (!updateOwnedByAgenticKit(home)) return 'none';
+  return facts.provenWithin(AGENTIC_KIT_PROOF_HOURS) ? 'delivering' : 'not-delivering';
+};
+
+/** Why the SessionStart knowledge auto-update may NEVER run on this machine ('' = it may). */
+export const autoUpdateOptOut = ({ env = process.env, home, facts }) => {
+  const flag = String(env.RUVNET_AUTO_UPDATE || '').toLowerCase();
+  if (flag === 'off') return 'RUVNET_AUTO_UPDATE=off';
+  if (env.RUVNET_BRAIN_TEST === '1' && flag !== 'on') return 'test mode';
+  if (read(path.join(facts.brainHome, '.auto-update-pref')).trim() === 'no') return 'you answered no to background auto-update';
+  if (agenticKitUpdates({ home, facts }) === 'delivering') {
+    return `agentic-kit owns updates and one is proven within ${AGENTIC_KIT_PROOF_HOURS}h: ak sync`;
+  }
+  if (!exists(path.join(facts.kbDir, 'forge-update.mjs'))) return 'this install predates the self-updater';
+  return '';
+};
+
+/**
+ * A newer corpus is PUBLISHED and not yet installed — decided by identity, never by age: the last
+ * recorded --if-newer check found a release whose tag is newer (UPDATE_AVAILABLE, or UNKNOWN when the
+ * installed tree carries no generation stamp) and that tag is not what SOURCE.json now names. A check
+ * recorded before the update landed therefore stops reading as pending the moment B is installed.
+ */
+const SEMVER_TAG = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/;
+/** Semver order of two release tags (>0 a newer, <0 older, 0 same); null when either is not semver. */
+export const compareReleaseTags = (a, b) => {
+  const A = SEMVER_TAG.exec(String(a ?? '')), B = SEMVER_TAG.exec(String(b ?? ''));
+  if (!A || !B) return null;
+  for (let i = 1; i <= 3; i++) if (Number(A[i]) !== Number(B[i])) return Number(A[i]) > Number(B[i]) ? 1 : -1;
+  if ((A[4] || '') === (B[4] || '')) return 0;
+  if (!A[4]) return 1;
+  if (!B[4]) return -1;
+  // Semver §11.4: dot-separated identifiers left to right; numeric ones numerically (alpha.10 > alpha.9),
+  // numeric below alphanumeric, alphanumeric in ASCII order; a longer set wins when all before it are equal.
+  const X = A[4].split('.'), Y = B[4].split('.');
+  for (let i = 0; i < Math.max(X.length, Y.length); i++) {
+    if (X[i] === undefined) return -1;
+    if (Y[i] === undefined) return 1;
+    const xn = /^\d+$/.test(X[i]), yn = /^\d+$/.test(Y[i]);
+    if (xn && yn) { if (Number(X[i]) !== Number(Y[i])) return Number(X[i]) > Number(Y[i]) ? 1 : -1; continue; }
+    if (xn !== yn) return xn ? -1 : 1;
+    if (X[i] !== Y[i]) return X[i] > Y[i] ? 1 : -1;
+  }
+  return 0;
+};
+
+export const newerCorpusPending = (facts) => {
+  const c = facts.corpusCheck;
+  if (!c?.candidateTag || !['UPDATE_AVAILABLE', 'UNKNOWN'].includes(c.verdict)) return null;
+  const installed = [facts.source?.corpusReleaseTag, facts.source?.releaseTag].filter(Boolean);
+  if (installed.includes(c.candidateTag)) return null;
+  // #401: a different tag is not a newer one. When both are semver release tags, order decides: a
+  // retained check naming v4.5.7 must never call an installed v4.5.9 out of date, and a v4.5.10
+  // candidate still reads as pending however recently something was installed.
+  const order = compareReleaseTags(c.candidateTag, facts.source?.releaseTag);
+  if (order !== null) { if (order <= 0) return null; }
+  else {
+    // Opaque (non-orderable) identities: a check recorded before the installed bytes were
+    // signature-verified is stale evidence the install superseded, not proof of a newer corpus.
+    const checkedMs = Date.parse(c.checkedAt || c.launchedAt || '');
+    if (Number.isFinite(facts.installedAtMs) && Number.isFinite(checkedMs) && checkedMs < facts.installedAtMs) return null;
+  }
+  return { tag: c.candidateTag, installed: installed[0] || null, checkedAt: c.checkedAt || c.launchedAt || null, outcome: c.outcome };
+};
+const shortTag = (tag) => (tag && tag.length > 28 ? `${tag.slice(0, 26)}…` : tag || 'unknown');
+
+/**
+ * Issue #391 / closure gap G-015: a FAILED run whose `update` phase PASSED left the knowledge current
+ * (the ledger stops at the first required failure, so every corpus phase before it passed too). When
+ * host-convergence is the ONLY failed phase, the host plugin sync is what did not finish: a host
+ * problem, not a knowledge failure, and it is reported as one. Any other failed phase (cleanup-pending,
+ * retention recovery-required) keeps its own reason through describeFailedRefreshRun.
+ * Returns { state, why } from the host-convergence evidence, or null for any other receipt.
+ */
+export const hostSyncOnlyFailure = (receipt) => {
+  if (receipt?.status !== 'FAILED' || !Array.isArray(receipt.phases)) return null;
+  if (!receipt.phases.some((entry) => entry?.phase === 'update' && entry.status === 'PASS')) return null;
+  const failed = receipt.phases.filter((entry) => entry?.status === 'FAIL');
+  if (failed.length !== 1 || failed[0].phase !== 'host-convergence') return null;
+  const host = failed[0];
+  const state = host?.evidence?.state || null;
+  const why = String(host?.evidence?.error || state || '').split('\n')[0].trim().slice(0, 200);
+  return { state, why: why || 'no reason recorded (run npx ruvnet-brain --doctor)' };
+};
+
+/**
+ * A coordinated (developer-suite) nightly reports in nightly-suite-update.json, never in refresh-runs, so a failing or stale
+ * suite stayed silent while the knowledge was current (AuditC #26). One line then; '' when it is healthy, never ran, or absent.
+ */
+const coordinatedSuiteLine = ({ brainHome, now, builtMs, age }) => {
+  let health;
+  try {
+    const registration = readNightlyRegistration({ brainHome });
+    if (!registration.ok || registration.record.mode !== 'developer-suite') return '';
+    health = developerRunHealth({ brainHome, registration: registration.record, now });
+  } catch { return ''; }
+  if (!['failed', 'stale'].includes(health.state)) return '';
+  const what = health.state === 'stale' ? `has not completed in ${Math.round(health.ageHours)}h`
+    : `FAILED${Number.isFinite(health.ageHours) ? ` ${age(now - health.ageHours * 3_600_000)}` : ''}: ${String(health.evidence || 'no reason recorded').split('\n')[0].slice(0, 200)}`;
+  return `${KNOWLEDGE_LINE_PREFIX}CURRENT, NIGHTLY SUITE ${health.state === 'stale' ? 'STALE' : 'FAILING'}] knowledge base built `
+    + `${Number.isFinite(builtMs) ? age(builtMs) : 'at an UNKNOWN time'} and current; the coordinated nightly update ${what}. `
+    + `Details: ${path.join(brainHome, 'scheduler', 'last-suite-attempt.json')} (verify: npx ruvnet-brain --doctor).`;
+};
+
+export const knowledgeCurrency = ({ env = process.env, home, now = Date.now(), windowHours = 48 } = {}) => {
+  const facts = knowledgeFacts({ env, home, now });
+  const { brainHome, builtMs, history, hours, attempt } = facts;
+  const day = (ms) => new Date(ms).toISOString().slice(0, 16).replace('T', ' ') + 'Z';
+  const age = (ms) => { const h = hours(ms); return h < 48 ? `${Math.round(h)}h ago` : `${Math.round(h / 24)}d ago`; };
+  const proven = facts.provenWithin(windowHours);
+  const latest = history.latest?.receipt;
+  // An automatic update that ended without a refresh receipt of its own (npx could not fetch the
+  // package, the lock was held, it was killed at its TTL) is a failure the receipts cannot show.
+  const launchedMs = Date.parse(attempt?.launchedAt || '');
+  const autoRunning = facts.lockMs > 0 && now - facts.lockMs < AUTO_UPDATE_LOCK_STALE_MS;
+  const autoAbandoned = attempt?.outcome === 'launched' && !autoRunning;
+  const autoFailed = Number.isFinite(launchedMs) && (attempt.outcome === 'failed' || autoAbandoned)
+    && !(history.latest && history.latest.at >= launchedMs);
+  const hostOnly = hostSyncOnlyFailure(latest);
+  const failing = (latest?.status === 'FAILED' && !hostOnly) || autoFailed;
+  const ageKnown = Number.isFinite(builtMs);
+  const pending = newerCorpusPending(facts);
+  if (!failing && pending && (proven || (ageKnown && hours(builtMs) <= windowHours))) {
+    const optOut = autoUpdateOptOut({ env, home, facts });
+    const what = autoRunning ? 'the automatic update is installing it now'
+      : optOut ? `automatic update is off (${optOut}). Fix: npx ruvnet-brain@latest --update`
+        : pending.outcome === 'not-converged' ? 'an automatic update to it finished without installing it; it retries within 6h'
+          : 'the automatic update installs it in the background';
+    return `${KNOWLEDGE_LINE_PREFIX}UPDATE PENDING] a newer corpus ${shortTag(pending.tag)} is published `
+      + `(this machine has ${shortTag(pending.installed)}, built ${ageKnown ? age(builtMs) : 'at an UNKNOWN time'}); ${what}.`;
+  }
+  const fresh = proven || (ageKnown && hours(builtMs) <= windowHours);
+  if (!failing && hostOnly && fresh) {
+    const restart = hostOnly.state === 'host-restart-required';
+    return `${KNOWLEDGE_LINE_PREFIX}CURRENT, HOST ${restart ? 'RESTART' : 'SYNC'} PENDING] `
+      + `knowledge base built ${ageKnown ? `${day(builtMs)} (${age(builtMs)})` : 'at an UNKNOWN time'}; `
+      + `the last refresh (${latest.action || 'unknown'}) ${age(history.latest.at)} passed its knowledge update phase, `
+      + `only the host plugin sync after it did not finish: ${hostOnly.why}. `
+      // A restart writes no refresh receipt, so this line stays until the next refresh records the sync.
+      + (restart ? 'Fix: restart Claude Code or Codex (`claude --continue` keeps a Claude conversation), then record it: npx ruvnet-brain@latest --update.'
+        : 'Fix: npx ruvnet-brain@latest --update (verify: npx ruvnet-brain --doctor).');
+  }
+  if (!failing && fresh) return coordinatedSuiteLine({ brainHome, now, builtMs, age });
+  const kit = agenticKitUpdates({ home, facts });
+  const agentKit = kit === 'delivering';
+  // An agentic-kit machine must never be told to also --enable-nightly (one owner per machine).
+  const scheduled = kit !== 'none' || readNightlyRegistration({ brainHome }).ok;
+  const parts = [ageKnown ? `knowledge base built ${day(builtMs)} (${age(builtMs)})`
+    : 'knowledge base age UNKNOWN (SOURCE.json missing or unreadable)'];
+  if (autoFailed) {
+    const why = autoAbandoned ? 'it never recorded an outcome (killed at its time limit, or the machine slept)'
+      : `exit ${attempt.code ?? 'unknown'}: ${attempt.reason || 'no reason recorded'}`;
+    parts.push(`automatic update launched ${age(launchedMs)} FAILED — ${why}`);
+  } else if (hostOnly) {
+    parts.push(`last refresh (${latest.action || 'unknown'}) passed its knowledge update phase ${age(history.latest.at)} but its host sync did not finish: ${hostOnly.why}`);
+  } else if (latest?.status === 'FAILED') {
+    const why = describeFailedRefreshRun(latest) || 'failed';
+    parts.push(`last refresh (${latest.action || 'unknown'}) FAILED ${age(history.latest.at)}: ${why}`);
+  }
+  if (autoRunning) parts.push(`an automatic update is running now (started ${age(facts.lockMs)})`);
+  parts.push(!history.receipts ? 'no refresh has ever run on this machine'
+    : history.lastSuccess ? `${history.failuresSinceSuccess} failed run(s) since the last success (${day(history.lastSuccess.at)})`
+      : `${history.failuresSinceSuccess} failed run(s) and no successful run on record`);
+  if (kit === 'not-delivering') {
+    parts.push(`agentic-kit claims updates (kit.json ruvnetBrain:true) but no update is proven in ${AGENTIC_KIT_PROOF_HOURS}h, so the Brain's own self-heal runs instead`);
+  }
+  if (!scheduled) parts.push('no nightly refresh is scheduled');
+  if (history.unreadable) parts.push(`${history.unreadable} unreadable receipt(s)`);
+  const fix = agentKit ? 'ak sync' : scheduled ? 'npx ruvnet-brain@latest --update'
+    : 'npx ruvnet-brain@latest --update && npx ruvnet-brain --enable-nightly';
+  const optOut = autoUpdateOptOut({ env, home, facts });
+  if (optOut) parts.push(`automatic update is off (${optOut})`);
+  else if (!autoRunning) parts.push('SessionStart retries the update automatically at most every 6h');
+  const head = failing ? 'UPDATE FAILING' : ageKnown ? 'STALE' : 'CURRENCY UNKNOWN';
+  return `${KNOWLEDGE_LINE_PREFIX}${head}] ${parts.join('; ')}. Fix: ${fix} (verify: npx ruvnet-brain --doctor).`;
+};
+
+export const mcpReadiness = (env, home) => {
+  const brainHome = env.RUVNET_BRAIN_HOME || path.join(home, '.cache', 'ruvnet-brain');
+  const receipt = json(path.join(brainHome, 'mcp-readiness.json'));
+  if (receipt?.state === 'ready' && Number.isInteger(receipt.pid) && Number.isInteger(receipt.workerPid)) {
+    try {
+      process.kill(receipt.pid, 0);
+      process.kill(receipt.workerPid, 0);
+      return { state: 'ready', receipt };
+    } catch { /* a stale receipt is registration evidence, not live evidence */ }
+  }
+  if (receipt?.state === 'degraded') return { state: 'degraded', receipt };
+  return { state: 'registered', receipt };
+};

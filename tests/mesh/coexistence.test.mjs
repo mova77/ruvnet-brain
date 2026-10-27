@@ -62,6 +62,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { CONSOLE_RUNTIME_SURFACE } from '../../scripts/console-runtime-identity.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const SENTINELS = path.join(REPO_ROOT, 'tests/fixtures/mesh-sentinels');
@@ -469,15 +470,28 @@ describe('§2b byte-equivalence — ~/.claude/settings.json', () => {
     mutantDirs.push(dir);
     const binDir = path.join(dir, 'bin');
     const kbDir = path.join(dir, 'kb');
+    const scriptsDir = path.join(dir, 'scripts');
     fs.mkdirSync(binDir);
     fs.mkdirSync(kbDir);
+    fs.cpSync(path.join(REPO_ROOT, 'scripts'), scriptsDir, { recursive: true });
     const file = path.join(binDir, 'install-mutant.mjs');
     fs.writeFileSync(file, source.replace(find, replace)); // .replace (no /g) hits ONLY the FIRST
     // occurrence — verified below to be the one inside writeSettingsStatusLine, not the removal path.
-    // Preserve the installer's real module shape. Copying only install.mjs made the mutant crash on
-    // its legitimate ../kb sibling imports before the mutation could be exercised.
-    for (const sibling of ['brain-profile.mjs', 'model-requirements.mjs']) {
-      fs.copyFileSync(path.join(REPO_ROOT, 'kb', sibling), path.join(kbDir, sibling));
+    // Preserve the installer's real module shape. The mutant changes only install.mjs; its runtime
+    // dependencies must remain byte-identical so the test exercises the mutation, not packaging.
+    for (const relative of CONSOLE_RUNTIME_SURFACE.filter((entry) => entry.startsWith('kb/'))) {
+      const target = path.join(dir, relative);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.cpSync(path.join(REPO_ROOT, relative), target, { recursive: true });
+    }
+    // The installer also imports from `plugin/scripts/` (ADR-067 added mcp-readiness there). The
+    // whole POINT of this fixture is that only install.mjs is mutated and its dependencies stay
+    // byte-identical — so the tree it needs is copied rather than hand-listed. A hand-list is what
+    // broke: adding one import to install.mjs made this fixture fail to load, reporting a mutation
+    // failure that was really a packaging one, three layers from its cause.
+    const pluginScripts = path.join(REPO_ROOT, 'plugin', 'scripts');
+    if (fs.existsSync(pluginScripts)) {
+      fs.cpSync(pluginScripts, path.join(dir, 'plugin', 'scripts'), { recursive: true });
     }
     process.env.RUVNET_BRAIN_IMPORT_ONLY = '1';
     try {

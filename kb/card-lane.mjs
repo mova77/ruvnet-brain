@@ -55,22 +55,52 @@ export function loadRepoAliases(dir) {
   return {};
 }
 
+// `@scope/name` exactly, or `@scope/*` — a whole npm scope owned by one repo.
+const OWNED_PACKAGE_KEY = /^@[a-z0-9._-]+\/(?:[a-z0-9._-]+|\*)$/i;
+
+/**
+ * Package ownership, MERGED rather than first-file-wins.
+ *
+ * WHY MERGED (changed 2026-09-11). The registry ships inside the knowledge bundle while this module
+ * ships on the code track, and they update on different clocks. First-file-wins meant an installed
+ * bundle's older registry SHADOWED every entry a newer release had learned: measured on
+ * ~/.cache/ruvnet-brain/kb (builtUtc 2026-08-20), the installed copy is 37 bytes holding exactly one
+ * package, so nothing added here could ever reach a real install until the next corpus rebuild.
+ * Merging keeps the bundle authoritative for every key it actually defines — a per-key override,
+ * not a per-file one — and lets the code track ADD knowledge without waiting on a corpus refresh.
+ */
 export function loadPackageOwners(dir) {
   const moduleDir = path.dirname(fileURLToPath(import.meta.url));
-  const candidates = [dir && path.join(dir, PACKAGE_OWNERS_FILE), path.join(moduleDir, PACKAGE_OWNERS_FILE)]
+  // Lowest precedence first: the module-local defaults, then the bundle's own registry.
+  const candidates = [path.join(moduleDir, PACKAGE_OWNERS_FILE), dir && path.join(dir, PACKAGE_OWNERS_FILE)]
     .filter(Boolean);
+  const merged = {};
   for (const file of candidates) {
     try {
       const value = JSON.parse(fs.readFileSync(file, 'utf8'));
       if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
-      return Object.fromEntries(Object.entries(value)
-        .filter(([packageName, repo]) =>
-          /^@[a-z0-9._-]+\/[a-z0-9._-]+$/i.test(packageName) && typeof repo === 'string' && repo));
+      for (const [packageName, repo] of Object.entries(value)) {
+        if (OWNED_PACKAGE_KEY.test(packageName) && typeof repo === 'string' && repo) {
+          merged[packageName.toLowerCase()] = repo;
+        }
+      }
     } catch {
       // Older bundles may not carry package ownership metadata.
     }
   }
-  return {};
+  return merged;
+}
+
+/**
+ * Which repo publishes this scoped package. An exact entry always beats a scope wildcard, so one
+ * package that lives somewhere else can be corrected without abandoning the scope rule.
+ */
+export function packageOwnerFor(packageName, owners) {
+  const name = String(packageName || '').toLowerCase();
+  if (!name) return null;
+  if (owners[name]) return owners[name];
+  const scope = name.split('/')[0];
+  return owners[`${scope}/*`] || null;
 }
 
 export function repositoryNames(repo, dir) {
@@ -96,12 +126,25 @@ const STOPWORDS = new Set(`
   each other
 `.trim().split(/\s+/));
 
+/**
+ * Phones and word processors type U+2019 (and sometimes U+2018 or U+02BC) for an apostrophe. Every
+ * possessive the router reads ("rUv's", "agent's scaffolding", "each other's context", "what's")
+ * is written with a straight one, so the curly forms are folded to it first.
+ */
+export function normalizeApostrophes(text) {
+  return String(text ?? '').replace(/[\u2018\u2019\u02BC]/g, "'");
+}
+
 function normalizePhrases(text) {
   // Normalize only unambiguous multi-word paraphrases. Keeping this before tokenization lets
   // ordinary language ("throw it away") match the product vocabulary ("discard") without
   // weakening the overlap, coverage, or winner-margin confidence gates.
-  return String(text || '')
+  return normalizeApostrophes(text || '')
     .toLowerCase()
+    .replace(
+      /^(?:please\s+)?(?:search|retrieve|find)\s+(?:these|those|my|our|the)\s+(?:docs?|documents?|passages?|chunks?|notes?)\s+by\s+meaning\b(?:\s+(?:instead of|rather than)\s+(?:exact\s+)?keywords?)?/g,
+      'semantic vector search document embeddings',
+    )
     .replace(/\bthrow\s+(?:it\s+)?away\b/g, 'discard')
     .replace(/\bspend\s+less\s+money\s+on\s+model\s+calls?\b/g, 'reduce model cost')
     .replace(/\bwithout\s+getting\s+dumber\s+answers?\b/g, 'without sacrificing quality')
@@ -311,24 +354,95 @@ export function routeReposFromCards(query, dir, availableRepos, { limit = 3 } = 
   const qTokens = contentTokens(q);
   const qIdentity = wholeTokens(q);
   const aliases = loadRepoAliases(dir);
+
+  // A card route is a safety boundary, not a license to turn any lexical overlap into an
+  // answer.  Queries that contain multiple concrete terms absent from the entire card catalogue
+  // are usually outside this corpus (for example, a Django/Stripe or Unity/DOTS question).  The
+  // old router let two generic overlaps pick an arbitrary repo, which made the abstention suite
+  // answer an unrelated document.  Refuse that route early; the caller can still widen only when
+  // an explicit repo or a stronger source directive is present.
+  // flatMap does not know how to flatten a Set (only arrays) -- `card.tokenSet` must be spread
+  // into an array first, or flatMap treats each whole Set object as one opaque element. Found
+  // live 2026-09-12: cardVocabulary held Set object references, never a single token string, so
+  // `cardVocabulary.has(anyRealWord)` was false for every card, every query, since this line was
+  // written -- the "outside the card catalogue" decline below fired off a permanently-empty
+  // vocabulary, for every repo, regardless of how complete or accurate any card's own text was.
+  const cardVocabulary = new Set(cards.flatMap((card) => [...card.tokenSet]));
+  // Languages, runtimes, and protocol terms are common in legitimate cross-domain questions;
+  // they are not enough on their own to declare a query outside this corpus.
+  const neutralProperTerms = new Set([
+    'rust', 'python', 'typescript', 'javascript', 'java', 'swift', 'kotlin', 'go',
+    'c', 'cpp', 'csharp', 'llm', 'api', 'sdk', 'rsa', 'sql', 'wasm', 'webassembly',
+  ]);
+  const unknownProperTerms = [...q.matchAll(/\b(?:[A-Z][a-z]{3,}|[A-Z]{2,})\b/g)]
+    .map((match) => match[0].toLowerCase())
+    .filter((token) => !STOPWORDS.has(token)
+      && !cardVocabulary.has(token)
+      && !neutralProperTerms.has(token));
+  const normalizedQueryIdentity = ` ${qIdentityPhrase} `;
+  const namesAvailableIdentity = (repo) => repositoryNames(repo, dir).some((name) => {
+    const normalizedName = String(name).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+    return normalizedName.length >= 3 && normalizedQueryIdentity.includes(` ${normalizedName} `);
+  });
+  const hasKnownProductIdentity = [...qIdentity].some((identity) =>
+    cards.some((card) => repositoryNames(card.repo, dir)
+      .some((name) => String(name).toLowerCase() === identity))
+    || [...available].some((repo) => repositoryNames(repo, dir)
+      .some((name) => String(name).toLowerCase() === identity)))
+    || [...available].some(namesAvailableIdentity);
+  if (!hasKnownProductIdentity && unknownProperTerms.length >= 2) {
+    return {
+      repos: [],
+      confidence: 'none',
+      reason: `query contains ${unknownProperTerms.slice(0, 3).join(', ')} outside the card catalogue`,
+    };
+  }
   const scopedPackage = /@[a-z0-9][a-z0-9._-]*\/[a-z0-9._-]+/i.test(q);
+  // Hyphen-safe phrase match (issue #284). The old version folded hyphens to spaces on BOTH the
+  // repo name and the query (qIdentityPhrase), so a bare store name matched INSIDE its own
+  // hyphen-prefixed compound sibling: a short name reads as present in its own longer sibling once
+  // that sibling's hyphen is folded to a space, and the same shape breaks any hyphen-prefixed pair.
+  // Fix: keep the useful part of folding -- a hyphen or a space between the repo's own WORDS is
+  // interchangeable, so a multi-word name still matches a query that typed a space instead of a
+  // hyphen -- but check it against the RAW query with a hyphen-safe outer boundary (the same
+  // technique forge-ask-all.mjs's inventoryReposFromQuery already uses), so the match fails the
+  // instant the name is glued to more identifier characters on either side.
   const namesRepo = (repo) => {
-    const phrase = String(repo).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
-    return phrase.length >= 3
-      && new RegExp(`(?:^|\\s)${phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:$|\\s)`).test(qIdentityPhrase);
+    const words = String(repo).toLowerCase().match(/[a-z0-9]+/g);
+    if (!words || words.join(' ').length < 3) return false;
+    const pattern = words.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('[\\s-]+');
+    return new RegExp(`(?:^|[^a-z0-9._-])${pattern}(?=$|[^a-z0-9._-])`, 'i').test(q);
   };
   const canonicalNamed = new Set();
   const aliasNamed = new Set();
+  const symbolOwner = q.match(/\b([A-Z][A-Za-z0-9_$]*)\.[A-Za-z_$][\w$]*\s*\(/)?.[1];
   for (const repo of available) {
     if (qIdentity.has(repo.toLowerCase()) || namesRepo(repo)) canonicalNamed.add(repo);
-    if (repositoryNames(repo, dir)
+    if ((symbolOwner && repositoryNames(repo, dir).some((name) => name === symbolOwner))
+      || repositoryNames(repo, dir)
       .filter((name) => name.toLowerCase() !== repo.toLowerCase())
       .some((name) => qIdentity.has(name.toLowerCase()) || namesRepo(name))) {
       aliasNamed.add(repo);
     }
   }
+  // A complete multiword/hyphenated store identity remains a source-search scope when its card
+  // has not been curated. Generic one-word product vocabulary still needs a card or another route.
+  for (const repo of available) {
+    if (/[-.]/.test(repo) && namesRepo(repo)) canonicalNamed.add(repo);
+  }
+  // Two independently maintained ruOS repositories have different owners. The fully qualified
+  // Cognitum name is an explicit disambiguator for its capability-summary store; the bare `ruos`
+  // identity continues to resolve to the public ruvnet desktop-control repository.
+  const explicitCognitumRuos = /\bcognitum(?:-one)?(?:\s+|\/)ruos\b/i.test(q)
+    && available.has('cognitum-ruos');
+  const cognitumRuosOnly = explicitCognitumRuos
+    && !/\b(?:compare|comparison|versus|vs\.?|between|across|difference|differ)\b/i.test(q);
+  if (explicitCognitumRuos) {
+    canonicalNamed.add('cognitum-ruos');
+    if (cognitumRuosOnly) canonicalNamed.delete('ruos');
+  }
   const namedPackage = q.match(/@[a-z0-9][a-z0-9._-]*\/[a-z0-9._-]+/i)?.[0]?.toLowerCase();
-  const packageOwner = namedPackage ? loadPackageOwners(dir)[namedPackage] : null;
+  const packageOwner = namedPackage ? packageOwnerFor(namedPackage, loadPackageOwners(dir)) : null;
   if (packageOwner && available.has(packageOwner)) canonicalNamed.add(packageOwner);
   const rawNamed = new Set([...canonicalNamed, ...aliasNamed]);
   const explicitAliasComparison = rawNamed.size > 1
@@ -405,9 +519,10 @@ export function routeReposFromCards(query, dir, availableRepos, { limit = 3 } = 
       const storeIdentity = repo.toLowerCase();
       const named = explicitlyNamed.has(repo)
         || (!primaryBrainScope && (
-          qIdentity.has(card.repoIdentity)
-          || qIdentity.has(storeIdentity)
-          || namesRepo(card.repo)
+          !(cognitumRuosOnly && repo === 'ruos')
+          && (qIdentity.has(card.repoIdentity)
+            || qIdentity.has(storeIdentity)
+            || namesRepo(card.repo))
         ));
       const tokens = qTokens.filter((token) =>
         token !== card.repoIdentity && token !== storeIdentity);
@@ -424,6 +539,15 @@ export function routeReposFromCards(query, dir, availableRepos, { limit = 3 } = 
     .sort((a, b) => Number(b.named) - Number(a.named) || b.overlap - a.overlap || b.coverage - a.coverage);
 
   const named = scored.filter((candidate) => candidate.named);
+  // An explicitly named installed store remains a valid source-search destination even when its
+  // optional capability card has not been curated yet. This is routing only: cardRepos deliberately
+  // omits it, so no card content can be mistaken for source evidence.
+  const cardBackedRepos = new Set(scored.map((candidate) => candidate.repo));
+  const namedWithoutCards = [...explicitlyNamed].filter((repo) =>
+    available.has(repo)
+    && !cardBackedRepos.has(repo)
+    && (/-|\./.test(repo) || repositoryNames(repo, dir).some((name) =>
+      String(name).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().includes(' '))));
   const first = scored[0];
   const second = scored[1];
   const described = !named.length
@@ -439,7 +563,7 @@ export function routeReposFromCards(query, dir, availableRepos, { limit = 3 } = 
       && candidate.coverage >= MIN_COVERAGE)
     : [];
   const describedCluster = !described && tiedLeaders.length >= 2 && tiedLeaders.length <= 3;
-  if (!named.length && !described && !describedCluster) {
+  if (!named.length && !namedWithoutCards.length && !described && !describedCluster) {
     return {
       repos: [],
       confidence: 'none',
@@ -449,7 +573,9 @@ export function routeReposFromCards(query, dir, availableRepos, { limit = 3 } = 
 
   const selected = [];
   const candidates = named.length
-    ? named
+    ? [...named, ...namedWithoutCards.map((repo) => ({ repo, named: true, overlap: 0 }))]
+    : namedWithoutCards.length
+      ? namedWithoutCards.map((repo) => ({ repo, named: true, overlap: 0 }))
     : describedCluster
       ? tiedLeaders
       : [first];
@@ -470,12 +596,12 @@ export function routeReposFromCards(query, dir, availableRepos, { limit = 3 } = 
     .filter(([, cardRepo]) => cardRepo));
   return {
     repos: selected,
-    namedRepos: named.map((candidate) => candidate.repo),
+    namedRepos: [...new Set([...named.map((candidate) => candidate.repo), ...namedWithoutCards])],
     cardRepos,
     primaryProductScope: primaryBrainScope,
-    confidence: named.length ? 'named' : 'described',
-    reason: named.length
-      ? `query explicitly names ${named.map((candidate) => candidate.repo).join(', ')}`
+    confidence: named.length || namedWithoutCards.length ? 'named' : 'described',
+    reason: named.length || namedWithoutCards.length
+      ? `query explicitly names ${[...new Set([...named.map((candidate) => candidate.repo), ...namedWithoutCards])].join(', ')}`
       : describedCluster
         ? `card evidence preserves ${tiedLeaders.length} tied source candidates (${first.overlap} matching concepts)`
         : `card evidence favors ${first.repo} (${first.overlap} matching concepts)`,
@@ -487,7 +613,7 @@ export function routeReposFromCards(query, dir, availableRepos, { limit = 3 } = 
  * the query, or { hit: false, reason } when they do not — never a guess dressed as an answer.
  */
 function isGuideQuestion(query) {
-  const q = String(query || '');
+  const q = normalizeApostrophes(query || '');
   const claimText = q.replace(/\bgreen\s+test\s+run\s+prove\b/gi, 'green test run establish');
   const sourceOrReleaseClaim =
     /\b(?:built|shipped|implemented|released|deployed|current(?:ly)?|latest|default|prove|proof|source\s+code|code\s+path|adr[-\s_]?\d+)\b/i;
@@ -495,7 +621,9 @@ function isGuideQuestion(query) {
   return /\b(?:what\s+is|what\s+does|what\s+happens|how\s+do\s+i|which\s+store|difference\s+between|fit\s+together|good\s+enough|chatbot|database|settings\s+screen|install\s+is\s+healthy|work\s+in\s+codex|turn\s+the\s+brain\s+off|green\s+test\s+run\s+prove|every\s+capability\s+described\s+in\s+an?\s+adr|what\s+exact\s+evidence)\b/i.test(q);
 }
 
-export function answerFromCards(query, dir, { allowGuideAnswers = false } = {}) {
+export function answerFromCards(query, dir, { allowGuideAnswers = false, k = 1 } = {}) {
+  // A single overview card cannot satisfy a request for multiple source documents.
+  if (k > 1) return { hit: false, reason: 'multiple documents require source retrieval' };
   const q = String(query || '').trim();
   if (!q) return { hit: false, reason: 'empty query' };
   if (requiresImplementationProof(q) && !(allowGuideAnswers && isGuideQuestion(q))) {
@@ -507,6 +635,11 @@ export function answerFromCards(query, dir, { allowGuideAnswers = false } = {}) 
   const scopedPackage = q.match(/@[a-z0-9][a-z0-9._-]*\/[a-z0-9._-]+/i)?.[0];
   if (scopedPackage) {
     return { hit: false, reason: `scoped package detail requires source retrieval (${scopedPackage})` };
+  }
+  const exactArtifact = /(?:^|[\s'"`])(?:\.{0,2}[\\/])?(?:[A-Za-z0-9_.-]+[\\/])+[A-Za-z0-9_.-]+(?:$|[\s'"`,:;?)])/u.test(q)
+    || /\b[A-Za-z0-9_.-]+\.(?:c|cc|cpp|go|h|hpp|java|js|jsx|mjs|cjs|md|py|rs|sh|sql|toml|ts|tsx|yaml|yml)\b/i.test(q);
+  if (exactArtifact) {
+    return { hit: false, reason: 'exact path or file query requires source retrieval' };
   }
   const sourceDetail =
     /\b(?:adr[-\s_]?\d+|api|sdk|backends?|exports?|registered|source code|code path|(?:code|working)\s+example|(?:three|\d+)\s+lines?\s+of\s+code|snippet|actually\s+mutate|supported?\s+topolog(?:y|ies)|topolog(?:y|ies)\s+does\s+it\s+support|package names?|crate names?|workspace|supersedes?|deployment\s+process|exact[-\s]+artifact|github\s+checks?|independent\s+graders?)\b/i;
@@ -536,6 +669,13 @@ export function answerFromCards(query, dir, { allowGuideAnswers = false } = {}) 
   const qTokens = contentTokens(q);
   if (!qTokens.length) return { hit: false, reason: 'query has no scoreable content words' };
   const qIdentity = wholeTokens(q); // exact whole-token set, for the "is this repo NAMED?" test only
+  // In ecosystem-selection questions, "RuvNet" names the umbrella, not the `ruvnet` repository.
+  // Treating it as a repo identity forces every "Which RuvNet tool …?" query onto the generic
+  // card before the requested capability can rank. Direct questions such as "What is ruvnet?"
+  // retain their exact-identity behavior.
+  if (/\b(?:what|which)\s+ruvnet\s+(?:tool|repo|repository|package)\b/i.test(q)) {
+    qIdentity.delete('ruvnet');
+  }
   let preferredGuideRepo = null;
   if (allowGuideAnswers) {
     if (/\b(?:chatbot|settings\s+screen|install\s+is\s+healthy|question\s+to\s+a\s+cited\s+answer|work\s+in\s+codex|turn\s+the\s+brain\s+off|green\s+test\s+run\s+prove|every\s+capability\s+described\s+in\s+an?\s+adr|what\s+exact\s+evidence)\b/i.test(q)) {
@@ -606,17 +746,29 @@ export function answerFromCards(query, dir, { allowGuideAnswers = false } = {}) 
 }
 
 /** Render a fast-lane hit into the same "text block" shape the heavy path returns, so a caller can
- *  read content[0].text uniformly either way — plus a plain marker a consumer can grep for. */
+ *  read content[0].text uniformly either way — plus a plain marker a consumer can grep for.
+ *
+ *  The printed `repo=`/`path :` pair must be a citation `kb/verify-citation.mjs`'s
+ *  `citationResolves()` can actually resolve on disk. The header names the card's OWN repo (the
+ *  subject, e.g. `repo=ruvector`), so routing credit and the ADR-055 receipt stay with that repo.
+ *  The path is the card's real stored passage path: capability cards are folded into the derived
+ *  `concepts` store at build time (`scripts/corpus-aggregates.mjs`'s `add(repository, 'CARD', ...)`)
+ *  under `${repository}/CARD/${repository}-card`, and `citationResolves()` looks a `CARD/` path up
+ *  there. The old `<repo>/kb/capability-cards.md#<repo>` path was never a stored passage path, so
+ *  every fast-lane answer was permanently unresolvable (Dream Cycle 2026-10-03, PR #372). */
 export function renderCardHit(hit) {
   const confidence = hit.namedRepo
     ? 'named directly'
     : `overlap ${hit.bodyOverlap}, coverage ${hit.coverage}`;
+  const line = (value) => String(value ?? '').replace(/[\r\n]+/g, ' ');
+  const body = String(hit.text ?? '');
   return (
     `⚡ FAST LANE — zero-ML keyword match (${confidence})\n`
-    + `#1  repo=${hit.repo}  evidence=curated-capability-card\n`
-    + `path : ${hit.repo}/kb/${hit.path}\n`
+    + `#1  repo=${line(hit.repo)}  evidence=curated-capability-card\n`
+    + `path : ${line(hit.repo)}/CARD/${line(hit.repo)}-card\n`
     + `----- grounded summary -----\n`
-    + `${hit.text}\n\n`
+    + `chars: ${body.length}\n----- full document -----\n`
+    + `${body}\n${'='.repeat(67)}\n\n`
     + `➡ This is a curated summary card, not a full-text passage. For code-level detail (exact APIs, `
     + `function signatures, ADR status), ask a more specific question — that runs the full source search.`
   );

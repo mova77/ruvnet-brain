@@ -111,6 +111,7 @@ describe('stack plugins — ISSUE #22: marketplace-installed rUv tools are count
     });
     try {
       expect(listInstalledPlugins(dir)[0].installed).toBe('3.9.9');
+      expect(listInstalledPlugins(dir)[0].instances.map(({ version }) => version)).toEqual(['2.9.0', '3.9.9']);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
@@ -131,9 +132,9 @@ describe('stack plugins — ISSUE #22: marketplace-installed rUv tools are count
     finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  it('classify() marks a plugin row CURRENT (counted, healthy) and never nags it as behind npm', () => {
+  it('installed plugins remain unverified until their marketplace currency is measured', () => {
     const rows = classify([{ name: 'ruvnet-brain', installed: '3.9.9', source: 'plugin', marketplace: 'ruvnet-brain' }]);
-    expect(rows[0]).toMatchObject({ state: 'CURRENT', tag: 'plugin', target: '3.9.9' });
+    expect(rows[0]).toMatchObject({ state: 'INSTALLED_UNVERIFIED', tag: 'plugin', target: null });
     // A plugin with a version is never BROKEN / UNRESOLVED — i.e. never reported "not installed".
     expect(['BROKEN', 'UNRESOLVED']).not.toContain(rows[0].state);
   });
@@ -147,4 +148,10 @@ describe('stack plugins — ISSUE #22: marketplace-installed rUv tools are count
       expect(pluginVersion(path.join(dir, 'nope'))).toBe(null);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
+});
+
+it('shares npm 12 singleton-record normalization with the canonical updater', async () => {
+  const { normalizeNpmDistTags } = await import('../../scripts/stack-sync.mjs');
+  expect(pickTargetTag(normalizeNpmDistTags([{latest:'3.56.3',alpha:'3.56.2'}]),'alpha')).toEqual({tag:'latest',target:'3.56.3'});
+  expect(()=>normalizeNpmDistTags([{latest:'1.0.0'},{latest:'2.0.0'}])).toThrow(/ambiguous/);
 });

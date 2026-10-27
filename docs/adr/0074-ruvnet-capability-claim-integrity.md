@@ -1,0 +1,177 @@
+---
+id: ADR-074
+title: RuvNet capability claims require live evidence
+status: Accepted
+date: 2026-08-22
+updated: 2026-10-26
+updated_source: derived-from-git
+reviewed_digest: 38329ebc9caa
+version: 1.1.2
+authors: [Stuart Kerr, Codex]
+tags: [architecture, truthfulness, capabilities, hosts, evidence, receipts]
+supersedes: []
+relates: [ADR-020, ADR-055, ADR-067, ADR-072, ADR-073]
+governs:
+  - docs/ddd/0020-capability-claim-integrity-context.md
+  - plugin/scripts/capability-inventory-receipt.mjs
+  - plugin/scripts/capability-claim-evidence.mjs
+  - plugin/scripts/continuation-gate.mjs
+  - plugin/scripts/completion-claim-evidence.mjs
+  - scripts/completion-claim-replay.mjs
+  - tests/unit/continuation-gate-completion-claims.test.mjs
+  - plugin/mcp/managed-cli-interface.mjs
+  - kb/forge-evidence.mjs
+  - plugin/scripts/codex-hook-adapter.mjs
+  - plugin/hooks/hooks.json
+  - plugin/hooks/codex-hooks.json
+  - tests/unit/capability-inventory-receipt.test.mjs
+  - tests/unit/capability-claim-evidence.test.mjs
+  - tests/unit/continuation-gate-capability-truth.test.mjs
+  - tests/unit/managed-cli-interface.test.mjs
+  - tests/unit/grounding-receipt-lanes.test.mjs
+  - tests/acceptance/adr-074-packed-capability-claims.acceptance.test.mjs
+---
+
+# ADR-074 — RuvNet capability claims require live evidence
+
+**Status**: Accepted
+
+Accepted by Stuart's 2026-08-22 mandate. Installation, exact-source behavior, current-installed
+version, and health claim enforcement are implemented in the working candidate and exercised
+through locally packed Claude/Codex hook wiring. A read-only registry producer now binds
+latest-version claims through the same packed Stop paths. The required non-local OS and public-byte
+matrix remains open. Nothing in this document is a shipped-capability claim.
+
+## Context
+
+An assistant said Ruflo ADR Verify was not installed after checking one guessed directory. The
+active host inventory already listed `ruflo-adr:adr-verify`. The answer converted an incomplete
+search into a factual absence claim, exactly the trust failure RuvNet Brain is meant to prevent.
+
+Prompt instructions already required verification. They did not prevent the statement. The system
+therefore needs a deterministic final-answer boundary that compares a claim with current host
+evidence before the answer can leave the session.
+
+## Decision
+
+### 1. S-12 is a ProductIntegrityCase obligation
+
+ADR-072 gains S-12 without adding a ninth delivery process. `ProductIntegrityCase` owns the final
+claim verdict. `HostConvergence` contributes the real installed-host inventory and
+`PublicVerification` contributes source/version evidence.
+
+### 2. Claims use evidence typed to the question
+
+One evidence source cannot prove every kind of claim:
+
+| Claim class | Required evidence | Failure meaning |
+|---|---|---|
+| Installed, registered, or present | Complete `CapabilityInventoryReceipt` over the active host's discoverable RuvNet skill/plugin surfaces | Present bytes contradict absence; complete absence contradicts presence; incomplete enumeration is `UNKNOWN` |
+| Behavior, API, support, or limitation | Fresh source-grounding receipt whose exact source path and content identity bind the claim | No binding or design-only evidence is `UNKNOWN`; absence of retrieval never proves absence of capability |
+| Current version, latest, healthy, or reachable | Fresh live command/registry/round-trip receipt for the exact installed/public surface | A stale document, version string alone, or adjacent path is `UNKNOWN` |
+| Completion ("fixed", "done", "shipped", "live", "it will now…") | This turn's host transcript shows a verification command executed after the last state-changing action with a present, non-error result; the answer names that check and discloses what is NOT verified | No post-change check, no named check, or no disclosure is `FAIL` (one correction); a Codex rollout is read through `nativeTurnLines` (4.7.21, #423) under a stricter rule (explicit exit 0, completed non-error MCP call); a rollout with no current-turn boundary is `UNKNOWN` for that half |
+
+The current implementation covers the first row, exact-source behavior claims, installed-current
+version, managed-CLI health observations, and a dedicated public-registry latest-version probe.
+The probe is read-only and emits a content-bound receipt only after an exact successful registry
+response; lookup failure or malformed metadata remains `UNKNOWN`.
+
+### 3. CapabilityInventoryReceipt is exhaustive or UNKNOWN
+
+The receipt records host, observed roots, every parsed skill identity, absolute source path, source
+digest, enumeration errors, time, and an aggregate digest. Missing optional roots are observed as
+absent. An unreadable root, malformed discovered skill, traversal bound, or receipt mutation makes
+the inventory incomplete. Incomplete inventory can still prove presence from a found byte; it can
+never prove absence.
+
+### 4. The existing Stop chokepoint owns answer-time enforcement
+
+No second final-answer gate is added. The existing continuation gate receives
+`last_assistant_message` from both Claude Code and Codex. Before normal open-work handling it audits
+RuvNet installation claims on eligible Stop events. A contradiction or unprovable absence emits a
+correction request under the existing loop/cooldown protections. The correction names the found capability and source path,
+or requires the answer to say `UNKNOWN`.
+
+### 5. Host membership is evidence-bound
+
+Claude Code and Codex are required once packed tests prove their adapters preserve the final answer
+and enforcement output. Grok is not a supported lifecycle host until a native adapter exposes an
+equivalent final-answer boundary and passes the same mutation cases. Provider routing is not a host
+adapter.
+
+## Failure semantics
+
+- Found installed bytes plus an absence claim: `FAIL`, request correction on eligible Stop events.
+- Complete inventory plus an unsupported presence claim: `FAIL`, request correction on eligible Stop events.
+- Incomplete inventory plus a claim that depends on absence: `UNKNOWN`, request re-verification or
+  explicitly uncertain language on eligible Stop events.
+- No recognized installation claim: this receipt class has no verdict about the rest of the prose.
+- Inventory code failure: Stop remains fail-open operationally, but S-12 remains unproven and the
+  product cannot receive an integrity PASS.
+
+## Acceptance
+
+1. Replay the exact false statement against installed `ruflo-adr:adr-verify`; both supported hosts
+   must refuse the answer and name the installed source.
+2. Mutate the inventory to complete-absent, incomplete, malformed, unreadable, stale, and
+   digest-tampered states; every case must produce its typed verdict.
+3. Prove behavior/API claims bind to exact source receipts and version/health claims bind to fresh
+   live receipts; unsupported confident language must not leave either host.
+4. Run the packed Claude/Codex matrix on Linux, macOS, and Windows with zero skip/todo leaves and
+   record the signed S-12 aggregate in the product-integrity receipt.
+5. Measure Stop latency and false-positive rate. Safety does not authorize a hook that loops,
+   mangles quoted user text, or blocks unrelated claims.
+
+## Current implementation status
+
+`Accepted, partially implemented.` `CapabilityInventoryReceipt`, full-SHA `SourceClaimReceipt`,
+managed-CLI `LiveSurfaceReceipt`, and their claim audits are wired into the shared Stop body. Proactive
+recommendations now bind to a live audit evidence digest and may emit a routing receipt naming an
+existing RuvNet building block; real rows fail closed when no known route exists. One locally packed candidate exercises installation, behavior, current-version, health, and
+registry-latest outcomes through both Claude and Codex registrations. The code can sign and verify
+an aggregate that derives `PASS | PARTIAL | FAIL` from typed per-lane claim verdicts; only its schema
+and cryptography are unit-proven, and no release candidate aggregate has been minted. Linux/Windows
+packed leaves, a real candidate/public registry receipt, Grok adapter proof, false-positive
+measurement, and the signed public S-12 aggregate remain unproven.
+
+## Recovery source review — 2026-09-07
+
+The shared Stop body requests correction only within an eligible active session. Cancellation,
+interruption, terminal continuation preferences, loop guards, and explicit development maintenance
+suppress output. Repository observations do not authorize new work; correction is limited to the
+original answer. Codex delegates from the declared existing project directory. Current subprocess
+tests establish request-envelope behavior, not native-host continuation or a signed public S-12
+result. Cross-platform, public-byte, false-positive, and aggregate obligations remain unproven.
+
+## Currency log
+| 2026-10-26 | Review `73f31f2f`: decision unchanged. Motion since 2026-10-15: completion audit judges Codex claims from the native rollout (#423, `2e78fcb2`) and treats Codex read-only tools as non-boundaries (`0482e3ab`); pronoun-only promises dropped and quoted claims may name their promise (#369, `1b3114a7`); a scope-only UNKNOWN completion is advisory, not blocked, and stays UNKNOWN (#425, `e2f0cc21`); continuation-gate ledger writes are atomic and its folder is created first (`f1864302`, `f885c7c8`); entrypoint sweep (`6add4dc6`); hooks.json wording (`07ef530d`); managed CLI honors RUFLO_BIN (`c1ddaa34`) and, in 4.7.21, spawns ruflo/claude-flow with `CLAUDE_FLOW_AUTO_UPDATE=false` and `RUFLO_DAEMON_AUTOSTART=0` so a tool call cannot self-update into the user's project. No evidence class, receipt or verdict rule changed; no UNKNOWN became PASS. | Read the listed commits' diffs to `plugin/scripts/completion-claim-evidence.mjs`, `plugin/scripts/continuation-gate.mjs`, `plugin/mcp/managed-cli-interface.mjs`, `plugin/hooks/hooks.json`; test `tests/integration/managed-cli-server-boundary.test.mjs`. |
+| 2026-10-25 | Review `38329ebc9caa` (4.7.21): decision unchanged, but the section 2 completion row's example that an unparsed Codex transcript is UNKNOWN is now out of date. `plugin/scripts/completion-claim-evidence.mjs` reads Codex rollouts through `nativeTurnLines` (#423) under a stricter rule: a command counts as a check only with an explicit exit 0, an MCP call only with a completed non-error status, an unrecognised Codex tool is a change, and a rollout with no current-turn boundary stays UNKNOWN; pronoun-only promises are no longer captured (#369). `plugin/scripts/continuation-gate.mjs`: an UNKNOWN whose only gap is task scope (a check after the last change, named, with what is NOT verified disclosed) is reported as `completion-scope-advisory` instead of a correction and still closes nothing (#425, owner decision); the work ledger is written atomically (Dream #474) and its folder is created before the cooldown lock (#404). `plugin/mcp/managed-cli-interface.mjs` resolves ruflo through `resolveRuflo`, so RUFLO_BIN is honoured (#449). `scripts/completion-claim-replay.mjs`: entry-point sweep only. | Reviewed diffs 320b778b..63ca7c0d for `plugin/scripts/completion-claim-evidence.mjs`, `plugin/scripts/continuation-gate.mjs`, `plugin/mcp/managed-cli-interface.mjs`, `scripts/completion-claim-replay.mjs`, `tests/unit/continuation-gate-completion-claims.test.mjs` and `tests/unit/managed-cli-interface.test.mjs`. |
+| 2026-10-15 | Review `9ad8b3485e0d`: decision unchanged. `plugin/scripts/continuation-gate.mjs` moved in 4.7.9 | The observed-work advisory line (open SLA-breach issues, red CI, open PRs, security alerts) is printed only under `RUVNET_STOP_NUDGES=full`; what the gate may force is unchanged. No claim-audit rule, receipt or verdict changed. Source: `plugin/scripts/continuation-gate.mjs`, `tests/unit/continuation-gate-quiet-default.test.mjs`. |
+| 2026-10-15 | Review `1515cbfab58a`: decision unchanged. `plugin/scripts/continuation-gate.mjs` moved in 4.7.7 | An assistant promise whose completion verdict cannot be PASS was forced at every Stop forever; it is now forced at most three times, counted beside the ledger, then retained as deferred and never marked completed, and the gate is quiet by default unless `RUVNET_STOP_NUDGES=full` (only an explicit user objective or a capability claim contradicted by typed evidence still speaks). No claim-audit rule, evidence receipt or verdict changed; a completion claim is still never marked verified by prose. Source: `plugin/scripts/continuation-gate.mjs`, `tests/unit/continuation-gate-quiet-default.test.mjs`. |
+| 2026-09-30 | `extractClaims` exported with an optional `tools` vocabulary (default scope unchanged, so this Stop body's audit is identical) and `currentTurnRecords` factored out of `claudeTurnEvents`, both reused by `grounding-turn-evidence.mjs` for ADR-0030 decision point #1; that gate skips sentences this ADR's RUVNET_TOOL class already audits. | `plugin/scripts/capability-claim-evidence.mjs`, `plugin/scripts/completion-claim-evidence.mjs`; `tests/unit/grounding-turn-assertion.test.mjs`, `tests/unit/continuation-gate-completion-claims.test.mjs`, `tests/unit/capability-claim-evidence.test.mjs` green. |
+| 2026-09-30 | Added claim class `completion` inside the existing Stop body (no new registration): one correction when a final answer claims work is done without post-change verification this turn, a named check and a NOT-verified disclosure; first-person promises are recorded in the same per-project ledger and close only on an evidence-passing completion claim. Claude transcripts are parsed; Codex enforces the answer-side half only (rollout format unparsed). Acceptance #5 partially measured for this class: replay over 15 real Claude transcripts / 1,016 turns (the labelled run) — arm 9.2%, block 8.6%, hand-labelled block precision 81/88 (92%), promise precision 39/44 (89%); packed-host latency and native continuation remain unproven. | `plugin/scripts/completion-claim-evidence.mjs`, `plugin/scripts/continuation-gate.mjs`, `plugin/scripts/continuation-objective.mjs`, `scripts/completion-claim-replay.mjs`, `tests/unit/continuation-gate-completion-claims.test.mjs`. |
+| 2026-09-27 | Currency review: decision unchanged. Motion: continuation-gate anti-faking correction, managed-CLI interruption/continuity fixes, and Codex post-tool validation. The capability-claim integrity model is unchanged; these close real bugs in its enforcement. | Reviewed `docs/ddd/0020-capability-claim-integrity-context.md`, `plugin/scripts/capability-inventory-receipt.mjs`, `plugin/scripts/capability-claim-evidence.mjs`, `plugin/scripts/continuation-gate.mjs`, `plugin/mcp/managed-cli-interface.mjs`, `kb/forge-evidence.mjs` against the commits listed above; reviewed_digest 0e03e3459a3b. |
+
+| 2026-09-12 | `continuation-gate.mjs` moved: `--commit-to` never actually armed the Stop-forcing gate — it wrote to `led.items`, which the forcing logic doesn't read; only `led.objective` does, and nothing ever wrote that. Fixed so `--commit-to` writes a real `led.objective` (session-wildcarded, per `continuation-objective.mjs`'s documented `'*'` exception); reverted an earlier wrong fix that derived an objective from any open ledger item, which broke the deliberate "legacy items never auto-force" safety test. No other governed path moved. | Reviewed `plugin/scripts/continuation-gate.mjs`, `plugin/scripts/continuation-objective.mjs`, `tests/unit/continuation-gate.test.mjs` (new fail-first CLI-level test, RED→GREEN). reviewed_digest bf4be44519d7. |
+| 2026-09-11 | Currency review at commit 7296c984: decision unchanged — only `plugin/hooks/hooks.json` and `codex-hooks.json` moved (plane retired `00526b12`, restored `56420430` / `9c45d408`, the session break `76632b15` reverted, gates `7b8e6e73`); `continuation-gate` remains registered on Stop for both hosts (`hooks:check` PASS). `plugin/scripts/capability-inventory-receipt.mjs`, `capability-claim-evidence.mjs`, `continuation-gate.mjs`, `plugin/mcp/managed-cli-interface.mjs`, `kb/forge-evidence.mjs`, `plugin/scripts/codex-hook-adapter.mjs` did not move. The console's gates card (`d61c05d3`) now reports S-12-relevant truth on the owner's machine: six on-disk blocking gates with no registration. | Reviewed `plugin/hooks/hooks.json`, `plugin/hooks/codex-hooks.json`, `plugin/scripts/continuation-gate.mjs`. reviewed_digest 3dc633e7f906. |
+| 2026-09-07 | Reviewed recovery source and corrected implementation boundaries; source digest a8fa5faa4014. | `plugin/scripts/continuation-gate.mjs`; source examination only, no renewed runtime or publication verification. |
+
+| 2026-08-30 | Capability and host changes now run through the canonical contract lane, and session-start output is filtered to factual signals. | `plugin/scripts/session-start-core.mjs`, `scripts/qa-runner.mjs`, and `tests/unit/session-start-core-parity.test.mjs` bind the user-visible claim to executable evidence. |
+
+| Date | What changed | Why |
+|---|---|---|
+| 2026-08-22 | Bound proactive capability routing to live audit evidence digests and added optional routing receipts with explicit RuvNet tool preferences. | Recommendations must not silently fall back to an invented hand-rolled capability; synthetic host fixtures remain compatible while real rows fail closed. |
+| 2026-08-22 | Added the read-only `ruvnet_registry_latest` MCP probe, content-bound registry receipts, exact version comparison, and packed Claude/Codex latest-version cases. | “Latest” is a public-surface claim; installed CLI output cannot prove it. Network failure and malformed registry metadata still emit no receipt, so the answer remains `UNKNOWN` instead of inheriting a cached or adjacent version. |
+| 2026-08-22 | Added full-SHA behavior receipts, managed-CLI current-version/health receipts, host-bound Stop auditing, typed signed aggregate logic, and packed Claude/Codex cases; latest remains `UNKNOWN`. | `plugin/scripts/capability-claim-evidence.mjs`, `plugin/mcp/managed-cli-interface.mjs`, and `tests/acceptance/adr-074-packed-capability-claims.acceptance.test.mjs` now distinguish evidence classes instead of treating installation as proof of behavior or currency. |
+| 2026-08-22 | Added locally packed Claude/Codex Stop-path acceptance for the installation-claim slice. | Direct shared-body tests did not prove either host registration preserved the final answer and enforcement output. |
+| 2026-08-22 | Established S-12 and implemented the first installation-claim receipt/audit slice. | A host asserted that an installed Ruflo ADR skill was absent because it searched one guessed path instead of the active inventory. |
+| 2026-08-26 | Revalidated the managed-CLI evidence path after the Windows `.cmd` shim and native worktree-path portability fixes. | `fc517c2` is the exact candidate change under review; the document now records the source movement before release gating. |
+
+
+## Completion claim checking — 4.5.15 surgical correction
+
+The existing Stop handler checks current completion claims before legacy objective terminal-state shortcuts. Arbitrary nonempty prose cannot complete an objective. FAIL and UNKNOWN evidence cannot be upgraded by mixed success language; a scoped passing statement cannot certify a broader change. Explicit native interruption or cancellation remains authoritative.
+
+Hook retirement requires the expected package definition, exact literal command, verified wrapper bytes, owned canonical namespace and safe current-user filesystem ancestry. Foreign, customized or ambiguous hooks are preserved and reported as conflicts. Only the verified Brain completion handler may be activated; other hook overrides and privacy preferences remain unchanged.
+
+This correction does not add an intake, task-contract or workflow engine. It strengthens false-completion refusal and existing scoped evidence checks; it does not prove arbitrary whole-goal acceptance. Local focused checks and a bounded Claude candidate Stop test have passed. Codex candidate execution and protected publication/installed activation are still separate required evidence.

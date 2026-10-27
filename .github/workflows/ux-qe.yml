@@ -1,11 +1,16 @@
 name: ux-qe
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  workflow_dispatch: {}
+  workflow_call:
+    inputs:
+      candidate_sha:
+        description: Exact 40-character candidate SHA
+        required: true
+        type: string
+
+concurrency:
+  group: ruvnet-brain-ux-qe-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   ux-qe:
@@ -18,6 +23,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_sha || github.sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -26,7 +33,21 @@ jobs:
         run: npm ci --no-audit --no-fund
       - name: Install Chromium and Linux system dependencies
         if: runner.os == 'Linux'
-        run: npx playwright install --with-deps chromium
+        run: |
+          set -euo pipefail
+          # GitHub's Ubuntu image occasionally serves a transiently inconsistent apt mirror.
+          # Retry the complete browser+dependency install instead of turning that infrastructure
+          # blip into a release verdict; the UX gate still runs only after Playwright succeeds.
+          for attempt in 1 2 3; do
+            if npx playwright install --with-deps chromium; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "Playwright dependency install failed (attempt $attempt/3); retrying..." >&2
+              sleep 5
+            fi
+          done
+          exit 1
       - name: Install Chromium
         if: runner.os != 'Linux'
         run: npx playwright install chromium
@@ -38,6 +59,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ux-qe-${{ runner.os }}
+          name: ux-evidence-${{ inputs.candidate_sha || github.sha }}-${{ runner.os }}
           path: artifacts/ux-qe-${{ runner.os }}.json
           if-no-files-found: error

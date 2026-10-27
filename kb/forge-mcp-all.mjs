@@ -17,13 +17,19 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { searchAll, discoverRepos } from './forge-ask-all.mjs';
+import { storeRoot } from './store-root.mjs';
+import { searchAll, discoverRepos, deployedFamilyReposFromQuery, relatedCapabilitySources } from './forge-ask-all.mjs';
 import { warmKnowledgeStores, warmQueryEmbedder } from './forge-ask.mjs';
 import { warmReranker } from './forge-rerank.mjs';
 import { guardPassages } from './forge-guard-injection.mjs';
 import { answerFromCards, renderCardHit } from './card-lane.mjs';
-import { implementationNotice } from './implementation-evidence.mjs';
+import { implementationNotice, requiresImplementationProof } from './implementation-evidence.mjs';
+import { isSourceDiscoveryIntent } from './source-discovery-intent.mjs';
+import { describeSearchOutcome, describeSearchFailure } from './search-outcome.mjs';
 import { groundedToolResult } from './grounded-response.mjs';
+import { startRecommendEndpoint, brainHomeFromEnv, recommenderFlagOn } from './recommend-endpoint.mjs';
+
+let recommendEndpoint = null;
 
 // ── THE GONG (brain-alarm.mjs): a total retrieval failure must NEVER read as "(no results)". ──
 // Loaded dynamically + guarded (same pattern as telemetry) so an older bundle without the module
@@ -98,6 +104,37 @@ function markGroundingProven() {
 // Read at CALL time, not at module load. This server is a long-lived warm child; caching the answer
 // at boot would mean a mid-session flip did nothing until the next restart, which is exactly the
 // failure ADR-054 §4 (per-operation snapshot) rules out.
+// ── HOW MUCH OF A DOCUMENT THE PROSE ANSWER REPEATS ───────────────────────────────────────────
+//
+// Measured 2026-09-11 over a fixed 9-question set at HEAD 2eef2024 (k=3, against the installed
+// corpus): one search_ruvnet response carried **83,006 bytes**, and the SAME document text appeared
+// three times in it — `content[0].text` 80,452 B across the set, `structuredContent.answer` 80,452 B
+// (byte-for-byte identical), and `structuredContent.retrieval.results[].text` 77,158 B. 94% of a
+// 252 KB set was documents, repeated.
+//
+// Two of those three are load-bearing and stay:
+//   • `answer` must equal `content[0].text` — structured-only hosts read it (proved by
+//     tests/unit/fourth-wall.test.mjs and tests/unit/implementation-truth.test.mjs).
+//   • `retrieval.results[].text` must stay WHOLE: scripts/retrieval-canary.mjs requires the returned
+//     text to CONTAIN a passage record verbatim, so truncating it would break the release canary.
+//     It is therefore the single full carrier, and the header above points at it by index.
+// So the lever is the PROSE copy, which is the one that is repeated twice.
+//
+// The bound is not a taste: the cross-encoder that decided this document is the answer read at most
+// 512 tokens of it (~2,000 characters). Shipping 26,000 characters of a document that was judged on
+// its first 2,000 is volume, not grounding. 6,000 characters keeps three times what the ranker read
+// — and leaves the whole document one field away, byte-identical and sha-bound.
+const DOC_RENDER_MAX = (() => {
+  const raw = process.env.RUVNET_BRAIN_DOC_RENDER_MAX;
+  if (raw === undefined || raw === '') return 6_000;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;   // 0 disables the bound
+})();
+function renderedDocument(body) {
+  const text = String(body || '');
+  return DOC_RENDER_MAX > 0 && text.length > DOC_RENDER_MAX ? text.slice(0, DOC_RENDER_MAX) : text;
+}
+
 function brainOffState() {
   try {
     const home = process.env.HOME || process.env.USERPROFILE || '';
@@ -146,7 +183,10 @@ function disabledResult(id, k, state) {
   return ok(id, { content: [{ type: 'text', text: body }], isError: false, disabled: true, _meta: { disabled: true } });
 }
 
-const KB_DIR = process.env.KB_DIR || process.cwd();
+// ONE RESOLVER (2026-08-13). This was `process.env.KB_DIR || process.cwd()`, so the brain you got
+// depended on where you stood — an ingest wrote one root while this read another, and three repos
+// reported 'searchable now' while search found none of them.
+const KB_DIR = storeRoot();
 const REPOS = (process.env.KB_REPOS || '').split(',').map((s) => s.trim()).filter(Boolean);
 let discovered = [];
 try { discovered = discoverRepos(KB_DIR); } catch { /* dir checked at call time */ }
@@ -240,6 +280,12 @@ const TOOLS = [
       },
       required: ['query'],
     },
+    // Same declaration the protocol shell publishes (plugin/mcp/server.mjs SEARCH_TOOL), repeated
+    // here so the two lists cannot disagree about what this tool is allowed to do. Every write
+    // reachable from a search lands under ~/.cache/ruvnet-brain (meterLog, markGroundingProven,
+    // brain-alarm health.json, telemetry stamps) — never the user's project tree, which is the
+    // property issue #36 fixed and the reason readOnlyHint is honest here.
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
   },
 ];
 
@@ -260,6 +306,15 @@ async function handle(msg) {
     case 'brain/warmup':
       await Promise.all([warmQueryEmbedder(), warmReranker()]);
       await warmKnowledgeStores(KB_DIR, CORE_WARM_REPOS);
+      // ADR-093 rev 2: lend the now-warm embedder to the UserPromptSubmit package recommender over a
+      // private local endpoint. ONLY when the recommender flag is an explicit opt-in; default off
+      // starts nothing. A failure here never fails warmup — the hook falls back to its lexical lane.
+      if (recommenderFlagOn() && !recommendEndpoint) {
+        // Endpoint traffic does NOT reset the idle-exit clock (#122): typing must not pin a multi-GB
+        // worker resident. When the worker retires, the hook falls back to its lexical lane.
+        recommendEndpoint = startRecommendEndpoint({ brainHome: brainHomeFromEnv() })
+          .catch(() => null);
+      }
       return ok(id, { ready: true });
     case 'tools/call': {
       const name = params?.name;
@@ -268,12 +323,47 @@ async function handle(msg) {
       try {
         const query = String(args.query || '').trim();
         const k = Math.max(1, parseInt(args.k ?? 6, 10) || 6);
+        // Whether the CALLER actually asked for more than one document, as opposed to `k` merely
+        // holding this tool's own advertised default (6, from inputSchema.properties.k above). Root
+        // cause of the 2026-09-07 card-lane regression (cdbca804): answerFromCards()'s k>1 guard was
+        // meant to defer ONLY a genuine multi-document request to source retrieval (its own test,
+        // tests/unit/card-lane.test.mjs, exercises k:1 vs k:10 explicitly) — but the caller here was
+        // passing the DEFAULTED k straight through, so every ordinary call omitting `k` (i.e. nearly
+        // all real traffic, this test file included) silently carried k=6 and the fast lane could
+        // never fire again. Distinguish "the caller wrote k" from "nothing was written and this
+        // function filled in its own default" so an ordinary single-question call still reaches the
+        // card lane, while an explicit k>1 request still correctly defers to full source retrieval.
+        const explicitK = args.k !== undefined && args.k !== null && args.k !== '';
         if (!query) return err(id, -32602, 'query is required');
         // BEFORE any retrieval work (ADR-054 §3): no model load, no store read, no telemetry event,
         // no grounded-once stamp. A switched-off brain must be indistinguishable from one that never
         // ran — including in what it costs and in what it counts.
         const offState = brainOffState();
         if (offState) return disabledResult(id, k, offState);
+        // A small, independently reviewed set of source witnesses can answer broad discovery
+        // questions without paying for an unrelated lexical candidate's full retrieval/rerank.
+        // This lane is deliberately a lead, not ranked evidence: exact API/implementation claims,
+        // explicit multi-result requests, and all unmatched questions continue through normal
+        // retrieval. The helper re-reads and hashes the real passage on every call.
+        const exactMemberQuestion = /\b[A-Za-z_$][\w$]*\.[A-Za-z_$][\w$]*\s*\(/.test(query);
+        const sourceDiscoveryIntent = isSourceDiscoveryIntent(query);
+        const directImplementationClaim = requiresImplementationProof(query) && !sourceDiscoveryIntent;
+        if (!explicitK && !directImplementationClaim && !exactMemberQuestion && sourceDiscoveryIntent) {
+          const discoverySources = await relatedCapabilitySources({ dir: KB_DIR, query, repos: REPOS });
+          if (discoverySources.length) {
+            const sourceRepos = [...new Set(discoverySources.map((source) => source.repo))];
+            const body = 'SOURCE-BOUNDED DISCOVERY: A reviewed repository source matches this capability area. '
+              + 'The separate source excerpt below is a discovery lead, not a complete answer or proof of '
+              + 'every requested constraint. Name a repository or exact API when you need primary retrieval.';
+            meterLog({ ts: new Date().toISOString(), source: 'mcp', tool: 'search_ruvnet', k,
+              bytes: body.length, sourceDiscovery: true });
+            return ok(id, groundedToolResult({
+              body, relatedSources: discoverySources,
+              query, k, results: [],
+              extra: { sourceDiscovery: { repos: sourceRepos, acceptedAsPrimaryEvidence: false } },
+            }));
+          }
+        }
         // ── FAST LANE — FIRST RESPONDER (card-lane.mjs) ─────────────────────────────────────────
         // Tried on EVERY query, BEFORE the heavy cross-repo search below. Zero ML: keyword overlap
         // over kb/capability-cards.md. Measured 2026-07-27: the heavy path (searchAll) costs
@@ -285,7 +375,10 @@ async function handle(msg) {
         // card-lane.mjs's header for the honesty contract (silence-or-fallthrough, never a
         // fabricated hit; naming a repo is not by itself sufficient confidence).
         // Heavy-path model revisions are materialized locally by forge-rerank before remote access.
-        const cardHit = answerFromCards(query, KB_DIR, { allowGuideAnswers: true });
+        const namedFamilyRepos = deployedFamilyReposFromQuery(query, KB_DIR, repoList);
+        const cardHit = namedFamilyRepos.length
+          ? { hit: false, reason: 'named deployed RVF family requires multi-store search' }
+          : answerFromCards(query, KB_DIR, { allowGuideAnswers: true, k: explicitK ? k : 1 });
         if (cardHit.hit) {
           const cardBody = renderCardHit(cardHit);
           // MINT THE RECEIPT ON THIS LANE TOO (ADR-055 §3.1). When the fast lane became the FIRST
@@ -313,6 +406,8 @@ async function handle(msg) {
           meterLog({ ts: new Date().toISOString(), source: 'mcp', tool: 'search_ruvnet', k, bytes: cardBody.length, cardLane: true });
           return ok(id, groundedToolResult({
             body: cardBody,
+            relatedSources: await relatedCapabilitySources({ dir: KB_DIR, query, repos: REPOS }),
+            query, k, results: [{ repo: cardHit.repo, path: cardHit.path, text: cardBody }],
             grounding: cardReceipt?.sources?.length ? cardReceipt : null,
             extra: {
               cardLane: { repo: cardHit.repo, path: cardHit.path, bodyOverlap: cardHit.bodyOverlap, coverage: cardHit.coverage, namedRepo: cardHit.namedRepo },
@@ -328,6 +423,7 @@ async function handle(msg) {
           adrCollision,
           implementation,
           routing,
+          relatedSources,
         } = await searchAll({
           dir: KB_DIR,
           query,
@@ -346,10 +442,9 @@ async function handle(msg) {
             `🚨🚨🚨 RUVNET BRAIN IS DOWN — ALL ${repos.length} repos failed to search. 🚨🚨🚨\n\n`
             + `This is NOT an empty result. Retrieval itself is broken; no RuvNet grounding is possible right now.\n`
             + `First error: ${firstErr}\n\n`
-            + `Most likely fix:  cd ~/.cache/ruvnet-brain/kb && npm i\n`
-            + `Then verify:      npx github:stuinfla/ruvnet-brain --doctor\n\n`
+            + describeSearchFailure({ dir: KB_DIR }) + '\n'
             + `➡ INSTRUCTION TO THE MODEL: tell the user PLAINLY and PROMINENTLY, before anything else, `
-            + `that the RuvNet Brain is broken and needs the fix above. Do NOT answer RuvNet questions `
+            + `that the RuvNet Brain is broken and needs diagnosis before choosing a repair. Do NOT answer RuvNet questions `
             + `from memory, and do NOT proceed as if this were a normal empty search.`;
           meterLog({ ts: new Date().toISOString(), source: 'mcp', tool: 'search_ruvnet', k, bytes: body.length });
           return ok(id, { content: [{ type: 'text', text: body }], isError: true });
@@ -360,14 +455,21 @@ async function handle(msg) {
         // as inert reference data so an autonomous Claude won't execute an instruction injected into
         // an untrusted ingested repo. Exit-safe: guardPassages never throws into the search path.
         const results = guardPassages(rawResults);
-        const text = results.map((r, i) =>
-          `#${i + 1}  repo=${r.repo}  (relevance ${r.ceScore == null ? 'n/a' : r.ceScore.toFixed(3)}; vec ${r.bestDistance == null ? 'n/a' : r.bestDistance.toFixed(4)})\n`
-          + `path : ${r.repo}/${r.path}\n`
-          + `title: ${r.title}\n`
-          + `evidence class: ${r.evidenceClass || 'unknown'}${r.lifecycleStatus ? `; lifecycle status: ${r.lifecycleStatus}` : ''}\n`
-          + `----- full document (${(r.fullText || '').length} chars, ${r.chunksJoined} chunk(s)${r.truncated ? ', truncated' : ''}) -----\n`
-          + `${r.fullText || r.text || ''}\n`
-        ).join('\n========================================================\n\n');
+        const line = (value) => String(value ?? '').replace(/[\r\n]+/g, ' ');
+        const text = results.map((r, i) => {
+          const body = r.fullText || r.text || '';
+          const shown = renderedDocument(body);
+          const header = shown.length === body.length
+            ? `----- full document (${body.length} chars, ${r.chunksJoined} chunk(s)${r.truncated ? ', truncated' : ''}) -----`
+            : `----- document, first ${shown.length} of ${body.length} chars (${r.chunksJoined} chunk(s); `
+              + `the WHOLE document is in structuredContent.retrieval.results[${i}].text, sha-bound) -----`;
+          return `#${i + 1}  repo=${line(r.repo)}  (relevance ${r.ceScore == null ? 'n/a' : r.ceScore.toFixed(3)}; vec ${r.bestDistance == null ? 'n/a' : r.bestDistance.toFixed(4)})\n`
+            + `path : ${line(r.repo)}/${line(r.path)}\n`
+            + `title: ${line(r.title)}\n`
+            + `evidence class: ${line(r.evidenceClass || 'unknown')}${r.lifecycleStatus ? `; lifecycle status: ${line(r.lifecycleStatus)}` : ''}\n`
+            + `chars: ${shown.length}\n${header}\n----- full document -----\n`
+            + `${shown}\n${'='.repeat(67)}\n`;
+        }).join('\n========================================================\n\n');
         // Partial failure is DEGRADED, not fine: name the dead repos in-band so a hit that "should
         // be there" missing is explainable, and the model can tell the user coverage was reduced.
         const degraded = failedRepos.length
@@ -391,19 +493,38 @@ async function handle(msg) {
             + (evidence.droppedIrrelevant > 0
               ? `${evidence.droppedIrrelevant} further result(s) were judged irrelevant by the reranker and WITHHELD rather than padded in.\n`
               : '')
-            + `➡ INSTRUCTION TO THE MODEL: do not tell the user this capability does not exist. Say coverage is thin, and try a narrower or artifact-named query first.\n\n`
+            + (evidence.grade === 'source_grounded'
+              ? `➡ INSTRUCTION TO THE MODEL: present this as a documented capability only; runtime implementation was not verified.\n\n`
+              : `➡ INSTRUCTION TO THE MODEL: do not tell the user this capability does not exist. Say coverage is thin, and try a narrower or artifact-named query first.\n\n`)
           : '';
         // Same discipline for cross-repo ADR-number collisions (issue #33 Part B).
         const adrNote = adrCollision ? `⚠ ${adrCollision.note}\n\n` : '';
-        const header = `Searched ${repos.length} RuvNet repos (${repos.join(', ')}).\n${staleness}`;
+        // ISSUE #132 — "Searched 0 RuvNet repos ()" IS NOT WHAT HAPPENED, AND IT READS AS THE ONE
+        // THING THIS TOOL MUST NEVER IMPLY: that the user's brain is empty.
+        //
+        // When the capability-card router declines (ambiguous cards, nothing over threshold), no
+        // search is run at all — `repos` is empty because NOTHING WAS CONSULTED, not because nothing
+        // matched. Rendered through the normal banner that became "Searched 0 RuvNet repos ()"
+        // followed by "nothing in the corpus matched this query", which a reader correctly parses as
+        // an empty installation. The reporter concluded exactly that and told their user twice, on a
+        // machine holding 1.5 GB across 30+ working repos.
+        //
+        // Absence of routing is not absence of corpus — the same distinction the evidence grade and
+        // the GONG already make for thin coverage and for outages. So the declined case gets its own
+        // sentence, and it states the corpus size, which makes the wrong reading impossible rather
+        // than merely less likely. The wording lives in kb/search-outcome.mjs because this file
+        // starts a server on import, so nothing here can be asserted by a test that reads it.
+        const { declined, header, emptyBody } = describeSearchOutcome({
+          repos, routing, staleness, installedRepoCount: repoList.length,
+        });
         const truthNote = implementationNotice(implementation);
         const body = text
           ? degraded + header + adrNote + truthNote + evidenceNote + text
           : degraded + header + adrNote
             + truthNote
-            + '(no results — the search ran; nothing in the corpus matched this query)\n'
-            + '➡ This means THIS QUERY found nothing, NOT that the capability is absent from the ecosystem. '
-            + 'Try a narrower query or name a specific repo or artifact before concluding it must be built.';
+            // `emptyBody` is chosen by the same call that chose the header, so the two halves of the
+            // message can never disagree about which event they are describing.
+            + emptyBody;
         meterLog({ ts: new Date().toISOString(), source: 'mcp', tool: 'search_ruvnet', k, bytes: body.length });
         // Local grounded-once stamp (never leaves the machine) + opt-in count ping. Guarded:
         // telemetry can never break or delay the response being returned right below.
@@ -433,10 +554,13 @@ async function handle(msg) {
         // receipt line just above — an empty result must never be mistaken for proof.
         if (results.length > 0) markGroundingProven();
         return ok(id, groundedToolResult({
-          body,
+          body, relatedSources,
+          query, k, results,
           grounding: receipt?.sources?.length ? receipt : null,
           implementation,
-          extra: routing ? { routing } : {},
+          extra: {
+            ...(routing ? { routing } : {}),
+          },
         }));
       } catch (e) {
         const body = `search_ruvnet error: ${e.message}`;
@@ -461,6 +585,36 @@ function maybeExit() { if (ended && inFlight === 0) process.exit(0); }
 // the event loop alive on its own (normal stdin-'end' exit still applies).
 const orphanGuard = setInterval(() => { if (process.ppid === 1) process.exit(0); }, 30000);
 orphanGuard.unref();
+
+// IDLE EXIT (issue #122). The orphan guard above only fires on reparent-to-init, so a parent that
+// is ALIVE BUT IDLE left this server resident indefinitely. The reporter measured four concurrent
+// instances at 3.7 / 3.3 / 3.0 / 15.7 GB — ~25 GB held by sessions that had gone quiet, each having
+// burned ~5 CPU-minutes warming an embedder, a cross-encoder and the knowledge stores.
+//
+// This is safe to do BECAUSE THIS PROCESS IS NOT THE MCP SERVER. plugin/mcp/server.mjs is what the
+// host speaks to; it stays alive, answers initialize/tools/list itself, and owns ensureChild(),
+// which respawns this worker on the next call (server.mjs:260 already relies on exactly that after
+// a timeout kill). So exiting when idle costs one warm-up on the next query and returns gigabytes
+// in the meantime — the host never sees a dropped server.
+//
+// Never exits mid-request: `inFlight` must be zero, and any traffic resets the clock.
+const IDLE_EXIT_MS = Number(process.env.RUVNET_BRAIN_IDLE_EXIT_MS ?? 15 * 60_000);
+let lastActivity = Date.now();
+export const noteActivity = () => { lastActivity = Date.now(); };
+if (IDLE_EXIT_MS > 0) {
+  const idleGuard = setInterval(() => {
+    if (inFlight > 0) { lastActivity = Date.now(); return; }
+    if (Date.now() - lastActivity < IDLE_EXIT_MS) return;
+    // stderr, not stdout: stdout is the JSON-RPC channel and a stray line would corrupt a reply.
+    const forHuman = IDLE_EXIT_MS >= 60_000 ? `${Math.round(IDLE_EXIT_MS / 60_000)}m` : `${Math.round(IDLE_EXIT_MS / 1000)}s`;
+    process.stderr.write(`[ruvnet-brain] worker idle ${forHuman} — exiting to release memory; it respawns on the next query.\n`);
+    process.exit(0);
+  // Poll at half the budget (capped at 30s) so a short budget is actually observable — a guard
+  // that only ticks every 30s cannot be tested with a 3s budget, and an untestable guard is one
+  // nobody can prove still works.
+  }, Math.max(250, Math.min(30_000, Math.floor(IDLE_EXIT_MS / 2))));
+  idleGuard.unref();
+}
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', (chunk) => {
   buf += chunk;
@@ -472,6 +626,7 @@ process.stdin.on('data', (chunk) => {
     let m;
     try { m = JSON.parse(line); } catch { continue; }
     inFlight++;
+    noteActivity();   // any traffic resets the idle-exit clock (#122)
     Promise.resolve(handle(m))
       .catch((e) => { if (m && m.id != null) err(m.id, -32603, e.message); })
       .finally(() => { inFlight--; maybeExit(); });

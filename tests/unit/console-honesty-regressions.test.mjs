@@ -20,6 +20,8 @@ import { execFileSync, spawnSync, spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+// The registry's contract (tests/unit/capability-registry.test.mjs): every UNKNOWN names its obstacle.
+const UNKNOWN_NAMES_OBSTACLE = /could not|cannot|not checked|does not exist|failed|unknown|has probably changed/i;
 
 // GitHub's Windows runners don't ship the sqlite3 CLI (confirmed live: `Error: spawnSync sqlite3
 // ENOENT`, windows-unit job of run 30202790095) — and scripts/memory-doctor.mjs's read path shells
@@ -222,11 +224,15 @@ describe('session capture counts commands, not containers', () => {
         hooks: { PreCompact: [{ matcher: '.*', hooks: [] }], SessionEnd: [{ matcher: '.*', hooks: [] }] },
       }));
       const r = JSON.parse(inHome(home, detect('session-capture')).out);
-      expect(r.state, 'zero registered commands cannot be "on"').toBe('off');
+      // Empty inspected declarations prove neither native absence nor activation.
+      expect(r.state, 'zero declared commands cannot be "on"').not.toBe('on');
+      expect(r.state, 'uninspected runtime hooks must not become a measured OFF').toBe('unknown');
+      expect(r.evidence).toMatch(/no state-saving declaration was observed/i);
+      expect(r.evidence).toMatch(/runtime.*not checked/i);
     } finally { fs.rmSync(home, { recursive: true, force: true }); }
   }, 60_000);
 
-  it('reports "on" only as REGISTERED, never as proven to have captured anything', () => {
+  it('reports "on" only as declared wiring, never as proven to have captured anything', () => {
     // The standard the MCP row already held itself to, applied here too: a settings entry proves a
     // command is wired to fire. No local artifact proves it ever ran, so the wording must not imply
     // that it did. Same discipline as "configured, which is not the same as currently reachable".
@@ -240,8 +246,10 @@ describe('session capture counts commands, not containers', () => {
       }));
       const r = JSON.parse(inHome(home, detect('session-capture')).out);
       expect(r.state).toBe('on');
-      expect(r.evidence, 'an "on" derived from config must say it is only registered')
-        .toMatch(/registered/i);
+      expect(r.evidence, 'an "on" derived from config must name the declared boundaries')
+        .toMatch(/declared at compaction and session end/i);
+      expect(r.evidence, 'declared commands must never imply observed native execution or capture')
+        .toMatch(/not proof of native activation or successful capture/i);
     } finally { fs.rmSync(home, { recursive: true, force: true }); }
   }, 60_000);
 });
@@ -654,10 +662,38 @@ describe('a resting database is not an unreadable one', () => {
       `], { encoding: 'utf8' }));
 
       expect(r.state, 'an unreadable store is unknown, never off').toBe('unknown');
+      expect(r.evidence, 'an unknown names its obstacle').toMatch(UNKNOWN_NAMES_OBSTACLE);
+      expect(r.evidence, 'a structural fault must not be described as a passing lock').not.toMatch(/passing lock/);
       if (/could not be read/.test(r.evidence)) {
         expect(r.evidence, 'a structural fault must not be described as transient').toMatch(/not a transient lock/);
       }
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  }, 60_000);
+
+  it('does call a REAL held lock passing — the one case where re-checking will clear it', async () => {
+    // FORCED REAL STATE: another connection holds the store in WAL exclusive locking mode mid-write,
+    // so the doctor's separate sqlite3 reader genuinely gets "database is locked".
+    const { DatabaseSync } = await import('node:sqlite');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lockeddb-'));
+    const file = path.join(dir, '.swarm/memory.db');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const holder = new DatabaseSync(file);
+    try {
+      holder.exec("PRAGMA journal_mode=WAL; PRAGMA locking_mode=EXCLUSIVE; CREATE TABLE memory_entries (id INTEGER PRIMARY KEY, namespace TEXT, embedding BLOB); INSERT INTO memory_entries (namespace) VALUES ('x');");
+      holder.exec("BEGIN EXCLUSIVE; INSERT INTO memory_entries (namespace) VALUES ('y');");
+      const r = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', `
+        const m = await import(${JSON.stringify(pathToFileURL(path.join(REPO, 'scripts/capability-registry.mjs')).href)});
+        const c = m.CAPABILITIES.find((c) => c.key === 'memory-distillation');
+        process.stdout.write(JSON.stringify(c.detect({ project: ${JSON.stringify(dir)} })));
+      `], { encoding: 'utf8' }));
+      expect(r.state, 'a locked store is unknown, never off').toBe('unknown');
+      expect(r.evidence).toMatch(/lock/);
+      expect(r.evidence, 'a real lock is the one case that IS passing').toMatch(/passing lock/);
+      expect(r.evidence, 'an unknown names its obstacle').toMatch(UNKNOWN_NAMES_OBSTACLE);
+    } finally {
+      holder.exec('COMMIT'); holder.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   }, 60_000);
 });
 

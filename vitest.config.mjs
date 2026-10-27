@@ -1,6 +1,11 @@
+import os from 'node:os';
+import path from 'node:path';
 import { defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
+    // Bound diagnostic rendering only: a failed whole-source assertion previously emitted
+    // over 70k tokens. Assertions and their exit status remain unchanged.
+    diff: { truncateThreshold: 40, truncateAnnotation: '... diff truncated; inspect the named source and assertion' },
     // This suite launches many real Git, shell, Codex, and Ruflo subprocesses. Unbounded file
     // parallelism starves the very watchdogs and latency probes the tests are measuring: the same
     // files pass alone, while the default full run produced ten timeout/latency failures. Five
@@ -8,6 +13,20 @@ export default defineConfig({
     // fourth-wall p95 exceed 2x its ceiling. Serialize files so the suite measures product work,
     // not competition from another subprocess-heavy test file.
     maxWorkers: 1,
+    // Turn-outcome capture (plugin/scripts/turn-outcome-capture.mjs) launches a detached `ruflo`
+    // writer from every Stop/SessionEnd the suite fires through the real hook path. Off here so no
+    // test writes into the developer's real machine-wide AgentDB; its own tests inject fakes.
+    // ruflo's per-project scratch cwd (plugin/scripts/ruflo-bin.mjs rufloCwdFor) lives
+    // under the Brain home in production; tests that build a store must never create it in the
+    // developer's real ~/.cache/ruvnet-brain, so the suite points it at a private test root.
+    env: { RUVNET_TURN_CAPTURE: 'off', RUVNET_CONTINUITY_CAPTURE: 'off',
+      // The Stop gates are quiet by default for users; the suite exercises every nudge, so it opts in.
+      RUVNET_STOP_NUDGES: 'full',
+      // scripts/transient-gh.mjs waits 15 s then 30 s before retrying a transient gh/git failure; a fake gh that
+      // answers "gateway timeout" would otherwise hold a test for 45 s. Tests that measure the retry itself
+      // inject their own sleep/baseDelayMs, so this hides nothing they assert.
+      RUVNET_TRANSIENT_RETRY_DELAY_MS: '0',
+      RUVNET_RUFLO_CWD_ROOT: path.join(os.tmpdir(), `ruvnet-brain-test-ruflo-cwd-${typeof process.getuid === 'function' ? process.getuid() : 'user'}`) },
     include: [
       'tests/unit/**/*.test.mjs', 'tests/integration/*.test.mjs', 'tests/mutation/*.test.mjs',
       // ADR-058 §D7: the interface-gate incident corpus. Listed here AND given its own npm script
@@ -20,10 +39,16 @@ export default defineConfig({
       // tests/qe but is absent from this include list is silently ignored even when its path is
       // supplied on the command line — the exact vacuous-green failure this suite is meant to stop.
       'tests/qe/**/*.test.mjs',
+      // Real-host closure for reopened GitHub issues. These tests exercise installed Codex and
+      // browser boundaries and must not become invisible merely because they live outside unit/QE.
+      'tests/acceptance/*.test.mjs',
       // ADR-058 D5: the coexistence suite. Same lesson, stated twice on one file in one night —
       // a directory absent from `include` is invisible to `vitest run` no matter what any npm
       // script or CI step claims to run.
       'tests/mesh/*.test.mjs',
+      // Concurrent session and load tests (ADR-TBD): stress testing and failure injection
+      // for RequestLifecycle concurrency refactor (SessionStart timeout isolation).
+      'tests/stress/*.test.mjs', 'tests/failure/*.test.mjs',
     ],
     // Windows runners spawn processes MUCH slower than macOS/Linux (Git Bash startup dominates), and
     // a large slice of this suite deliberately exercises real shell hooks as subprocesses rather than
@@ -57,7 +82,7 @@ export default defineConfig({
       // code, not source — excluded from the denominator like tests/.
       // The visual console is shipped product code too. Omitting it let source-string assertions
       // look green while the browser behavior itself contributed nothing to the release denominator.
-      include: ['scripts/**/*.mjs', 'kb/*.mjs', 'bin/*.mjs', 'plugin/mcp/*.mjs', 'console/**/*.js'],
+      include: ['scripts/**/*.mjs', 'kb/*.mjs', 'bin/*.mjs', 'plugin/mcp/*.mjs', 'plugin/scripts/**/*.mjs', 'console/**/*.js'],
       exclude: ['kb/node_modules/**', 'kb/clones/**', 'kb/test-guard-injection.mjs'],
       // json-summary writes coverage/coverage-summary.json, which scripts/claims-verify.mjs's
       // verifyCoverageBadge RE-DERIVES the README badge % from (it no longer string-matches a

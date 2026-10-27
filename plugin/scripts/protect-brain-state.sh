@@ -41,6 +41,7 @@ INPUT=""
 # exactly why a hook that CAN hang forever survives unnoticed. -t bounds the wait, and the string
 # is truncated AFTER the loop because a hook payload is one line with no newline, so `read` hands
 # the whole thing back at once and a per-iteration cap never fires.
+_l=""   # set -u: a read that times out before any byte leaves _l unset ("unbound variable" on stderr)
 while IFS= read -r -t 2 _l; do
   INPUT+="$_l"
   [ ${#INPUT} -ge 65536 ] && break
@@ -51,10 +52,22 @@ INPUT="${INPUT:0:65536}"
 
 field() { local re="\"$1\"[[:space:]]*:[[:space:]]*\"([^\"]*)\""; [[ $INPUT =~ $re ]] && printf '%s' "${BASH_REMATCH[1]}"; }
 
-case "$(field tool_name)" in Write|Edit|MultiEdit|NotebookEdit) ;; *) exit 0 ;; esac
+# Case-insensitive (4.5): Grok sends its own spelling (`write`, `search_replace`) — a case-sensitive
+# match let a Grok write past this guard silently. nocasematch is scoped to this one test.
+shopt -s nocasematch
+case "$(field tool_name)" in Write|Edit|MultiEdit|NotebookEdit|search_replace|multi_edit) shopt -u nocasematch ;; *) exit 0 ;; esac
 
 FILE_PATH=$(field file_path)
 [ -n "$FILE_PATH" ] || exit 0
+
+# Windows sends `C:\Users\me\.config\ruvnet-brain\settings.json`, and because the payload is JSON,
+# field() — which does no unescaping — hands us DOUBLED backslashes. Every pattern below is written
+# with `/`, so without this the case block matched nothing and the guard exited 0: the consent
+# boundary failed OPEN for every Windows user, silently. Measured on windows-unit 2026-08-10
+# (`expected +0 to be 2`), and reproduced on macOS — it is the payload's shape, not the host.
+# Normalization is for MATCHING ONLY; nothing here opens the file.
+FILE_PATH=${FILE_PATH//\\\\/\\}   # JSON-doubled backslash → one
+FILE_PATH=${FILE_PATH//\\//}      # separator → the one every pattern below is written in
 
 # The same two paths brain-state.mjs and user-settings.mjs compute, resolved the same way. The env
 # overrides exist so this suite (and a second machine profile) can point them elsewhere; the literal

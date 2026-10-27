@@ -64,6 +64,10 @@ import path from 'node:path';
 import os from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+// THE canonical continuity policy — the same module bin/install.mjs and scripts/hook-retirement-check.mjs
+// import. Never re-implement this predicate locally; see the note below the imports.
+import { isAllowedContinuityRegistration } from '../plugin/scripts/continuity-hook-policy.mjs';
+import { isDirectInvocation } from '../plugin/scripts/entrypoint.mjs';
 
 // ── contract constants (ADR-053 §2.5 / §2.3) ────────────────────────────────────────────────────
 export const STDOUT_CAP_BYTES = 4096; // it lands in the user's context window
@@ -72,6 +76,32 @@ export const WATCHDOG_GRACE_MS = 2000; // SIGTERM → this long → hard kill, t
 
 /** Advisory hooks may only ever exit 0. Blocking hooks may exit 0, 1 or 2 (ADR-023's table). */
 export const ALLOWED_EXITS = Object.freeze({ advisory: [0], blocking: [0, 1, 2] });
+
+// THE SECOND COPY OF THE CONTINUITY POLICY — DELETED 2026-09-15, and this is why.
+//
+// This file used to carry its OWN isAllowedContinuityRegistration(), hardcoding the two ids
+// 'session-start' and 'continuation-gate'. That was correct when the plane really was retired to
+// continuity-only (00526b12, 2026-09-07). The project then deliberately grew the plane back to
+// ELEVEN registrations (9c45d408 restored the lifecycle, 7b8e6e73 wired the search-first gate,
+// ef2b8e12 extended it to Codex). plugin/scripts/continuity-hook-policy.mjs was updated. This
+// duplicate was not.
+//
+// WHAT THAT COST: `npm run hooks:check` and bin/install.mjs both import the canonical policy, so
+// both reported the plane compliant -- while THIS file, which runs unconditionally at the end of
+// every `npx ruvnet-brain` install and every --doctor, classified 9 of the 11 shipped registrations
+// as LEGACY and exited 1. Reproduced byte-for-byte outside CI against an `installed:<version>`
+// surface -- the directory a SUCCESSFUL `claude plugin install` creates. The more correctly the
+// install succeeded, the more certainly it reported failure. Only the stranger matrix could see it,
+// and stranger had been skipped for a month behind a red `ci` job.
+//
+// The old comment justified the duplicate as "selfcheck is copied into isolated mutation fixtures
+// and must remain runnable when only this one file is present". That is no longer true and is
+// verified, not assumed: tests/mutation/install-selfcheck-consumption-mutation.test.mjs stages
+// CONSOLE_RUNTIME_SURFACE, which lists 'plugin/scripts' (scripts/console-runtime-identity.mjs:34),
+// so the canonical policy is already present in that fixture.
+//
+// ONE policy, ONE source of truth. A checker and its subject that disagree guarantee recurring red
+// builds -- the same lesson scripts/repo-count-detector.mjs was extracted to record.
 
 /**
  * Load hook-registry.mjs. It is a sibling in `scripts/`, shipped alongside this file — see the
@@ -159,17 +189,31 @@ export function resolveInstalledSurface({ home = os.homedir(), repo = null } = {
     for (const v of fs.readdirSync(cache)) {
       const root = path.join(cache, v);
       if (fs.existsSync(path.join(root, 'hooks', 'hooks.json'))) {
-        candidates.push({ root, source: `installed:${v}`, mtime: fs.statSync(path.join(root, 'hooks', 'hooks.json')).mtimeMs });
+        candidates.push({ root, source: `installed:${v}`, hooksFile: path.join(root, 'hooks', 'hooks.json'), mtime: fs.statSync(path.join(root, 'hooks', 'hooks.json')).mtimeMs });
       }
     }
   } catch { /* no packed install on this machine */ }
   candidates.sort((a, b) => b.mtime - a.mtime); // newest generation wins; several can coexist
   const clone = path.join(home, '.claude', 'plugins', 'marketplaces', 'ruvnet-brain', 'plugin');
   if (fs.existsSync(path.join(clone, 'hooks', 'hooks.json'))) {
-    candidates.push({ root: clone, source: 'marketplace-clone', mtime: 0 });
+    candidates.push({ root: clone, source: 'marketplace-clone', hooksFile: path.join(clone, 'hooks', 'hooks.json'), mtime: 0 });
   }
+  // Codex installs the same immutable payload under its own cache. A Codex-only machine has no
+  // Claude marketplace clone, so treating that layout as "no plugin" made the real installed
+  // Codex hooks impossible to self-check (the release host matrix caught this). Keep the same
+  // newest-generation rule and read the Codex hook registry from the installed payload itself.
+  const codexCache = path.join(home, '.codex', 'plugins', 'cache', 'ruvnet-brain', 'ruvnet-brain');
+  try {
+    for (const v of fs.readdirSync(codexCache)) {
+      const root = path.join(codexCache, v);
+      if (fs.existsSync(path.join(root, 'hooks', 'codex-hooks.json'))) {
+        candidates.push({ root, source: `codex-installed:${v}`, hooksFile: path.join(root, 'hooks', 'codex-hooks.json'), mtime: fs.statSync(path.join(root, 'hooks', 'codex-hooks.json')).mtimeMs, codex: true });
+      }
+    }
+  } catch { /* no Codex plugin cache on this machine */ }
   if (repo && fs.existsSync(path.join(repo, 'plugin', 'hooks', 'hooks.json'))) {
-    candidates.push({ root: path.join(repo, 'plugin'), source: 'checkout', mtime: 0 });
+    const root = path.join(repo, 'plugin');
+    candidates.push({ root, source: 'checkout', hooksFile: path.join(root, 'hooks', 'hooks.json'), mtime: 0 });
   }
   const chosen = candidates[0];
   if (!chosen) return { ok: false, reason: 'no installed ruvnet-brain plugin payload found on this machine' };
@@ -177,8 +221,9 @@ export function resolveInstalledSurface({ home = os.homedir(), repo = null } = {
     ok: true,
     root: chosen.root,
     source: chosen.source,
-    hooksFile: path.join(chosen.root, 'hooks', 'hooks.json'),
+    hooksFile: chosen.hooksFile,
     shimFile: path.join(chosen.root, 'scripts', 'hook-shim.mjs'),
+    codex: Boolean(chosen.codex),
     alternates: candidates.slice(1).map((c) => c.source),
   };
 }
@@ -462,7 +507,7 @@ export function assertContract({ rec, measurement, mode, timeoutSec }) {
 }
 
 // ── §4 THE BATTERY: every installed registration × every stdin regime ───────────────────────────
-export async function runBattery({ home = os.homedir(), repo = null, cwd = os.tmpdir(), regimes = STDIN_REGIMES, surface = null, env = {} } = {}) {
+export async function runBattery({ home = os.homedir(), repo = null, cwd = os.tmpdir(), regimes = STDIN_REGIMES, surface = null, env = {}, inspectOnly = false } = {}) {
   const reg = await loadRegistry();
   const s = surface ?? resolveInstalledSurface({ home, repo });
   if (!s.ok) return { ok: false, reason: s.reason, violations: [], results: [] };
@@ -472,6 +517,7 @@ export async function runBattery({ home = os.homedir(), repo = null, cwd = os.tm
   const { contracts } = reg.loadContracts(s.root);
 
   const registrations = readInstalledRegistrations(s.hooksFile);
+  if (inspectOnly) return { ok: true, surface: s, registrations, violations: [], results: [] };
   const violations = [];
   const results = [];
 
@@ -480,7 +526,7 @@ export async function runBattery({ home = os.homedir(), repo = null, cwd = os.tm
     const shimId = reg.shimIdIn(r.command);
     const entry = shimId ? table[shimId] : null;
     const contract = entry ? null : contracts.find((c) => reg.contractMatches(c, { layer: 'plugin', event: r.event, matcher: r.matcher, command: r.command }));
-    const mode = entry?.mode ?? contract?.mode ?? null;
+    const mode = entry?.mode ?? contract?.mode ?? (s.codex ? 'advisory' : null);
     const handler = entry?.file ?? reg.basenamesIn(r.command).filter((b) => b !== 'hook-shim.mjs').pop() ?? null;
     const rec = { ...r, handler, shimId, mode };
 
@@ -517,7 +563,15 @@ export async function runBattery({ home = os.homedir(), repo = null, cwd = os.tm
 export async function checkCoexistence({ home = os.homedir(), repo = null } = {}) {
   const reg = await loadRegistry();
   const registry = reg.buildRegistry({ repo: repo ?? reg.REPO, home, includeMachine: true });
-  const ours = registry.records.filter((r) => r.layer === 'plugin' || r.layer === 'plugin-installed' || r.layer === 'marketplace-clone');
+  // 'codex' joined hook-registry.mjs's mesh 2026-08-20 (Dream Cycle cross-host-conformance) — it is
+  // OURS (plugin/hooks/codex-hooks.json, shipped in package.json's "files" tree same as plugin/),
+  // never a foreign registration. Omitting it here silently undercounted `ourCount` and dropped all
+  // 16 Codex registrations from both buckets — caught by an independent critique before this shipped.
+  // 'codex' joined hook-registry.mjs's mesh 2026-08-20 (Dream Cycle cross-host-conformance) — it is
+  // OURS (plugin/hooks/codex-hooks.json, shipped in package.json's "files" tree same as plugin/),
+  // never a foreign registration. Omitting it here silently undercounted `ourCount` and dropped all
+  // 16 Codex registrations from both buckets — caught by an independent critique before this shipped.
+  const ours = registry.records.filter((r) => r.layer === 'plugin' || r.layer === 'codex' || r.layer === 'plugin-installed' || r.layer === 'marketplace-clone');
   const foreign = registry.records.filter((r) => r.layer === 'user' || r.layer.startsWith('third-party:') || r.layer === 'project');
 
   // DOUBLE REGISTRATION — reused wholesale from hook-registry (ADR-055 M1): one handler, an
@@ -557,6 +611,10 @@ export async function checkCoexistence({ home = os.homedir(), repo = null } = {}
  * "not available" line and score nothing — a security check that invents a pass is worse than none.
  */
 export function runSecurityScan({ cwd = process.cwd(), timeoutMs = 20000, env = process.env } = {}) {
+  // Every `ruflo` invocation auto-starts a project background daemon unless this is set (verified
+  // live against the installed CLI: ~/.npm-global/lib/node_modules/ruflo/node_modules/@claude-flow/cli/dist/src/services/daemon-autostart.js:85).
+  // A read-only version probe + two scan subcommands have no business leaving a daemon running.
+  env = { ...env, RUFLO_DAEMON_AUTOSTART: '0', CLAUDE_FLOW_AUTO_UPDATE: 'false' };
   const probe = spawnSync('ruflo', ['--version'], { encoding: 'utf8', timeout: 5000, env });
   if (probe.error || probe.status !== 0) {
     return { available: false, reason: 'ruflo not found on PATH — MCP surface not scanned (install: npm i -g ruflo)' };
@@ -591,13 +649,53 @@ export async function selfCheck({ home = os.homedir(), repo = null, cwd = os.tmp
   }
 
   // (b) THE BATTERY
-  const battery = await runBattery({ home, repo, cwd, regimes });
+  // Inventory the installed surface before dispatching anything. A stale lifecycle registration
+  // is itself the finding; executing it first defeats the safety check (and can run an arbitrary
+  // sentinel or user command) before we report that it should never have been installed. Healthy
+  // surfaces are then executed by the same full battery, so this preflight does not weaken coverage.
+  let battery = await runBattery({ home, repo, cwd, regimes, inspectOnly: true });
   if (!battery.ok) {
     lines.push(`hooks: ${battery.reason}`);
     violations.push({ kind: 'no-plugin', where: 'hooks', detail: battery.reason });
   } else {
-    violations.push(...battery.violations);
-    lines.push(`hooks: ${battery.registrations.length} registrations from ${battery.surface.source}, ${regimes.length} stdin regimes each (${battery.results.length} firings)`);
+    let contracts = [];
+    try {
+      contracts = (await loadRegistry()).loadContracts(battery.surface.root).contracts || [];
+      if (!contracts.length) {
+        const file = path.join(battery.surface.root, 'hooks', 'hook-contracts.json');
+        const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
+        contracts = Array.isArray(doc.contracts) ? doc.contracts : [];
+      }
+    } catch { /* battery already has the authoritative result */ }
+    const legacyRegistrations = battery.registrations.filter((registration) =>
+      !isAllowedContinuityRegistration({ ...registration, layer: 'plugin' })
+      // KEPT DELIBERATELY. The current plugin/hooks/hook-contracts.json carries no
+      // `commandIncludes`, so it is tempting to call this dead and delete it -- I did, and
+      // tests/mesh/coexistence.test.mjs immediately proved it wrong. `git log -S commandIncludes`
+      // shows the field WAS on real contracts until 00526b12 (2026-09-07, the retire-automatic-hooks
+      // release), so anyone still installed from a bundle older than that has contracts only this
+      // branch can recognise. Charging their valid registration as "legacy" would fail their install
+      // for upgrading late. The BUG was never this fallback -- it was the hardcoded two-id list
+      // above it, now replaced by the canonical policy.
+      && !(battery.surface.source.startsWith('installed:')
+        && contracts.some((contract) => typeof contract?.commandIncludes === 'string'
+          && String(registration.command || '').includes(contract.commandIncludes))));
+
+    if (legacyRegistrations.length !== 0) {
+      violations.push({
+        kind: 'automatic-registration',
+        where: battery.surface.source,
+        detail: `${legacyRegistrations.length} legacy Brain lifecycle registration(s) remain installed`,
+      });
+      // Keep the result machine-readable, but do not execute any of the stale commands. This is a
+      // hard safety boundary: a release acceptance test must prove detection without side effects.
+    } else {
+      // No stale registrations were found, so run every declared handler through all stdin regimes
+      // and enforce its timeout, exit-code, output, and process-tree contract.
+      battery = await runBattery({ home, repo, cwd, regimes });
+      violations.push(...battery.violations);
+    }
+    lines.push(`hooks: ${battery.registrations.length - legacyRegistrations.length} continuity + ${legacyRegistrations.length} legacy registrations from ${battery.surface.source}`);
   }
 
   // (c) COEXISTENCE — reported, never charged to the user
@@ -633,7 +731,7 @@ export function formatVerdict(result, { color = null } = {}) {
   const out = [];
   for (const l of result.lines) out.push(`  ${c.dim(l)}`);
   if (!result.violations.length) {
-    out.push(`  ${c.green('✓ Self-check passed.')} Every shipped hook answered inside its contract on this machine.`);
+    out.push(`  ${c.green('✓ Self-check passed.')} The installed Brain surface has only the two guarded continuity lifecycle handlers.`);
     return out.join('\n');
   }
   out.push(`  ${c.red(`✗ Self-check FAILED — ${result.violations.length} contract violation(s):`)}`);
@@ -642,7 +740,7 @@ export function formatVerdict(result, { color = null } = {}) {
 }
 
 // ── CLI ─────────────────────────────────────────────────────────────────────────────────────────
-if (process.argv[1] && (() => { try { return fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url)); } catch { return false; } })()) {
+if (isDirectInvocation(import.meta.url)) {
   const noSecurity = process.argv.includes('--no-security');
   const json = process.argv.includes('--json');
   const result = await selfCheck({ security: !noSecurity });

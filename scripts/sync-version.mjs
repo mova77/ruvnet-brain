@@ -33,6 +33,22 @@ export function writeLockVersion(s, version) {
   return `${JSON.stringify(doc, null, 2)}\n`;
 }
 
+export function readExplainerBadgeVersion(s) {
+  return s.match(/&middot;\s*v(\d+\.\d+\.\d+(?:-[\w.-]+)?)(?=\s*(?:&middot;|<))/)?.[1] ?? null;
+}
+
+export function writeExplainerBadgeVersion(s, version) {
+  return s.replace(/(&middot;\s*v)\d+\.\d+\.\d+(?:-[\w.-]+)?/, `$1${version}`);
+}
+
+// The explainer once showed a second, competing version next to the product version
+// ("candidate preview" ... "public npm vX.Y.Z") — two versions on one public page, exactly the
+// defect single-source-check.mjs check B10 exists to catch (fixed 2026-09-26). This regression
+// guard keeps it from silently coming back.
+export function hasSplitVersionLabel(s) {
+  return /candidate preview|public npm v\d/i.test(s);
+}
+
 // Each target: a file, a regex to find the version-bearing line, and the corrected line.
 const targets = [
   { // Codex plugin manifest — same product, same release train as the Claude manifest
@@ -71,12 +87,12 @@ const targets = [
     file: 'explainer/index.html',
     get: (s) => {
       const ld = s.match(/"softwareVersion"\s*:\s*"([^"]+)"/)?.[1] ?? null;
-      const badge = s.match(/&middot;\s*v([0-9][^\s<]*)</)?.[1] ?? null;
+      const badge = readExplainerBadgeVersion(s);
       return ld === badge ? ld : `mixed(${ld}, ${badge})`;
     },
     set: (s) => s
       .replace(/("softwareVersion"\s*:\s*)"[^"]+"/, `$1"${V}"`)
-      .replace(/(&middot;\s*v)[0-9][^\s<]*</, `$1${V}<`),
+      .replace(/&middot;\s*v\d+\.\d+\.\d+(?:-[\w.-]+)?/, (label) => writeExplainerBadgeVersion(label, V)),
   },
 ];
 
@@ -113,16 +129,16 @@ for (const rel of ['kb/RVF-GENERATIONS.json']) {
 
 if (CHECK && fs.existsSync(path.join(ROOT, 'kb/RVF-GENERATIONS.json'))) {
   const kbDir = path.join(ROOT, 'kb');
-  const requiredStores = fs.readdirSync(kbDir)
-    .filter((file) => file.endsWith('.big.rvf'))
-    .map((file) => file.slice(0, -'.big.rvf'.length));
-  // CI/source-only clones intentionally omit the gitignored RVF binaries. In that shape, validate
-  // the committed ledger's version fields but defer byte checks to bundle assembly, where the RVFs
-  // are present. A checkout containing any canonical RVF remains fail-closed for every ledger row.
-  const { failures } = verifyRvfGenerations(kbDir, {
-    requiredStores,
-    allowMissingFiles: requiredStores.length === 0,
-  });
+  // Validate the committed ledger's version fields ONLY. The previous form scanned the working
+  // directory for `*.big.rvf` and byte-compared every ledger row against whatever this machine
+  // happened to have — but those binaries are gitignored, so the verdict described the machine, not
+  // the commit. It was unsatisfiable in practice (ledger: 72 stores; a real checkout: 71, because
+  // the nightly rebuilds RVFs and regenerates the ledger as one step) and it blocked every push,
+  // tags included, while pointing at a remedy that cannot clear it. Byte verification now happens
+  // where the bytes are genuinely present and genuinely shipped: scripts/build-bundle.mjs:204-214.
+  // This is the same rule release.mjs:100 already applies — a verdict is only about the committed
+  // candidate.
+  const { failures } = verifyRvfGenerations(kbDir, { verifyBytes: false });
   for (const failure of failures) {
     console.error(`[version] RVF GENERATION DRIFT: ${failure}`);
     drift++;
@@ -152,6 +168,20 @@ if (CHECK && fs.existsSync(path.join(ROOT, 'kb/RVF-GENERATIONS.json'))) {
   }
 }
 
+// Guard: the explainer must never again show a second, competing version next to the product
+// version (the "candidate preview" / "public npm vX.Y.Z" split fixed 2026-09-26 — see
+// hasSplitVersionLabel() above and single-source-check.mjs check B10). This is a content
+// regression, not a mechanical one, so --check only reports it; there is no auto-fix.
+{
+  const p = path.join(ROOT, 'explainer/index.html');
+  if (fs.existsSync(p) && hasSplitVersionLabel(fs.readFileSync(p, 'utf8'))) {
+    if (CHECK) {
+      console.error('[version] DRIFT: explainer/index.html shows a second/candidate version label ("candidate preview" / "public npm vX") — the page must show exactly one current version');
+      drift++;
+    }
+  }
+}
+
 // Guard: no stray hardcoded product-version literal anywhere in the source tree — every code path must
 // read getVersion() (or inherit a synced literal via the `targets` above / the README badge). Rather than
 // a fixed 3-file allowlist (which silently missed strays in every other file), walk the WHOLE tree and
@@ -175,6 +205,8 @@ if (CHECK) {
     'tests/unit/version.test.mjs', 'tests/unit/sync-version-drift.test.mjs', 'tests/unit/self-update-plan.test.mjs',
     // Asserts stripTag('v1.14.1-dev') === '1.14.1-dev' — the literals ARE the fixture.
     'tests/unit/version-tag-vs-field.test.mjs',
+    // MCP reload tests carry version literals in fixture manifests — these are test payloads, not production code.
+    'tests/unit/mcp-graceful-reload.test.mjs', 'tests/integration/mcp-reload-no-restart-required.test.mjs',
   ]);
   const litRe = /['"`](v?\d+\.\d+\.\d+(?:-dev)?)['"`]/g;
 

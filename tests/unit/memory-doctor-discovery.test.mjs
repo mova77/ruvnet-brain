@@ -1,0 +1,139 @@
+import { afterEach, describe, expect, it } from 'vitest';
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { candidateRoots, findProjects } from '../../scripts/memory-doctor.mjs';
+
+const REPO = path.resolve(import.meta.dirname, '../..');
+const DOCTOR = path.join(REPO, 'scripts', 'memory-doctor.mjs');
+const homes = [];
+
+function isolatedHome() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'brain-memory-discovery-'));
+  homes.push(home);
+  // Canonicalise, so expectations are built in the SAME namespace the product reports in.
+  // Discovery now de-duplicates by the OS's own answer (fs.realpathSync.native, via
+  // plugin/scripts/project-identity.mjs) rather than by string. On Windows os.tmpdir() hands back
+  // the 8.3 short form — C:\Users\RUNNER~1\AppData\Local\Temp — while realpath resolves the long
+  // one, so a raw mkdtemp path and a discovered path are two spellings of one directory and
+  // toEqual fails on a difference that is not a defect. macOS has the same hazard via /var -> /private/var.
+  return fs.realpathSync.native(home);
+}
+
+function store(home, relative) {
+  const db = path.join(home, relative, '.swarm', 'memory.db');
+  fs.mkdirSync(path.dirname(db), { recursive: true });
+  fs.writeFileSync(db, 'fixture');
+  return fs.realpathSync(db);
+}
+
+function discover(home, explicitRoot) {
+  const expression = explicitRoot === undefined
+    ? 'm.findStores()'
+    : `m.findStores(${JSON.stringify(explicitRoot)})`;
+  const run = spawnSync(process.execPath, ['--input-type=module', '-e', [
+    `const m = await import(${JSON.stringify(pathToFileURL(DOCTOR).href)});`,
+    `process.stdout.write(JSON.stringify(${expression}));`,
+  ].join('\n')], {
+    env: { ...process.env, HOME: home, USERPROFILE: home },
+    encoding: 'utf8',
+  });
+  expect(run.status, run.stderr).toBe(0);
+  return JSON.parse(run.stdout);
+}
+
+afterEach(() => {
+  for (const home of homes.splice(0)) fs.rmSync(home, { recursive: true, force: true });
+});
+
+describe('issue #81 — shared AgentDB fleet discovery', () => {
+  it('shares one canonical project traversal across wiring consumers', () => {
+    const home = isolatedHome();
+    const project = path.join(home, 'source', 'project');
+    fs.mkdirSync(path.join(project, '.claude'), { recursive: true });
+    fs.writeFileSync(path.join(project, '.mcp.json'), '{}');
+    const vendor = path.join(home, 'source', 'ruvnet-repos', 'clone');
+    fs.mkdirSync(path.join(vendor, '.claude'), { recursive: true });
+    expect(findProjects(path.join(home, 'source'), { purpose: 'wiring' })).toEqual([project]);
+  });
+
+  it('finds common, configured, and known stores once when no root is supplied', () => {
+    const home = isolatedHome();
+    const expected = [
+      store(home, 'source/hm/a'),
+      store(home, 'work/b'),
+      store(home, 'custom/c'),
+      store(home, '.claude'),
+      store(home, 'cognitum-trader'),
+    ].sort();
+    fs.mkdirSync(path.join(home, '.claude', 'ruvnet-brain'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.claude', 'ruvnet-brain', 'config.json'), JSON.stringify({
+      scanRoots: ['custom'],
+    }));
+
+    expect(discover(home)).toEqual(expected);
+  });
+
+  it('canonicalizes symlinked roots and store paths before de-duplicating', () => {
+    const home = isolatedHome();
+    const expected = store(home, 'source/hm/a');
+    fs.symlinkSync(path.join(home, 'source'), path.join(home, 'work'), process.platform === 'win32' ? 'junction' : 'dir');
+    fs.mkdirSync(path.join(home, '.claude', 'ruvnet-brain'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.claude', 'ruvnet-brain', 'config.json'), JSON.stringify({
+      scanRoots: ['source', 'work'],
+    }));
+
+    expect(discover(home)).toEqual([expected]);
+  });
+
+  it('keeps an explicit root scoped and deterministic', () => {
+    const home = isolatedHome();
+    const sourceStore = store(home, 'source/hm/a');
+    store(home, 'work/b');
+    store(home, '.claude');
+    store(home, 'cognitum-trader');
+
+    expect(discover(home, path.join(home, 'source'))).toEqual([sourceStore]);
+  });
+
+  it('renders every home-owned store with one home-relative naming rule', () => {
+    const home = isolatedHome();
+    const codeStore = store(home, 'Code/a');
+    const sourceStore = store(home, 'source/hm/b');
+    const run = spawnSync(process.execPath, ['--input-type=module', '-e', [
+      `const m = await import(${JSON.stringify(pathToFileURL(DOCTOR).href)});`,
+      `process.stdout.write(JSON.stringify([m.displayStoreName(${JSON.stringify(codeStore)}), m.displayStoreName(${JSON.stringify(sourceStore)})]));`,
+    ].join('\n')], {
+      env: { ...process.env, HOME: home, USERPROFILE: home },
+      encoding: 'utf8',
+    });
+
+    expect(run.status, run.stderr).toBe(0);
+    expect(JSON.parse(run.stdout)).toEqual(['~/Code/a', '~/source/hm/b']);
+  });
+
+  it('the standalone CLI does not report a false-zero fleet outside ~/Code', () => {
+    const home = isolatedHome();
+    store(home, 'source/hm/a');
+
+    const run = spawnSync(process.execPath, [DOCTOR], {
+      env: { ...process.env, HOME: home, USERPROFILE: home },
+      encoding: 'utf8',
+    });
+
+    expect(run.stdout).toContain('AgentDB fleet — 1 stores found');
+  });
+
+  it('fails loudly instead of reporting zero when every configured scan root is invalid', () => {
+    const home = isolatedHome();
+    const configPath = path.join(home, 'config.json');
+    fs.writeFileSync(configPath, JSON.stringify({
+      scanRoots: ['missing-source', path.join(home, 'also-missing')],
+    }));
+
+    expect(() => candidateRoots({ home, configPath }))
+      .toThrow('configured scanRoots contain no existing directories');
+  });
+});

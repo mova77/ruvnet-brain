@@ -53,21 +53,56 @@ function seedBrain(tag) {
 }
 
 /**
+ * Copy every LOCAL module the installer imports, transitively, preserving relative layout.
+ *
+ * This used to be a hand-written list — `kb/brain-profile.mjs`, `kb/model-requirements.mjs`,
+ * `scripts/model-router-catalog.mjs`. That is a second copy of a fact the installer already states
+ * in its own import block, and it drifted the moment a fourth import landed: #76/#79 added
+ * `scripts/console-runtime-identity.mjs`, the list did not know, and this test failed with
+ * ERR_MODULE_NOT_FOUND — reported as "expected 'node:internal/modules/esm/resolve:275…' to match
+ * /could not check/", which reads like an honesty regression rather than a missing file.
+ *
+ * Deriving the closure from the source means the fixture cannot fall behind the installer again.
+ * Node itself is the arbiter of what is missing, so a genuine packaging break still fails here.
+ */
+function copyLocalImportClosure(entry, fromRoot, toRoot, seen = new Set()) {
+  const abs = path.resolve(entry);
+  if (seen.has(abs) || !fs.existsSync(abs)) return;
+  seen.add(abs);
+  const src = fs.readFileSync(abs, 'utf8');
+  // static `from '…'` plus dynamic `import('…')`; relative specifiers only — bare ones are packages.
+  const specs = [...src.matchAll(/(?:from|import)\s*\(?\s*['"](\.[^'"]+)['"]/g)].map((m) => m[1]);
+  for (const spec of specs) {
+    const depAbs = path.resolve(path.dirname(abs), spec);
+    if (!depAbs.startsWith(fromRoot) || !fs.existsSync(depAbs)) continue;
+    const rel = path.relative(fromRoot, depAbs);
+    const dest = path.join(toRoot, rel);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.copyFileSync(depAbs, dest);
+    copyLocalImportClosure(depAbs, fromRoot, toRoot, seen);
+  }
+}
+
+/**
  * Run the installer. `breakLookup` copies it with the repo slug pointed at a nonexistent repo so
  * the real GitHub call genuinely 404s — exercising the fallback path rather than simulating it.
  */
-function runInstaller({ breakLookup = false, latestTag } = {}) {
+function runInstaller({ breakLookup = false, refuseLookup = false, latestTag } = {}) {
   let script = INSTALLER;
-  if (breakLookup) {
+  if (breakLookup || refuseLookup) {
     script = path.join(work, 'bin', 'install.mjs');
     fs.mkdirSync(path.dirname(script), { recursive: true });
     fs.mkdirSync(path.join(work, 'kb'), { recursive: true });
-    const src = fs.readFileSync(INSTALLER, 'utf8')
-      .replace("const REPO = 'stuinfla/ruvnet-brain';", "const REPO = 'stuinfla/definitely-not-a-real-repo-xyz';");
+    fs.mkdirSync(path.join(work, 'scripts'), { recursive: true });
+    let src = fs.readFileSync(INSTALLER, 'utf8');
+    src = refuseLookup
+      // Offline, without the network: a port nothing listens on refuses the connection at once.
+      ? src.replace('const RELEASE_API = `https://api.github.com/repos/${REPO}/releases/latest`;',
+        'const RELEASE_API = \'https://127.0.0.1:9/releases/latest\';')
+      : src.replace("const REPO = 'stuinfla/ruvnet-brain';", "const REPO = 'stuinfla/definitely-not-a-real-repo-xyz';");
+    if (src === fs.readFileSync(INSTALLER, 'utf8')) throw new Error('lookup seam not found in the installer');
     fs.writeFileSync(script, src);
-    for (const sibling of ['brain-profile.mjs', 'model-requirements.mjs']) {
-      fs.copyFileSync(path.join(ROOT, 'kb', sibling), path.join(work, 'kb', sibling));
-    }
+    copyLocalImportClosure(INSTALLER, ROOT, work);
   }
   const res = spawnSync(process.execPath, [script, '--no-verify'], {
     encoding: 'utf8',
@@ -143,6 +178,18 @@ describe('stale-install trap', () => {
 
     expect(out, 'must not treat the known-good pin as "latest"').not.toMatch(/out of date/i);
     expect(out, 'must be honest that it could not verify').toMatch(/could not check|WITHOUT verifying/i);
+  });
+
+  it('a FRESH install whose release lookup fails stops loudly with the cause, never on the pinned old bundle', () => {
+    // Measured 2026-09-30: the lookup hit a network blip, the installer quietly chose the pinned
+    // known-good bundle and said "the install is still safe and complete" — and that bundle, which
+    // predates COVERAGE.json, failed validation two steps later with the real cause off screen.
+    const out = runInstaller({ refuseLookup: true });
+
+    expect(out).toMatch(/couldn't look up the latest RuvNet Brain release \(.*ECONNREFUSED/);
+    expect(out).toMatch(/re-run the same command/);
+    expect(out).not.toMatch(/safe and complete|Downloading the brain/);
+    expect(fs.existsSync(path.join(home, '.cache', 'ruvnet-brain', 'kb', 'forge-mcp-all.mjs'))).toBe(false);
   });
 });
 

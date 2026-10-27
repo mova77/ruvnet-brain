@@ -557,9 +557,27 @@ function conceptBoost(nouns, p, title) {
   if (strong === 0 && weak === 0) return 0;
   return Math.min(0.62, 0.30 * strong + 0.06 * weak);
 }
-const CODE_INTENT_RE = /\b(in (the )?code|in source|source code|actual code|implementation|implements?|code path|storage backend|\bbackend\b|which algorithms?|which file|\bfunction\b|\bstruct\b|signature|how (is|does|do|are) [\w@/.\- ]*?(implemented|computed|calculated|coded|done|persists?|persisted|stores?|stored|recalls?|recalled|saved?|loaded?|initiali[sz]ed?|registers?|registered|spawns?|spawned|coordinate[sd]?|searche?[sd]?|works?)|where is [\w@/.\- ]*?(coded|implemented|defined|registered)|the mechanism)\b/i;
+// A bare "implementation" naming a DOCUMENT (an "... Implementation Report/Summary/Overview/
+// Write-up") is not a request to see code — it is the literal title shape of many of this corpus's
+// own summary docs (e.g. "Synaptic Neural Mesh - Rust Implementation Summary"). Found live
+// 2026-09-12: this exact false positive fired code-intent + symbol routing on a synthesis question
+// ("...implementation report assign to QuDAG Core, ruv-FANN WASM and Neural Mesh?"), mass-boosting
+// hundreds of unrelated source files (every one defining a symbol matching a query word) past the
+// one document that actually answers the question. Shared between CODE_INTENT_RE and IMPL_INTENT_RE
+// so the two classifiers cannot drift apart. Deliberately narrow: only excludes "implementation"
+// immediately followed by a doc-shaped noun — "implement"/"implemented", and "implementation" on its
+// own or followed by anything else (e.g. "implementation status"), are untouched.
+const IMPLEMENTATION_DOC_NOUN = 'report|summary|overview|write-?up';
+const CODE_INTENT_RE = new RegExp(
+  '\\b(in (the )?code|in source|source code|actual code|'
+    + `implementation(?!\\s+(?:${IMPLEMENTATION_DOC_NOUN})s?\\b)`
+    + '|implements?|code path|storage backend|\\bbackend\\b|which algorithms?|which file|\\bfunction\\b|\\bstruct\\b|signature'
+    + '|how (is|does|do|are) [\\w@/.\\- ]*?(implemented|computed|calculated|coded|done|persists?|persisted|stores?|stored|recalls?|recalled|saved?|loaded?|initiali[sz]ed?|registers?|registered|spawns?|spawned|coordinate[sd]?|searche?[sd]?|works?)'
+    + '|where is [\\w@/.\\- ]*?(coded|implemented|defined|registered)|the mechanism)\\b',
+  'i',
+);
 const DESIGN_INTENT_RE = /\b(why\b|rationale|design decision|design choice|proposed\b|proposal\b|trade[- ]?off|tradeoff|motivation|reasoning behind|the decision to)\b/i;
-function codeDocIntent(query) {
+export function codeDocIntent(query) {
   if (CODE_INTENT_RE.test(query)) return 'code';
   if (DESIGN_INTENT_RE.test(query)) return 'design';
   return null;
@@ -571,12 +589,12 @@ function codeDocIntent(query) {
 // deps, **/main.rs, **/bin/**, Cargo.toml; PROMOTE the named crate's own src/**/*.rs (non-main),
 // extra for a filename token-matching the named operation. Vendored-dep demotion is global.
 const IMPL_INTENT_RE = new RegExp([
-  '\\bimplement(ed|ation)?\\b',
+  `\\bimplement(?:ed|ation(?!\\s+(?:${IMPLEMENTATION_DOC_NOUN})s?\\b))?\\b`,
   '\\bhow\\s+(is|does)\\b.*\\b(work|works|coded|done)\\b.*\\bin\\s+(the\\s+)?(code|source)\\b',
   '\\bhow\\s+\\w+\\s+(is|works?)\\s+coded\\b',
   '\\bwhere\\s+is\\s+\\w+\\s+(coded|implemented)\\b',
 ].join('|'), 'i');
-function isImplIntent(query) { return IMPL_INTENT_RE.test(query); }
+export function isImplIntent(query) { return IMPL_INTENT_RE.test(query); }
 
 // ADR-0003 — point-deeper symbol routing. Resolve query identifiers / package names to the SOURCE
 // paths that DEFINE them (from <name>.symbols.json), so an implementation question hard-routes to the
@@ -591,7 +609,7 @@ function loadSymbols(dir, name) {
   return s;
 }
 const SYM_STOP = new Set(['does','data','code','what','where','which','this','that','with','from','into','your','their','how','the','and','for','project','package','implement','implemented','implementation','source','file','files','work','works','used','uses','using','support','system','store','stores','recall','persist']);
-function symbolRoute(query, sym) {
+export function symbolRoute(query, sym) {
   const out = new Set();
   if (!sym) return out;
   const q = query.toLowerCase();
@@ -599,10 +617,13 @@ function symbolRoute(query, sym) {
   const snake = ids.filter((t) => t.includes('_') && t.length >= 5);
   const words = ids.filter((t) => !t.includes('_') && t.length >= 4 && !SYM_STOP.has(t));
   const pkgs = (q.match(/@[\w-]+\/([\w-]+)/g) || []).map((s) => s.split('/')[1].toLowerCase());
-  const push = (m) => { if (m) for (const p of m) out.add(p); };
-  for (const t of snake) push(sym.bySymbol[t]);
-  for (const t of pkgs) { push(sym.byPackage[t]); push(sym.bySymbol[t]); }
-  for (const t of words) { push(sym.bySymbol[t]); push(sym.byStem[t]); }
+  const push = (table, key) => {
+    if (!table || !Object.hasOwn(table, key) || !Array.isArray(table[key])) return;
+    for (const sourcePath of table[key]) if (typeof sourcePath === 'string') out.add(sourcePath);
+  };
+  for (const t of snake) push(sym.bySymbol, t);
+  for (const t of pkgs) { push(sym.byPackage, t); push(sym.bySymbol, t); }
+  for (const t of words) { push(sym.bySymbol, t); push(sym.byStem, t); }
   return out;
 }
 const VENDORED_DEP_RE = /(^|\/)(patches)\/|(^|\/)hnsw_rs\//i;

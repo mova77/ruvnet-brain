@@ -62,6 +62,51 @@ function repair(db) {
   return { out: `${r.stdout || ''}${r.stderr || ''}`, code: r.status };
 }
 
+function seedDistillableStore(home, relative) {
+  const db = path.join(home, relative, '.swarm', 'memory.db');
+  fs.mkdirSync(path.dirname(db), { recursive: true });
+  sqlite(db, `CREATE TABLE memory_entries(id INTEGER PRIMARY KEY, namespace TEXT, embedding BLOB);
+              CREATE TABLE reasoning_patterns(id INTEGER PRIMARY KEY, promoted INTEGER DEFAULT 0);
+              INSERT INTO memory_entries(namespace, embedding) VALUES ('lessons', x'01');`);
+  return fs.realpathSync(db);
+}
+
+/**
+ * `writeBackupFile` defaults to true — a real `ruflo memory backup` actually lands a snapshot file
+ * in `--dir`, and the fixture must model that or it never exercises the real production shape.
+ * Passing false reproduces the exact hazard `distillFleet()`'s freshness check (this file's own
+ * "refuses to distill" test below) exists to catch: the backup subcommand exits 0 without writing
+ * anything — a killed process, a --dir misconfiguration, or a ruflo regression could all look like
+ * this from the caller's side.
+ */
+function fakeRuflo(home, marker, { writeBackupFile = true } = {}) {
+  const executable = path.join(home, '.npm-global', 'bin', 'ruflo');
+  fs.mkdirSync(path.dirname(executable), { recursive: true });
+  fs.writeFileSync(executable, `#!/bin/sh
+if [ "$1" = "memory" ] && [ "$2" = "backup" ]; then
+  ${writeBackupFile ? `shift 2
+  dir=""
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--dir" ]; then dir="$2"; shift 2; else shift; fi
+  done
+  if [ -n "$dir" ]; then mkdir -p "$dir"; printf 'snapshot fixture' > "$dir/memory-$$-$(date +%s).db"; fi` : '# deliberately writes nothing — simulates a backup call that reports success but lands no file'}
+  exit 0
+fi
+if [ "$1" = "memory" ] && [ "$2" = "distill" ] && [ "$3" = "run" ]; then
+  shift 3
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--db" ]; then db="$2"; shift 2; else shift; fi
+  done
+  sqlite3 "$db" "INSERT INTO reasoning_patterns(promoted) VALUES (0);"
+  printf '%s\\n' "$db" >> "$DISTILL_MARKER"
+  exit 0
+fi
+exit 1
+`);
+  fs.chmodSync(executable, 0o755);
+  return { ...process.env, HOME: home, DISTILL_MARKER: marker };
+}
+
 const backupsIn = () => fs.readdirSync(dir).filter((f) => f.includes('.rescue-'));
 
 describe('health-repair --repair-memory', () => {
@@ -103,5 +148,115 @@ describe('health-repair --repair-memory', () => {
     const { out, code } = repair(path.join(dir, 'does-not-exist.db'));
     expect(code).toBe(1);
     expect(out).toMatch(/no memory store/i);
+  });
+});
+
+describe('health-repair --distill-fleet discovery', () => {
+  it('uses the shared no-argument fleet policy so hidden known stores are not dropped', () => {
+    const home = path.join(dir, 'home');
+    fs.mkdirSync(home, { recursive: true });
+    const source = seedDistillableStore(home, 'source/hm/a');
+    const global = seedDistillableStore(home, '.claude');
+    const marker = path.join(dir, 'distilled.txt');
+    const run = spawnSync(process.execPath, [SCRIPT, '--distill-fleet'], {
+      env: fakeRuflo(home, marker),
+      encoding: 'utf8',
+      timeout: 120_000,
+    });
+
+    expect(run.status, `${run.stdout}\n${run.stderr}`).toBe(0);
+    expect(fs.readFileSync(marker, 'utf8').trim().split('\n').sort()).toEqual([global, source].sort());
+  });
+
+  it('keeps --root genuinely scoped', () => {
+    const home = path.join(dir, 'home');
+    fs.mkdirSync(home, { recursive: true });
+    const source = seedDistillableStore(home, 'source/hm/a');
+    seedDistillableStore(home, '.claude');
+    const marker = path.join(dir, 'distilled.txt');
+    const run = spawnSync(process.execPath, [SCRIPT, '--distill-fleet', '--root', path.join(home, 'source')], {
+      env: fakeRuflo(home, marker),
+      encoding: 'utf8',
+      timeout: 120_000,
+    });
+
+    expect(run.status, `${run.stdout}\n${run.stderr}`).toBe(0);
+    expect(fs.readFileSync(marker, 'utf8').trim().split('\n')).toEqual([source]);
+  });
+});
+
+describe('health-repair --distill-fleet snapshot freshness', () => {
+  // The gap this candidate closes: `ruflo memory backup` reporting success (exit 0) is not proof a
+  // NEW snapshot landed. Reused `distill-project.mjs`'s own discipline (PR #192) rather than
+  // re-deriving it — see scripts/snapshot-freshness.mjs.
+  it('refuses to distill a store whose backup reported success but landed no file', () => {
+    const home = path.join(dir, 'home');
+    fs.mkdirSync(home, { recursive: true });
+    const source = seedDistillableStore(home, 'source/hm/a');
+    const marker = path.join(dir, 'distilled.txt');
+    const run = spawnSync(process.execPath, [SCRIPT, '--distill-fleet'], {
+      env: fakeRuflo(home, marker, { writeBackupFile: false }),
+      encoding: 'utf8',
+      timeout: 120_000,
+    });
+
+    expect(run.status, `${run.stdout}\n${run.stderr}`).toBe(1);
+    expect(`${run.stdout}${run.stderr}`).toMatch(/no fresh file landed/i);
+    expect(fs.existsSync(marker), 'distill run must never fire on an unverified snapshot').toBe(false);
+    // The store itself must be untouched — no reasoning_patterns row from a distill that should
+    // never have run.
+    expect(Number(sqlite(source, 'SELECT COUNT(*) FROM reasoning_patterns;'))).toBe(0);
+  });
+
+  it('a stale snapshot left over from a PRIOR fleet run must not be mistaken for proof this run landed one', () => {
+    const home = path.join(dir, 'home');
+    fs.mkdirSync(home, { recursive: true });
+    const source = seedDistillableStore(home, 'source/hm/a');
+    // Seed a backups dir with an old file BEFORE this run, exactly as a real repeated fleet run
+    // would leave behind — the whole point of this executor is that it runs against the same
+    // stores repeatedly.
+    const backupsDir = path.join(path.dirname(source), 'backups');
+    fs.mkdirSync(backupsDir, { recursive: true });
+    const stale = path.join(backupsDir, 'memory-old.db');
+    fs.writeFileSync(stale, 'x');
+    fs.utimesSync(stale, (Date.now() - 60_000) / 1000, (Date.now() - 60_000) / 1000);
+
+    const marker = path.join(dir, 'distilled.txt');
+    const run = spawnSync(process.execPath, [SCRIPT, '--distill-fleet'], {
+      // writeBackupFile:false — this run's own `memory backup` call lands nothing new; only the
+      // stale file from before this run exists in the directory.
+      env: fakeRuflo(home, marker, { writeBackupFile: false }),
+      encoding: 'utf8',
+      timeout: 120_000,
+    });
+
+    expect(run.status, `${run.stdout}\n${run.stderr}`).toBe(1);
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  it('rejects an unchanged prior snapshot even inside the timestamp grace window', () => {
+    const home = path.join(dir, 'home'); fs.mkdirSync(home, { recursive: true });
+    const source = seedDistillableStore(home, 'source/hm/a');
+    const backupsDir = path.join(path.dirname(source), 'backups'); fs.mkdirSync(backupsDir);
+    fs.writeFileSync(path.join(backupsDir, 'memory-prior.db'), 'recent but from a prior run');
+    const marker = path.join(dir, 'distilled.txt');
+    const result = spawnSync(process.execPath, [SCRIPT, '--distill-fleet'], {
+      env: fakeRuflo(home, marker, { writeBackupFile: false }), encoding: 'utf8', timeout: 120_000,
+    });
+    expect(result.status).toBe(1);
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  it('refuses mutation if an explicitly requested undo receipt cannot be written', () => {
+    const home = path.join(dir, 'home'); fs.mkdirSync(home, { recursive: true });
+    seedDistillableStore(home, 'source/hm/a');
+    const blocked = path.join(dir, 'not-a-directory'); fs.writeFileSync(blocked, 'preserve');
+    const marker = path.join(dir, 'distilled.txt');
+    const result = spawnSync(process.execPath, [SCRIPT, '--distill-fleet', '--receipt', path.join(blocked, 'receipt.json')], {
+      env: fakeRuflo(home, marker), encoding: 'utf8', timeout: 120_000,
+    });
+    expect(result.status).toBe(1);
+    expect(fs.existsSync(marker)).toBe(false);
+    expect(fs.readFileSync(blocked, 'utf8')).toBe('preserve');
   });
 });

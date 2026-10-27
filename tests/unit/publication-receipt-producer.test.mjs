@@ -1,0 +1,411 @@
+import { afterEach, describe, expect, it } from 'vitest';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { REQUIRED_CHECKS } from '../../scripts/release-proof.mjs';
+import {
+  assertInstalledPayload,
+  commandInvocation,
+  createIsolatedPath,
+  nativeCodexExecutable,
+  generatePublicationReceipt,
+  rpcSearch,
+  runMeasuredHostSearches,
+  runHostDoctors,
+  stageVerifiedBundle,
+  tarExtractionInvocation,
+} from '../../scripts/publication-receipt.mjs';
+import { createPayloadManifest, signPayloadManifest } from '../../scripts/release-payload.mjs';
+import { getVersion } from '../../scripts/version.mjs';
+import { parseRetrievalResult } from '../../kb/retrieval-result.mjs';
+
+const SHA = 'a'.repeat(40);
+const VERSION = getVersion();
+const BYTES = Buffer.from('one immutable public artifact');
+const DIGEST = crypto.createHash('sha256').update(BYTES).digest('hex');
+
+const temporaryRoots = new Set();
+
+function temporaryRoot(prefix) {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
+  temporaryRoots.add(root);
+  return root;
+}
+
+afterEach(() => {
+  for (const root of temporaryRoots) fs.rmSync(root, { recursive: true, force: true });
+  temporaryRoots.clear();
+});
+
+it('extracts actual archive bytes into a native path containing spaces', () => {
+  const root = temporaryRoot('public tar ');
+  try {
+    const source = path.join(root, 'source');
+    const destination = path.join(root, 'native destination');
+    fs.mkdirSync(source); fs.mkdirSync(destination);
+    fs.writeFileSync(path.join(source, 'receipt.txt'), 'exact public bytes');
+    const archive = path.join(root, 'package.tgz');
+    const create = commandInvocation('tar', ['-czf', archive, '-C', source, 'receipt.txt']);
+    execFileSync(create.executable, create.args, { timeout: 10000 });
+    const extraction = tarExtractionInvocation(archive, destination);
+    const extract = commandInvocation('tar', extraction.args);
+    execFileSync(extract.executable, extract.args, { cwd: extraction.cwd, timeout: 10000 });
+    expect(fs.readFileSync(path.join(destination, 'receipt.txt'), 'utf8')).toBe('exact public bytes');
+    expect(commandInvocation('tar', [], { platform: 'win32', env: { SystemRoot: 'D:\\Windows' } }).executable)
+      .toBe('D:\\Windows\\System32\\tar.exe');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+function candidate(root) {
+  const evidence = path.join(root, 'release-evidence');
+  fs.mkdirSync(evidence, { recursive: true });
+  const artifactPath = path.join(evidence, `ruvnet-brain-${VERSION}.tgz`);
+  fs.writeFileSync(artifactPath, BYTES);
+  const bundlePath = path.join(evidence, 'ruvnet-brain.zip');
+  fs.writeFileSync(bundlePath, 'one immutable public bundle');
+  const manifest = createPayloadManifest({
+    version: VERSION, tag: `v${VERSION}`, candidateSha: SHA, producer: { runId: 'test' },
+    members: [
+      { role: 'npm', name: path.basename(artifactPath), file: artifactPath },
+      { role: 'bundle', name: path.basename(bundlePath), file: bundlePath },
+    ],
+  });
+  const keys = crypto.generateKeyPairSync('ed25519');
+  fs.mkdirSync(path.join(root, 'keys'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'keys', 'ruvnet-brain-signing.pub.pem'), keys.publicKey.export({ type: 'spki', format: 'pem' }));
+  fs.writeFileSync(path.join(evidence, 'payload-manifest.json'), JSON.stringify(manifest));
+  fs.writeFileSync(path.join(evidence, 'payload-manifest.sig'), signPayloadManifest(manifest, keys.privateKey));
+  const receipt = {
+    schemaVersion: 1, phase: 'candidate', sha: SHA, tree: 'b'.repeat(40), dirty: false,
+    version: VERSION, tag: `v${VERSION}`,
+    sourceVersions: { package: VERSION, claudePlugin: VERSION, codexPlugin: VERSION },
+    artifact: {
+      path: `release-evidence/ruvnet-brain-${VERSION}.tgz`, sha256: DIGEST, sourceSha: SHA,
+      version: VERSION, bundle: { brainVersion: VERSION, releaseTag: `v${VERSION}` },
+    },
+    releaseVector: { verdict: 'PASS', sha: SHA, unknown: 0, skipped: 0 },
+    tests: { total: 1, passed: 1, failed: 0, skipped: 0, todo: 0 },
+    coverage: { status: 'PASS', lines: 95, requiredLines: 80 },
+    security: { status: 'PASS', critical: 0, high: 0 },
+    issues: { open: [] },
+    github: { sha: SHA, checks: REQUIRED_CHECKS.map((name) => ({ name, status: 'completed', conclusion: 'success' })) },
+    hosts: {
+      claude: { status: 'PASS', version: VERSION, artifactSha256: DIGEST },
+      codex: { status: 'PASS', version: VERSION, artifactSha256: DIGEST },
+    },
+    brain: { status: 'PASS', selfStore: true, citedSelfSource: true, narrowMs: 10, broadMs: 20, concurrentMs: 15, deadlineMs: 100 },
+    qe: { status: 'PASS', total: 1, passed: 1, failed: 0, skipped: 0 },
+    graders: [
+      { id: 'a', independent: true, score: 95, sha: SHA, artifactSha256: DIGEST },
+      { id: 'b', independent: true, score: 96, sha: SHA, artifactSha256: DIGEST },
+    ],
+  };
+  const receiptPath = path.join(evidence, 'candidate-receipt.json');
+  fs.writeFileSync(receiptPath, JSON.stringify(receipt));
+  return { receiptPath, artifactPath };
+}
+
+function adapter(overrides = {}) {
+  const write = (destination, bytes = BYTES) => { fs.writeFileSync(destination, bytes); return destination; };
+  return {
+    async downloadNpm({ destination }) { return { path: write(destination), version: VERSION, sha: SHA }; },
+    async downloadGithub({ destination, assetName }) {
+      const bytes = assetName.endsWith('.zip') ? Buffer.from('one immutable public bundle') : BYTES;
+      return { path: write(destination, bytes), tag: `v${VERSION}`, sha: SHA };
+    },
+    async installHosts() {
+      return {
+        claudeOnly: { status: 'PASS', doctorExit: 0, version: VERSION, artifactSha256: DIGEST, functionalSearch: true, searchMs: 10 },
+        codexOnly: { status: 'PASS', doctorExit: 0, version: VERSION, artifactSha256: DIGEST, functionalSearch: true, searchMs: 10 },
+        dual: { status: 'PASS', doctorExit: 0, version: VERSION, artifactSha256: DIGEST, functionalSearch: true, searchMs: 10 },
+        bundle: { brainVersion: VERSION, releaseTag: `v${VERSION}` },
+      };
+    },
+    async probeBrain() { return { status: 'PASS', selfStore: true, broadMs: 40, deadlineMs: 30_000 }; },
+    async probePublishedSurface() {
+      return { name: 'published-surface-probe', status: 'completed', conclusion: 'success', sha: SHA };
+    },
+    ...overrides,
+  };
+}
+
+async function run(overrides = {}) {
+  const root = temporaryRoot('publication-receipt-');
+  const files = candidate(root);
+  const outPath = path.join(root, 'release-evidence', 'publication-receipt.json');
+  const result = await generatePublicationReceipt({
+    root, candidatePath: files.receiptPath, outPath,
+    adapter: adapter(overrides),
+  });
+  return { root, outPath, result };
+}
+
+describe('publication receipt producer', () => {
+  it('measures each installed host serially against the unchanged per-search deadline', async () => {
+    const hosts = [{ mode: 'claudeOnly' }, { mode: 'codexOnly' }, { mode: 'dual' }];
+    const order = [];
+    let active = 0;
+    let maxActive = 0;
+    const results = await runMeasuredHostSearches(hosts, async (host, timeoutMs) => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      order.push(`${host.mode}:start:${timeoutMs}`);
+      await Promise.resolve();
+      order.push(`${host.mode}:end`);
+      active -= 1;
+      return host.mode;
+    });
+    expect(maxActive).toBe(1);
+    expect(order).toEqual([
+      'claudeOnly:start:30000', 'claudeOnly:end',
+      'codexOnly:start:30000', 'codexOnly:end',
+      'dual:start:30000', 'dual:end',
+    ]);
+    expect([...results]).toEqual([['claudeOnly', 'claudeOnly'], ['codexOnly', 'codexOnly'], ['dual', 'dual']]);
+  });
+
+  it('runs each warmup and measured search within one host lifecycle before advancing', async () => {
+    const hosts = [{ mode: 'claudeOnly' }, { mode: 'codexOnly' }];
+    const events = [];
+    const results = await runMeasuredHostSearches(hosts, async (host, timeoutMs) => {
+      events.push(`measure:${host.mode}:${timeoutMs}`);
+      return host.mode;
+    }, {
+      warmup: async (host) => events.push(`warm:${host.mode}`),
+      after: async (host) => events.push(`retire:${host.mode}`),
+    });
+    expect(events).toEqual([
+      'warm:claudeOnly', 'measure:claudeOnly:30000', 'retire:claudeOnly',
+      'warm:codexOnly', 'measure:codexOnly:30000', 'retire:codexOnly',
+    ]);
+    expect([...results]).toEqual([['claudeOnly', 'claudeOnly'], ['codexOnly', 'codexOnly']]);
+  });
+
+  it('runs the installed doctors one at a time, never three cold readers at once', async () => {
+    const hosts = [{ mode: 'claudeOnly' }, { mode: 'codexOnly' }, { mode: 'dual' }];
+    const order = [];
+    let active = 0;
+    let maxActive = 0;
+    await runHostDoctors(hosts, async (host) => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      order.push(`${host.mode}:start`);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      order.push(`${host.mode}:end`);
+      active -= 1;
+    });
+    expect(maxActive).toBe(1);
+    expect(order).toEqual(['claudeOnly:start', 'claudeOnly:end', 'codexOnly:start', 'codexOnly:end', 'dual:start', 'dual:end']);
+  });
+
+  it('still runs every doctor after one fails, and the failure names each failed host', async () => {
+    const hosts = [{ mode: 'claudeOnly' }, { mode: 'codexOnly' }, { mode: 'dual' }];
+    const ran = [];
+    await expect(runHostDoctors(hosts, async (host) => {
+      ran.push(host.mode);
+      if (host.mode !== 'codexOnly') throw new Error(`${host.mode} doctor exit 1`);
+    })).rejects.toThrow('installed doctor failed for claudeOnly, dual: claudeOnly doctor exit 1');
+    expect(ran).toEqual(['claudeOnly', 'codexOnly', 'dual']);
+  });
+
+  it('teardown cannot delete the install while a later doctor is still reading it', async () => {
+    // 4.4.1 run 36877770786: Promise.all rejected on the first doctor's exit 1, the lane's finally
+    // ran adapter.dispose() (rmSync of the install temp), and the third doctor — still running —
+    // reported verify-citation.mjs and six plugin manifests missing under the deleted package.
+    const temp = temporaryRoot('doctor-teardown-');
+    const manifest = path.join(temp, 'package', 'plugin', 'host-adapters', 'claude.json');
+    fs.mkdirSync(path.dirname(manifest), { recursive: true });
+    fs.writeFileSync(manifest, '{}');
+    const seen = [];
+    const hosts = [{ mode: 'claudeOnly' }, { mode: 'codexOnly' }, { mode: 'dual' }];
+    try {
+      await runHostDoctors(hosts, async (host) => {
+        if (host.mode === 'claudeOnly') throw new Error('doctor exit 1');
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        seen.push(`${host.mode}:${fs.existsSync(manifest) ? 'present' : 'ENOENT'}`);
+      });
+    } catch { /* the lane rejects; what matters is what the later doctors saw first */ }
+    finally { fs.rmSync(temp, { recursive: true, force: true }); }
+    expect(seen).toEqual(['codexOnly:present', 'dual:present']);
+  });
+
+  it('resolves the actual optional-package Windows Codex executable, not its cmd wrapper', () => {
+    const root = temporaryRoot('public-codex-native-');
+    try {
+      const modules = path.join(root, 'node_modules');
+      const bin = path.join(modules, '.bin');
+      const core = path.join(modules, '@openai', 'codex');
+      const native = path.join(core, 'node_modules', '@openai', 'codex-win32-x64');
+      const executable = path.join(native, 'vendor', 'x86_64-pc-windows-msvc', 'bin', 'codex.exe');
+      fs.mkdirSync(bin, { recursive: true });
+      fs.mkdirSync(path.dirname(executable), { recursive: true });
+      fs.writeFileSync(path.join(core, 'package.json'), '{"name":"@openai/codex"}');
+      fs.writeFileSync(path.join(native, 'package.json'), '{"name":"@openai/codex-win32-x64"}');
+      fs.writeFileSync(executable, 'native executable fixture');
+      const options = { platform: 'win32', arch: 'x64', wrapper: path.join(bin, 'codex.cmd') };
+      expect(nativeCodexExecutable(options)).toBe(fs.realpathSync(executable));
+      fs.rmSync(executable);
+      expect(() => nativeCodexExecutable(options)).toThrow();
+      expect(nativeCodexExecutable({ platform: 'darwin' })).toBeNull();
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+  it('uses native Windows command shims and an isolated USERPROFILE-safe PATH', () => {
+    const root = temporaryRoot('publication-windows-');
+    const tools = path.join(root, 'tools');
+    fs.mkdirSync(tools);
+    for (const name of ['node.exe', 'npm.cmd', 'claude.cmd', 'codex.cmd']) {
+      fs.writeFileSync(path.join(tools, name), name);
+    }
+    const resolve = (name) => path.join(tools, name === 'node' ? 'node.exe' : `${name}.cmd`);
+    const isolated = createIsolatedPath('dual', root, {
+      platform: 'win32', resolve,
+      env: { SystemRoot: 'C:\\Windows', ProgramFiles: 'C:\\Program Files' },
+    });
+    expect(isolated.split(';')[0]).toBe(path.join(root, 'bin-dual'));
+    expect(isolated).toContain(tools);
+    for (const name of ['npm.cmd', 'claude.cmd', 'codex.cmd']) {
+      expect(fs.readFileSync(path.join(root, 'bin-dual', name), 'utf8'))
+        .toBe(`@call "${path.join(tools, name)}" %*\r\n`);
+    }
+    expect(commandInvocation('npm', ['view', 'ruvnet-brain'], {
+      platform: 'win32', env: { ComSpec: 'C:\\Windows\\System32\\cmd.exe' },
+    })).toEqual({ executable: 'C:\\Windows\\System32\\cmd.exe',
+      args: ['/d', '/c', 'npm.cmd', 'view', 'ruvnet-brain'] });
+  });
+
+  it('stages only the exact already-verified public bundle for installation', () => {
+    const root = temporaryRoot('publication-bundle-');
+    const source = path.join(root, 'public.zip');
+    const packageRoot = path.join(root, 'package');
+    fs.writeFileSync(source, 'signed public bundle');
+    const expected = crypto.createHash('sha256').update(fs.readFileSync(source)).digest('hex');
+    const staged = stageVerifiedBundle({ bundlePath: source, bundleSha256: expected, packageRoot });
+    expect(staged).toBe(path.join(packageRoot, 'dist', 'ruvnet-brain.zip'));
+    expect(fs.readFileSync(staged, 'utf8')).toBe('signed public bundle');
+    expect(() => stageVerifiedBundle({ bundlePath: source, bundleSha256: '0'.repeat(64),
+      packageRoot: path.join(root, 'other') })).toThrow(/verified bundle digest mismatch/i);
+  });
+
+  it('forwards the requested result count through the real MCP JSON-RPC boundary', async () => {
+    const root = temporaryRoot('publication-mcp-');
+    const server = path.join(root, 'server.mjs');
+    fs.writeFileSync(server, `
+      import readline from 'node:readline';
+      const rl = readline.createInterface({ input: process.stdin });
+      rl.on('line', (line) => {
+        const request = JSON.parse(line);
+        const result = request.method === 'tools/list'
+          ? { tools: [{ name: 'search_ruvnet' }] }
+          : request.method === 'tools/call'
+            ? { content: [{ type: 'text', text: 'repo=ruvnet-brain path: result-k-' + request.params.arguments.k }] }
+            : {};
+        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }) + '\\n');
+      });
+    `);
+    const result = await rpcSearch(server, process.env, 'query', 10, 2_000);
+    expect(result.text).toContain('path: result-k-10');
+    expect(result.mcpResult).toEqual({ content: [{ type: 'text', text: 'repo=ruvnet-brain path: result-k-10' }] });
+  });
+
+  it('preserves content hashes when MCP output splits a UTF-8 character between chunks', async () => {
+    const root = temporaryRoot('publication-utf8-');
+    const server = path.join(root, 'server.mjs');
+    try {
+      fs.writeFileSync(server, `
+        import readline from 'node:readline';
+        import {buildRetrievalResult} from ${JSON.stringify(new URL('../../kb/retrieval-result.mjs', import.meta.url).href)};
+        readline.createInterface({input: process.stdin}).on('line', line => {
+          const request = JSON.parse(line);
+          const result = request.method === 'tools/list' ? {tools: [{name: 'search_ruvnet'}]}
+            : request.method === 'tools/call' ? {
+              content: [{type: 'text', text: 'repo=ruvnet-brain path: README.md'}],
+              structuredContent: {retrieval: buildRetrievalResult({query: 'probe', k: 1,
+                results: [{repo: 'ruvnet-brain', path: 'README.md', text: 'measured π Unicode'}]})}
+            } : {};
+          const bytes = Buffer.from(JSON.stringify({jsonrpc: '2.0', id: request.id, result}) + '\\n');
+          const at = bytes.indexOf(Buffer.from('π'));
+          if (at < 0) process.stdout.write(bytes);
+          else {
+            process.stdout.write(bytes.subarray(0, at + 1));
+            setTimeout(() => process.stdout.write(bytes.subarray(at + 1)), 100);
+          }
+        });
+      `);
+      const response = await rpcSearch(server, process.env, 'probe', 1, 3000);
+      expect(parseRetrievalResult(response.mcpResult, {query: 'probe', k: 1})[0].text).toBe('measured π Unicode');
+    } finally { fs.rmSync(root, {recursive: true, force: true}); }
+  });
+
+  it('requires installed host payload bytes to match every sealed plugin file', () => {
+    const root = temporaryRoot('publication-payload-');
+    const sealed = path.join(root, 'sealed');
+    const installed = path.join(root, 'installed');
+    fs.mkdirSync(path.join(sealed, 'commands'), { recursive: true });
+    fs.mkdirSync(path.join(installed, 'commands'), { recursive: true });
+    fs.writeFileSync(path.join(sealed, 'commands', 'rvbc.md'), 'sealed bytes');
+    fs.writeFileSync(path.join(installed, 'commands', 'rvbc.md'), 'sealed bytes');
+    expect(assertInstalledPayload(sealed, installed)).toBe(1);
+    fs.writeFileSync(path.join(installed, 'commands', 'rvbc.md'), 'mutated bytes');
+    expect(() => assertInstalledPayload(sealed, installed)).toThrow(/byte mismatch/);
+  });
+
+  it('writes one append-only receipt only after all public evidence matches the candidate', async () => {
+    const { outPath, result } = await run();
+    expect(result.verdict).toBe('PASS');
+    const receipt = JSON.parse(fs.readFileSync(outPath, 'utf8'));
+    expect(receipt).toMatchObject({
+      schemaVersion: 2, phase: 'publication', sha: SHA, artifactSha256: DIGEST, version: VERSION,
+      npm: { version: VERSION, sha: SHA, artifactSha256: DIGEST },
+      githubRelease: { tag: `v${VERSION}`, sha: SHA, artifactSha256: DIGEST },
+      installed: {
+        claudeOnly: { status: 'PASS', doctorExit: 0, version: VERSION, artifactSha256: DIGEST },
+        codexOnly: { status: 'PASS', doctorExit: 0, version: VERSION, artifactSha256: DIGEST },
+        dual: { status: 'PASS', doctorExit: 0, version: VERSION, artifactSha256: DIGEST },
+      },
+    });
+  });
+
+  it('hands the exact verified GitHub bundle bytes to the installer adapter', async () => {
+    let installInput;
+    await run({ installHosts: async (input) => {
+      installInput = { ...input,
+        observedSha256: crypto.createHash('sha256').update(fs.readFileSync(input.bundlePath)).digest('hex') };
+      return adapter().installHosts();
+    } });
+    expect(installInput.bundleSha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(installInput.observedSha256).toBe(installInput.bundleSha256);
+  });
+
+  it('binds npm identity through exact sealed bytes when the registry omits gitHead', async () => {
+    const { outPath } = await run({
+      downloadNpm: async ({ destination }) => ({ path: (fs.writeFileSync(destination, BYTES), destination), version: VERSION, sha: null }),
+    });
+    expect(JSON.parse(fs.readFileSync(outPath, 'utf8')).npm.sha).toBe(SHA);
+  });
+
+  it.each([
+    ['npm byte drift', { downloadNpm: async ({ destination }) => ({ path: (fs.writeFileSync(destination, 'wrong'), destination), version: VERSION, sha: SHA }) }],
+    ['GitHub byte drift', { downloadGithub: async ({ destination }) => ({ path: (fs.writeFileSync(destination, 'wrong'), destination), tag: `v${VERSION}`, sha: SHA }) }],
+    ['split npm SHA', { downloadNpm: async ({ destination }) => ({ path: (fs.writeFileSync(destination, BYTES), destination), version: VERSION, sha: 'c'.repeat(40) }) }],
+    ['split GitHub SHA', { downloadGithub: async ({ destination }) => ({ path: (fs.writeFileSync(destination, BYTES), destination), tag: `v${VERSION}`, sha: 'c'.repeat(40) }) }],
+    ['failed Claude-only install', { installHosts: async () => ({ claudeOnly: { status: 'FAIL', doctorExit: 1, version: VERSION, artifactSha256: DIGEST }, codexOnly: { status: 'PASS', doctorExit: 0, version: VERSION, artifactSha256: DIGEST }, dual: { status: 'PASS', doctorExit: 0, version: VERSION, artifactSha256: DIGEST }, bundle: { brainVersion: VERSION, releaseTag: `v${VERSION}` } }) }],
+    ['missing self store', { probeBrain: async () => ({ status: 'PASS', selfStore: false, broadMs: 40, deadlineMs: 30_000 }) }],
+    ['slow Brain', { probeBrain: async () => ({ status: 'PASS', selfStore: true, broadMs: 30_001, deadlineMs: 30_000 }) }],
+    ['red surface probe', { probePublishedSurface: async () => ({ name: 'published-surface-probe', status: 'completed', conclusion: 'failure', sha: SHA }) }],
+    ['probe SHA split', { probePublishedSurface: async () => ({ name: 'published-surface-probe', status: 'completed', conclusion: 'success', sha: 'd'.repeat(40) }) }],
+  ])('fails closed and writes no receipt on %s', async (_name, overrides) => {
+    await expect(run(overrides)).rejects.toThrow();
+  });
+
+  it('refuses to overwrite an existing publication receipt', async () => {
+    const root = temporaryRoot('publication-receipt-');
+    const files = candidate(root);
+    const outPath = path.join(root, 'release-evidence', 'publication-receipt.json');
+    fs.writeFileSync(outPath, 'immutable\n');
+    await expect(generatePublicationReceipt({ root, candidatePath: files.receiptPath, outPath, adapter: adapter() }))
+      .rejects.toThrow(/refus.*overwrite|already exists/i);
+    expect(fs.readFileSync(outPath, 'utf8')).toBe('immutable\n');
+  });
+});

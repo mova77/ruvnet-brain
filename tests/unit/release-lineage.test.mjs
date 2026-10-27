@@ -26,16 +26,21 @@ describe('release candidate lineage', () => {
 });
 
 describe('release command wording', () => {
-  it('never calls a check-only preflight SHIPPED', () => {
+  it('calls publication PUBLISHED NOT VERIFIED and never promotes check-only wording', () => {
     const src = fs.readFileSync(path.join(ROOT, 'scripts/release.mjs'), 'utf8');
     expect(src).toContain('PREFLIGHT PASS — NOT PUBLISHED');
-    expect(src).toMatch(/PUBLISH\s*\\?[\s\S]*SHIPPED[\s\S]*PREFLIGHT PASS — NOT PUBLISHED/);
+    expect(src).toContain("c.y(c.b('PUBLISHED, NOT VERIFIED'))");
+    expect(src).not.toContain("c.g(c.b('✓✓✓ SHIPPED'))");
   });
 
-  it('publishes prerelease versions with an explicit npm tag on both ship paths', () => {
+  it('publishes only through the canonical release path with an explicit npm tag', () => {
     const release = fs.readFileSync(path.join(ROOT, 'scripts/release.mjs'), 'utf8');
+    const provider = fs.readFileSync(path.join(ROOT, 'scripts/release-transaction-provider.mjs'), 'utf8');
     const nightly = fs.readFileSync(path.join(ROOT, 'scripts/self-update.mjs'), 'utf8');
-    expect(release).toContain("runOrDie('npm publish', 'npm', ['publish', '--tag', 'latest'])");
-    expect(nightly).toContain("execFileSync('npm', ['publish', '--tag', 'latest']");
+    expect(release).toContain('await runReleaseTransaction');
+    expect(provider).toContain("command('npm', ['publish', packagePath, '--tag', `candidate-v${identity.version}`], PUBLISH_COMMAND_OPTIONS)");
+    expect(provider).toContain("command('npm', ['dist-tag', 'add', `${PACKAGE}@${identity.version}`, 'latest'])");
+    expect(nightly).not.toMatch(/execFileSync\(['"]npm['"],\s*\[['"]publish['"]/);
+    expect(nightly).toContain('self-update is rebuild-only');
   });
 });

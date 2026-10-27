@@ -4,29 +4,67 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
+import { extractTarball } from '../../helpers/extract-tarball.mjs';
+import { parseNpmPack } from '../../helpers/npm-pack-json.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '../../..');
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'brain-release-qe-'));
 let packed;
 let artifact;
 let install;
+const previousImportOnly = process.env.RUVNET_BRAIN_IMPORT_ONLY;
 
 beforeAll(async () => {
-  const raw = execFileSync('npm', ['pack', '--json', '--pack-destination', temp], {
-    cwd: ROOT,
-    encoding: 'utf8',
-    shell: process.platform === 'win32',
-  });
-  packed = JSON.parse(raw.slice(raw.indexOf('[')))[0];
-  execFileSync('tar', ['-xzf', path.join(temp, packed.filename), '-C', temp]);
+  const sealed = process.env.RUVNET_SEALED_PACKAGE;
+  if (sealed) {
+    const packageManifest = JSON.parse(execFileSync('tar', ['-xOf', path.basename(sealed), 'package/package.json'], { cwd: path.dirname(sealed), encoding: 'utf8' }));
+    packed = {
+      filename: path.basename(sealed),
+      version: packageManifest.version,
+      files: execFileSync('tar', ['-tzf', path.basename(sealed)], { cwd: path.dirname(sealed), encoding: 'utf8' })
+        .trim().split('\n').map((entry) => ({ path: entry.replace(/^package\//, '').replace(/\/$/, '') })),
+    };
+    extractTarball(sealed, temp);
+  } else {
+    // Local focused runs remain self-contained. CI always supplies RUVNET_SEALED_PACKAGE,
+    // making the release-QE fleet consume the single artifact later published byte-for-byte.
+    const raw = execFileSync('npm', ['pack', '--json', '--pack-destination', temp], {
+      cwd: ROOT,
+      encoding: 'utf8',
+      shell: process.platform === 'win32',
+    });
+    packed = parseNpmPack(raw, { expectName: 'ruvnet-brain' });
+    extractTarball(path.join(temp, packed.filename), temp);
+  }
   artifact = path.join(temp, 'package');
   process.env.RUVNET_BRAIN_IMPORT_ONLY = '1';
   install = await import(pathToFileURL(path.join(artifact, 'bin/install.mjs')).href);
 }, 180_000);
 
-afterAll(() => fs.rmSync(temp, { recursive: true, force: true }));
+afterAll(() => {
+  fs.rmSync(temp, { recursive: true, force: true });
+  if (previousImportOnly === undefined) delete process.env.RUVNET_BRAIN_IMPORT_ONLY;
+  else process.env.RUVNET_BRAIN_IMPORT_ONLY = previousImportOnly;
+});
 
 describe('npm artifact boundary', () => {
+  it('packs one exact product version for npm, Claude Code, and Codex', () => {
+    const packageManifest = JSON.parse(fs.readFileSync(path.join(artifact, 'package.json'), 'utf8'));
+    const claudeManifest = JSON.parse(fs.readFileSync(path.join(artifact, 'plugin/.claude-plugin/plugin.json'), 'utf8'));
+    const codexManifest = JSON.parse(fs.readFileSync(path.join(artifact, 'plugin/.codex-plugin/plugin.json'), 'utf8'));
+    expect({
+      packed: packed.version,
+      package: packageManifest.version,
+      claude: claudeManifest.version,
+      codex: codexManifest.version,
+    }).toEqual({
+      packed: packageManifest.version,
+      package: packageManifest.version,
+      claude: packageManifest.version,
+      codex: packageManifest.version,
+    });
+  });
+
   it('contains both host manifests, hooks, skills, updater, and MCP runtime', () => {
     const files = packed.files.map((entry) => entry.path);
     for (const required of [
@@ -45,7 +83,6 @@ describe('npm artifact boundary', () => {
       'console/app.js',
       'scripts/onboarding-console.mjs',
       'scripts/nightly-controller.mjs',
-      'docs/RELEASE-NOTES-4.0.md',
     ]) expect(files).toContain(required);
   });
 
@@ -73,7 +110,7 @@ describe('clean host installation from only the packed artifact', () => {
     expect(marketplace.plugins.some((entry) => entry.name === plugin.name)).toBe(true);
     expect(plugin).not.toHaveProperty('updated');
     expect(hooks.hooks).toBeTypeOf('object');
-    expect(Object.keys(hooks).sort()).toEqual(['description', 'hooks']);
+    expect(JSON.stringify(hooks.hooks)).toContain('session-start');
     expect(fs.existsSync(path.join(artifact, 'plugin/.mcp.json'))).toBe(true);
   });
 
@@ -94,6 +131,29 @@ describe('clean host installation from only the packed artifact', () => {
     expect(retry.changed).toBe(false);
     expect(fs.readFileSync(config)).toEqual(before);
     expect(install.codexStatus({ codexDir, configPath: config }).wired).toBe(true);
+  });
+
+  // WAS: 'ships continuity-only automatic registrations', asserting the plane is exactly
+  // ['SessionStart', 'Stop']. That described a real state -- the plane WAS retired to
+  // continuity-only at 00526b12 (2026-09-07) -- and then the project deliberately grew it back:
+  // 9c45d408 restored the continuity lifecycle, 7b8e6e73 wired the search-first gate
+  // (ground-ruvnet on UserPromptSubmit, decision-gate on PreToolUse, grounding-stamp on
+  // PostToolUse), ef2b8e12 extended those to Codex and added the Stop gate. The assertion was never
+  // updated, so it failed every release-QE run while describing a world that no longer existed.
+  //
+  // The GUARD is still worth having and is what this now checks: the PACKED manifests must carry
+  // exactly the plane the SOURCE declares -- a packaging step that silently drops or adds a hook
+  // event is a real defect. Reading the expectation from plugin/hooks/*.json means this cannot go
+  // stale again the next time the plane legitimately changes.
+  it('packs exactly the hook plane the source declares, in both host manifests', () => {
+    for (const name of ['hooks.json', 'codex-hooks.json']) {
+      const packed = JSON.parse(fs.readFileSync(path.join(artifact, 'plugin/hooks', name), 'utf8'));
+      const source = JSON.parse(fs.readFileSync(path.join(ROOT, 'plugin/hooks', name), 'utf8'));
+      // Event names alone miss altered commands, matchers, timeouts and host metadata.
+      expect(packed, `${name} must preserve every source declaration`).toEqual(source);
+      const commands = Object.values(packed.hooks).flatMap((groups) => groups.flatMap((group) => group.hooks.map((hook) => hook.command)));
+      expect(commands.filter((command) => command.includes('session-start'))).toHaveLength(1);
+    }
   });
 
   it('persists a runnable /rvbc runtime with no source checkout', async () => {

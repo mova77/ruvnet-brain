@@ -48,6 +48,17 @@
 //               stdout — an opted-in refusal is never swallowed.
 //   alarm     → always delivered. Not gated by anything. Silence here = a broken install looking healthy.
 //
+// WHO ACTUALLY READS THE ADVISORY PATH — a precision this file's own wording keeps blurring, and the
+// blur causes a real authoring mistake. "User-facing bytes" is right about OWNERSHIP (these are the
+// only bytes that leave the hook) and wrong about AUDIENCE on the advisory path: `additionalContext`
+// is injected into the MODEL's context window, not printed to the user's terminal. So an advisory
+// `copy` that reads as finished user-facing prose produces a sentence the user never sees and a model
+// that may or may not paraphrase it. An advisory candidate should be written as ONE INSTRUCTION TO
+// THE MODEL, with any user-facing sentence quoted inside it (see advocacy-route.mjs for the shape).
+// The BLOCK path is different and unchanged: exit 2's stderr becomes the refusal the user is shown.
+// Consequence for measurement: a test at this boundary proves CANDIDATE DELIVERED. Whether the user
+// ever saw a sentence is the model's behaviour and is only observable in a real-host run.
+//
 // DELIVERY (the runtime writes the final envelope to the REAL streams, itself):
 //   advisory → exit 0, stdout = {"hookSpecificOutput":{"hookEventName":…, "additionalContext":…}}.
 //   block    → exit 2, reason on stderr, stdout byte-empty.
@@ -72,28 +83,62 @@
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 
 import fs from 'node:fs';
+import { contextBlock, contextFrame, emitOwnedContext, selectContextFrame, recordContextBudget } from './hook-context-budget.mjs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { readStdinBounded } from './hook-input.mjs';
+import { readStdinBounded, isHarnessGenerated } from './hook-input.mjs';
+import { resolveBash } from './hook-shim-bash.mjs';
+import { ADVISORY_CONTRACT } from './advisory-contract.mjs';
 
-// <codeRoot>/plugin/scripts/unprompted-runtime.mjs → <codeRoot>. Resolved from THIS file's own
-// location so it is correct under the Stable Spine (an immutable versions/<gen> tree) and in a dev
-// checkout alike — hook-shim.mjs has already chosen the tree by the time it dispatches this body.
+// WHERE THIS FILE'S SIBLINGS LIVE. Resolved from THIS file's own location so it is correct under the
+// Stable Spine (an immutable versions/<gen> tree) and in a dev checkout alike — hook-shim.mjs has
+// already chosen the tree by the time it dispatches this body.
+//
+// THIS USED TO ALSO COMPUTE `CODE_ROOT = SCRIPTS_DIR/../..`, and that line was WRONG in exactly the
+// way anticipate.sh's was (PR #114): it assumed `scripts/` is a sibling of `plugin/`, which holds
+// ONLY in a git checkout. Both shipped layouts flatten the `plugin/` level —
+//
+//   ~/.cache/ruvnet-brain/versions/<gen>/scripts/…        → ../.. = …/versions
+//   ~/.claude/plugins/cache/…/<ver>/scripts/…             → ../.. = …/ruvnet-brain
+//   <src>/plugin/scripts/…                                → ../.. = <src>            ← only this one
+//
+// — so `$CODE_ROOT/scripts/user-settings.mjs` pointed at nothing on every real install. Both consumers
+// (the 1–5 advocacy dial and the DismissalLedger, wired at SETTINGS_MODULE/ADVOCACY_MODULE below)
+// `catch` an import failure and fall back to defaults, so the dial was silently UNREAD for every user
+// while the code read as if it were honoured. Same defect class, same fix: the modules are SIBLINGS of
+// this file inside the payload, so name them from SCRIPTS_DIR and never reach outside it.
 const SELF = fileURLToPath(import.meta.url);
-const SCRIPTS_DIR = path.dirname(SELF);                     // <codeRoot>/plugin/scripts
-const CODE_ROOT = path.resolve(SCRIPTS_DIR, '..', '..');    // <codeRoot>
+const SCRIPTS_DIR = path.dirname(SELF);                     // the payload's scripts/ dir, whatever its parent
 
 // The CC event name the shim forwarded. No event → nothing to run; stay silent.
 const EVENT = process.argv[2] || '';
 
-// Bound the whole runtime well under the 5s hook budget: producers run sequentially and each has its
-// own internal watchdog, but a backstop timeout here means a wedged producer can never hang the turn.
-const PRODUCER_TIMEOUT_MS = Number(process.env.RUVNET_UNPROMPTED_TIMEOUT_MS) || 4000;
+// Bound the whole runtime well under this hook's DECLARED timeout (hooks.json: 'unprompted-speech' is
+// 9s; codex-hooks.json: 10s host, 9000ms outer — it was 3s when this budget was first set) — producers run sequentially and
+// each has its own internal watchdog, but a backstop timeout here means a wedged producer can never
+// hang the turn. Found live 2026-09-27: the old 4000ms default left NO real margin under a 3000ms
+// declared timeout once Node startup + per-producer spawnSync overhead is counted, and slower
+// per-process-spawn hosts (Windows CI) pushed measured wall-clock to 83% of budget — selfcheck.mjs's
+// own 80%-margin rule exists exactly to catch a hook running this close to its declared contract.
+// 2000ms leaves real headroom (Node/import startup + the 80% margin check at 2400ms) on every host,
+// not just a Windows-specific patch.
+const PRODUCER_TIMEOUT_MS = Number(process.env.RUVNET_UNPROMPTED_TIMEOUT_MS) || 2000;
 const MAX_BUFFER = 1 << 20;
 
 const VALID_CHANNELS = new Set(['advocacy', 'promotion', 'lesson', 'alarm']);
 const VALID_EFFECTS = new Set(['advisory', 'block']);
+// QUIET BY DEFAULT, ENFORCED HERE (4.7.21 review F1). Unless RUVNET_STOP_NUDGES=full, this run is narrowed
+// to lesson + alarm: lesson producers still run and deliver, advocacy/promotion producers are never spawned.
+// The shim also exports RUVNET_UNPROMPTED_CHANNELS, but the shim is boot-frozen and this body is hot-updated,
+// so the quiet promise must not depend on which shim generation happens to dispatch it. An explicit
+// RUVNET_UNPROMPTED_CHANNELS still wins (the shim's own narrowing, or a caller that names channels).
+const QUIET_DEFAULT_CHANNELS = 'lesson,alarm';
+const NUDGES_FULL = String(process.env.RUVNET_STOP_NUDGES || '').toLowerCase() === 'full';
+const CHANNEL_LIST = process.env.RUVNET_UNPROMPTED_CHANNELS || (NUDGES_FULL ? '' : QUIET_DEFAULT_CHANNELS);
+const ALLOWED_CHANNELS = CHANNEL_LIST
+  ? new Set(CHANNEL_LIST.split(',').map((c) => c.trim()).filter((c) => VALID_CHANNELS.has(c)))
+  : VALID_CHANNELS;
 
 /** Exit 0 with byte-empty stdout — the fail-safe and the "nothing to say" path. */
 function silent() { process.exit(0); }
@@ -114,11 +159,30 @@ function silent() { process.exit(0); }
 // `channels` binds each producer to the ONLY channels it is authorised to emit (GPT-5.6-Sol anti-spoof).
 // Without it, any producer could emit `{channel:'alarm'}` (always-delivered) or `lesson:block` (force
 // exit 2) and bypass its intended per-channel policy — defeating the whole point of the chokepoint.
-const ANTICIPATE = { argv: ['/bin/bash', path.join(SCRIPTS_DIR, 'anticipate.sh')], feedStdin: true, channels: ['advocacy', 'promotion'] };
-const lesson = (subEvent) => ({ argv: ['/bin/bash', path.join(SCRIPTS_DIR, 'lesson-hooks.sh'), subEvent], feedStdin: true, channels: ['lesson'] });
+// BASH COMES FROM THE RESOLVER, NEVER A LITERAL. Found 2026-08-13 by an adversarial audit: with
+// `/bin/bash` hardcoded here, win32 has no such file, spawnSync errors, the fail-closed filter at
+// `!r.error && r.status === 0` discards every candidate, and the runtime exits 0 through silent().
+// That is the ENTIRE unprompted plane — every lesson delivery, every advocacy card, every promotion
+// — dead on Windows and indistinguishable from "nothing to say". The invariant tests all inject
+// producers through the RUVNET_UNPROMPTED_PRODUCERS seam, so they stay green while the real registry
+// is broken: a suite that cannot fail on the shipped path. resolveBash() has handled this since
+// issue #38 and sat one import away.
+const BASH = resolveBash();
+const ANTICIPATE = { argv: [BASH, path.join(SCRIPTS_DIR, 'anticipate.sh')], feedStdin: true, channels: ['advocacy', 'promotion'] };
+const lesson = (subEvent) => ({ argv: [BASH, path.join(SCRIPTS_DIR, 'lesson-hooks.sh'), subEvent], feedStdin: true, channels: ['lesson'] });
+
+// THE RECOMMENDATION PRODUCER (advocacy-route.mjs). It answers a DIFFERENT question from anticipate:
+// anticipate asks "what is installed here and switched OFF?", the route asks "what does rUv already
+// ship that would materially help THIS ordinary request?" — the second is unreachable through the
+// first, because anticipate's SILENCE RULE 1 makes an 'absent' capability silent by design and
+// goal-match.mjs's GLOBAL_VETO rejects `customers`/`production`/`deploy` prompts outright.
+// It is bound to the advocacy channel ONLY: it can never emit a lesson block or an alarm.
+// process.execPath, not 'node' — the same reason resolveBash() exists: a PATH lookup that fails on
+// one host is a producer that is dead there and indistinguishable from "nothing to say".
+const ADVOCACY_ROUTE = { argv: [process.execPath, path.join(SCRIPTS_DIR, 'advocacy-route.mjs')], feedStdin: true, channels: ['advocacy'] };
 
 const BUILTIN_REGISTRY = {
-  'UserPromptSubmit': [ANTICIPATE, lesson('UserPromptSubmit')],
+  'UserPromptSubmit': [lesson('UserPromptSubmit'), ANTICIPATE, ADVOCACY_ROUTE],
   'PreToolUse-write': [lesson('PreToolUse-write')],
   'PreToolUse-bash':  [lesson('PreToolUse-bash')],
   'PreToolUse-push':  [lesson('PreToolUse-push')],
@@ -179,7 +243,18 @@ try {
 } catch { /* not JSON → no occasion → silence, below */ }
 if (!event) silent();
 
-const producers = resolveProducers(EVENT);
+// H2: a background task notification, slash-command scaffold, or other harness-authored message
+// arrives on UserPromptSubmit exactly like real user text (wrapped in tags such as
+// <task-notification>, <local-command-caveat>, <system-reminder>, ...). None of that is something a
+// user typed, so no producer here should react to it — an advocacy nudge, a lesson prompt, or a
+// promotion offer fired at the harness's own bookkeeping is noise on every background-task turn.
+// PreToolUse payloads carry no `prompt`/`user_prompt`/`input` field, so this is a no-op for them.
+{
+  const promptText = event.prompt ?? event.user_prompt ?? event.input;
+  if (typeof promptText === 'string' && isHarnessGenerated(promptText)) silent();
+}
+
+const producers = resolveProducers(EVENT).filter((p) => p.channels.some((c) => ALLOWED_CHANNELS.has(c)));
 if (!producers.length) silent();   // unknown event, or nothing wired for it — never speak on a guess
 
 // ── Spawn producers as CAPTURED children, collect candidate lines ──────────────────────────────────
@@ -196,12 +271,27 @@ for (const p of producers) {
   if (remaining <= 0) break;                 // global budget spent → run no more producers
   let out = '';
   try {
+    // Build env for the spawned producer. advocacy-route.mjs needs RUVNET_ADVOCACY_ROUTE_BUDGET_MS
+    // to self-limit under concurrent load; pass it through if set by the test or caller.
+    const producerEnv = {
+      ...process.env,
+      RUVNET_EMIT_CANDIDATES: '1',
+    };
+    if (process.env.RUVNET_ADVOCACY_ROUTE_BUDGET_MS) {
+      producerEnv.RUVNET_ADVOCACY_ROUTE_BUDGET_MS = process.env.RUVNET_ADVOCACY_ROUTE_BUDGET_MS;
+    }
     const r = spawnSync(p.argv[0], p.argv.slice(1), {
       input: p.feedStdin ? payload : Buffer.alloc(0),
-      env: { ...process.env, RUVNET_EMIT_CANDIDATES: '1' },
+      env: producerEnv,
       timeout: remaining,
       maxBuffer: MAX_BUFFER,
     });
+    // Never forward producer diagnostics verbatim: lesson failures may include private paths.
+    // Preserve the fact that memory degraded instead of presenting it as an empty healthy store.
+    if (p.channels.includes('lesson') && (r.error || r.signal || r.status !== 0 || r.stderr?.length)) {
+      rawLines.push({ s: JSON.stringify({ channel: 'lesson', effect: 'advisory',
+        hookEventName: event, copy: 'Project lessons could not be fully loaded. Learning context is incomplete; verify relevant project decisions before consequential changes.' }), channels: ['lesson'] });
+    }
     // FAIL CLOSED (GPT-5.6-Sol): a producer that errored, exited non-zero, was signalled (a timeout kill),
     // or overflowed maxBuffer has UNTRUSTWORTHY partial output — discard it, never deliver a fragment.
     if (!r.error && r.status === 0 && !r.signal && r.stdout) out = r.stdout.toString('utf8');
@@ -221,11 +311,12 @@ for (const { s, channels } of rawLines) {
   try { c = JSON.parse(s); } catch { continue; }              // not JSON → drop (a rogue's raw line)
   if (!c || typeof c !== 'object' || Array.isArray(c)) continue;
   if (!VALID_CHANNELS.has(c.channel)) continue;               // unknown/absent channel → drop
+  if (!ALLOWED_CHANNELS.has(c.channel)) continue;             // narrowed by the shim's quiet default → drop
   if (!channels.includes(c.channel)) continue;                // ANTI-SPOOF (GPT-5.6-Sol): this producer is
                                                               // not authorised for this channel → drop
   if (!VALID_EFFECTS.has(c.effect)) continue;                 // unknown/absent effect → drop
   if (typeof c.copy !== 'string' || !c.copy.trim()) continue; // nothing to say → drop
-  c.copy = c.copy.slice(0, MAX_COPY);                         // cap size; delivery below is synchronous
+  if (process.env.RUVNET_HOOK_CONTEXT_BUDGET !== '1') c.copy = c.copy.slice(0, MAX_COPY);                         // cap size; delivery below is synchronous
   candidates.push(c);
 }
 if (!candidates.length) silent();
@@ -235,8 +326,10 @@ if (!candidates.length) silent();
 // RUVNET_SETTINGS_FILE); suppression comes from advocacy-outcomes.shouldStillOffer()/record(). Both
 // are loaded only if an advocacy/promotion candidate is actually present, so a lesson- or alarm-only
 // event pays nothing for them.
-const SETTINGS_MODULE = process.env.RUVNET_USER_SETTINGS_MODULE || path.join(CODE_ROOT, 'scripts', 'user-settings.mjs');
-const ADVOCACY_MODULE = process.env.RUVNET_ADVOCACY_OUTCOMES_MODULE || path.join(CODE_ROOT, 'scripts', 'advocacy-outcomes.mjs');
+// SIBLINGS, not `$CODE_ROOT/scripts/…` — see the SCRIPTS_DIR note at the top of this file for the
+// measured layouts that made the old path resolve to nothing on every shipped install.
+const SETTINGS_MODULE = process.env.RUVNET_USER_SETTINGS_MODULE || path.join(SCRIPTS_DIR, 'user-settings.mjs');
+const ADVOCACY_MODULE = process.env.RUVNET_ADVOCACY_OUTCOMES_MODULE || path.join(SCRIPTS_DIR, 'advocacy-outcomes.mjs');
 
 // THE 1–5 DIAL (ADR-052). This runtime is the SINGLE enforcement chokepoint (DDD-0004): the level maps
 // to exactly what each channel is allowed to deliver, and no producer decides. LEVEL_POLICY is the one
@@ -265,11 +358,13 @@ async function advocacyLevel() {
   try {
     const m = await import(pathToFileURL(SETTINGS_MODULE).href);
     if (typeof m.loadSettings === 'function') {
-      const v = m.loadSettings().values?.advocacy;   // loadSettings already migrates legacy strings → 1-5
+      const settings = m.loadSettings();
+      if (!settings.healthy || settings.fromFuture || settings.errors?.length) return (_level = 1);
+      const v = settings.values?.advocacy;   // loadSettings already migrates legacy strings → 1-5
       const n = typeof v === 'number' ? v : LEGACY_LEVEL[v];
       if (Number.isInteger(n) && n >= 1 && n <= 5) _level = n;
     }
-  } catch { /* keep the safe default */ }
+  } catch { _level = 1; } // Unavailable preferences cannot authorize optional speech.
   return _level;
 }
 async function policy() { return LEVEL_POLICY[await advocacyLevel()] || LEVEL_POLICY[3]; }
@@ -290,6 +385,15 @@ async function ledger() {
 
 // ── Apply per-channel policy ───────────────────────────────────────────────────────────────────────
 const advisories = [];   // { copy, hookEventName }
+const budgetDeferredIds = [];
+const framedBlock = (a) => contextBlock(a.copy, { id: a.channel, critical: a.channel === 'alarm' });
+const hasAdvisoryRoom = (copy, channel) => {
+  if (process.env.RUVNET_HOOK_CONTEXT_BUDGET !== '1' || channel === 'alarm') return true;
+  const candidate = framedBlock({ copy, channel });
+  const selected = selectContextFrame(contextFrame('unprompted-speech', EVENT.split('-')[0], [...advisories.map(framedBlock), candidate]));
+  if (selected.frame.blocks.some((block) => block.id === candidate.id)) return true;
+  budgetDeferredIds.push(candidate.id); return false;
+};
 const blocks = [];       // reason strings
 
 for (const c of candidates) {
@@ -300,7 +404,7 @@ for (const c of candidates) {
     case 'alarm':
       // Always delivered, never gated. Alarms inform; they do not refuse — a stray block effect on an
       // alarm is treated as advisory rather than allowed to refuse the user's work.
-      advisories.push({ copy, hookEventName });
+      if (hasAdvisoryRoom(copy, c.channel)) advisories.push({ copy, hookEventName, channel: c.channel });
       break;
 
     case 'lesson':
@@ -310,7 +414,7 @@ for (const c of candidates) {
         // and never swallows one.
         blocks.push(copy);
       } else {
-        advisories.push({ copy, hookEventName });
+        if (hasAdvisoryRoom(copy, c.channel)) advisories.push({ copy, hookEventName, channel: c.channel });
       }
       break;
 
@@ -320,7 +424,7 @@ for (const c of candidates) {
       // violation → drop it.
       if (c.effect !== 'advisory') break;
       if (!(await policy()).promotion) break;   // levels 1–3 ⇒ no promotion nudges
-      advisories.push({ copy, hookEventName });
+      if (hasAdvisoryRoom(copy, c.channel)) advisories.push({ copy, hookEventName, channel: c.channel });
       break;
     }
 
@@ -341,11 +445,15 @@ for (const c of candidates) {
       let offer = true;
       try { offer = led.shouldStillOffer(findingId, { severity, stateHash }); } catch { offer = false; }
       if (!offer) break;                                     // dismissed / budget spent → drop
-      // Deliver, and record the OFFERED denominator centrally (best-effort; recording never breaks
-      // the hook it measures). Moving OFFERED here is what makes precision computable at the one place
-      // that actually decides to show a card.
-      try { led.record({ id: findingId, action: led.ACTIONS.OFFERED, severity, stateHash }); } catch { /* a lost row costs one denominator, never the turn */ }
-      advisories.push({ copy, hookEventName });
+      if (!hasAdvisoryRoom(copy, c.channel)) break;
+      // Persist the OFFERED denominator before delivery. A recommendation whose delivery receipt was
+      // not durably written cannot participate in the later applied/dismissed lifecycle; emitting it
+      // anyway would create a card the next prompt cannot resolve and would make precision lie.
+      let receipt;
+      try { receipt = led.record({ id: findingId, action: led.ACTIONS.OFFERED, severity, stateHash }); }
+      catch { receipt = null; }
+      if (!receipt?.ok) break;
+      advisories.push({ copy, hookEventName, channel: c.channel });
       break;
     }
 
@@ -363,7 +471,11 @@ if (blocks.length) {
   process.exit(2);
 }
 
-if (!advisories.length) silent();
+if (!advisories.length && !budgetDeferredIds.length) silent();
+if (budgetDeferredIds.length) {
+  recordContextBudget({ handler: 'unprompted-speech', event: EVENT.split('-')[0], scope: 'pre-offer-budget-deferral', deferredCount: budgetDeferredIds.length, deferredIds: budgetDeferredIds.slice(0, 8) });
+
+}
 
 // hookEventName MUST name the firing CC event or the harness discards the envelope. DERIVE it from the
 // runtime's own EVENT (GPT-5.6-Sol) rather than trusting a producer-stamped value — the runtime knows the
@@ -371,7 +483,14 @@ if (!advisories.length) silent();
 const hookEventName = EVENT ? EVENT.split('-')[0] : 'UserPromptSubmit';
 
 // SYNCHRONOUS write — the truncation fix on the byte-owner itself (see the block path above).
-const additionalContext = advisories.map((a) => a.copy).join('\n\n');
-try { fs.writeSync(1, JSON.stringify({ hookSpecificOutput: { hookEventName, additionalContext } })); }
+if (!advisories.length) silent();
+// #489: optional recommendations carry the advisory contract into the model-visible context, once,
+// so a suggestion is never promoted into a question/approval dialog. Alarms and lessons are not offers.
+const delivered = advisories.some((a) => a.channel === 'advocacy')
+  ? [...advisories, { copy: ADVISORY_CONTRACT, channel: 'advisory-contract' }] : advisories;
+const additionalContext = delivered.map((a) => a.copy).join('\n\n');
+try { fs.writeSync(1, process.env.RUVNET_HOOK_CONTEXT_BUDGET === '1'
+  ? emitOwnedContext(contextFrame('unprompted-speech', hookEventName, delivered.map((a) => contextBlock(a.copy, { id: a.channel, critical: a.channel === 'alarm' }))))
+  : JSON.stringify({ hookSpecificOutput: { hookEventName, additionalContext } })); }
 catch { /* if even the final write fails, silence is the fail-safe */ }
 process.exit(0);

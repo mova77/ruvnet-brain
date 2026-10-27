@@ -9,24 +9,64 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
-import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
+import { fork } from 'node:child_process';
 import { loadTransformers } from './resolve-deps.mjs';
-import { materializeModelRevision, modelCacheReady } from './model-requirements.mjs';
+import { QueryDeadlineExceeded } from './query-deadline.mjs';
+import { materializeModelRevision, modelCacheReady, RERANKER_MODEL } from './model-requirements.mjs';
 
-// ADR-0011 Phase 3: this file doubles as its OWN worker_threads entry (single-file pattern —
-// scripts/build-bundle.mjs ships a fixed tools list, so no new file may be added to the bundle).
-// A CE worker is identified by the workerData sentinel below, NOT by !isMainThread alone, so being
-// imported inside someone else's worker (e.g. a vitest thread pool) never trips worker mode.
-const IS_CE_WORKER = !isMainThread && workerData && workerData.__ceWorker === true;
+// Same packaged entry, separate process: a native ONNX/V8 fault cannot kill the parent host.
+// Both the literal fork argument and a live IPC channel are required; ambient env cannot opt in.
+const IS_CE_WORKER = process.argv[2] === '--ce-worker' && typeof process.send === 'function';
+const localRequire = createRequire(import.meta.url);
+const DEFAULT_INLINE_CE_THREADS = 2;
 
-// searchKb is only needed by rerankKb on the main thread. forge-ask.mjs calls loadRvf() at import
+/** Resolve a bounded ONNX intra-op thread budget without changing model inputs or scores. */
+export function resolveCeIntraOpThreads({
+  requested = process.env.CE_INTRA_OP_THREADS,
+  cores = typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length,
+  fallback = DEFAULT_INLINE_CE_THREADS,
+} = {}) {
+  const configured = Number(requested);
+  if (String(requested ?? '').trim() && Number.isSafeInteger(configured) && configured > 0) return configured;
+  const available = Number.isSafeInteger(Math.floor(Number(cores))) && Number(cores) > 0
+    ? Math.floor(Number(cores)) : 1;
+  const defaultThreads = Number.isSafeInteger(Math.floor(Number(fallback))) && Number(fallback) > 0
+    ? Math.floor(Number(fallback)) : DEFAULT_INLINE_CE_THREADS;
+  return Math.max(1, Math.min(available, defaultThreads));
+}
+
+/** Set thread limits on the shared ONNX session factory; preserve all other caller options. */
+export function applyCeIntraOpThreadBudget(ort, threads) {
+  if (!Number.isSafeInteger(threads) || threads < 1 || typeof ort?.InferenceSession?.create !== 'function') return false;
+  const original = ort.InferenceSession.create.bind(ort.InferenceSession);
+  ort.InferenceSession.create = (model, options = {}) => original(model, {
+    ...options,
+    intraOpNumThreads: threads,
+    interOpNumThreads: 1,
+  });
+  return true;
+}
+
+function configureCeIntraOpThreadBudget(fallback = DEFAULT_INLINE_CE_THREADS) {
+  try {
+    const ort = localRequire('onnxruntime-node');
+    const threads = resolveCeIntraOpThreads({ fallback });
+    return applyCeIntraOpThreadBudget(ort, threads);
+  } catch {
+    // Transformers.js can fall back to its WASM backend when the native runtime is unavailable.
+    return false;
+  }
+}
+
+// searchKb is only needed by rerankKb in the parent. forge-ask.mjs calls loadRvf() at import
 // time, so a static import would drag the whole @ruvector/rvf native module into every CE worker
 // for nothing — conditional top-level await keeps the worker's module graph down to transformers.
 let searchKb = null;
 if (!IS_CE_WORKER) ({ searchKb } = await import('./forge-ask.mjs'));
 
-const DEFAULT_CE_MODEL = 'Xenova/ms-marco-MiniLM-L-6-v2';
+const DEFAULT_CE_MODEL = RERANKER_MODEL;
 const CE_MODEL = process.env.CE_MODEL || DEFAULT_CE_MODEL;
 // MODEL-WEIGHT PIN: when using the DEFAULT cross-encoder, pin it to an exact HuggingFace commit SHA
 // instead of the floating `main` branch so reranking is reproducible and cannot silently shift under
@@ -37,6 +77,7 @@ const CE_REVISION = CE_MODEL === DEFAULT_CE_MODEL ? 'a09144355adeed5f58c8ed011d2
 let _ce = null;
 async function loadCE() {
   if (_ce) return _ce;
+  if (!IS_CE_WORKER) configureCeIntraOpThreadBudget();
   const { T, modelCache } = await loadTransformers();   // same resolver as forge-ask (KB node_modules / XENOVA_PATH), not a bare import
   // Bug A (issue #29, found+fixed by Jan Lafko): the cache dir was only wired up when KB_MODEL_CACHE
   // was explicitly exported — otherwise the loader had no idea where the pre-cached models lived and
@@ -69,6 +110,8 @@ async function loadCE() {
     if (ceDir && fs.existsSync(ceDir)) {
       console.error(`[forge-rerank] cross-encoder failed to load (${String(e.message).slice(0, 120)}) — treating the local copy as corrupted: wiping ${ceDir} and re-fetching once (issue #29)`);
       fs.rmSync(ceDir, { recursive: true, force: true });
+      // The ready-cache probe disabled downloads above; that copy no longer exists.
+      T.env.allowRemoteModels = true;
       _ce = await attempt();
     } else throw e;
   }
@@ -112,10 +155,15 @@ const CE_BATCH_SIZE = 16;
 // score a whole batch of (query, passage) pairs in ONE forward pass per chunk — the actual perf win
 // vs. one ONNX invocation per candidate (100+ pooled across repos). Falls back to per-pair scoring
 // (isolating a single bad passage to -Infinity) if a chunk's batched call throws.
-async function ceScoreBatch(ce, query, passages, maxLength) {
+async function ceScoreBatch(ce, query, passages, maxLength, deadline = null) {
   if (!passages.length) return [];
   const scores = new Array(passages.length);
   for (let start = 0; start < passages.length; start += CE_BATCH_SIZE) {
+    // THE ONLY PLACE THIS PHASE CAN BE INTERRUPTED. An ONNX forward pass is a native call on the
+    // JS thread: nothing in this process — not a timer, not a promise — runs while the model is
+    // inside a batch. So the deadline's granularity here is exactly one batch, by construction,
+    // and kb/query-deadline.mjs's watchdog exists because of it.
+    deadline?.check('rerank');
     const chunk = passages.slice(start, start + CE_BATCH_SIZE);
     try {
       const inputs = ce.tok(new Array(chunk.length).fill(query), tokOpts(chunk.map((p) => p.slice(0, 3000)), maxLength));
@@ -135,10 +183,10 @@ async function ceScoreBatch(ce, query, passages, maxLength) {
   return scores;
 }
 
-// ---------- ADR-0011 Phase 3: worker_threads parallel scoring ----------
+// ---------- ADR-0011 Phase 3: process-isolated parallel scoring ----------
 // ONNX inference is CPU-bound and serializes on the JS thread (Promise.all concurrency buys
 // nothing). The cross-repo rerank (~248 pairs at ~61ms/pair ≈ 12-15s) is ~97% of query time, so
-// big pools are sharded across worker threads, each running THIS file as its worker entry with its
+// big pools are sharded across child processes, each running THIS file as its worker entry with its
 // own copy of the CE model (~30MB per worker; loaded lazily on the worker's first task).
 //
 // DETERMINISM: shards are CONTIGUOUS and aligned to CE_BATCH_SIZE chunk boundaries, so every ONNX
@@ -154,10 +202,10 @@ async function ceScoreBatch(ce, query, passages, maxLength) {
 //   CE_PARALLEL_MIN       min pairs before workers engage (default 2*CE_BATCH_SIZE+1 = 33 — below
 //                         that, pool spawn + per-worker model load costs more than inline scoring).
 //   CE_FORCE_WORKER_FAIL  test hook: makes worker spawn throw, proving the inline fallback.
-let _pool = null;         // Worker[] — spawned lazily on the first big-enough call, reused after
+let _pool = null;         // ChildProcess[] — spawned lazily and reused while warm
 let _poolBroken = false;  // any spawn/runtime worker failure pins this process to the inline path
 let _msgId = 0;
-const _stats = { parallelCalls: 0, inlineCalls: 0 };
+const _stats = { parallelCalls: 0, inlineCalls: 0, childResponses: 0 };
 
 function ceWorkerCount() {
   const raw = process.env.CE_WORKERS;
@@ -173,6 +221,51 @@ function ceParallelMin() {
   return Number.isFinite(n) && n > 0 ? n : CE_BATCH_SIZE * 2 + 1;
 }
 
+// Keep child cleanup single-flight, including partial-spawn and fallback paths.
+let _shutdown = Promise.resolve();
+function forceStop(worker) {
+  if (worker.__ceDead) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const done = () => { clearTimeout(hard); clearTimeout(deadline); worker.off('exit', done); resolve(); };
+    worker.once('exit', done);
+    const hard = setTimeout(() => { try { worker.kill('SIGKILL'); } catch { /* exit races */ } }, 1000);
+    const deadline = setTimeout(() => {
+      worker.off('exit', done); reject(new Error('CE child could not be reaped'));
+    }, 2000);
+    try { worker.kill('SIGTERM'); } catch { /* escalation remains armed */ }
+  });
+}
+async function stopWorker(worker) {
+  if (worker.__ceDead) return;
+  try {
+    await new Promise((resolve, reject) => {
+      const done = (error) => {
+        clearTimeout(timer);
+        worker.off('exit', onExit); worker.off('error', onError);
+        if (error) reject(error); else resolve();
+      };
+      const onExit = () => done();
+      const onError = (error) => done(error);
+      const timer = setTimeout(() => done(new Error('CE shutdown timed out')), 5000);
+      worker.once('exit', onExit); worker.once('error', onError);
+      try { worker.ref(); worker.channel?.ref(); worker.send({ shutdown: true }, (error) => { if (error) done(error); }); } catch (error) { done(error); }
+    });
+  } catch {
+    // Broken/unresponsive workers still have a bounded forced-exit path.
+    await forceStop(worker);
+  }
+}
+function terminateWorkers(workers) {
+  if (workers.length) _shutdown = _shutdown.catch(() => {}).then(async () => {
+    const failures = [];
+    for (const worker of workers) {
+      try { await stopWorker(worker); } catch (error) { failures.push(error); }
+    }
+    if (failures.length) throw new AggregateError(failures, 'CE children could not all be reaped');
+  });
+  return _shutdown;
+}
+
 function spawnPool(n) {
   if (process.env.CE_FORCE_WORKER_FAIL) throw new Error('CE_FORCE_WORKER_FAIL is set (test hook)');
   const workers = [];
@@ -185,18 +278,22 @@ function spawnPool(n) {
     const cores = typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length;
     const intraOpThreads = Math.max(1, Math.floor(cores / n));
     for (let i = 0; i < n; i++) {
-      const w = new Worker(fileURLToPath(import.meta.url), { workerData: { __ceWorker: true, intraOpThreads } });
+      const w = fork(fileURLToPath(import.meta.url), ['--ce-worker', String(intraOpThreads)], {
+        execPath: process.execPath, execArgv: [], serialization: 'advanced',
+        stdio: ['ignore', 'ignore', 'inherit', 'ipc'],
+      });
       w.unref(); // idle workers must never keep a one-shot CLI process alive
+      w.channel?.unref();
       // A worker that dies while IDLE would otherwise emit an unhandled 'error' (process crash —
       // a failure mode the inline path never had) or silently hang the next call. Permanent `on`
       // (not `once`): every error must stay handled, or a second one would crash after all.
-      w.on('error', (e) => { w.__ceDead = true; _poolBroken = true; if (process.env.CE_DEBUG) console.error('CE worker error:', e.message); });
-      w.once('exit', () => { w.__ceDead = true; });
+      w.on('error', (e) => { _poolBroken = true; if (process.env.CE_DEBUG) console.error('CE worker error:', e.message); });
+      w.once('exit', () => { w.__ceDead = true; if (!w.__ceStopping) _poolBroken = true; });
       workers.push(w);
     }
     return workers;
   } catch (e) {
-    for (const w of workers) w.terminate().catch(() => {});
+    void terminateWorkers(workers).catch(() => {}); // fallback awaits and surfaces the same cleanup result
     throw e;
   }
 }
@@ -217,23 +314,45 @@ function shardRanges(total, maxShards) {
 }
 
 function callWorker(w, query, passages, maxLength) {
-  return new Promise((resolve, reject) => {
+  // Bound queued work and include queue time in the existing MCP call budget, not a
+  // shorter new search deadline (plugin/mcp/server.mjs owns the external watchdog).
+  if ((w.__cePending || 0) >= 32) return Promise.reject(new Error('CE child queue full'));
+  const configured = Number(process.env.RUVNET_BRAIN_CALL_TIMEOUT_MS);
+  const deadline = Date.now() + (Number.isFinite(configured) && configured > 0 ? configured : 240_000);
+  w.__cePending = (w.__cePending || 0) + 1;
+  const task = (w.__ceQueue || Promise.resolve()).then(() => new Promise((resolve, reject) => {
+    if (w.__ceDead || w.__ceStopping) return reject(new Error('CE child is unavailable'));
     const id = ++_msgId;
-    const done = (fn, v) => { w.off('message', onMsg); w.off('error', onErr); w.off('exit', onExit); fn(v); };
-    const onMsg = (m) => { if (m && m.id === id) (m.error ? done(reject, new Error(m.error)) : done(resolve, m.scores)); };
+    let settled = false;
+    const done = (fn, v) => { if (settled) return; settled = true; clearTimeout(timer); w.off('message', onMsg); w.off('error', onErr); w.off('exit', onExit); fn(v); };
+    const onMsg = (m) => { if (m && m.id === id) {
+      if (m.error) done(reject, new Error(m.error));
+      else if (!Array.isArray(m.scores) || m.scores.length !== passages.length
+        || m.scores.some((score) => !Number.isFinite(score) && score !== -Infinity)) done(reject, new Error('invalid CE child scores'));
+      else { _stats.childResponses++; done(resolve, m.scores); }
+    } };
     const onErr = (e) => done(reject, e);
     const onExit = (code) => done(reject, new Error(`CE worker exited (${code}) mid-task`));
+    const timer = setTimeout(() => {
+      _poolBroken = true; w.__ceStopping = true;
+      void forceStop(w).catch(() => {});
+      done(reject, new Error('CE child task timed out'));
+    }, Math.max(1, deadline - Date.now()));
     w.on('message', onMsg); w.on('error', onErr); w.on('exit', onExit);
-    w.postMessage({ id, query, passages, maxLength });
-  });
+    try { w.send({ id, query, passages, maxLength }, (error) => { if (error) done(reject, error); }); }
+    catch (error) { done(reject, error); }
+  }));
+  w.__ceQueue = task.catch(() => {});
+  return task.finally(() => { w.__cePending--; });
 }
 
-async function ceScoreParallel(query, passages, maxLength) {
+async function ceScoreParallel(query, passages, maxLength, deadline = null) {
+  deadline?.check('rerank');
   if (!_pool) _pool = spawnPool(ceWorkerCount());
   const ranges = shardRanges(passages.length, _pool.length);
   const used = _pool.slice(0, ranges.length);
   if (used.some((w) => w.__ceDead)) throw new Error('CE worker pool degraded (a worker exited)');
-  for (const w of used) w.ref();
+  for (const w of used) { w.ref(); w.channel?.ref(); }
   try {
     const parts = await Promise.all(ranges.map((r, i) => callWorker(used[i], query, passages.slice(r.start, r.end), maxLength)));
     const scores = new Array(passages.length);
@@ -242,42 +361,49 @@ async function ceScoreParallel(query, passages, maxLength) {
     }
     return scores;
   } finally {
-    for (const w of used) { try { w.unref(); } catch { /* already terminated */ } }
+    for (const w of used) { try { if (!w.__cePending) { w.unref(); w.channel?.unref(); } } catch { /* already terminated */ } }
   }
 }
 
 // Dispatch: parallel path for big pools when workers are enabled and healthy, the pre-existing
 // inline ceScoreBatch otherwise. NEVER crashes where the inline path worked — any worker failure
 // (construction throw, worker death, worker-side error) tears the pool down and falls back inline.
-async function ceScoreAuto(ce, query, passages, maxLength) {
+async function ceScoreAuto(ce, query, passages, maxLength, deadline = null) {
+  if (_poolBroken && _pool) await ceWorkerShutdown();
   const eligible = !_poolBroken
     && ceWorkerCount() >= 2
     && passages.length >= ceParallelMin()
     && passages.length > CE_BATCH_SIZE; // a single chunk has nothing to parallelize
   if (eligible) {
     try {
-      const scores = await ceScoreParallel(query, passages, maxLength);
+      const scores = await ceScoreParallel(query, passages, maxLength, deadline);
       _stats.parallelCalls++;
       return scores;
     } catch (e) {
+      // A deadline is a DECISION, not a worker fault: reap the children (so a timeout can never
+      // orphan forked work) and re-raise instead of silently retrying the same work inline, which
+      // would double the overrun the deadline just caught.
+      await ceWorkerShutdown();
+      if (e instanceof QueryDeadlineExceeded) throw e;
       _poolBroken = true;
-      if (_pool) { for (const w of _pool) { try { w.terminate(); } catch { /* best effort */ } } _pool = null; }
       if (process.env.CE_DEBUG) console.error('CE worker path failed, falling back to inline:', e.message);
     }
   }
   _stats.inlineCalls++;
-  return ceScoreBatch(ce, query, passages, maxLength);
+  return ceScoreBatch(ce, query, passages, maxLength, deadline);
 }
 
 // Diagnostics + lifecycle helpers (rerankKb/rerankPairs contracts unchanged). ceWorkerStats lets
 // tests prove which path actually scored; ceWorkerShutdown lets long-running hosts / test files
 // release the pool deterministically (workers are unref()ed, so exit never blocks on them anyway).
 export function ceWorkerStats() {
-  return { ..._stats, poolSize: _pool ? _pool.length : 0, poolBroken: _poolBroken };
+  return { ..._stats, poolSize: _pool ? _pool.length : 0, poolBroken: _poolBroken,
+    childPids: (_pool || []).map((worker) => worker.pid) };
 }
 export async function ceWorkerShutdown() {
   const pool = _pool; _pool = null;
-  if (pool) await Promise.allSettled(pool.map((w) => w.terminate()));
+  for (const worker of pool || []) worker.__ceStopping = true;
+  await terminateWorkers(pool || []);
 }
 
 export async function rerankKb({ dir, name, query, k = 6, variant, pool = 20 }) {
@@ -326,12 +452,12 @@ export async function rerankKb({ dir, name, query, k = 6, variant, pool = 20 }) 
 // where the curve stops being free. Cost is superlinear in length (attention is quadratic), which
 // is why cutting the sequence buys more than cutting the pool: half the tokens is well under half
 // the time, while half the pool is exactly half the time.
-export async function cePrefilterScores(query, docs, { maxLength = 192 } = {}) {
+export async function cePrefilterScores(query, docs, { maxLength = 192, deadline = null } = {}) {
   if (!Array.isArray(docs) || docs.length === 0) return [];
   let ce;
   try { ce = await loadCE(); }
   catch (e) { if (process.env.CE_DEBUG) console.error('CE load failed, no prefilter scores:', e.message); return null; }
-  return ceScoreAuto(ce, query, docs.map((d) => (typeof d === 'string' ? d : d.fullText || d.text || '')), maxLength);
+  return ceScoreAuto(ce, query, docs.map((d) => (typeof d === 'string' ? d : d._ceText || d.fullText || d.text || '')), maxLength, deadline);
 }
 
 // rerankPairs — cross-repo common-scale scorer. Given an ALREADY-RETRIEVED candidate list (e.g.
@@ -339,12 +465,16 @@ export async function cePrefilterScores(query, docs, { maxLength = 192 } = {}) {
 // and score every (query, passage) pair on the SAME logit scale, so candidates from different repos
 // (and different embedders/dims) become directly comparable. Returns the list sorted by ceScore desc.
 // Falls back to input order (ceScore=null) if the cross-encoder can't load — never throws.
-export async function rerankPairs(query, docs) {
+export async function rerankPairs(query, docs, { deadline = null } = {}) {
   if (!Array.isArray(docs) || docs.length === 0) return [];
   let ce;
   try { ce = await loadCE(); }
   catch (e) { if (process.env.CE_DEBUG) console.error('CE load failed, using input order:', e.message); return docs.map((d) => ({ ...d, ceScore: null })); }
-  const scores = await ceScoreAuto(ce, query, docs.map((d) => d.fullText || d.text || ''));
+  // `_ceText` is the window a candidate's OWN lane says the ranker should judge — currently only
+  // the identifier lane sets it, to put the cross-encoder's 512-token read over the identifier
+  // rather than over whatever happened to be at the top of a 4,000-character chunk. It narrows what
+  // the RANKER reads, never what the reader is shown: fullText still carries the whole passage.
+  const scores = await ceScoreAuto(ce, query, docs.map((d) => d._ceText || d.fullText || d.text || ''), undefined, deadline);
   const scored = docs.map((d, i) => ({ ...d, ceScore: scores[i] }));
   scored.sort((a, b) => (b.ceScore ?? -Infinity) - (a.ceScore ?? -Infinity));
   return scored;
@@ -361,25 +491,32 @@ if (IS_CE_WORKER) {
   // onnxruntime-node isn't resolvable (e.g. a wasm-only environment), default threading applies.
   // Thread count does NOT change numerics (verified: identical score digest at 2 vs 16 threads).
   try {
-    const { createRequire } = await import('node:module');
-    const ort = createRequire(import.meta.url)('onnxruntime-node');
-    const cap = Math.max(1, Math.floor(Number(workerData.intraOpThreads) || 0));
-    if (cap && ort?.InferenceSession?.create) {
-      const orig = ort.InferenceSession.create.bind(ort.InferenceSession);
-      ort.InferenceSession.create = (buf, opts = {}) => orig(buf, { ...opts, intraOpNumThreads: cap, interOpNumThreads: 1 });
-    }
+    const fallback = Math.max(1, Math.floor(Number(process.argv[3]) || 0));
+    const ort = localRequire('onnxruntime-node');
+    applyCeIntraOpThreadBudget(ort, resolveCeIntraOpThreads({ fallback }));
   } catch { /* onnxruntime-node not present — transformers' fallback backend keeps its defaults */ }
-  parentPort.on('message', async ({ id, query, passages, maxLength }) => {
+  let tasks = Promise.resolve();
+  // IPC disconnect is also delivered when the parent is killed: do not orphan a warm model.
+  process.on('disconnect', () => { process.exit(0); });
+  process.on('message', (message) => { tasks = tasks.then(async () => {
+    const { id, query, passages, maxLength } = message;
+    if (message.shutdown === true) {
+      // Drain scoring, call the supported disposal API, then allow normal isolate exit.
+      // Older onnxruntime-node handlers implement dispose() as a no-op: this does not claim
+      // native release on those versions, and must still be exercised with the real backend.
+      try { await _ce?.model?.dispose(); } finally { _ce = null; process.disconnect(); }
+      return;
+    }
     try {
       const hadCE = !!_ce;
       const t0 = Date.now();
       const ce = await loadCE();
       if (!hadCE && process.env.CE_DEBUG) console.error(`[ce-worker] model loaded in ${Date.now() - t0}ms`);
-      parentPort.postMessage({ id, scores: await ceScoreBatch(ce, query, passages, maxLength) });
+      process.send?.({ id, scores: await ceScoreBatch(ce, query, passages, maxLength) });
     } catch (e) {
-      parentPort.postMessage({ id, error: String((e && e.message) || e) });
+      process.send?.({ id, error: String((e && e.message) || e) });
     }
-  });
+  }).catch((error) => { if (process.connected) process.send?.({ error: String(error?.message || error) }); }); });
 }
 
 // CLI smoke. The IS_CE_WORKER guard is load-bearing: inside a worker, process.argv[1] IS this

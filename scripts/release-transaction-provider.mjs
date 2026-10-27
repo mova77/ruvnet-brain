@@ -1,0 +1,519 @@
+import { execFileSync, spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { canonicalJson } from './coverage-integrity.mjs';
+import { isCorpusReleaseTag, latestCodeReleaseTag } from './release-channel-kind.mjs';
+import {
+  pollObservation, RECEIPT_PREFIX, receiptDisposition, transactionIdFor,
+} from './release-transaction.mjs';
+
+const REPO = 'stuinfla/ruvnet-brain';
+const PACKAGE = 'ruvnet-brain';
+export const ASSET_DOWNLOAD_TIMEOUT_MS = Number(process.env.RUVNET_RELEASE_ASSET_TIMEOUT_MS || 600_000);
+
+// maxBuffer: execFileSync defaults to 1MB, which this helper never overrode. `refresh()` below
+// slurps EVERY release's metadata (`releases?per_page=100 --paginate --slurp`) through it, and by
+// 2026-09-27 the accumulated release history (many releases, several now carrying 14-15 chained
+// transaction receipts as assets each) finally crossed that ceiling — same shape of bug as #77
+// (spawnSync gh ENOBUFS), just at the metadata-listing call site instead of the asset-download one.
+// 32MB matches the buffer already used for JSON metadata elsewhere in this codebase (e.g.
+// release-abort-stale.mjs's artifact fetch) and costs nothing: no call through this helper handles
+// raw asset bytes (those stream to disk via assetToFile), only ever-growing-but-still-small JSON.
+const command = (name, args, options = {}) => execFileSync(name, args, {
+  encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 32 * 1024 * 1024, ...options,
+}).trim();
+
+// The 683MB 4.5.12 payload outlasted metadata's 30s budget despite completing remotely.
+// Size uploads independently at 1MiB/s, capped at ten minutes per file; no added retry.
+export function assetUploadTimeoutMs(bytes) {
+  if (!Number.isSafeInteger(bytes) || bytes < 0) throw new Error('Safe asset byte count required');
+  return Math.max(30_000, Math.min(600_000, Math.ceil(bytes / (1024 * 1024)) * 1000));
+}
+const json = (name, args, options) => JSON.parse(command(name, args, options));
+// ADR-086 S1: `releases/latest` is the customer download pointer and is a corpus generation on any
+// night a corpus round shipped. Every question this provider asks is about the CODE generation, so
+// it must resolve the latest CODE release rather than read a pointer that now answers differently.
+const latestCodeTag = () => latestCodeReleaseTag(json('gh', ['api', `repos/${REPO}/releases?per_page=30`]));
+// Two DIFFERENT questions, deliberately: latestCodeTag() is "which CODE generation is newest" (a
+// corpus generation may hold the pointer — designed steady state); githubPointerTag() is "what does
+// GitHub's releases/latest actually point at right now". The publish-github-nonlatest gate needs the
+// second and was reading the first, which made it unsatisfiable for every freshly published release.
+const githubPointerTag = () => maybe(() => json('gh', ['api', `repos/${REPO}/releases/latest`]).tag_name, null);
+const maybe = (callback, fallback = null) => {
+  try { return callback(); } catch { return fallback; }
+};
+
+const tagSha = (tag, root) => {
+  const rows = command('git', ['ls-remote', 'origin', `refs/tags/${tag}`, `refs/tags/${tag}^{}`], { cwd: root })
+    .split('\n').filter(Boolean).map((line) => line.split(/\s+/));
+  return rows.find(([, ref]) => ref?.endsWith('^{}'))?.[0] || rows[0]?.[0] || '';
+};
+
+// THE RELEASE BUNDLE OUTGREW spawnSync's BUFFER, AND THAT IS WHAT BROKE EVERY PUBLISH (#77).
+//
+// This buffered the whole asset in memory via `spawnSync(..., encoding: 'buffer')`. The knowledge
+// bundle is ~529MB, far past spawnSync's maxBuffer, so the download died with
+//     cannot download transaction asset ruvnet-brain.zip: spawnSync gh ENOBUFS
+// and the caller reported it as `staged GitHub payload mismatch` — sending three days of
+// investigation after a corruption that never existed. Every asset actually matched the sealed
+// identity byte-for-byte, GitHub's own digest agreed, and the publish still failed.
+//
+// This was never a digest problem and it was never version drift. It is a size ceiling that the
+// corpus crossed, so it would have broken EVERY release from that moment on regardless of content,
+// and it is why hand-publishing became the only way to ship.
+//
+// Assets now stream to a temp file and are hashed incrementally, so peak memory is one 1MB chunk
+// instead of the whole bundle and there is no ceiling to outgrow. Small assets (receipts) still
+// come back as bytes, because callers parse them as JSON.
+//
+// 2026-09-29: ONE FLAKY DOWNLOAD MUST NOT ABORT A RELEASE. discover() reads the receipts of every
+// published release (411 assets, serially, ~3 minutes); a single transient `gh api` failure among
+// them killed the 4.3.36 publish with only "exit 1" -- the stderr that said why was discarded, and
+// re-fetching the same asset a minute later worked. A download is now retried with backoff, and the
+// final error carries the real cause. A genuinely missing/corrupt asset still fails, just not on
+// the first hiccup; the digest checks downstream are unchanged.
+export const ASSET_DOWNLOAD_ATTEMPTS = 4;
+const sleepSync = (ms) => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
+export const downloadAsset = (asset, destination, {
+  spawn = spawnSync, wait = sleepSync, attempts = ASSET_DOWNLOAD_ATTEMPTS, baseDelayMs = 2000,
+} = {}) => {
+  let cause = '';
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const fd = fs.openSync(destination, 'w'); // 'w' truncates any partial bytes from the previous attempt
+    let result;
+    try {
+      result = spawn('gh', ['api', asset.url, '-H', 'Accept: application/octet-stream'], {
+        stdio: ['ignore', fd, 'pipe'], timeout: ASSET_DOWNLOAD_TIMEOUT_MS,
+      });
+    } finally { fs.closeSync(fd); }
+    if (!result.error && !result.signal && result.status === 0) return destination;
+    const stderr = String(result.stderr || '').trim().slice(0, 300);
+    cause = `${result.error?.message || result.signal || `exit ${result.status}`}${stderr ? ` (${stderr})` : ''}`;
+    if (attempt < attempts) wait(baseDelayMs * 2 ** (attempt - 1));
+  }
+  throw new Error(`cannot download transaction asset ${asset.name} after ${attempts} attempts: ${cause}`);
+};
+const assetToFile = (asset, destination) => {
+  downloadAsset(asset, destination);
+  return destination;
+};
+const withTempAsset = (asset, fn) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ruvnet-asset-'));
+  const file = path.join(dir, path.basename(asset.name) || 'asset.bin');
+  try { return fn(assetToFile(asset, file)); } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+};
+const assetBytes = (asset) => withTempAsset(asset, (file) => fs.readFileSync(file));
+const assetReceipt = (asset) => JSON.parse(assetBytes(asset).toString('utf8'));
+const sha256 = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex');
+// Streamed digest — never materialises the asset in memory, so a bundle of any size can be verified.
+const sha256File = (file) => {
+  const hash = crypto.createHash('sha256');
+  const fd = fs.openSync(file, 'r');
+  try {
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    for (;;) {
+      const read = fs.readSync(fd, buffer, 0, buffer.length, null);
+      if (read <= 0) break;
+      hash.update(buffer.subarray(0, read));
+    }
+  } finally { fs.closeSync(fd); }
+  return hash.digest('hex');
+};
+const assetDigest = (asset) => withTempAsset(asset, sha256File);
+// 4.3.25 run 35056636514: `npm publish` succeeded at ~04:47:31Z and the registry first showed the
+// version at 04:53:40Z (time.modified) — roughly six minutes. The poll gave up at 156s, the job
+// reported FAILURE, and an already-published release was left half-promoted with npm and GitHub
+// naming different generations (the exact #77 split). The action was never the problem; the
+// deadline was shorter than npm's propagation for this package. Ten minutes covers the observed
+// ~6 with margin; the env overrides remain for a runner that knows better.
+const OBSERVATION_POLICY = {
+  maxElapsedMs: Number(process.env.RUVNET_NPM_VISIBILITY_TIMEOUT_MS || 600_000),
+  maxAttempts: Number(process.env.RUVNET_NPM_VISIBILITY_ATTEMPTS || 40),
+  initialDelayMs: 1_000,
+  maxDelayMs: 15_000,
+  multiplier: 1.8,
+  jitter: (delay) => Math.floor(Math.random() * Math.min(1_000, delay * 0.2)),
+};
+// The one command in this file that mutates a public channel gets its stderr in the job log and a
+// timeout sized for a real registry upload. command()'s defaults — stderr piped and dropped, 30s —
+// meant 4.3.25's first run left NO diagnostic between "stage-npm" and the deadline error, and a slow
+// registry would have killed a legitimate publish mid-upload. Named, so the publish call stays one
+// pinnable line for tests/unit/release-lineage + publication-receipt-wiring (one publisher, one tag).
+const PUBLISH_COMMAND_OPTIONS = Object.freeze({ stdio: ['ignore', 'pipe', 'inherit'], timeout: 600_000 });
+
+export function selectCurrentReleaseBytes({ remoteBytes, localBytes, generatedBytes, identity }) {
+  const bytes = remoteBytes || localBytes || generatedBytes;
+  let value;
+  try { value = JSON.parse(Buffer.from(bytes).toString('utf8')); } catch { throw new Error('public receipt is invalid JSON'); }
+  if (value.transactionId !== identity.transactionId || value.version !== identity.version
+    || value.candidateSha !== identity.candidateSha || value.verdict !== 'PASS'
+    || value.hosts?.verdict !== 'PASS') {
+    throw new Error('public receipt identity conflict');
+  }
+  return Buffer.from(bytes);
+}
+
+export function liveReleaseProvider({ root = process.cwd() } = {}) {
+  let releases = [];
+  let activeDraft = null;
+  const assetDigestCache = new Map();
+  const refresh = () => {
+    const pages = json('gh', ['api', `repos/${REPO}/releases?per_page=100`, '--paginate', '--slurp']);
+    releases = (Array.isArray(pages?.[0]) ? pages : [pages]).flat();
+    return releases;
+  };
+  const releaseById = (id) => json('gh', ['api', `repos/${REPO}/releases/${id}`]);
+  const assetsForRelease = (id) => {
+    const pages = json('gh', ['api', `repos/${REPO}/releases/${id}/assets?per_page=100`, '--paginate', '--slurp']);
+    return (Array.isArray(pages?.[0]) ? pages : [pages]).flat();
+  };
+  const hydratedRelease = (release) => ({ ...release, assets: assetsForRelease(release.id) });
+  const receiptsFor = (release) => (release?.assets || [])
+    .filter(({ name }) => name.startsWith(RECEIPT_PREFIX) && name.endsWith('.json'))
+    .map(assetReceipt);
+  const expectedAssets = (identity) => ({
+    'ruvnet-brain.zip': identity.bundleSha256,
+    'ruvnet-brain.zip.sig': identity.bundleSignatureSha256,
+    'ruvnet-brain.zip.sha256': identity.bundleDigestSha256,
+    [identity.packageAssetName || '']: identity.packageSha256 || null,
+  });
+  const digestAsset = (asset, force = false) => {
+    const key = `${asset.id}:${asset.size}`;
+    if (!force && assetDigestCache.has(key)) return assetDigestCache.get(key);
+    const digest = assetDigest(asset);   // streamed — the 529MB bundle must never be buffered
+    assetDigestCache.set(key, digest);
+    return digest;
+  };
+  const assetsExactFor = (release, identity, force = false) => {
+    const expected = expectedAssets(identity);
+    return Object.entries(expected).filter(([name, digest]) => name && digest).every(([name, digest]) => {
+      const asset = release?.assets?.find((item) => item.name === name);
+      return asset && digestAsset(asset, force) === digest;
+    });
+  };
+  const materializeRemoteAssets = async (draft, identity) => {
+    const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'ruvnet-release-staged-'));
+    try {
+      const release = hydratedRelease(releaseById(draft.id));
+      const required = [
+        ['bundlePath', 'ruvnet-brain.zip'],
+        ['bundleSignaturePath', 'ruvnet-brain.zip.sig'],
+        ['bundleDigestPath', 'ruvnet-brain.zip.sha256'],
+      ];
+      const assets = {};
+      for (const [key, name] of required) {
+        const remote = release.assets?.find((asset) => asset.name === name);
+        if (!remote) throw new Error(`staged GitHub asset missing: ${name}`);
+        const file = path.join(temp, name);
+        // Streamed straight to disk. Buffering here would reintroduce the ENOBUFS ceiling the
+        // 529MB bundle already crossed once — the defect that broke every publish (#77).
+        assetToFile(remote, file);
+        fs.chmodSync(file, 0o600);
+        assets[key] = file;
+      }
+      if (sha256File(assets.bundlePath) !== identity.bundleSha256) {
+        throw new Error('staged GitHub bundle digest does not match transaction identity');
+      }
+      if (identity.bundleSignatureSha256
+        && sha256(fs.readFileSync(assets.bundleSignaturePath)) !== identity.bundleSignatureSha256) {
+        throw new Error('staged GitHub bundle signature bytes do not match transaction identity');
+      }
+      if (identity.bundleDigestSha256
+        && sha256(fs.readFileSync(assets.bundleDigestPath)) !== identity.bundleDigestSha256) {
+        throw new Error('staged GitHub digest sidecar bytes do not match transaction identity');
+      }
+      const { value: metadata } = await pollObservation(
+        async () => json('npm', ['view', `${PACKAGE}@candidate-v${identity.version}`, '--json']),
+        (value) => value?.version === identity.version
+          && value?.dist?.integrity === identity.packageIntegrity
+          && typeof value?.dist?.tarball === 'string',
+        OBSERVATION_POLICY,
+      );
+      const response = await fetch(metadata.dist.tarball, { signal: AbortSignal.timeout(30_000) });
+      if (!response.ok) throw new Error(`npm candidate tarball download failed: HTTP ${response.status}`);
+      assets.packagePath = path.join(temp, identity.packageAssetName || `${PACKAGE}-${identity.version}.tgz`);
+      fs.writeFileSync(assets.packagePath, Buffer.from(await response.arrayBuffer()), { flag: 'wx', mode: 0o600 });
+      const integrity = `sha512-${crypto.createHash('sha512').update(fs.readFileSync(assets.packagePath)).digest('base64')}`;
+      if (integrity !== identity.packageIntegrity) throw new Error('staged npm package integrity mismatch');
+      return { assets, cleanup: () => fs.rmSync(temp, { recursive: true, force: true }) };
+    } catch (error) {
+      fs.rmSync(temp, { recursive: true, force: true });
+      throw error;
+    }
+  };
+
+  return {
+    observationPolicy: OBSERVATION_POLICY,
+
+    async discover(identity) {
+      const all = refresh();
+      const matchingDrafts = all.filter((release) => release.tag_name === identity.tag)
+        .map((release) => ({
+          id: release.id,
+          tag: release.tag_name,
+          sha: release.draft ? release.target_commitish : tagSha(identity.tag, root),
+          draft: release.draft,
+        }))
+        .filter((release) => release.sha === identity.candidateSha);
+      activeDraft = matchingDrafts[0] || null;
+      const receipts = matchingDrafts.length === 1
+        ? receiptsFor(hydratedRelease(releaseById(matchingDrafts[0].id))) : [];
+      const latestByTransaction = new Map();
+      for (const release of all) {
+        // Draft-release assets are not readable through the public GitHub API (they return 404
+        // even though the release metadata is visible).  The matching candidate above is read
+        // explicitly because the publisher owns it; unrelated drafts are not public channel
+        // state and must not make every subsequent release fail while scanning history. Published
+        // releases remain fully receipt-gated and continue to block competing transactions.
+        if (release.draft && release.tag_name !== identity.tag) continue;
+        for (const receipt of receiptsFor(hydratedRelease(release))) {
+          const prior = latestByTransaction.get(receipt.transactionId);
+          if (!prior || receipt.sequence > prior.receipt.sequence) {
+            latestByTransaction.set(receipt.transactionId, { receipt, release });
+          }
+        }
+      }
+      const npmLatest = command('npm', ['view', `${PACKAGE}@latest`, 'version']);
+      const githubLatest = latestCodeTag();
+      const legacySettled = [];
+      const pending = [];
+      for (const { receipt, release } of latestByTransaction.values()) {
+        const disposition = receiptDisposition(receipt);
+        if (['verified', 'closed-unsuccessful', 'legacy-closed'].includes(disposition)) continue;
+        // CONVERGENCE IS A FACT ABOUT THE CHANNELS, NOT ABOUT THE RECEIPT FORMAT (fixed 2026-08-07).
+        //
+        // This required `receipt.schemaVersion === 1`. Receipts are written as schemaVersion 2
+        // (release-transaction.mjs stateReceipt), so NO current transaction could ever be recognised
+        // as settled — it stayed `pending` forever and blocked every later release, which is the
+        // same deadlock shape as `aborted` being unreachable. It bit immediately: 4.0.24 published
+        // successfully to both channels, failed only on its final ledger entry, and then blocked
+        // 4.0.27 with `pending release 064b6b4e… blocks …`.
+        //
+        // The three conditions below are what actually prove convergence: the release is published,
+        // and this transaction's exact version and tag are what npm and GitHub currently serve. If
+        // all three hold, the transaction reached its goal whatever schema its receipts use. The
+        // check is not weakened — the schema clause was never load-bearing for that question, it
+        // just silently expired when the schema moved on.
+        const settled = receipt.schemaVersion <= 2 && release.draft === false
+          && receipt.identity?.version === npmLatest && receipt.identity?.tag === githubLatest;
+        if (settled) legacySettled.push(receipt.transactionId);
+        else pending.push(receipt);
+      }
+      return { matchingDrafts, receipts, pending, legacySettled, prior: { npmLatest, githubLatest } };
+    },
+
+    async createDraft(identity) {
+      const release = json('gh', [
+        'api', '-X', 'POST', `repos/${REPO}/releases`,
+        '-f', `tag_name=${identity.tag}`, '-f', `target_commitish=${identity.candidateSha}`,
+        '-f', `name=${identity.tag} staged candidate`, '-F', 'draft=true', '-F', 'prerelease=false',
+      ]);
+      activeDraft = { id: release.id, tag: release.tag_name, sha: release.target_commitish };
+      return activeDraft;
+    },
+
+    async observeSnapshot(identity, draft = activeDraft, { forceAssets = false } = {}) {
+      try {
+        const release = draft?.id ? hydratedRelease(releaseById(draft.id)) : null;
+        const latestTag = latestCodeTag();
+        const pointerTag = githubPointerTag();
+        const candidate = maybe(() => json('npm', ['view', `${PACKAGE}@candidate-v${identity.version}`, '--json']), null);
+        const exactVersion = maybe(() => json('npm', ['view', `${PACKAGE}@${identity.version}`, '--json']), null);
+        const latestVersion = command('npm', ['view', `${PACKAGE}@latest`, 'version']);
+        const resolvedSha = release && !release.draft ? tagSha(identity.tag, root) : release?.target_commitish || draft?.sha || null;
+        const publicReceipt = release?.assets?.find((asset) => asset.name === 'current-release.json');
+        let publicReceiptExact = false;
+        let publicHostsExact = false;
+          if (publicReceipt) {
+            const value = assetReceipt(publicReceipt);
+            publicReceiptExact = value?.transactionId === transactionIdFor(identity)
+              && value?.version === identity.version
+              && value?.candidateSha === identity.candidateSha
+              && /^[a-f0-9]{64}$/.test(value?.publicationReceiptSha256 || '');
+            publicHostsExact = value?.verdict === 'PASS' && value?.hosts?.verdict === 'PASS'
+              && ['claudeOnly', 'codexOnly', 'dual'].every((mode) => value.hosts?.[mode]?.status === 'PASS'
+                && value.hosts?.[mode]?.doctorExit === 0
+                && value.hosts?.[mode]?.artifactSha256 === identity.packageSha256);
+        }
+        return {
+          npm: {
+            candidateVersion: candidate?.version || exactVersion?.version || null,
+            candidateIntegrity: candidate?.dist?.integrity || exactVersion?.dist?.integrity || null,
+            candidateTagVersion: candidate?.version || null,
+            latestVersion,
+          },
+          github: release ? {
+            tag: release.tag_name,
+            sha: resolvedSha,
+            draft: release.draft === true,
+            published: release.draft === false,
+            latest: latestTag === identity.tag,
+            latestTag,
+            // What releases/latest actually points at — distinct from `latest` (code recency) above.
+            pointerTag,
+            assetsExact: assetsExactFor(release, identity, forceAssets),
+          } : { tag: null, sha: null, draft: false, published: false, latest: false, pointerTag, assetsExact: false },
+          publicReceiptExact,
+          publicHostsExact,
+        };
+      } catch (error) {
+        return { readError: error.message };
+      }
+    },
+
+    async observeNpm(identity) {
+      const candidate = maybe(() => json('npm', ['view', `${PACKAGE}@candidate-v${identity.version}`, '--json']), null);
+      const exactVersion = maybe(() => json('npm', ['view', `${PACKAGE}@${identity.version}`, '--json']), null);
+      return {
+        candidateVersion: candidate?.version || exactVersion?.version || null,
+        candidateIntegrity: candidate?.dist?.integrity || exactVersion?.dist?.integrity || null,
+        candidateTagVersion: candidate?.version || null,
+        latestVersion: command('npm', ['view', `${PACKAGE}@latest`, 'version']),
+      };
+    },
+
+    async appendReceipt(draft, receipt, name) {
+      const anchor = draft || activeDraft;
+      if (!anchor) throw new Error('no draft anchor for transaction receipt');
+      const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'ruvnet-release-receipt-'));
+      const file = path.join(temp, name);
+      try {
+        fs.writeFileSync(file, `${JSON.stringify(receipt, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+        command('gh', ['release', 'upload', anchor.tag, file, '--repo', REPO]);
+      } finally {
+        fs.rmSync(temp, { recursive: true, force: true });
+      }
+    },
+
+    async materializePublicVerificationAggregate({ aggregate }) {
+      const anchor = activeDraft;
+      if (!anchor) throw new Error('no release anchor for public verification aggregate');
+      const release = hydratedRelease(releaseById(anchor.id));
+      const aggregateAsset = Buffer.from(canonicalJson(aggregate));
+      const signatureAsset = Buffer.from(aggregate.signature, 'base64');
+      const expected = {
+        'public-verification-aggregate.json': aggregateAsset,
+        'public-verification-aggregate.sig': signatureAsset,
+      };
+      const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'ruvnet-public-aggregate-'));
+      try {
+        for (const [name, bytes] of Object.entries(expected)) {
+          const existing = release.assets?.find((asset) => asset.name === name);
+          if (existing) {
+            if (!assetBytes(existing).equals(bytes)) throw new Error(`public verification asset conflict: ${name}`);
+            continue;
+          }
+          const file = path.join(temp, name);
+          fs.writeFileSync(file, bytes, { flag: 'wx', mode: 0o600 });
+          command('gh', ['release', 'upload', anchor.tag, file, '--repo', REPO]);
+        }
+        const observed = hydratedRelease(releaseById(anchor.id));
+        for (const [name, bytes] of Object.entries(expected)) {
+          const asset = observed.assets?.find((item) => item.name === name);
+          if (!asset || !assetBytes(asset).equals(bytes)) throw new Error(`public verification asset readback differs: ${name}`);
+        }
+        return {
+          aggregateSha256: aggregate.aggregateSha256,
+          aggregateAssetSha256: sha256(aggregateAsset),
+          signatureAssetSha256: sha256(signatureAsset),
+        };
+      } finally {
+        fs.rmSync(temp, { recursive: true, force: true });
+      }
+    },
+
+    async readReceipt(draft, sequence) {
+      const name = `${RECEIPT_PREFIX}${String(sequence).padStart(4, '0')}.json`;
+      const release = hydratedRelease(releaseById((draft || activeDraft).id));
+      const asset = release.assets?.find((item) => item.name === name);
+      if (!asset) throw new Error(`remote receipt ${name} is missing after upload`);
+      return assetReceipt(asset);
+    },
+
+    async uploadAssets(draft, assets) {
+      const paths = [assets.bundlePath, assets.bundleSignaturePath, assets.bundleDigestPath, assets.packagePath];
+      for (const file of paths) {
+        const release = hydratedRelease(releaseById(draft.id));
+        const existing = release.assets?.find(({ name }) => name === path.basename(file));
+        if (existing) {
+          if (sha256(assetBytes(existing)) !== sha256(fs.readFileSync(file))) {
+            throw new Error(`refusing to replace staged asset with different bytes: ${existing.name}`);
+          }
+          continue;
+        }
+        command('gh', ['release', 'upload', draft.tag, file, '--repo', REPO], {
+          timeout: assetUploadTimeoutMs(fs.statSync(file).size),
+        });
+      }
+    },
+
+    async materializeStagedAssets(draft, identity) {
+      return materializeRemoteAssets(draft, identity);
+    },
+
+    async stageNpm(identity, packagePath) {
+      const existing = maybe(() => command('npm', ['view', `${PACKAGE}@${identity.version}`, 'dist.integrity']), null);
+      if (existing) {
+        if (existing !== identity.packageIntegrity) throw new Error('existing npm version has different immutable bytes');
+        command('npm', ['dist-tag', 'add', `${PACKAGE}@${identity.version}`, `candidate-v${identity.version}`]);
+        return;
+      }
+      command('npm', ['publish', packagePath, '--tag', `candidate-v${identity.version}`], PUBLISH_COMMAND_OPTIONS);
+    },
+
+    async observeNpmCandidate(identity) {
+      const metadata = json('npm', ['view', `${PACKAGE}@candidate-v${identity.version}`, '--json']);
+      return { version: metadata.version, integrity: metadata.dist?.integrity, tag: `candidate-v${identity.version}` };
+    },
+
+    async publishDraftNonLatest(draft) {
+      command('gh', ['api', '-X', 'PATCH', `repos/${REPO}/releases/${draft.id}`, '-F', 'draft=false', '-f', 'make_latest=false']);
+    },
+
+    async observeGithub(identity) {
+      const release = json('gh', ['api', `repos/${REPO}/releases/tags/${identity.tag}`]);
+      // "Is this release the current CODE generation", not "does it hold the latest pointer". Once a
+      // corpus generation takes the pointer — which is the designed steady state — a genuinely
+      // published code release would otherwise start observing itself as no longer latest.
+      const latest = maybe(() => latestCodeTag(), null);
+      return { tag: release.tag_name, sha: tagSha(identity.tag, root), latest: latest === identity.tag };
+    },
+
+    async promoteNpm(identity, expectedPrior) {
+      const current = command('npm', ['view', `${PACKAGE}@latest`, 'version']);
+      if (current !== expectedPrior && current !== identity.version) {
+        throw new Error(`refusing npm promotion: latest is ${current}, expected ${expectedPrior}`);
+      }
+      command('npm', ['dist-tag', 'add', `${PACKAGE}@${identity.version}`, 'latest']);
+    },
+    async observeNpmLatest() {
+      return { version: command('npm', ['view', `${PACKAGE}@latest`, 'version']) };
+    },
+    async makeGithubLatest(draft, identity, expectedPrior) {
+      // The prior-generation check is about the CODE lineage: it exists to catch "someone promoted a
+      // different product generation while this transaction was in flight". A corpus generation
+      // legitimately holding `releases/latest` is NOT that — it is the designed steady state between
+      // code releases — so the comparison is made against the latest CODE release, and the pointer's
+      // own kind is recorded rather than treated as a conflict.
+      const pointer = githubPointerTag();
+      const current = latestCodeTag();
+      if (current !== expectedPrior && current !== identity.tag) {
+        throw new Error(`refusing GitHub promotion: latest code release is ${current}, expected ${expectedPrior}`);
+      }
+      if (isCorpusReleaseTag(pointer)) {
+        process.stdout.write(`[release] promoting over corpus generation ${pointer} — the code bundle carries its own corpus\n`);
+      }
+      command('gh', ['api', '-X', 'PATCH', `repos/${REPO}/releases/${draft.id}`, '-f', 'make_latest=true']);
+    },
+    async observeGithubLatest() {
+      return { tag: latestCodeTag() };
+    },
+    async restoreNpmLatest(prior, expected) {
+      const current = command('npm', ['view', `${PACKAGE}@latest`, 'version']);
+      if (current !== expected) throw new Error(`refusing compensation: npm latest is ${current}, expected ${expected}`);
+      command('npm', ['dist-tag', 'add', `${PACKAGE}@${prior}`, 'latest']);
+    },
+  };
+}

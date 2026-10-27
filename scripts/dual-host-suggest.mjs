@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 
 import { fileURLToPath } from 'node:url';
+import fs from 'node:fs';
 import { hardProblem } from './dual-host-deliberation.mjs';
 import { probeSubscriptionHosts } from './subscription-hosts.mjs';
+import { isDirectInvocation } from '../plugin/scripts/entrypoint.mjs';
 
 const HOSTS = Object.freeze([
   ['claude', 'claude-code'],
@@ -53,6 +55,6 @@ export function main(argv = process.argv.slice(2), {
   return 0;
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+if (isDirectInvocation(import.meta.url)) {
   process.exitCode = main();
 }

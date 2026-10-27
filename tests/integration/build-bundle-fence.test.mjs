@@ -3,12 +3,13 @@
 // (SEC-0010 #4). scripts/build-bundle.mjs has never had this fence tested — see
 // docs adr history + memory `test-coverage-gaps-2026-07-07`.
 //
-// WHY SUBPROCESS, NOT IMPORT: loadPrivateStores() runs at MODULE TOP LEVEL (build-bundle.mjs line
-// 73) and calls process.exit(1) on every fail-closed path. Importing the module in-process would
-// kill the test runner itself. This is a repo-wide pattern (forge-guard.mjs's `main().catch()`,
-// sign-bundle.mjs's unconditional `signBundle()` call, check-indexation.mjs's top-level IIFE all do
-// the same thing) — none of these CLI scripts are in-process-importable; subprocess is the only
-// correct harness, mirroring how tests/integration/install-smoke.mjs already tests bin/install.mjs.
+// WHY SUBPROCESS, NOT IMPORT: this suite tests the CLI contract — exit codes and the exact stderr/
+// stdout a release operator sees. Since Step 5 (2026-09-13) build-bundle.mjs's assembly logic is an
+// importable `assembleBundle` function that only THROWS (tests/unit/assemble-bundle.test.mjs calls it
+// in-process); the process.exit(1) lives solely in the CLI wrapper at the bottom of the file, guarded
+// by the entry-point check. The subprocess harness here is therefore a choice about WHAT is under
+// test (the wrapper's fail-closed behaviour), no longer a necessity, mirroring how
+// tests/integration/install-smoke.mjs tests bin/install.mjs.
 //
 // WHY A CLONED ROOT, NOT node_modules/tmp COPY OF THE WHOLE REPO: build-bundle.mjs computes
 // ROOT = path.dirname(script's own location).."/..", so copying just
@@ -25,8 +26,28 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 
 const REPO_ROOT = path.resolve(import.meta.dirname, '../..');
+
+// Imported under RUVNET_BRAIN_IMPORT_ONLY=1 so the installer main never runs on import.
+process.env.RUVNET_BRAIN_IMPORT_ONLY = '1';
+const { serverDependencies } = await import(path.join(REPO_ROOT, 'bin/install.mjs'));
+const { materializePublicInputs } = await import(path.join(REPO_ROOT, 'scripts/public-inputs.mjs'));
+
+// Step 5 remediation (2026-09-13): an EXTERNAL assets directory must be a SEALED corpus. It carries
+// the public-input selection receipt reconciliation wrote — sealed here with the REAL producer,
+// against tmp/kb (the checkout fixture) — plus the installed updater's configuration (SOURCE.json,
+// one entry per repository store) and the derived-store registry. build-bundle.mjs no longer
+// self-materializes into, or silently defaults, a directory it does not own; an unsealed external
+// directory is rejected (proven in tests/unit/assemble-bundle.test.mjs).
+function sealExternalAssets(assets, stores) {
+  fs.writeFileSync(path.join(assets, 'SOURCE.json'), JSON.stringify({
+    builder: 'rvf-kb-forge', stores: Object.fromEntries(stores.map((store) => [store, { kbName: store }])),
+  }));
+  fs.writeFileSync(path.join(assets, 'public-store-classes.json'), JSON.stringify({ schemaVersion: 1, derived: [] }));
+  materializePublicInputs({ builderRoot: tmp, outDir: assets });
+}
 
 let tmp;
 beforeEach(() => {
@@ -35,9 +56,24 @@ beforeEach(() => {
   fs.mkdirSync(path.join(tmp, 'kb'), { recursive: true });
   fs.mkdirSync(path.join(tmp, 'data'), { recursive: true });
   fs.mkdirSync(path.join(tmp, 'plugin/.claude-plugin'), { recursive: true });
-  fs.copyFileSync(path.join(REPO_ROOT, 'scripts/build-bundle.mjs'), path.join(tmp, 'scripts/build-bundle.mjs'));
-  fs.copyFileSync(path.join(REPO_ROOT, 'scripts/version.mjs'), path.join(tmp, 'scripts/version.mjs'));
-  fs.copyFileSync(path.join(REPO_ROOT, 'kb/zip-extract.mjs'), path.join(tmp, 'kb/zip-extract.mjs'));
+  // THE DEPENDENCY LIST IS DERIVED, NOT HAND-LISTED (2026-08-12).
+  //
+  // This copied build-bundle.mjs plus two siblings named as literals — a second copy of that file's
+  // import graph. Adding ONE import to build-bundle (the derived org-repo count) broke all nine cases
+  // here with `node:internal/modules/esm/resolve`, and the symptom read as "the private-store fence
+  // stopped FATALing" — a packaging failure wearing a security-gate's clothes.
+  //
+  // Third occurrence of this exact class in one session: wireCodexHost hand-listed the MCP server's
+  // deps, the mesh mutation fixture hand-listed the installer's, and this hand-listed build-bundle's.
+  // All three now walk the real imports. `serverDependencies` is generic over any entry file, which
+  // is why it is reused here rather than reimplemented a fourth time.
+  const src = path.join(REPO_ROOT, 'scripts/build-bundle.mjs');
+  fs.copyFileSync(src, path.join(tmp, 'scripts/build-bundle.mjs'));
+  for (const dep of serverDependencies(src)) {
+    const target = path.resolve(path.join(tmp, 'scripts'), dep.spec);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.copyFileSync(dep.from, target);
+  }
   // This suite measures only the private-store fence. The production bundle builder's independent
   // RVF-index gate is covered by rvf-index-audit.test.mjs and build-bundle release tests; using
   // empty placeholder RVFs here cannot exercise the native reader. Keep the dependency present and
@@ -48,16 +84,56 @@ beforeEach(() => {
   fs.writeFileSync(path.join(tmp, 'data/registry.tiers.json'), JSON.stringify({ tiers: {} }));
   // version.mjs's single source of truth — build-bundle.mjs resolves the version tag before the fence.
   fs.writeFileSync(path.join(tmp, 'plugin/.claude-plugin/plugin.json'), JSON.stringify({ version: '0.0.0-test' }));
+  // SOURCE.json is now a required identity surface: the bundle builder rewrites both fields to the
+  // candidate version and must fail before publication if that source surface is absent.
+  fs.writeFileSync(path.join(tmp, 'kb/SOURCE.json'), JSON.stringify({
+    brainVersion: '0.0.0-previous', releaseTag: 'v0.0.0-previous',
+  }));
 });
 afterEach(() => { fs.rmSync(tmp, { recursive: true, force: true }); });
 
-function runBuildBundle(env = {}) {
+function runBuildBundle(env = {}, args = []) {
   // spawnSync (not execFileSync) — execFileSync only returns stdout on a zero exit, and the
   // ALLOW_NO_PRIVATE_FENCE warning is written to stderr on the SUCCESS path via console.warn.
-  const r = spawnSync('node', ['scripts/build-bundle.mjs'], {
+  const r = spawnSync(process.execPath, ['scripts/build-bundle.mjs', ...args], {
     cwd: tmp, env: { ...process.env, ...env }, encoding: 'utf8',
+    timeout: 30_000,
   });
+  expect(r.error, r.stderr || r.stdout).toBeUndefined();
+  expect(r.signal, r.stderr || r.stdout).toBeNull();
   return { code: r.status, stdout: r.stdout || '', stderr: r.stderr || '' };
+}
+
+// These discovery fixtures deliberately omit public sidecars. Partial manifest/README output
+// proves selection only; the same run must refuse to create a publishable archive.
+function expectIncompletePublicBundle(result) {
+  expect(result.code, result.stderr).toBe(1);
+  expect(result.stderr).toMatch(/FATAL.*missing required bundle files/i);
+  expect(result.stderr).toContain('public-repo.big.rvf.idmap.json');
+  expect(fs.existsSync(path.join(tmp, 'dist/ruvnet-brain.zip'))).toBe(false);
+}
+
+function stampGenerationLedger(assets, stores) {
+  const rows = {};
+  for (const store of stores) {
+    const file = `${store}.big.rvf`;
+    const bytes = fs.readFileSync(path.join(assets, file));
+    rows[store] = {
+      file,
+      sha256: crypto.createHash('sha256').update(bytes).digest('hex'),
+      bytes: bytes.length,
+      model: 'fixture-model',
+      dimensions: 384,
+      sourceCommit: 'a'.repeat(40),
+      builtUtc: '2026-08-21T00:00:00.000Z',
+    };
+  }
+  fs.writeFileSync(path.join(assets, 'RVF-GENERATIONS.json'), JSON.stringify({
+    schemaVersion: 1,
+    brainVersion: '0.0.0-test',
+    releaseTag: 'v0.0.0-test',
+    stores: rows,
+  }));
 }
 
 describe('build-bundle.mjs — private-store fence (fail-closed)', () => {
@@ -88,12 +164,14 @@ describe('build-bundle.mjs — private-store fence (fail-closed)', () => {
     expect(r.stderr).toMatch(/no valid "privateStores" array/i);
   });
 
-  it('excludes a named private store from discovery and never surfaces it in the manifest/README', () => {
+  it('excludes a named private store from partial discovery output, then refuses missing public sidecars', () => {
     fs.writeFileSync(path.join(tmp, 'kb/PRIVATE-STORES.json'), JSON.stringify({ privateStores: ['cognitum-seed'] }));
     // Placeholder store files — discoverBuilt() matches by filename only, never opens them.
     fs.writeFileSync(path.join(tmp, 'kb/cognitum-seed.big.rvf'), '');
     fs.writeFileSync(path.join(tmp, 'kb/public-repo.big.rvf'), '');
+    stampGenerationLedger(path.join(tmp, 'kb'), ['cognitum-seed', 'public-repo']);
     const r = runBuildBundle();
+    expectIncompletePublicBundle(r);
     expect(r.stdout).toMatch(/EXCLUDED 1 PRIVATE store\(s\): cognitum-seed/);
     const manifest = JSON.parse(fs.readFileSync(path.join(tmp, 'dist/ruvnet-brain/manifest.json'), 'utf8'));
     const names = manifest.builtRepos.map((b) => b.name.toLowerCase());
@@ -105,6 +183,42 @@ describe('build-bundle.mjs — private-store fence (fail-closed)', () => {
 });
 
 describe('build-bundle.mjs — publishable artifact gate (fail-closed)', () => {
+  it('ignores AppleDouble RVF metadata in partial discovery, then refuses missing public sidecars', () => {
+    const assets = path.join(tmp, 'release-assets');
+    fs.mkdirSync(assets);
+    fs.writeFileSync(path.join(tmp, 'kb/PRIVATE-STORES.json'), JSON.stringify({ privateStores: [] }));
+    fs.writeFileSync(path.join(assets, 'public-repo.big.rvf'), '');
+    fs.writeFileSync(path.join(assets, '._public-repo.big.rvf'), '');
+    stampGenerationLedger(assets, ['public-repo']);
+    sealExternalAssets(assets, ['public-repo']);
+
+    const r = runBuildBundle({}, ['--assets', assets]);
+    expectIncompletePublicBundle(r);
+
+    expect(r.stdout).not.toContain('._public-repo');
+    const manifest = JSON.parse(fs.readFileSync(path.join(tmp, 'dist/ruvnet-brain/manifest.json'), 'utf8'));
+    expect(manifest.builtRepos.map(({ name }) => name)).toEqual(['public-repo']);
+  });
+
+  it('selects external assets through the source private fence, then refuses missing public sidecars', () => {
+    const assets = path.join(tmp, 'release-assets');
+    fs.mkdirSync(assets);
+    fs.writeFileSync(path.join(tmp, 'kb/PRIVATE-STORES.json'), JSON.stringify({ privateStores: ['private-repo'] }));
+    fs.writeFileSync(path.join(assets, 'private-repo.big.rvf'), '');
+    fs.writeFileSync(path.join(assets, 'public-repo.big.rvf'), '');
+    stampGenerationLedger(assets, ['private-repo', 'public-repo']);
+    sealExternalAssets(assets, ['private-repo', 'public-repo']);
+
+    const r = runBuildBundle({}, ['--assets', assets]);
+    expectIncompletePublicBundle(r);
+
+    expect(r.stdout).toMatch(/EXCLUDED 1 PRIVATE store\(s\): private-repo/);
+    const manifest = JSON.parse(fs.readFileSync(path.join(tmp, 'dist/ruvnet-brain/manifest.json'), 'utf8'));
+    expect(manifest.builtRepos.map(({ name }) => name)).toEqual(['public-repo']);
+    expect(JSON.parse(fs.readFileSync(path.join(tmp, 'dist/ruvnet-brain/PRIVATE-STORES.json'), 'utf8')))
+      .toEqual({ privateStores: ['private-repo'] });
+  });
+
   it('FATALs when discovery yields zero public RVFs, including a private-only KB', () => {
     fs.writeFileSync(path.join(tmp, 'kb/PRIVATE-STORES.json'), JSON.stringify({ privateStores: ['private-repo'] }));
     fs.writeFileSync(path.join(tmp, 'kb/private-repo.big.rvf'), '');
@@ -119,6 +233,7 @@ describe('build-bundle.mjs — publishable artifact gate (fail-closed)', () => {
   it('FATALs instead of publishing a ZIP when any required bundle file is missing', () => {
     fs.writeFileSync(path.join(tmp, 'kb/PRIVATE-STORES.json'), JSON.stringify({ privateStores: [] }));
     fs.writeFileSync(path.join(tmp, 'kb/public-repo.big.rvf'), '');
+    stampGenerationLedger(path.join(tmp, 'kb'), ['public-repo']);
 
     const r = runBuildBundle();
 

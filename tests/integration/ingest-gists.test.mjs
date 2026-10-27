@@ -14,23 +14,37 @@
 // this suite has hit (prove.mjs, brain-grade-groundtruth.mjs, eval-brain.mjs all need a live ONNX+built
 // .rvf; this one does not).
 //
-// LIVE-REPRODUCED FINDING (not fixed here, same norm as every other gap file in this suite — flagged,
-// not silently patched): a gist file with `truncated: true` and a `raw_url` is NEVER actually fetched
-// from that raw_url. `body = f.truncated && f.raw_url ? '' : (f.content || '')` unconditionally sets
-// body to the EMPTY STRING for any truncated file, so it falls into `if (!body.trim()) { skipped++;
-// continue; }` and is silently dropped — the exact case the `raw_url` field exists to handle. A large
-// gist (>1MB, the GitHub truncation threshold) contributes ZERO of its real content to the KB, with no
-// error and no signal beyond the aggregate "N skipped" count in stdout. Reproduced for real below.
+// The ingest must fail closed: a truncated or failed gist cannot produce a receipt-only or partial
+// corpus that looks searchable. The command is bounded per gist so the nightly cannot wedge forever.
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { paragraphChunks, provenanceBanner } from '../../scripts/gist-receipts.mjs';
 
 const REPO_ROOT = path.resolve(import.meta.dirname, '../..');
 
 let tmp, binDir, logFile, fixtures;
+
+// Step 2 (2026-09-13): ingest-gists.mjs's real content path routes through the canonical
+// gist-receipts.mjs pipeline, so this hermetic fixture needs that pipeline's full static-import closure
+// copied alongside it. The closure is DERIVED with serverDependencies() (bin/install.mjs), never listed:
+// the hand-written list this replaced missed scripts/transient-gh.mjs from v4.7.16 and
+// plugin/scripts/entrypoint.mjs from 4.7.21, and every subprocess case died on ERR_MODULE_NOT_FOUND.
+process.env.RUVNET_BRAIN_IMPORT_ONLY = '1';
+const { serverDependencies } = await import(new URL('../../bin/install.mjs', import.meta.url).href);
+const ENTRY = path.join(REPO_ROOT, 'scripts', 'ingest-gists.mjs');
+// plugin.json is DATA that scripts/version.mjs reads at runtime (PLUGIN_JSON), not an import, so the
+// import walk cannot see it; it is the one file named here.
+const DATA_FILES = ['plugin/.claude-plugin/plugin.json'];
+
+function copyIntoFixture(from) {
+  const destination = path.join(tmp, path.relative(REPO_ROOT, from));
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  fs.copyFileSync(from, destination);
+}
 
 beforeEach(() => {
   // realpathSync: macOS's os.tmpdir() resolves through a /tmp -> /private/tmp symlink; the child
@@ -38,7 +52,9 @@ beforeEach(() => {
   tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ingest-gists-')));
   fs.mkdirSync(path.join(tmp, 'scripts'), { recursive: true });
   fs.mkdirSync(path.join(tmp, 'kb'), { recursive: true });
-  fs.copyFileSync(path.join(REPO_ROOT, 'scripts/ingest-gists.mjs'), path.join(tmp, 'scripts/ingest-gists.mjs'));
+  copyIntoFixture(ENTRY);
+  for (const dep of serverDependencies(ENTRY)) copyIntoFixture(dep.from);
+  for (const relative of DATA_FILES) copyIntoFixture(path.join(REPO_ROOT, relative));
 
   binDir = path.join(tmp, 'stub-bin');
   fs.mkdirSync(binDir);
@@ -77,12 +93,14 @@ function writeFixture(name, obj) {
   fs.writeFileSync(path.join(fixtures, name), JSON.stringify(obj));
 }
 
-function runGists(args, { forceFail = false, env: extraEnv = {} } = {}) {
+function runGists(args, { forceFail = false, prepare = true, env: extraEnv = {} } = {}) {
+  if (prepare && !args.includes('--index-only') && !args.includes('--dry-run')) prepareGitFixtures();
   const r = spawnSync(process.execPath, ['scripts/ingest-gists.mjs', ...args], {
     cwd: tmp,
     env: {
       ...process.env,
       PATH: `${binDir}:${process.env.PATH}`,
+      REAL_GIT: execFileSync('which', ['git'], { encoding: 'utf8' }).trim(),
       LOGFILE: logFile,
       FIXTURES: fixtures,
       GH_FAIL: forceFail ? '1' : '',
@@ -98,12 +116,72 @@ function runGists(args, { forceFail = false, env: extraEnv = {} } = {}) {
   };
 }
 
+function prepareGitFixtures() {
+  const listPath = path.join(fixtures, 'list.json');
+  const list = JSON.parse(fs.readFileSync(listPath, 'utf8'));
+  const gitRoot = path.join(fixtures, 'git');
+  fs.mkdirSync(gitRoot, { recursive: true });
+  const gitShim = [
+    '#!/usr/bin/env node',
+    "const { spawnSync } = require('node:child_process');",
+    "const path = require('node:path');",
+    "const args = process.argv.slice(2);",
+    "const index = args.findIndex((arg) => /^https:\\/\\/gist\\.github\\.com\\/[a-f0-9]{20,64}\\.git$/i.test(arg));",
+    "if (index >= 0) { const id = args[index].match(/\\/([a-f0-9]{20,64})\\.git$/i)[1]; args[index] = path.join(process.env.FIXTURES, 'git', `${id}.git`); }",
+    "const input = []; process.stdin.on('data', (chunk) => input.push(chunk)); process.stdin.on('end', () => {",
+    "  const result = spawnSync(process.env.REAL_GIT, args, { cwd: process.cwd(), env: process.env, input: Buffer.concat(input), encoding: null });",
+    "  if (result.stdout) process.stdout.write(result.stdout); if (result.stderr) process.stderr.write(result.stderr);",
+    "  process.exit(result.status ?? 1);",
+    "});",
+    '',
+  ].join('\n');
+  fs.writeFileSync(path.join(binDir, 'git'), gitShim);
+  fs.chmodSync(path.join(binDir, 'git'), 0o755);
+
+  for (const gist of list) {
+    const detail = JSON.parse(fs.readFileSync(path.join(fixtures, 'gists', `${gist.id}.json`), 'utf8'));
+    const work = path.join(fixtures, 'git-work', gist.id);
+    const bare = path.join(gitRoot, `${gist.id}.git`);
+    fs.mkdirSync(work, { recursive: true });
+    execFileSync('git', ['init', '-q', work]);
+    execFileSync('git', ['-C', work, 'config', 'user.name', 'Gist Fixture']);
+    execFileSync('git', ['-C', work, 'config', 'user.email', 'fixture@example.invalid']);
+    const fullFiles = Object.entries(detail.files || {});
+    for (const [filename, file] of fullFiles) {
+      const body = file.truncated ? 'The full, untruncated body.' : String(file.content || '');
+      const destination = path.join(work, filename);
+      fs.mkdirSync(path.dirname(destination), { recursive: true });
+      fs.writeFileSync(destination, body);
+    }
+    execFileSync('git', ['-C', work, 'add', '.']);
+    execFileSync('git', ['-C', work, 'commit', '-qm', 'fixture gist snapshot']);
+    execFileSync('git', ['clone', '-q', '--bare', work, bare]);
+    gist.truncated = false;
+    gist.files = Object.fromEntries(fullFiles.map(([filename, file]) => {
+      const blob = execFileSync('git', ['--git-dir', bare, 'rev-parse', `HEAD:${filename}`], { encoding: 'utf8' }).trim();
+      const body = file.truncated ? 'The full, untruncated body.' : String(file.content || '');
+      return [filename, { filename, raw_url: `https://gist.githubusercontent.com/ruvnet/${gist.id}/raw/${blob}/${filename}`,
+        size: Buffer.byteLength(body), type: file.type || 'text/plain', language: file.language || 'Text' }];
+    }));
+  }
+  fs.writeFileSync(listPath, JSON.stringify(list));
+}
+
+// Real gist ids are 32-char lowercase hex (captureGistSources now validates this, matching every
+// other gist producer in this repo). Each id below is its old short fixture id repeated to 32 hex
+// chars, so `.slice(0, 8)` — the passage-path truncation — reproduces the EXACT original 8-char
+// prefix and every path assertion below still reads the same.
+const GIST_A = 'abc12345'.repeat(4);
+const GIST_B = 'def67890'.repeat(4);
+const GIST_C = '7bad5eed'.repeat(4);
+
 const ONE_GIST = [{
-  id: 'abc12345', updated_at: '2026-07-01T00:00:00Z', description: 'Flywheel notes',
+  id: GIST_A, updated_at: '2026-07-01T00:00:00Z', description: 'Flywheel notes',
   files: { 'flywheel.md': {} },
 }];
 const ONE_GIST_FULL = {
-  id: 'abc12345', updated_at: '2026-07-01T00:00:00Z', description: 'Flywheel notes',
+  id: GIST_A, updated_at: '2026-07-01T00:00:00Z', description: 'Flywheel notes',
+  history: [{ version: 'c'.repeat(40) }],
   files: { 'flywheel.md': { content: 'Some flywheel content here.', truncated: false } },
 };
 
@@ -135,16 +213,19 @@ onPosix('ingest-gists.mjs — --dry-run', () => {
 });
 
 onPosix('ingest-gists.mjs — real ingest, banner + chunking', () => {
-  it('writes passages.jsonl with the provenance banner prepended to every passage, plus meta.json and the cache', () => {
+  it('writes passages.jsonl with the provenance banner prepended to every passage, plus meta.json, the receipt, and the local capture cache', () => {
     writeFixture('list.json', ONE_GIST);
-    writeFixture('gists/abc12345.json', ONE_GIST_FULL);
+    writeFixture(`gists/${GIST_A}.json`, ONE_GIST_FULL);
     const r = runGists([]);
-    expect(r.code).toBe(0);
+    expect(r.code, r.stderr).toBe(0);
 
     const passages = fs.readFileSync(path.join(tmp, 'kb/ruv-gists.passages.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
     expect(passages).toHaveLength(1);
     expect(passages[0].path).toBe('abc12345/flywheel.md'); // single chunk: no `#N` suffix
-    expect(passages[0].text).toMatch(/^SOURCE: GitHub gist by @ruvnet — "Flywheel notes"/);
+    // The canonical renderer (gist-receipts.mjs's renderGistPassages, the SAME implementation every
+    // other gist producer in this repo now uses) titles the banner from the FILENAME -- the only
+    // field the receipt schema actually carries -- not the gist's free-text description.
+    expect(passages[0].text).toMatch(/^SOURCE: GitHub gist by @ruvnet — "flywheel\.md"/);
     expect(passages[0].text).toMatch(/GIST STATUS: rUv's own notes/);
     expect(passages[0].text).toMatch(/Some flywheel content here\.$/);
 
@@ -152,11 +233,37 @@ onPosix('ingest-gists.mjs — real ingest, banner + chunking', () => {
     expect(meta.entries['0'].path).toBe('abc12345/flywheel.md');
     expect(meta.entries['0'].kind).toBe('doc');
 
-    const cache = JSON.parse(fs.readFileSync(path.join(tmp, 'kb/.ruv-gists.cache.json'), 'utf8'));
-    expect(cache).toEqual({ abc12345: '2026-07-01T00:00:00Z' });
+    // The ONE canonical schema-3 receipt -- not a private ad hoc cache file.
+    const receipt = JSON.parse(fs.readFileSync(path.join(tmp, 'kb/ruv-gists.sources.json'), 'utf8'));
+    expect(receipt.schemaVersion).toBe(3);
+    expect(receipt.gists[GIST_A]).toMatchObject({ updatedAt: '2026-07-01T00:00:00Z', complete: true });
+    expect(receipt.passagesSha256).toMatch(/^[a-f0-9]{64}$/);
+    // The local, never-published capture cache -- a resumable optimization, not publication evidence.
+    const cache = JSON.parse(fs.readFileSync(path.join(tmp, 'kb/.ruv-gists.capture-cache.json'), 'utf8'));
+    expect(cache.gists[GIST_A].files[0].body).toBe('Some flywheel content here.');
 
     // writeIndex also runs at the end of a real ingest, not just --index-only.
     expect(fs.existsSync(path.join(tmp, 'docs/RUV-GISTS.md'))).toBe(true);
+  });
+
+  it('escapes Unicode line/paragraph separators so JSONL remains one physical line per passage', () => {
+    // The canonical renderer (gist-receipts.mjs's renderGistPassages -- the SAME jsonLine escaping
+    // every gist producer in this repo now shares) ESCAPES U+2028/U+2029 to the literal `\u2028`/
+    // `\u2029` sequence at serialization time, rather than normalizing them to `\n` in the passage
+    // text itself (the old, ingest-gists-only behavior). Both fixes solve the same JSONL-integrity
+    // problem; only one implementation exists now, so this file's expectation follows it.
+    writeFixture('list.json', ONE_GIST);
+    writeFixture(`gists/${GIST_A}.json`, {
+      ...ONE_GIST_FULL,
+      files: { 'flywheel.md': { content: 'before\u2028after\u2029end', truncated: false } },
+    });
+    const r = runGists([]);
+    expect(r.code, r.stderr).toBe(0);
+    const raw = fs.readFileSync(path.join(tmp, 'kb/ruv-gists.passages.jsonl'), 'utf8');
+    expect(raw.split('\n').filter(Boolean)).toHaveLength(1);
+    expect(raw).toContain('\\u2028');
+    expect(raw).toContain('\\u2029');
+    expect(JSON.parse(raw).text).toMatch(/before\u2028after\u2029end$/);
   });
 
   it('forwards --owner into the list call instead of the "ruvnet" default', () => {
@@ -168,40 +275,68 @@ onPosix('ingest-gists.mjs — real ingest, banner + chunking', () => {
 
 onPosix('ingest-gists.mjs — code files are silently excluded by design (TEXT_EXT), counted as neither indexed nor skipped', () => {
   it('indexes only the .md file in a gist that also contains a .mjs file', () => {
-    writeFixture('list.json', [{ id: 'def67890', updated_at: '2026-07-02T00:00:00Z', description: 'Mixed gist', files: { 'run.mjs': {}, 'notes.md': {} } }]);
-    writeFixture('gists/def67890.json', {
-      id: 'def67890', updated_at: '2026-07-02T00:00:00Z', description: 'Mixed gist',
+    writeFixture('list.json', [{ id: GIST_B, updated_at: '2026-07-02T00:00:00Z', description: 'Mixed gist', files: { 'run.mjs': {}, 'notes.md': {} } }]);
+    writeFixture(`gists/${GIST_B}.json`, {
+      id: GIST_B, updated_at: '2026-07-02T00:00:00Z', description: 'Mixed gist',
+      history: [{ version: 'd'.repeat(40) }],
       files: {
         'run.mjs': { content: 'console.log(1)', truncated: false },
         'notes.md': { content: 'Prose notes.', truncated: false },
       },
     });
     const r = runGists([]);
-    expect(r.code).toBe(0);
-    expect(r.stdout).toMatch(/1 text files/); // not 2 — run.mjs never even reaches the skip counter
+    expect(r.code, r.stderr).toBe(0);
+    expect(r.stdout).toMatch(/fetched 1 fresh/); // not 2 — run.mjs never even reaches the skip counter
     const passages = fs.readFileSync(path.join(tmp, 'kb/ruv-gists.passages.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
     expect(passages).toHaveLength(1);
     expect(passages[0].path).toBe('def67890/notes.md');
   });
 });
 
-onPosix('ingest-gists.mjs — LIVE BUG: truncated content is silently dropped, never fetched from raw_url', () => {
-  it('a truncated file with a raw_url present still produces ZERO passages for that file', () => {
-    writeFixture('list.json', [{ id: 'trunc001', updated_at: '2026-07-03T00:00:00Z', description: 'Huge gist', files: { 'big-log.md': {} } }]);
-    writeFixture('gists/trunc001.json', {
-      id: 'trunc001', updated_at: '2026-07-03T00:00:00Z', description: 'Huge gist',
-      files: { 'big-log.md': { truncated: true, raw_url: 'https://gist.githubusercontent.com/ruvnet/trunc001/raw/big-log.md', content: '' } },
+onPosix('ingest-gists.mjs — truncated content is fetched via raw_url, not silently dropped', () => {
+  // BEHAVIOR CHANGE (Step 2, 2026-09-13): the OLD ad hoc ingest loop treated ANY truncated file as
+  // unusable and failed the whole run rather than fetching it. Routing through the canonical
+  // captureGistSources/defaultFetchRaw transport (the same one buildGistAggregate and
+  // corpus-reconcile.mjs use) fixes that: a truncated file's raw_url is fetched for real, exactly
+  // like every other gist producer in this repo already does. A tiny local HTTP server stands in
+  // for gist.githubusercontent.com so this stays hermetic.
+  //
+  // Deliberately run as a genuinely SEPARATE OS process (spawn), never an in-process http.Server:
+  // runGists() below drives the real ingest via spawnSync, which blocks this test process's entire
+  // event loop for the duration of the child run. An in-process server could never service the
+  // child's raw_url request while frozen like that -- exactly the deadlock this was first written
+  // against and hit immediately.
+  let server;
+  let rawBase;
+  beforeEach(async () => {
+    server = spawn(process.execPath, ['-e', [
+      "const http = require('node:http');",
+      "const s = http.createServer((req, res) => { res.writeHead(200, {'content-type':'text/plain'}); res.end('The full, untruncated body.'); });",
+      "s.listen(0, '127.0.0.1', () => { process.stdout.write(String(s.address().port)); });",
+    ].join('\n')], { stdio: ['ignore', 'pipe', 'ignore'] });
+    const port = await new Promise((resolve) => { server.stdout.once('data', (chunk) => resolve(String(chunk).trim())); });
+    rawBase = `http://127.0.0.1:${port}`;
+  });
+  afterEach(() => {
+    server.kill();
+  });
+
+  it('fetches the raw_url for a truncated file and ingests its full content', () => {
+    // The list endpoint's file entries ALSO carry raw_url/size/type/language for real -- the exact
+    // per-file identity captureGistSources cross-checks the detail fetch against.
+    writeFixture('list.json', [{ id: GIST_C, updated_at: '2026-07-03T00:00:00Z', description: 'Huge gist',
+      files: { 'big-log.md': { filename: 'big-log.md', raw_url: `${rawBase}/big-log.md`, size: 999999, type: 'text/plain', language: 'Markdown' } } }]);
+    writeFixture(`gists/${GIST_C}.json`, {
+      id: GIST_C, updated_at: '2026-07-03T00:00:00Z', description: 'Huge gist',
+      history: [{ version: 'e'.repeat(40) }],
+      files: { 'big-log.md': { filename: 'big-log.md', raw_url: `${rawBase}/big-log.md`, size: 999999, type: 'text/plain', language: 'Markdown',
+        truncated: true, content: '' } },
     });
     const r = runGists([]);
-    expect(r.code).toBe(0);
-    expect(r.stdout).toMatch(/1 skipped/); // the ONLY signal this ever happened is an aggregate count
-    // passages.jsonl is still written (main() has no early-return here) but with ZERO real content —
-    // the truncated file's text never made it in, despite raw_url being available on the fixture.
-    const passages = fs.readFileSync(path.join(tmp, 'kb/ruv-gists.passages.jsonl'), 'utf8').trim();
-    expect(passages).toBe('');
-    // Proves the bug: `gh()` (and therefore the stub) was NEVER called a second time for the raw_url,
-    // even though one exists on the fixture — only the original per-gist fetch call is logged.
-    expect(r.calls.filter((c) => c.includes('trunc001'))).toHaveLength(1);
+    expect(r.code, r.stderr).toBe(0);
+    const passages = fs.readFileSync(path.join(tmp, 'kb/ruv-gists.passages.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    expect(passages).toHaveLength(1);
+    expect(passages[0].text).toMatch(/The full, untruncated body\.$/);
   });
 });
 
@@ -220,13 +355,55 @@ onPosix('ingest-gists.mjs — gh failure falls back to the public API; only a de
   });
 });
 
-describe.todo('ingest-gists.mjs — remaining gaps blocked on module-private functions (no export seam; flagged, not applied per this suite\'s sign-off norm)', () => {
-  it.todo('chunk(text) never splits WITHIN a single paragraph larger than `size` (3200) — one oversized paragraph becomes one oversized chunk, no hard cap enforced');
-  it.todo('chunk(text) collapses 3+ consecutive newlines the same as exactly 2 (the `/\\n\\n+/` split regex)');
-  it.todo('chunk("") and chunk(whitespace-only) both return [] rather than [""]');
-  it.todo('banner(g, file) falls back to the filename when g.description is empty/missing');
-  it.todo('banner(g, file) prints the literal string "undefined" for the updated date when g.updated_at is missing (g.updated_at?.slice(0,10) on undefined) — a real formatting gap, not just a hypothetical');
-  it.todo('listGists\'s pages.flat() defensive handling: a --slurp response shaped as an array-of-pages (nested one level) flattens to the same result as an already-flat array');
-  it.todo('the incremental "nothing to do" short-circuit (unchanged gists AND an existing passages.jsonl) only fires on a SECOND run — requires seeding kb/ruv-gists.passages.jsonl from a prior real run first, not just a fresh tmpdir');
-  it.todo('--dry-run\'s "… and N more" truncation message when more than 20 gists have changed');
+// The old TODOs referred to private chunk/banner functions removed by pipeline consolidation.
+// Exercise their exported canonical replacements and the actual CLI paths instead.
+onPosix('ingest-gists remaining boundary cases', () => {
+  it('preserves an oversized paragraph without dropping source text', () => {
+    const source = 'vector-storage '.repeat(500);
+    expect(paragraphChunks(source).join('\n\n')).toBe(source);
+  });
+  it('normalizes paragraph separators consistently', () => {
+    expect(paragraphChunks('first\n\n\n\nsecond')).toEqual(paragraphChunks('first\n\nsecond'));
+  });
+  it('does not create searchable passages from blank bodies', () => {
+    expect(paragraphChunks('')).toEqual([]);
+    expect(paragraphChunks('  \n\n  ')).toEqual([]);
+  });
+  it('uses the filename in provenance even with no gist description', () => {
+    const banner = provenanceBanner({ owner: 'ruvnet', gistId: GIST_A, filename: 'notes.md', updatedAt: '2026-07-01T00:00:00Z' });
+    expect(banner).toContain('"notes.md"');
+    expect(banner).toContain('may describe PROPOSED or UNRELEASED work');
+  });
+  it('rejects a missing provenance date instead of printing undefined', () => {
+    expect(() => provenanceBanner({ owner: 'ruvnet', gistId: GIST_A, filename: 'notes.md' })).toThrow();
+  });
+  it('produces the same index from nested list pages and a flat response', () => {
+    writeFixture('list.json', [ONE_GIST]);
+    expect(runGists(['--index-only']).code).toBe(0);
+    const index = fs.readFileSync(path.join(tmp, 'docs/RUV-GISTS.md'), 'utf8');
+    writeFixture('list.json', ONE_GIST);
+    expect(runGists(['--index-only']).code).toBe(0);
+    expect(fs.readFileSync(path.join(tmp, 'docs/RUV-GISTS.md'), 'utf8')).toBe(index);
+  });
+  it('leaves the real previous output unchanged on a second unchanged run', () => {
+    writeFixture('list.json', ONE_GIST);
+    writeFixture(`gists/${GIST_A}.json`, ONE_GIST_FULL);
+    expect(runGists([]).code).toBe(0);
+    const file = path.join(tmp, 'kb/ruv-gists.passages.jsonl');
+    const before = fs.readFileSync(file);
+    const second = runGists([], { prepare: false });
+    expect(second.code).toBe(0);
+    expect(second.stdout).toContain('nothing to do');
+    expect(fs.readFileSync(file)).toEqual(before);
+  });
+  it('limits a large dry-run listing without writing corpus output', () => {
+    writeFixture('list.json', Array.from({ length: 23 }, (_, i) => ({
+      id: String(i + 1).padStart(32, '0'), updated_at: '2026-07-01T00:00:00Z', files: { [`entry-${i}.md`]: {} },
+    })));
+    const result = runGists(['--dry-run']);
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain('… and 3 more');
+    expect((result.stdout.match(/entry-\d+\.md/g) || [])).toHaveLength(20);
+    expect(fs.existsSync(path.join(tmp, 'kb/ruv-gists.passages.jsonl'))).toBe(false);
+  });
 });

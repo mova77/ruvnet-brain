@@ -28,12 +28,87 @@
 
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { isDirectInvocation } from './entrypoint.mjs';
 
-/** Parse the raw stdin payload into the hook event object, or null if it isn't valid JSON. */
+// ── GROK CLI PAYLOADS (4.5) ──────────────────────────────────────────────────────────────────────
+//
+// Grok CLI runs Claude-format hooks (its docs: ~/.grok/docs/user-guide/10-hooks.md, "Hook Locations"
+// and "Tool Name Aliases"), but its payload is not Claude's. Captured from grok 1.0.13
+// (tests/fixtures/hook-payloads/grok/):
+//   · event names are snake_case: hook_event_name "pre_tool_use", "stop", "user_prompt_submit";
+//   · tool names are Grok's own: the measured file tool is `write` (docs also name `search_replace`,
+//     and `run_terminal_command` / `run_terminal_cmd` for the shell);
+//   · camelCase fields (hookEventName, toolName, toolInput, toolResult, stopHookActive,
+//     lastAssistantMessage) with snake_case duplicates for SOME of them only — the Stop payload has no
+//     `stop_hook_active` and no `last_assistant_message` at all.
+// A Grok matcher written with Claude names still fires (Grok aliases Write→its tool in the MATCHER), but
+// the payload keeps the native name — so every policy that compared tool_name to "Write" saw "write" and
+// silently allowed. Normalising HERE, in the one parser, means every consumer reads Claude's shape.
+// Only a payload that is recognisably Grok's is rewritten; a Claude or Codex payload comes back untouched.
+export const GROK_TOOL_ALIASES = Object.freeze({
+  write: 'Write', search_replace: 'Edit', edit: 'Edit', multi_edit: 'MultiEdit',
+  run_terminal_command: 'Bash', run_terminal_cmd: 'Bash', read_file: 'Read', grep: 'Grep',
+  list_dir: 'Glob', web_search: 'WebSearch', web_fetch: 'WebFetch', spawn_subagent: 'Task', task: 'Task',
+});
+
+/** True for a payload in Grok's shape (camelCase envelope, or a snake_case lowercase event name). */
+export function isGrokEvent(ev) {
+  if (!ev || typeof ev !== 'object') return false;
+  if (typeof ev.hookEventName === 'string') return true;
+  return typeof ev.hook_event_name === 'string' && /^[a-z]+(?:_[a-z]+)+$|^stop$/.test(ev.hook_event_name);
+}
+
+const pascalEvent = (e) => String(e).split('_').filter(Boolean).map((x) => x[0].toUpperCase() + x.slice(1)).join('');
+
+/** Claude's tool name for a host tool name (Grok's `write` → `Write`); unknown names pass through. */
+export function canonicalToolName(name) {
+  const s = typeof name === 'string' ? name : '';
+  return Object.prototype.hasOwnProperty.call(GROK_TOOL_ALIASES, s) ? GROK_TOOL_ALIASES[s] : s;
+}
+
+/**
+ * Is this a FILE-WRITE tool, on any host? Case-insensitive, so a host that spells Write in another case
+ * (Grok's `write`) can never walk past a write guard again. apply_patch is Codex's raw name.
+ */
+const WRITE_TOOLS = new Set(['write', 'edit', 'multiedit', 'multi_edit', 'notebookedit', 'search_replace', 'apply_patch']);
+export function isWriteTool(name) {
+  return typeof name === 'string' && WRITE_TOOLS.has(name.toLowerCase());
+}
+
+/** A Claude-shaped copy of a Grok payload; any other payload is returned as-is (same object). */
+export function normalizeHostEvent(ev) {
+  if (!isGrokEvent(ev)) return ev;
+  const out = { ...ev };
+  const set = (snake, camel) => { if (out[snake] === undefined && ev[camel] !== undefined) out[snake] = ev[camel]; };
+  out.hook_event_name = pascalEvent(ev.hook_event_name || ev.hookEventName || '');
+  set('session_id', 'sessionId');
+  set('transcript_path', 'transcriptPath');
+  set('permission_mode', 'permissionMode');
+  set('tool_input', 'toolInput');
+  set('tool_response', 'toolResult');
+  set('tool_use_id', 'toolUseId');
+  set('stop_hook_active', 'stopHookActive');
+  set('last_assistant_message', 'lastAssistantMessage');
+  const native = typeof ev.tool_name === 'string' ? ev.tool_name : (typeof ev.toolName === 'string' ? ev.toolName : undefined);
+  if (native !== undefined) {
+    out.tool_name = canonicalToolName(native);
+    if (out.tool_name !== native) out.host_tool_name = native;
+  }
+  out.host = 'grok';
+  return out;
+}
+
+/** The raw payload TEXT, rewritten to Claude's shape only when it is a Grok payload (else unchanged bytes). */
+export function normalizePayloadText(raw) {
+  const ev = (() => { try { const j = JSON.parse(raw); return j && typeof j === 'object' ? j : null; } catch { return null; } })();
+  return ev && isGrokEvent(ev) ? JSON.stringify(normalizeHostEvent(ev)) : raw;
+}
+
+/** Parse the raw stdin payload into the hook event object (Claude-shaped), or null if it isn't valid JSON. */
 export function parseHookEvent(raw) {
   try {
     const j = JSON.parse(raw);
-    return j && typeof j === 'object' ? j : null;
+    return j && typeof j === 'object' ? normalizeHostEvent(j) : null;
   } catch {
     return null;
   }
@@ -96,9 +171,24 @@ export function readStdinBounded({ maxBytes = 65536, idleMs = 50, emptyMs = 250 
   });
 }
 
+/**
+ * The Stop-hook payload with its provenance, shared by every Stop gate (was a verbatim copy in
+ * continuation-gate and grounding-turn-gate). Three sources, treated differently by callers:
+ * 'tty' (run bare, never force), 'unreadable' (read/parse failed — fs.readFileSync(0) throws EAGAIN
+ * intermittently on macOS; laundering that into {} would read as a fresh stop), 'stdin' (parsed — the
+ * only source allowed to force). ADR-043.
+ */
+export async function readStopHookInput() {
+  if (process.stdin.isTTY) return { __source: 'tty' };
+  try {
+    const raw = (await readStdinBounded()).toString('utf8');
+    return { ...normalizeHostEvent(JSON.parse(raw || '{}')), __source: 'stdin' };
+  } catch { return { __source: 'unreadable' }; }
+}
+
 /** The tool being invoked ("Bash", "Write", …), or "" if absent. */
 export function toolName(ev) {
-  return ev && typeof ev.tool_name === 'string' ? ev.tool_name : '';
+  return ev && typeof ev.tool_name === 'string' ? canonicalToolName(ev.tool_name) : '';
 }
 
 /**
@@ -126,6 +216,60 @@ export function rawToolResponse(ev) {
   if (!ev || typeof ev !== 'object' || !('tool_response' in ev)) return null;
   return ev.tool_response;
 }
+
+// ── HARNESS-GENERATED PROMPT DETECTION (H2) ─────────────────────────────────────────────────────
+//
+// WHY THIS LIVES HERE, and not only in scripts/correction-detect.mjs where it started. Background
+// task notifications, slash-command scaffolding, and other harness-authored bookkeeping arrive on
+// UserPromptSubmit exactly like real user text — wrapped in tags such as <task-notification>,
+// <local-command-caveat>, <command-name>, <local-command-stdout>, and <system-reminder>. None of
+// that is something a human typed, but before this fix every UserPromptSubmit consumer that reads
+// `prompt`/`user_prompt`/`input` reacted to it as if it were a real prompt: grounding-turn-mark.mjs
+// could arm the Stop-time grounding gate off a harness message that happens to mention a rUv term,
+// unprompted-runtime.mjs's producers could fire advisories at a background notification, and
+// capacity-aware-parallel-work.mjs could recommend a parallel-work fan-out for text nobody wrote.
+// scripts/correction-detect.mjs already carried the exact regex list needed to recognise these
+// (HARNESS_TEMPLATES, built from live corpus evidence — see that file's header for the measured
+// 29%-of-holdout-pool finding that justified it) but as a private, unexported-to-this-purpose copy
+// nothing else could reuse. This is now the ONE owner; correction-detect.mjs re-exports its old name
+// from here instead of keeping its own literal array (tests/unit/hook-input-harness.test.mjs proves
+// the two never drift).
+export const HARNESS_GENERATED_PATTERNS = [
+  /\[Your previous response/i,
+  /\[Request interrupted/i,
+  /<\/?system-reminder>/i,
+  /<\/?(?:command-name|command-message|command-args|local-command-stdout|local-command-stderr|local-command-caveat|task-notification|function_results|function_calls|budget)\b/i,
+  /^\s*Caveat:/i,
+  /Base directory for this skill:/i,
+  /This session is being continued from a previous conversation/i,
+  /^\s*#\s*claudeMd\b/im,
+  /\[INTELLIGENCE\]/i,
+];
+
+/** True when `promptText` is harness-authored bookkeeping rather than something a user typed. */
+export function isHarnessGenerated(promptText) {
+  const text = typeof promptText === 'string' ? promptText : String(promptText ?? '');
+  if (!text) return false;
+  return HARNESS_GENERATED_PATTERNS.some((re) => re.test(text));
+}
+
+/**
+ * The bash-portable EQUIVALENT of isHarnessGenerated(), for ground-ruvnet.sh — a hot, every-prompt
+ * hook (see its own header on the 38s-regression bounded-read fix) that must not pay a `node` spawn
+ * per prompt just for this check. This constant is exactly what ground-ruvnet.sh embeds as its own
+ * `grep -qiE` literal (SOURCE OF TRUTH here — tests/unit/hook-input-harness.test.mjs parses
+ * ground-ruvnet.sh's copy and asserts byte-identity, same idiom as ruvnet-gate1-pattern.mjs's own
+ * copy-with-a-drift-test for Gate 1). Its relationship to HARNESS_GENERATED_PATTERNS above is
+ * BEHAVIORAL parity only, not byte-identity: that is an array of independently-flagged regexes (one
+ * uses the 'm' flag) with no single source ERE it could be copied from verbatim, so the same test
+ * instead proves real `grep -qiE` against this string agrees with isHarnessGenerated() on
+ * representative inputs — the same idiom ruvnet-gate1-pattern.test.mjs uses for ITS third,
+ * non-identity assertion. POSIX `[[:space:]]` is used instead of `\s` and plain `(...)` instead of
+ * `(?:...)` — GNU/PCRE extensions with no POSIX ERE guarantee — because this string must run under
+ * whatever `grep` a user's shell resolves to, not only the one on the machine that wrote it.
+ */
+export const HARNESS_GENERATED_SHELL_PATTERN =
+  '\\[Your previous response|\\[Request interrupted|</?system-reminder>|</?(command-name|command-message|command-args|local-command-stdout|local-command-stderr|local-command-caveat|task-notification|function_results|function_calls|budget)\\b|^[[:space:]]*Caveat:|Base directory for this skill:|This session is being continued from a previous conversation|^[[:space:]]*#[[:space:]]*claudeMd\\b|\\[INTELLIGENCE\\]';
 
 /** Arbitrary dotted-path lookup (e.g. "tool_input.file_path"); "" if any segment is missing. */
 export function field(ev, dottedPath) {
@@ -425,7 +569,7 @@ export function preToolUseEnvelope(decision, additionalContext) {
   return JSON.stringify({
     hookSpecificOutput: {
       hookEventName: 'PreToolUse',
-      permissionDecision: String(decision || 'defer'),
+      ...(decision ? { permissionDecision: String(decision) } : {}),
       additionalContext: String(additionalContext || ''),
     },
   }, null, 2);
@@ -534,8 +678,7 @@ export function invocationLines(cmd, tools) {
 // argv[1] pointing at some other file.
 function isMain() {
   try {
-    if (!process.argv[1]) return false;
-    return fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));
+    return isDirectInvocation(import.meta.url);
   } catch {
     return false;
   }

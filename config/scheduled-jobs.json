@@ -1,63 +1,34 @@
 {
-  "_why": "THE REGISTRY OF WHAT MUST BE RUNNING. Created 2026-07-13 after a failure that must never repeat: com.ruvnet.brain-nightly's launchd trigger had NEVER fired, and nothing noticed, because 'is it running?' was only ever answered by looking at a job's own exit code \u2014 and launchd reports exit 0 for a job that has never run, which is indistinguishable from success. Silence was being read as health.",
+  "_why": "THE REGISTRY OF WHAT MUST BE RUNNING. Created 2026-07-13 after a failure that must never repeat: com.ruvnet.brain-nightly's launchd trigger had NEVER fired, and nothing noticed, because 'is it running?' was only ever answered by looking at a job's own exit code — and launchd reports exit 0 for a job that has never run, which is indistinguishable from success. Silence was being read as health.",
   "_how_it_works": "scripts/job-heartbeat.sh wraps every job and writes start/end/exit receipts that a dying job cannot forge or skip (trap-protected). scripts/nightly-watchdog.mjs compares THIS registry against reality: a job listed here that is not loaded, or loaded but has no fresh receipt, or has a receipt with a non-zero exit, is a VIOLATION and gongs the phone. Absence of evidence is failure, never 'probably fine'.",
-  "_adding_a_job": "Add it here FIRST, then wrap its plist command in job-heartbeat.sh. A job not in this registry is unwatched by definition \u2014 that is the whole point of a registry rather than per-job good intentions.",
+  "_adding_a_job": "Add it here FIRST, then wrap its plist command in job-heartbeat.sh. A job not in this registry is unwatched by definition — that is the whole point of a registry rather than per-job good intentions.",
   "heartbeatDir": "~/.cache/ruvnet-brain/heartbeats",
   "jobs": [
-    {
-      "label": "com.ruvnet.brain-nightly",
-      "what": "Refreshes every RuvNet repo, rebuilds the brain, publishes the GitHub Release",
-      "schedule": "daily 03:15",
-      "maxAgeHours": 26,
-      "required": true,
-      "legacyLog": "logs/nightly.log"
-    },
-    {
-      "label": "com.ruvnet.brain-gists",
-      "what": "Pulls rUv's new gists into the brain and re-embeds when they change",
-      "schedule": "daily 21:47",
-      "maxAgeHours": 26,
-      "required": true,
-      "legacyLog": "logs/gists-nightly.log"
-    },
     {
       "label": "com.ruvnet.goldie-weekly",
       "what": "Re-researches the cheapest/best models and refreshes the router catalog",
       "schedule": "Mondays 07:30",
       "maxAgeHours": 192,
       "required": true,
-      "legacyLog": "logs/goldie.log"
+      "legacyLog": "logs/goldie.log",
+      "maxRunHours": 3
     },
     {
       "label": "com.ruvnet.model-refresh",
       "what": "Refreshes the live model list (~/.claude/models.json) that the router prices against",
       "schedule": "daily 09:00",
       "maxAgeHours": 26,
-      "required": true
-    },
-    {
-      "label": "com.ruvnet.npm-token-renew",
-      "what": "Renews the npm publish token before it expires (silently lets publishing die if it stops)",
-      "schedule": "daily 03:33",
-      "maxAgeHours": 26,
       "required": true,
-      "_was_blind": "THE PUREST CASE OF THE BUG. On a healthy day this script returns early and writes ZERO BYTES anywhere \u2014 its log and state file sat frozen 2+ days stale while it fired on schedule every night. 'Ran and did nothing (healthy)' was literally indistinguishable from 'never ran', ~76 days out of every 90. The heartbeat wrapper fixes this for free: the RECEIPT is written by the wrapper, so the job no longer has to remember to report."
+      "maxRunHours": 1
     },
     {
       "label": "com.stuartkerr.api-spend-watchdog",
-      "what": "Hourly guard against runaway API spend and agent bursts \u2014 the one that actually pages the phone",
+      "what": "Hourly guard against runaway API spend and agent bursts — the one that actually pages the phone",
       "schedule": "hourly",
       "maxAgeHours": 3,
       "required": true,
-      "_note": "It has been pushing '4 scheduled jobs failing silently' every hour, correctly \u2014 but off launchctl's exit-code field, which CANNOT see a job that never ran. It alerts; it just can't see the hole. Now it is itself watched: nothing supervised the supervisor."
-    },
-    {
-      "label": "com.stuartkerr.ruflo-autoupdate",
-      "what": "Keeps the whole RuvNet/Ruflo npm stack current (npm i -g ~26 packages on @latest/@alpha)",
-      "schedule": "daily 03:30",
-      "maxAgeHours": 26,
-      "required": true,
-      "_note": "This is THE job that keeps rUv's stack fresh on this machine. It was unwatched until 2026-07-13 \u2014 the single most important update job here had no supervision at all."
+      "_note": "It has been pushing '4 scheduled jobs failing silently' every hour, correctly — but off launchctl's exit-code field, which CANNOT see a job that never ran. It alerts; it just can't see the hole. Now it is itself watched: nothing supervised the supervisor.",
+      "maxRunHours": 1
     },
     {
       "label": "com.cognitum.ruvector-autoupdate",
@@ -65,7 +36,8 @@
       "schedule": "every 6h",
       "maxAgeHours": 8,
       "required": true,
-      "_note": "Its git stash pop has silently failed once (orphaned stash@{0} from 2026-06-28 \u2014 it swallowed local edits and nothing said so). The heartbeat now catches a non-zero exit; the orphaned stash still needs a human decision."
+      "_note": "Its git stash pop has silently failed once (orphaned stash@{0} from 2026-06-28 — it swallowed local edits and nothing said so). The heartbeat now catches a non-zero exit; the orphaned stash still needs a human decision.",
+      "maxRunHours": 1
     },
     {
       "label": "com.stuartkerr.clear-claude-tmp",
@@ -73,47 +45,95 @@
       "schedule": "every 3h",
       "maxAgeHours": 5,
       "required": true,
-      "_was_lying": "Its log line had the date BAKED IN at plist-write time \u2014 all 43 entries since 2026-04-06 were byte-identical. It worked; its log was a lie. Now a real script with a real $(date) and a real delete count."
+      "_was_lying": "Its log line had the date BAKED IN at plist-write time — all 43 entries since 2026-04-06 were byte-identical. It worked; its log was a lie. Now a real script with a real $(date) and a real delete count.",
+      "maxRunHours": 1
     },
     {
       "label": "com.ruvnet.nightly-watchdog",
-      "what": "Watches all of the above. Listed here so that IT is watched too \u2014 a watchdog nobody watches is the same blind spot one level up",
-      "schedule": "daily 09:00",
+      "what": "Watches all of the above. Listed here so that IT is watched too — a watchdog nobody watches is the same blind spot one level up",
+      "schedule": "daily 09:30",
       "maxAgeHours": 26,
-      "required": true
+      "required": true,
+      "maxRunHours": 1
     },
     {
       "label": "com.ruvnet.issue-watch",
-      "what": "Hourly GitHub-issues SLA watcher (stuinfla/ruvnet-brain) \u2014 pages ntfy when an open issue sits >4h with no comment from the repo owner",
+      "what": "Hourly GitHub-issues SLA watcher (stuinfla/ruvnet-brain): pages once when a person's issue arrives and once if it passes 4h unanswered; one 9 a.m. ET summary of anything still waiting (owner/bot issues never page)",
       "schedule": "hourly",
       "maxAgeHours": 3,
-      "required": true
+      "required": true,
+      "maxRunHours": 1
     },
     {
       "label": "com.ruvnet.issue-fix",
-      "what": "Every 30 min (was 10 \u2014 a real run takes ~13 min, so the 10-min schedule SIGTERMed its own overlapping runs, fixed 2026-07-18): auto-fixes newly opened GitHub issues (stuinfla/ruvnet-brain) \u2014 bounded headless `claude -p` per issue in a disposable git worktree, pushes an issue-fix/<N> branch + comment or posts an honest triage comment, never touches main, never closes an issue",
-      "schedule": "every 10 min",
-      "maxAgeHours": 1,
-      "required": true
+      "what": "Every 30 min: read-only triage of eligible GitHub issues (stuinfla/ruvnet-brain); no code mutation, no worktree creation, no branch push, no public comment, and no promotion. Real fixes run only in explicit session-supervised isolated worktrees.",
+      "schedule": "every 30 min",
+      "maxAgeHours": 3,
+      "required": true,
+      "maxRunHours": 1
     },
     {
       "label": "com.ruvnet.routing-flywheel",
       "schedule": "nightly 04:45",
       "maxAgeHours": 26,
-      "what": "nightly data-readiness DRY-RUN of the routing flywheel (the plist runs --dry-run: reads receipts + prints readiness, runs NO loop and writes NO receipt — honest label per F13 2026-07-18; switch the plist to --synthetic to run a real $0 loop)"
+      "what": "nightly data-readiness DRY-RUN of the routing flywheel (the plist runs --dry-run: reads receipts + prints readiness, runs NO loop and writes NO receipt — honest label per F13 2026-07-18; switch the plist to --synthetic to run a real $0 loop)",
+      "maxRunHours": 1
     },
     {
       "label": "com.ruvnet.npx-witness",
       "schedule": "WatchPaths on ~/.npm/_npx (event-driven, no cadence)",
       "maxAgeHours": 2160,
-      "what": "records every npx-cache mutation to the witness log (pure observer). Event-driven: weeks of silence are NORMAL when nothing touches _npx — maxAgeHours is a 90-day tripwire against the job being unloaded, not a freshness SLA. Registered per F2 2026-07-18: it was loaded+wrapped but absent here, i.e. unwatched by the registry's own definition."
+      "what": "records every npx-cache mutation to the witness log (pure observer). Event-driven: weeks of silence are NORMAL when nothing touches _npx — maxAgeHours is a 90-day tripwire against the job being unloaded, not a freshness SLA. Registered per F2 2026-07-18: it was loaded+wrapped but absent here, i.e. unwatched by the registry's own definition.",
+      "maxRunHours": 1
+    },
+    {
+      "label": "com.ruvnet.ntfy-inbox",
+      "what": "Every 15 min: reads the owner's ntfy topic into ~/.cache/ruvnet-brain/ntfy-inbox.jsonl and keeps the open-alert list SessionStart shows (scripts/ntfy-inbox.mjs)",
+      "schedule": "every 15 minutes",
+      "maxAgeHours": 2,
+      "required": true,
+      "maxRunHours": 1
+    },
+    {
+      "label": "com.stuartkerr.purge-local-snapshots",
+      "what": "Hourly: deletes Time Machine LOCAL snapshots on the internal SSD (skips while a backup runs); real backups stay on the external drive (~/Library/Scripts/purge-local-snapshots.sh)",
+      "schedule": "hourly",
+      "maxAgeHours": 3,
+      "maxRunHours": 1,
+      "required": true,
+      "_registered": "2026-10-26 (4.7.21): loaded and wrapped by job-heartbeat.sh but absent here, so it was unwatched by the registry's own definition."
+    },
+    {
+      "label": "com.stuartkerr.model-freshness-watchdog",
+      "what": "Daily 09:10: compares each provider's LIVE model list with the models referenced in Repo-Explainer/.env and flags a newer family (~/.claude/scripts/model-freshness-watchdog.sh)",
+      "schedule": "daily 09:10",
+      "maxAgeHours": 26,
+      "maxRunHours": 1,
+      "required": true,
+      "_registered": "2026-10-26 (4.7.21): loaded and wrapped by job-heartbeat.sh but absent here."
     }
   ],
   "_retired": [
     {
+      "label": "com.ruvnet.brain-nightly",
+      "retired": "2026-08-22",
+      "why": "It ran author-side source mutators in the primary developer checkout and accumulated generated changes beside live work. The plist was unloaded and archived; deploy/com.ruvnet.brain-nightly.plist was removed. Author rebuilds are now explicit clean linked-worktree operations. End-user cache freshness remains com.ruvnet.brain-update; Dream Machine remains the non-promoting evaluation schedule."
+    },
+    {
       "label": "io.ruv.auto-subscribe",
       "retired": "2026-07-14",
       "why": "archived as cruft (archive-cruft-2026-07-14/); hourly RuvNet package auto-install is superseded by com.stuartkerr.ruflo-autoupdate (daily) + com.cognitum.ruvector-autoupdate. Removed from watch registry 2026-07-18 so nightly-watchdog stops flagging a deliberately-killed job."
+    },
+    {
+      "label": "com.ruvnet.npx-72h-verdict",
+      "retired": "2026-10-26",
+      "why": "A one-shot 72-hour verdict job: its script boots itself out after reporting, and its receipt sat at \"running\" from 2026-10-17. Its plist is no longer in ~/Library/LaunchAgents. Retired so a finished one-shot job is never read as a stuck one."
+    },
+    {
+      "label": "com.ruvnet.brain-gists",
+      "retired": "2026-10-26",
+      "why": "The local re-embed wrote the developer checkout's kb/ruv-gists.big.rvf, which no installed brain reads (installed brains get fresh gists from the nightly cloud corpus). Measured: 6-10 minute batches against a 15 minute stall watcher, runs killed on a loaded machine, and no consumer of the result. The plist was unloaded and archived on the owner Mac. scripts/nightly-gists.sh stays for a manual run."
     }
-  ]
+  ],
+  "_maxRunHours_note": "maxRunHours (4.7.21): a receipt still 'running' past this many hours with a LIVE wrapper pid is STUCK (nightly-watchdog judge()); a gone pid is FAILING. job-heartbeat.sh stops a job at JOB_MAX_SECONDS (default 2 h), so 1 h is a warning before that kill for the short jobs."
 }

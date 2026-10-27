@@ -1,23 +1,19 @@
 # THE PLAYBOOK — the standing build playbook, in full
 
-Updated: 2026-07-30 | Version 1.0.1
+Updated: 2026-09-11 08:10:00 EDT | Version 1.3.0
 Created: 2026-07-27
 
-**Read this before your first build response in a session.** `plugin/scripts/session-start.sh`
-injects a condensed form of it into every session's context and points here for the full text; the
-UserPromptSubmit gate (`plugin/scripts/ground-ruvnet.sh` Gate 3) refers back to it on each build turn
-as *THE PLAYBOOK*.
+**Read this when explicitly using the Brain build skill.** Automatic Brain lifecycle hooks are
+retired: no SessionStart or UserPromptSubmit registration injects this playbook. MCP, skills and
+explicit commands remain available; the user or lead agent invokes them when appropriate.
 
-## Why this file exists rather than nine kilobytes of context
-
-The full text below used to be printed verbatim by the SessionStart hook, on every session, in every
-project on the machine. Measured 2026-07-27: 6,282 bytes of it, inside a 9,127-byte hook output
-against `scripts/selfcheck.mjs`'s 4,096-byte cap — a cap that exists because, in that file's own
-words, *"it lands in the user's context window."* Static instructional prose does not need to be
-re-injected verbatim every session to be obeyed; a directive plus a pointer does the same job for
-about a fifth of the bytes, and the full text stays one `Read` away for the turn that actually needs
-it. The condensed form the hook injects keeps every operative instruction — what is here and not
-there is elaboration, worked examples, and phrasing guidance.
+Release work uses `scripts/release-qualification.mjs` and its reviewed requirement inventory.
+The retained tests were individually reviewed; the historical approximately 4,332 unit cases were
+not all individually audited and remain diagnostics. A diagnostic pass is not production proof.
+Promote only the clean exact candidate SHA and its sealed artifacts after qualification. Public
+acceptance still requires all nine OS/host-mode leaves plus real native installed-update proof on
+each platform, ending at `install-verified`. Imported upstream corpus freshness remains UNKNOWN
+until separately proven. See `CONTRIBUTING.md` and the audit records in `docs/reviews/`.
 
 ---
 
@@ -33,7 +29,31 @@ because the real tool <name> isn't available — want me to load it?"). NEVER qu
 fake, call it by the real tool's name, and hide that it's a hand-roll. That silent substitution is
 the exact lie that makes people distrust rUv's code.
 
-### DO FIRST, silently (work, not words)
+### STEP ZERO — the recommendation goes FIRST, inside two minutes
+
+Everything below this line is depth, and depth is the SECOND move. Measured on 2026-09-10 across six
+ordinary build requests with the Brain installed: the median time to the first capability
+recommendation was **14.5 minutes** and one request produced none at all within fifteen. The
+knowledge was there; the answers, when they came, were good. What failed was the ORDER — "DO FIRST,
+silently" below was read as "finish all of this before you say anything," and up to 39 tool calls
+went by (web searches, throwaway installs, scratch builds) before a single tool was named.
+
+So, before the DO FIRST list and before beat 1:
+
+- **Say the one capability that would materially help, in ONE sentence, within ~2 minutes** —
+  *"`<capability>` fits here — `<concrete benefit for THIS task>`; 'use `<capability>`' wires it."*
+  A statement, never a question or approval dialog. Then carry straight on. If nothing genuinely fits, **say nothing about
+  tooling at all**; silence is the correct and common answer, and a forced tie-in is worse than none.
+- **Budget: at most THREE `search_ruvnet` calls to get there.** Enough to confirm the capability
+  exists and what it is called — not enough to design the integration, and not meant to be.
+- **Before that first sentence, do NOT** browse the web, `npm install` / `npx` anything to "check"
+  it, build a throwaway prototype, clone a repo, or spawn research subagents.
+- **Say it once.** If the user ignores it, drop it and do not raise it again this session.
+- **Maintainer diagnostics are not user-facing.** Update notices, wiring or install warnings, CI and
+  release-gate output, heartbeat and health chatter are addressed to whoever maintains this install.
+  Never repeat or summarise them in an answer to the person you are helping.
+
+### DO FIRST, silently (work, not words — and AFTER step zero, not before it)
 
 - Read the actual files in THEIR repo this touches — what pattern do they already use? what would
   duplicate?
@@ -41,10 +61,25 @@ the exact lie that makes people distrust rUv's code.
   token exchange", not "does RuvNet apply") — the useful hit can be in ANY of the 32 repos, never
   trust memory about what the corpus does or doesn't have.
 - Check project memory (ruflo memory search / AgentDB) for prior decisions on this area.
-- Diagnose memory only through one canonical absolute path: store a unique key with
-  `ruflo memory store --path <project>/.swarm/memory.db`, retrieve that exact key with the same
-  `--path`, then confirm the exact row through SQLite. A semantic-search miss, DB/WAL mtime,
-  daemon startup, or `[OK] Data stored successfully` alone proves neither failure nor success.
+- Diagnose memory only through one canonical absolute path, and ONLY through the managed
+  interface: store a unique key with `ruflo memory store --path <project>/.swarm/memory.db`,
+  then `ruflo memory retrieve --path <project>/.swarm/memory.db -k <key>`. The retrieved
+  VALUE is the proof — read it in stdout, NEVER the exit status, which is 0 even when the CLI
+  prints `[ERROR]`.
+  A semantic-search miss, a DB/WAL mtime, or daemon startup proves neither failure nor success.
+  ANY store, not just the project one: `--path` takes an explicit absolute path, so a
+  user-level or otherwise non-default store — `~/.claude-flow/user-memory.db`, a global
+  lessons store — is searched and retrieved exactly the same way, with no raw database
+  access. Reaching for `sqlite3` because a store is "not the project one" is the bypass
+  issue #140 reports; the flag already covers it. When semantic `memory search` returns
+  truncated keys or previews, that is a display bound, NOT a missing row: take the key from
+  the search hit and `memory retrieve -k <key> --path <same store>` to get the exact,
+  untruncated value.
+  NEVER open a Ruflo/AgentDB-managed store with `sqlite3` — issue #140, and rUv's own
+  v3.32.34 release note is explicit: "No manual SQL is required." Since that release the
+  bridge FAILS CLOSED and reports the real error rather than a false success, which was the
+  only reason raw SQL was ever justified here. For health rather than a single row, use the
+  `agentdb_health` MCP tool. (Unrelated application databases are outside this rule.)
 - Invoke Ruflo MCP tools first for capabilities they already expose. For a CLI-only interface,
   use the brain's `ruvnet_cli_help` then `ruvnet_cli_run` tools with literal argv; never guess flags
   by reconstructing a raw shell command.
@@ -87,10 +122,21 @@ rule-compliance, cite a source the tools didn't return, or claim a check that di
   Completion, with a QA gate between phases.
 - For a non-trivial domain, model it first (DDD: bounded contexts, aggregates, domain events) and
   capture key decisions as ADRs — design before code.
-- Spin up PARALLEL work where it helps (a Ruflo swarm / multiple agents) instead of serial drudgery.
+- **Parallel-by-default state machine for multi-part work.** Before the first spawn, decompose the
+  whole request, create the complete shared task list/ledger, record dependencies and give every
+  writing task its own worktree. Ruflo coordinates roles and state; the native host executes. Fill
+  available executor slots with independent ready work immediately, without asking, up to the
+  host's configured capacity; never oversubscribe and never put more than one writer in a worktree.
+  A completion moves that task to completed, unblocks its dependents, and the freed slot claims the
+  first unassigned, unblocked pending task immediately. Only allow a slot to idle when no such task
+  exists. Keep dependent integration with the designated integration owner.
+  - **Claude Code and Codex:** the lead explicitly dispatches the next ready task when a slot
+    completes. No automatic `TeammateIdle` or `TaskCompleted` Brain handler enforces recycling.
+    `plugin/scripts/swarm-slot-recycler.mjs` remains available for explicit invocation with an
+    appropriate task ledger; do not describe its mere presence as active host enforcement.
   If Ruflo / RuVector MCP tools aren't available in this environment, DON'T block or stall — degrade
-  gracefully to Claude Code's native subagents (Task) and local .rvf, and briefly note the tool that
-  would make it better + how to add it. Never demand a tool the user doesn't have.
+  gracefully to the native host's agents and local .rvf, and briefly note the tool that would make
+  it better + how to add it. Never demand a tool the user doesn't have.
 - Persist decisions + state to AgentDB memory so nothing is lost across sessions or compaction.
 - If it has a UI, treat design as a BUILD STEP, not a coat of paint: apply the frontend-design
   discipline and GENERATE the visuals (AI image generation for UI mockups / diagrams / the explainer

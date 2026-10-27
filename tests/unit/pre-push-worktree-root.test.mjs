@@ -7,7 +7,18 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const HOOK = path.join(ROOT, 'scripts', 'git-hooks', 'pre-push');
+const PUSH_CHECK = path.join(ROOT, 'scripts', 'development-push-check.mjs');
 const temps = [];
+
+// The push check is copied alone into a disposable repo, so its imports are DERIVED from the source
+// (serverDependencies in bin/install.mjs), keeping each file at its path relative to the repo root.
+process.env.RUVNET_BRAIN_IMPORT_ONLY = '1';
+const { serverDependencies } = await import(new URL('../../bin/install.mjs', import.meta.url).href);
+function copyBeside(from, root) {
+  const to = path.join(root, path.relative(ROOT, from));
+  fs.mkdirSync(path.dirname(to), { recursive: true });
+  fs.copyFileSync(from, to);
+}
 
 afterEach(() => {
   for (const dir of temps.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
@@ -23,19 +34,16 @@ describe('pre-push gate worktree routing', () => {
     fs.mkdirSync(path.dirname(foreignHook), { recursive: true });
     fs.copyFileSync(HOOK, foreignHook);
     fs.chmodSync(foreignHook, 0o755);
-    fs.mkdirSync(path.join(repo, 'scripts'), { recursive: true });
-    fs.writeFileSync(
-      path.join(repo, 'scripts', 'verify-channels.mjs'),
-      'process.stdout.write(`verified:${process.cwd()}`);',
-    );
-    fs.writeFileSync(path.join(repo, 'scripts', 'doc-currency.mjs'), 'process.exit(0);');
+    copyBeside(PUSH_CHECK, repo);
+    for (const dep of serverDependencies(PUSH_CHECK)) copyBeside(dep.from, repo);
 
     expect(spawnSync('git', ['init', '-q'], { cwd: repo }).status).toBe(0);
     fs.writeFileSync(path.join(repo, 'tracked.txt'), 'fixture\n');
     expect(spawnSync('git', ['add', 'tracked.txt'], { cwd: repo }).status).toBe(0);
     expect(spawnSync('git', [
+      '-c', 'core.hooksPath=/dev/null',
       '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
-      'commit', '-qm', 'fixture',
+      'commit', '-qm', 'test(git): create pre-push fixture',
     ], { cwd: repo }).status).toBe(0);
     expect(spawnSync('git', ['init', '--bare', '-q'], { cwd: remote }).status).toBe(0);
     expect(spawnSync('git', ['remote', 'add', 'origin', remote], { cwd: repo }).status).toBe(0);
@@ -49,6 +57,27 @@ describe('pre-push gate worktree routing', () => {
     });
 
     expect(result.status, result.error?.message || result.stderr).toBe(0);
-    expect(`${result.stdout}${result.stderr}`).toContain(`verified:${fs.realpathSync(repo)}`);
+    const output = `${result.stdout}${result.stderr}`;
+    expect(output).toContain('unpublished-commit-secret-scan');
+
+    fs.writeFileSync(path.join(repo, 'tracked.txt'), 'second fixture\n');
+    expect(spawnSync('git', ['add', 'tracked.txt'], { cwd: repo }).status).toBe(0);
+    expect(spawnSync('git', [
+      '-c', 'core.hooksPath=/dev/null',
+      '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+      'commit', '-qm', 'test(git): exercise generated-surface failures',
+    ], { cwd: repo }).status).toBe(0);
+    fs.writeFileSync(path.join(repo, 'synthetic-secret.txt'), 'sk-' + 'proj-' + 'A'.repeat(30));
+    expect(spawnSync('git', ['add', 'synthetic-secret.txt'], { cwd: repo }).status).toBe(0);
+    expect(spawnSync('git', [
+      '-c', 'core.hooksPath=/dev/null', '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+      'commit', '-qm', 'test(git): add synthetic secret',
+    ], { cwd: repo }).status).toBe(0);
+    const secretFailure = spawnSync('git', ['push', 'origin', 'HEAD:refs/heads/main'], {
+      cwd: repo,
+      encoding: 'utf8',
+    });
+    expect(secretFailure.status).not.toBe(0);
+    expect(`${secretFailure.stdout}${secretFailure.stderr}`).toMatch(/credential-shaped/i);
   });
 });

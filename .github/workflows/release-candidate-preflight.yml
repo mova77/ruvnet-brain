@@ -1,0 +1,346 @@
+name: release-candidate-preflight
+
+# Expensive product discovery happens once, before promotion. A successful run emits the exact
+# package, payload, and typed evidence envelope that protected-release later verifies and publishes.
+on:
+  push:
+    branches: ['release/**']
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: ruvnet-brain-candidate-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  candidate-preflight:
+    name: candidate-preflight
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install exact candidate dependencies
+        run: npm ci --no-audit --no-fund --ignore-scripts
+      - name: Validate changed release and grounding paths before the matrix
+        run: |
+          set -euo pipefail
+          node --check scripts/release.mjs
+          npm run version:check
+          npm run release:authority
+          node scripts/architecture-review-lock.mjs
+
+  ci:
+    needs: candidate-preflight
+    uses: ./.github/workflows/ci.yml
+    with:
+      candidate_sha: ${{ github.sha }}
+
+  integration:
+    needs: candidate-preflight
+    uses: ./.github/workflows/integration-linux.yml
+    with:
+      candidate_sha: ${{ github.sha }}
+
+  ux:
+    needs: candidate-preflight
+    uses: ./.github/workflows/ux-qe.yml
+    with:
+      candidate_sha: ${{ github.sha }}
+
+  stranger:
+    needs: ci
+    uses: ./.github/workflows/stranger-matrix.yml
+    with:
+      candidate_sha: ${{ github.sha }}
+
+  # Explicit reusable jobs keep each OS receipt visible in GitHub and required by aggregate.
+  early-public-linux:
+    needs: ci
+    uses: ./.github/workflows/early-public.yml
+    with:
+      candidate_sha: ${{ github.sha }}
+      os_name: linux
+      runner: ubuntu-latest
+  early-public-macos:
+    needs: ci
+    uses: ./.github/workflows/early-public.yml
+    with:
+      candidate_sha: ${{ github.sha }}
+      os_name: macos
+      runner: macos-latest
+  early-public-windows:
+    needs: ci
+    uses: ./.github/workflows/early-public.yml
+    with:
+      candidate_sha: ${{ github.sha }}
+      os_name: windows
+      runner: windows-latest
+
+  macos-candidate-search:
+    name: macos-exact-candidate-search
+    needs: ci
+    runs-on: macos-latest
+    timeout-minutes: 60
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci --no-audit --no-fund
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-evidence-${{ github.sha }}
+          path: release-evidence
+      - name: Install current hosts for exact Mac candidate qualification
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global --prefix "$RUNNER_TEMP/host-clis" \
+            @anthropic-ai/claude-code@latest \
+            @openai/codex@latest
+          echo "$RUNNER_TEMP/host-clis/bin" >> "$GITHUB_PATH"
+      - name: Run three installed host searches against sealed candidate bytes
+        shell: bash
+        env:
+          CANDIDATE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          package_name="$(node -p "JSON.parse(require('fs').readFileSync('release-evidence/npm-pack.json'))[0].filename")"
+          test -s "release-evidence/$package_name"
+          node scripts/candidate-host-evidence.mjs \
+            --manifest release-evidence/payload-manifest.json \
+            --package "release-evidence/$package_name" \
+            --bundle release-evidence/ruvnet-brain.zip \
+            --plan release-evidence/retrieval-canary-plan.json \
+            --coverage release-evidence/COVERAGE.json \
+            --sequential-searches \
+            --out "$RUNNER_TEMP/candidate-host-evidence-macos.json"
+          test "$(node -p "JSON.parse(require('fs').readFileSync('$RUNNER_TEMP/candidate-host-evidence-macos.json')).sha")" = "$CANDIDATE_SHA"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-candidate-search-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/candidate-host-evidence-macos.json
+            ${{ runner.temp }}/candidate-host-evidence-macos.json.failure.json
+          if-no-files-found: warn
+          retention-days: 30
+        if: always()
+
+  aggregate:
+    needs: [candidate-preflight, ci, integration, ux, stranger, early-public-linux, early-public-macos, early-public-windows, macos-candidate-search]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-evidence-${{ github.sha }}
+          path: release-evidence
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-acceptance-*-${{ github.sha }}
+          path: acceptance-reports
+          merge-multiple: true
+      - name: Bind every required CI job to the candidate payload
+        env:
+          CANDIDATE_SHA: ${{ github.sha }}
+          CI_RESULT: ${{ needs.ci.result }}
+          PREFLIGHT_RESULT: ${{ needs.candidate-preflight.result }}
+          CI_RESULTS_JSON: ${{ toJson(needs.ci.outputs) }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p lane-evidence/ci
+          node scripts/candidate-ci-receipt.mjs
+      - uses: actions/download-artifact@v4
+        with:
+          name: integration-evidence-${{ github.sha }}
+          path: lane-evidence/integration
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ux-evidence-${{ github.sha }}-*
+          path: lane-evidence/ux
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: stranger-evidence-${{ github.sha }}
+          path: lane-evidence/stranger
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: early-public-${{ github.sha }}-*
+          path: lane-evidence/early-public
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-candidate-search-${{ github.sha }}
+          path: lane-evidence/macos-candidate-search
+      - name: Validate all three early public-artifact receipts
+        shell: bash
+        env:
+          CANDIDATE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import path from 'node:path';
+          const { payloadIdFor } = await import('./scripts/release-payload.mjs');
+          const manifest = JSON.parse(fs.readFileSync('release-evidence/payload-manifest.json', 'utf8'));
+          if (manifest.candidateSha !== process.env.CANDIDATE_SHA || manifest.producer?.runId !== process.env.GITHUB_RUN_ID) {
+            throw new Error('early-public payload differs from candidate or producer run');
+          }
+          const npm = manifest.members.filter(member => member.role === 'npm');
+          if (npm.length !== 1) throw new Error('expected one sealed npm payload member');
+          const root = 'lane-evidence/early-public';
+          const files = [];
+          const walk = dir => {
+            for (const name of fs.readdirSync(dir)) {
+              const file = path.join(dir, name);
+              const stat = fs.statSync(file);
+              if (stat.isDirectory()) walk(file);
+              else if (name === 'early-public.json') files.push(file);
+            }
+          };
+          walk(root);
+          if (files.length !== 3) throw new Error(`expected three early-public receipts, found ${files.length}`);
+          const platforms = new Set();
+          for (const file of files) {
+            const receipt = JSON.parse(fs.readFileSync(file, 'utf8'));
+            const platform = receipt.host?.split('-')[0];
+            if (receipt.schema !== 'ruvnet-brain.agentic-qe.receipt'
+              || receipt.contract !== 'agentic-qe-4.3'
+              || receipt.lane !== 'early-public'
+              || receipt.status !== 'PASS'
+              || receipt.sha !== process.env.CANDIDATE_SHA
+              || receipt.runId !== process.env.GITHUB_RUN_ID
+              || !['linux', 'darwin', 'win32'].includes(platform) || platforms.has(platform)
+              || receipt.payloadId !== payloadIdFor(manifest)
+              || receipt.artifactSha256 !== npm[0].sha256
+              || receipt.steps.some(step => step.status !== 'PASS'
+                || (step.tests && (step.tests.total === 0 || step.tests.skipped > 0)))) {
+              throw new Error(`invalid early-public receipt: ${file}`);
+            }
+            platforms.add(platform);
+          }
+          console.log(JSON.stringify({ status: 'PASS', receipts: files.length, sha: process.env.CANDIDATE_SHA }));
+          NODE
+      - name: Require exact-candidate macOS search timing evidence
+        shell: bash
+        env:
+          CANDIDATE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import { payloadIdFor } from './scripts/release-payload.mjs';
+          import { RELEASE_SEARCH_DEADLINE_MS } from './scripts/host-install-matrix.mjs';
+          import { readCandidateRetrieval } from './scripts/staged-host-verifier.mjs';
+          import { validateRetrievalCanaryReceipt } from './scripts/retrieval-canary.mjs';
+          const manifest = JSON.parse(fs.readFileSync('release-evidence/payload-manifest.json', 'utf8'));
+          const receipt = JSON.parse(fs.readFileSync('lane-evidence/macos-candidate-search/candidate-host-evidence-macos.json', 'utf8'));
+          const retrieval = readCandidateRetrieval({ manifest,
+            planFile: 'release-evidence/retrieval-canary-plan.json', coverageFile: 'release-evidence/COVERAGE.json' });
+          const npm = manifest.members?.filter(({ role }) => role === 'npm') || [];
+          const modes = ['claude-only', 'codex-only', 'dual-host'];
+          if (receipt.schemaVersion !== 1 || receipt.hostPlatform !== 'darwin'
+            || receipt.sha !== process.env.CANDIDATE_SHA || receipt.sha !== manifest.candidateSha
+            || receipt.payloadId !== payloadIdFor(manifest) || npm.length !== 1
+            || receipt.artifactSha256 !== npm[0].sha256 || receipt.leaves?.length !== modes.length) {
+            throw new Error('macOS host receipt is not bound to the exact sealed candidate');
+          }
+          if (JSON.stringify(receipt.leaves.map(({ name }) => name).sort()) !== JSON.stringify([...modes].sort())) {
+            throw new Error('macOS host mode coverage is incomplete');
+          }
+          for (const leaf of receipt.leaves) {
+            if (leaf.sha !== receipt.sha || leaf.payloadId !== receipt.payloadId || leaf.status !== 'completed'
+              || leaf.conclusion !== 'success' || leaf.verdict !== 'PASS' || leaf.functionalSearch !== true
+              || leaf.searchExit !== 0 || !Number.isFinite(leaf.searchMs) || leaf.searchMs < 0
+              || leaf.searchMs > RELEASE_SEARCH_DEADLINE_MS || leaf.artifactSha256 !== receipt.artifactSha256
+              || !leaf.grounding || ['repo', 'path', 'file', 'storedPath'].some((key) => !String(leaf.grounding[key] || '').trim())) {
+              throw new Error(`macOS ${leaf.name} search failed exact timing or grounding acceptance`);
+            }
+            validateRetrievalCanaryReceipt(leaf.retrieval, { plan: retrieval.plan });
+          }
+          console.log(JSON.stringify({ verdict: 'PASS', sourceSha: receipt.sha, hostPlatform: receipt.hostPlatform,
+            searchMs: Object.fromEntries(receipt.leaves.map(({ name, searchMs }) => [name, searchMs])), deadlineMs: RELEASE_SEARCH_DEADLINE_MS }));
+          NODE
+      - name: Validate typed receipts and bind the candidate envelope
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/release-proof.mjs --candidate release-evidence/candidate-receipt.json
+          node scripts/release-payload.mjs verify-members \
+            --manifest release-evidence/payload-manifest.json > "$RUNNER_TEMP/payload.json"
+          node scripts/prepublication-evidence.mjs \
+            --sha "$GITHUB_SHA" \
+            --version "$(node -p "require('./package.json').version")" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --manifest release-evidence/payload-manifest.json \
+            --payload-proof "$RUNNER_TEMP/payload.json" \
+            --hosts release-evidence/candidate-host-evidence.json \
+            --runtime-census release-evidence/runtime-census.json \
+            --plan release-evidence/retrieval-canary-plan.json \
+            --coverage release-evidence/COVERAGE.json \
+            --ci lane-evidence/ci/candidate-ci-evidence.json \
+            --integration lane-evidence/integration/integration-evidence.json \
+            --ux-dir lane-evidence/ux \
+            --stranger lane-evidence/stranger/stranger-evidence.json \
+            --leaves-out release-evidence/release-leaves.json \
+            --envelope-out release-evidence/aggregate-envelope.json
+      - name: Persist the only promotable candidate for this SHA
+        id: qualified-artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-candidate-${{ github.sha }}
+          path: release-evidence/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Bind lightweight qualification receipt to immutable artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QUALIFIED_ARTIFACT_ID: ${{ steps.qualified-artifact.outputs.artifact-id }}
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import { execFileSync } from 'node:child_process';
+          const artifact = JSON.parse(execFileSync('gh', ['api',
+            `repos/${process.env.GITHUB_REPOSITORY}/actions/artifacts/${process.env.QUALIFIED_ARTIFACT_ID}`], { encoding: 'utf8' }));
+          const sha = process.env.GITHUB_SHA;
+          const runId = Number(process.env.GITHUB_RUN_ID);
+          if (artifact.name !== `release-candidate-${sha}` || artifact.expired
+            || artifact.workflow_run?.id !== runId || !/^sha256:[a-f0-9]{64}$/.test(artifact.digest || '')) {
+            throw new Error('uploaded candidate artifact identity is not authentic');
+          }
+          const read = name => JSON.parse(fs.readFileSync(`release-evidence/${name}`, 'utf8'));
+          const receipt = { schemaVersion: 1, kind: 'ruvnet-brain-qualified-candidate', sha, runId,
+            artifact: { id: artifact.id, name: artifact.name, digest: artifact.digest, size: artifact.size_in_bytes },
+            candidateReceipt: read('candidate-receipt.json'), payloadManifest: read('payload-manifest.json'),
+            aggregateEnvelope: read('aggregate-envelope.json') };
+          fs.writeFileSync('qualification-receipt.json', JSON.stringify(receipt) + '\n');
+          NODE
+      - name: Persist lightweight qualification receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: qualification-receipt-${{ github.sha }}
+          path: qualification-receipt.json
+          if-no-files-found: error
+          retention-days: 30

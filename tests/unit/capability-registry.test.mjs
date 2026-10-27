@@ -22,6 +22,10 @@ import { CAPABILITIES, STATE, SCOPE, auditAll } from '../../scripts/capability-r
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const STATES = Object.values(STATE);
 const SCOPES = Object.values(SCOPE);
+// ONE vocabulary for "this unknown names its obstacle", used by every test below. Two wordings grew up
+// separately (could-not/not-checked, and not-inferred/does-not-establish); the sweep knew only the first, so
+// a correctly-worded routing unknown failed it on any machine without a routing declaration.
+const UNKNOWN_NAMES_OBSTACLE = /could not|cannot|not checked|does not exist|failed|unknown|has probably changed|not inferred|does not prove|not establish|unreadable/i;
 
 describe('capability descriptors', () => {
   it('ships a real list, not a stub', () => {
@@ -170,46 +174,38 @@ describe('detect() is safe to call', () => {
 describe('unknown outranks off when a probe cannot run', () => {
   const saved = {};
   afterEach(() => {
-    if ('receipts' in saved) {
-      if (saved.receipts === undefined) delete process.env.METAHARNESS_RECEIPTS;
-      else process.env.METAHARNESS_RECEIPTS = saved.receipts;
-      delete saved.receipts;
-    }
     if ('platform' in saved) {
       Object.defineProperty(process, 'platform', { value: saved.platform, configurable: true });
       delete saved.platform;
     }
   });
 
-  it('reports unknown — not off — when a ledger exists but cannot be read', () => {
-    // FORCED REAL FAILURE, not a mock: point the receipt ledger at a directory. It exists, so the
-    // "never set up" branch is correctly skipped, and reading it throws EISDIR. The tempting
-    // shortcut (`lines || 0`) would call this "0 receipts — never used", accusing a user whose
-    // routing may have run thousands of times.
-    saved.receipts = process.env.METAHARNESS_RECEIPTS;
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cap-registry-'));
-    process.env.METAHARNESS_RECEIPTS = dir;
+  it('reports unknown — not off — when the routing declaration exists but cannot be read', () => {
+    // FORCED REAL FAILURE, not a mock: the routing declaration path is a DIRECTORY. It exists, so the
+    // "never set up" branch is correctly skipped, and reading it throws EISDIR. (This test used to set
+    // METAHARNESS_RECEIPTS, which the detector no longer reads; it passed on the not-configured branch
+    // and proved nothing about an unreadable source.)
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cap-registry-'));
     try {
-      const r = CAPABILITIES.find((c) => c.key === 'cheap-model-routing').detect();
+      fs.mkdirSync(path.join(home, '.cache/ruvnet-brain/model-routing/terminal-launcher-config.json'), { recursive: true });
+      const r = CAPABILITIES.find((c) => c.key === 'cheap-model-routing').detect({ home });
       expect(r.state).toBe(STATE.UNKNOWN);
       expect(r.state).not.toBe(STATE.OFF);
-      expect(r.evidence).toMatch(/could not be read/i);
+      expect(r.evidence).toMatch(/unreadable/);
+      expect(r.evidence).toMatch(UNKNOWN_NAMES_OBSTACLE);
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(home, { recursive: true, force: true });
     }
   });
 
-  it('reports unknown — not off — for launchd jobs on a platform without launchd', () => {
-    // This is the Linux CI runner's real situation, and this repo has already shipped a macOS-only
-    // assumption that went red the moment it met that runner. Telling a Linux user "your nightly
-    // refresh is OFF" would be the same bug wearing a worse costume: an actionable-looking fault
-    // about a subsystem that cannot exist there.
+  it('reports unknown — not off — on a platform without a scheduler adapter', () => {
+    // Linux has a cron adapter. An actually unsupported platform cannot establish an off state.
     saved.platform = process.platform;
-    Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
+    Object.defineProperty(process, 'platform', { value: 'freebsd', configurable: true });
     const r = CAPABILITIES.find((c) => c.key === 'nightly-refresh').detect();
     expect(r.state).toBe(STATE.UNKNOWN);
     expect(r.state).not.toBe(STATE.OFF);
-    expect(r.evidence).toMatch(/linux/);
+    expect(r.evidence).toMatch(/freebsd/);
   });
 
   it('never concludes learning is off from ruflo\'s hook table', () => {
@@ -226,14 +222,52 @@ describe('unknown outranks off when a probe cannot run', () => {
     expect([STATE.UNKNOWN, STATE.ABSENT]).toContain(r.state);
   });
 
+  it('a store with no memory_entries table is unknown, and its reason names the obstacle', async () => {
+    // FORCED REAL STATE, not a mock: a real SQLite file with no memory_entries table — exactly what a
+    // fresh CI runner with the global ruflo installed produced (2026-10-01, ubuntu full-suite), where
+    // the machine sweep below failed on wording this machine never reaches.
+    const { DatabaseSync } = await import('node:sqlite');
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'cap-registry-schemaless-'));
+    try {
+      fs.mkdirSync(path.join(project, '.swarm'));
+      const db = new DatabaseSync(path.join(project, '.swarm', 'memory.db'));
+      db.exec('CREATE TABLE unrelated (id INTEGER PRIMARY KEY)');
+      db.close();
+      const r = CAPABILITIES.find((c) => c.key === 'memory-distillation').detect({ project });
+      expect(r.state).toBe(STATE.UNKNOWN);
+      expect(r.evidence).toMatch(/no memory_entries table/);
+      expect(r.evidence).toMatch(UNKNOWN_NAMES_OBSTACLE);
+    } finally {
+      fs.rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it('every cheap-model-routing unknown branch names its obstacle (absent, unreadable, incomplete, declared)', () => {
+    // Forces each branch on a real HOME, so the sweep below is not the only check and cannot pass vacuously.
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cap-registry-routing-'));
+    const file = path.join(home, '.cache/ruvnet-brain/model-routing/terminal-launcher-config.json');
+    const detect = () => CAPABILITIES.find((c) => c.key === 'cheap-model-routing').detect({ home });
+    try {
+      const seen = [detect().evidence];                                            // absent
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, '{');            seen.push(detect().evidence);        // unreadable
+      fs.writeFileSync(file, '{}');           seen.push(detect().evidence);        // incomplete
+      fs.writeFileSync(file, JSON.stringify({ runtimeRoot: home, runtimeDigest: 'a'.repeat(64) }));
+      seen.push(detect().evidence);                                                // declared
+      expect(new Set(seen).size, 'four distinct branches').toBe(4);
+      for (const evidence of seen) expect(evidence).toMatch(UNKNOWN_NAMES_OBSTACLE);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it('every unknown reason names the obstacle, so it can never read as a measurement', () => {
     // Sweep whatever is genuinely unknown on THIS machine and require it to explain itself. On a
     // fully-configured box this may match nothing, which is fine — the two forced tests above carry
     // the load; this one catches a badly-worded unknown wherever one happens to occur.
     for (const r of auditAll()) {
       if (r.state !== STATE.UNKNOWN) continue;
-      expect(r.evidence, `${r.key} unknown without a reason`)
-        .toMatch(/could not|cannot|not checked|does not exist|failed|unknown|has probably changed/i);
+      expect(r.evidence, `${r.key} unknown without a reason`).toMatch(UNKNOWN_NAMES_OBSTACLE);
     }
   });
 });
@@ -300,7 +334,11 @@ describe('house rules', () => {
   it('hardcodes no version literal', () => {
     // A gate greps the repo for X.Y.Z-dev literals; a capability list is exactly the kind of file
     // that tempts someone to pin "requires 3.4.1-dev".
-    const src = fs.readFileSync(path.join(REPO, 'scripts/capability-registry.mjs'), 'utf8');
+    // THE PAYLOAD COPY, not scripts/. Since the L4 payload-boundary move (2026-08-06) the file at
+    // `scripts/capability-registry.mjs` is a four-line re-export shim: reading THAT would satisfy this
+    // assertion trivially, forever, while the real 900-line registry went unchecked — a green test
+    // guarding nothing, which is the same failure shape as the inert hook that move existed to fix.
+    const src = fs.readFileSync(path.join(REPO, 'plugin/scripts/capability-registry.mjs'), 'utf8');
     expect(/\b\d+\.\d+\.\d+-dev\b/.test(src), 'version literal found').toBe(false);
   });
 
@@ -308,5 +346,33 @@ describe('house rules', () => {
     // Empty-first: every state this registry can emit must be one a fresh machine can legitimately
     // show. 'absent' and 'unknown' are what a bare box produces, and neither is an accusation.
     for (const r of auditAll()) expect(STATES).toContain(r.state);
+  });
+});
+
+
+describe('current declaration truth', () => {
+  it('counts capture declarations from an explicitly enabled installed plugin without claiming execution', () => {
+    const home=fs.mkdtempSync(path.join(os.tmpdir(),'capture-declaration-'));
+    const plugin=path.join(home,'plugin');
+    try {
+      fs.mkdirSync(path.join(home,'.claude/plugins'),{recursive:true});fs.mkdirSync(path.join(plugin,'hooks'),{recursive:true});
+      fs.writeFileSync(path.join(home,'.claude/settings.json'),JSON.stringify({enabledPlugins:{'brain@test':true}}));
+      fs.writeFileSync(path.join(home,'.claude/plugins/installed_plugins.json'),JSON.stringify({plugins:{'brain@test':[{installPath:plugin,scope:'user'}]}}));
+      fs.writeFileSync(path.join(plugin,'hooks/hooks.json'),JSON.stringify({hooks:{PreCompact:[{hooks:[{command:'node hook-shim.mjs session-snapshot PreCompact'}]}],SessionEnd:[{hooks:[{command:'node hook-shim.mjs session-snapshot SessionEnd'}]}]}}));
+      const row=CAPABILITIES.find(c=>c.key==='session-capture').detect({home,project:home});
+      expect(row.state).toBe(STATE.ON);expect(row.evidence).toMatch(/not proof.*native activation|not proof.*capture/i);
+      fs.writeFileSync(path.join(home,'.claude/settings.json'),JSON.stringify({enabledPlugins:{'brain@test':false}}));
+      const disabled=CAPABILITIES.find(c=>c.key==='session-capture').detect({home,project:home});
+      expect(disabled.state).toBe(STATE.UNKNOWN);
+    } finally {fs.rmSync(home,{recursive:true,force:true});}
+  });
+  it('recognizes current managed routing without requiring a retired Task hook or claiming execution', () => {
+    const home=fs.mkdtempSync(path.join(os.tmpdir(),'managed-declaration-'));
+    try {
+      const directory=path.join(home,'.cache/ruvnet-brain/model-routing');fs.mkdirSync(directory,{recursive:true});
+      fs.writeFileSync(path.join(directory,'terminal-launcher-config.json'),JSON.stringify({runtimeRoot:path.join(directory,'versions/current'),runtimeDigest:'a'.repeat(64)}));
+      const row=CAPABILITIES.find(c=>c.key==='cheap-model-routing').detect({home});
+      expect(row.state).toBe(STATE.UNKNOWN);expect(row.evidence).toContain('managed native');expect(row.evidence).toContain('not a prerequisite');expect(row.evidence).toContain('does not prove');
+    }finally{fs.rmSync(home,{recursive:true,force:true});}
   });
 });

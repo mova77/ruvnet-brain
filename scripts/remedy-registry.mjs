@@ -69,20 +69,11 @@ export const REMEDIES = [
     inverse: () => ({ kind: K.RESTORE_MEMORY_BACKUP }),
   },
   {
-    key: 'learning-flush',
-    summary: 'drain the capture queue into the learner',
-    match: (id) => (id === 'learning:flush' ? {} : null),
-    plan: () => ({ script: 'scripts/health-repair.mjs', args: ['--flush-learning'] }),
-    // Genuinely additive: it moves already-captured local events into the learner. Declared NONE on
-    // purpose, and the human string says what a user would actually do instead.
-    inverse: () => ({ kind: K.NONE, human: 'nothing to reverse — this only adds observations the learner already had queued; learned state can be reset separately' }),
-  },
-  {
     key: 'learning-train',
-    summary: 'run one training cycle',
+    summary: 'distill canonical observations into structural patterns',
     match: (id) => (id === 'learning:train' ? {} : null),
     plan: () => ({ script: 'scripts/health-repair.mjs', args: ['--train-learning'] }),
-    inverse: () => ({ kind: K.NONE, human: 'nothing to reverse here — learned state is reset with `ruflo hooks intelligence --reset`, which is a separate, deliberate action' }),
+    inverse: () => ({ kind: K.NONE, human: 'a verified snapshot is retained; automatic exact restore is unavailable and no ratified lessons are claimed' }),
   },
   {
     // THE ONE THAT HAD NO EXECUTOR. See ADR-027's North Star case: stores full of memories that
@@ -103,26 +94,19 @@ export const REMEDIES = [
     inverse: () => ({ kind: K.RESTORE_STORE_BACKUPS }),
   },
   {
-    // THE CAPABILITY BRIDGE'S ONLY CURRENT MEMBER. buildCapabilityRecommendations() in
-    // console-engine.mjs offers `enable:memory-distillation` only while the capability is OFF; this
-    // is the executor behind it. See distill-project.mjs's header for why THIS script and not bare
-    // `ruflo memory distill run`: the wrapper snapshots first, fails closed on a receipt-write
-    // failure, and its `--restore` is the tested inverse (proven 644→648→644→648, 2026-07-24).
+    // Retained for explicit execution and existing receipts, not offered as reversible.
+    // The restore command refuses unsafe replacement; historical roundtrips do not authorize it.
     key: 'enable-memory-distillation',
-    autoEligible: true,
-    summary: "mine this project's stored memories into reusable patterns (snapshots first; reversible)",
+    autoEligible: false,
+    summary: "mine this project's stored memories into reusable patterns (snapshots first; automatic undo unavailable)",
     match: (id) => (id === 'enable:memory-distillation' ? {} : null),
     // This console instance is always scoped to ONE project — the directory it was started in — the
     // same assumption the memory-index/learning-flush/learning-train remedies above already make.
     // `usesServerProject` asks onboarding-console.mjs (impure, process-aware) to supply that directory
     // at call time; this file stays pure and never reads process.cwd() itself (see header).
     plan: () => ({ script: 'scripts/distill-project.mjs', args: [], usesServerProject: true }),
-    // `--restore` with no path argument uses distill-project.mjs's OWN newestSnapshot() lookup inside
-    // this project's `.swarm/backups` — the exact mechanism its header proves end to end. Re-deriving
-    // which snapshot to restore here, instead of asking the tool that took it, is the kind of
-    // duplicate implementation this project has already been burned by once (ADR-047's rejected
-    // "offered command and promised undo live on different execution paths" bug).
-    inverse: () => ({ kind: K.RESTORE_PROJECT_DISTILL }),
+    inverse: () => ({ kind: K.RESTORE_PROJECT_DISTILL, available: false,
+      human: 'automatic undo is unavailable; retain the snapshot and coordinate offline SQLite recovery with all database users stopped' }),
   },
   {
     key: 'stack-sync',
@@ -235,7 +219,6 @@ export function assertRegistryClosure(offeredIds = [], handledUndoKinds = []) {
 export function sampleIdFor(remedy) {
   switch (remedy.key) {
     case 'memory-index': return 'repair:memory-index';
-    case 'learning-flush': return 'learning:flush';
     case 'learning-train': return 'learning:train';
     case 'distill-fleet': return 'learning:distill-fleet';
     case 'enable-memory-distillation': return 'enable:memory-distillation';

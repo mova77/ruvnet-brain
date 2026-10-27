@@ -1,0 +1,1278 @@
+name: protected-release
+run-name: ${{ inputs.mode == 'corpus' && inputs.corpus_dispatch_id && format('protected-release corpus {0}', inputs.corpus_dispatch_id) || format('protected-release {0} {1}', inputs.mode || 'code', inputs.version) }}
+
+# The candidate CI produces one immutable package + receipt. This workflow proves that exact
+# candidate is current main, carries it across the branch-protected Production boundary, and is
+# the only workflow allowed to invoke the publisher.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: code = machine-gated product release (no human approval step; CONTRIBUTING.md); corpus = unattended corpus generation
+        required: false
+        default: code
+        type: choice
+        options:
+          - code
+          - corpus
+      candidate_sha:
+        description: Full 40-character SHA — code mode, exactly origin/main; corpus mode, the approved runtime's source (the newest install-verified code release, an ancestor of main)
+        required: true
+        type: string
+      version:
+        description: Exact release generation (must equal package.json at candidate_sha)
+        required: true
+        type: string
+      corpus_dispatch_id:
+        description: Optional scheduler correlation id; grants no publication authority
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  issues: read
+
+# Code publication and corpus promotion both move releases/latest, so they serialize against each
+# other in ONE group, `ruvnet-brain-release` — ADR-086 step 17's "serialized code/corpus promotion".
+# A code run holds it for the whole run. A corpus run does NOT (2026-09-29 nightly redesign): its ~3 h
+# preparation moves nothing public, so it runs in its own group, and only the corpus-publish (stage)
+# and corpus-promote jobs enter `ruvnet-brain-release` (job-level concurrency below). Correctness never depends on how the
+# two levels interact: corpus-publish re-resolves the newest code release at publish time and stands
+# down as `superseded` if one landed meanwhile; corpus-promote re-resolves it again after the canary. cancel-in-progress stays false everywhere: a
+# half-cancelled promotion is exactly the "stale or concurrent promotion moves customers backward" failure.
+concurrency:
+  group: ${{ inputs.mode == 'corpus' && 'ruvnet-brain-corpus-preparation' || 'ruvnet-brain-release' }}
+  cancel-in-progress: false
+
+env:
+  # NOT a hardcoded version. This was `EXPECTED_VERSION: 4.0.8`, which pinned the ONLY workflow
+  # allowed to sign and publish to a single generation — so 4.0.9 and 4.0.10 could not be released
+  # by the release rail at all, and every release after 4.0.8 was done by hand or by "emergency
+  # promotion". That is the whole reason the release process has felt broken: the publisher was
+  # version-locked in a literal, the same one-fact-stated-twice defect as everywhere else.
+  #
+  # The generation is now DERIVED from package.json at the candidate SHA, and the dispatch input is
+  # checked against it. The safety property is unchanged and actually stronger: it used to assert
+  # "matches the literal someone last edited", it now asserts "the version you asked to release is
+  # the version that commit actually is".
+  #
+  # THE RENAME ABOVE SHIPPED HALF-DONE, AND IT BRICKED THE PUBLISHER (found 2026-08-06).
+  # `EXPECTED_VERSION: 4.0.8` was replaced with `REQUESTED_VERSION` here, but the five USES kept the
+  # old name (lines 64, 158, 171, 174, 175). Every one of those runs under `set -euo pipefail` or
+  # reads `process.env.EXPECTED_VERSION`, so the first check aborted on an unbound variable before it
+  # could compare anything — this workflow, the ONLY path allowed to sign and publish, could not
+  # complete a release at all. Unpinning the version and disabling the publisher landed in the same
+  # commit (`da42a21`), so "the release rail is fixed" and "no release can run" were true together.
+  #
+  # That is the source of #77, not a symptom of it: with the rail dead, every release since was done
+  # by hand, and hand-releases are exactly how npm and GitHub came to name different generations.
+  # The name is now defined once, where it is used.
+  EXPECTED_VERSION: ${{ inputs.version }}
+  EXPECTED_SHA: ${{ inputs.candidate_sha }}
+  # The mode SELECTS a chain; it does not grant authority. Every code job below is gated on it, and
+  # the corpus chain re-proves corpus-only routing inside its own jobs. Dual, verbatim:
+  # "workflow_dispatch proves event identity, not human approval. Enforce corpus-only and
+  # code authority separately in the target workflow." Code authority is the machine gates in this
+  # file (exact-SHA identity, trusted preflight, sealed payload, install verification); no person
+  # approves a code release (CONTRIBUTING.md, "What replaces a human approval").
+  RELEASE_MODE: ${{ inputs.mode || 'code' }}
+
+jobs:
+  identity:
+    name: authorize-current-main-candidate
+    if: inputs.mode != 'corpus'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      candidate_sha: ${{ steps.candidate.outputs.candidate_sha }}
+      version: ${{ steps.candidate.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Bind to main; identity below proves it equals EXPECTED_SHA.
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - id: candidate
+        name: Bind this run to one current-main source identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EXPECTED_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          git fetch --no-tags origin main
+          test "$GITHUB_SHA" = "$EXPECTED_SHA"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          test "$(git rev-parse origin/main)" = "$EXPECTED_SHA"
+          test "$(node -p "require('./package.json').version")" = "$EXPECTED_VERSION"
+          test -z "$(git status --porcelain)"
+          printf 'candidate_sha=%s\nversion=%s\n' "$EXPECTED_SHA" "$EXPECTED_VERSION" >> "$GITHUB_OUTPUT"
+
+  verified-candidate:
+    name: import-exact-preflight-candidate
+    if: inputs.mode != 'corpus'
+    needs: identity
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      issues: read
+    outputs:
+      candidate_sha: ${{ steps.verify.outputs.candidate_sha }}
+      artifact_sha256: ${{ steps.verify.outputs.artifact_sha256 }}
+      version: ${{ steps.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Require zero maintainer-governed release blockers
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          blockers="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --label release-blocker --limit 100 --json number --jq 'length')"
+          test "$blockers" -eq 0 || { echo "$blockers governed release blocker(s) remain open" >&2; exit 1; }
+      - name: Restore the one successful preflight artifact for this exact SHA
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ needs.identity.outputs.candidate_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Artifact names and receipt fields are not producer authentication.
+          # Resolve GitHub-owned run metadata before downloading bytes for signing.
+          artifact_id="$(node --input-type=module <<'NODE'
+          import { execFileSync } from 'node:child_process';
+          const repo = process.env.GITHUB_REPOSITORY;
+          const sha = process.env.CANDIDATE_SHA;
+          const workflowPath = '.github/workflows/release-candidate-preflight.yml';
+          const api = (endpoint) => JSON.parse(execFileSync('gh', ['api', `repos/${repo}/${endpoint}`], {
+            encoding: 'utf8', timeout: 30000, maxBuffer: 16 * 1024 * 1024,
+          }));
+          const workflow = api('actions/workflows/release-candidate-preflight.yml');
+          if (!Number.isSafeInteger(workflow.id) || workflow.id <= 0 || workflow.path !== workflowPath) {
+            throw new Error('untrusted preflight workflow identity');
+          }
+          const trustedRun = (run) => Number.isSafeInteger(run.id) && run.id > 0
+            && run.workflow_id === workflow.id && run.path === workflowPath
+            && run.status === 'completed' && run.conclusion === 'success' && run.event === 'push'
+            && run.head_sha === sha && /^release\/.+/.test(run.head_branch || '')
+            && Number.isSafeInteger(run.repository?.id) && run.repository.id > 0
+            && run.repository.full_name === repo && run.head_repository?.full_name === repo
+            && run.head_repository.id === run.repository.id;
+          const runs = api(`actions/workflows/${workflow.id}/runs?event=push&status=success&head_sha=${sha}&per_page=100`);
+          const selected = (runs.workflow_runs || []).filter(trustedRun).sort((a, b) => b.id - a.id)[0];
+          if (!selected) throw new Error('no trusted successful exact-SHA release preflight run');
+          const run = api(`actions/runs/${selected.id}`);
+          if (run.id !== selected.id || !trustedRun(run)) throw new Error('preflight run provenance changed');
+          const artifactName = `release-candidate-${sha}`;
+          const trustedArtifact = (artifact) => Number.isSafeInteger(artifact.id) && artifact.id > 0
+            && artifact.name === artifactName && artifact.expired === false
+            && artifact.workflow_run?.id === run.id && artifact.workflow_run.head_sha === sha
+            && artifact.workflow_run.head_branch === run.head_branch
+            && artifact.workflow_run.repository_id === run.repository.id
+            && artifact.workflow_run.head_repository_id === run.repository.id;
+          const listed = api(`actions/runs/${run.id}/artifacts?per_page=100`);
+          const artifacts = (listed.artifacts || []).filter(trustedArtifact);
+          if (artifacts.length !== 1) throw new Error('expected one authentic preflight artifact');
+          const artifact = api(`actions/artifacts/${artifacts[0].id}`);
+          if (artifact.id !== artifacts[0].id || !trustedArtifact(artifact)) throw new Error('artifact provenance changed');
+          process.stdout.write(String(artifact.id));
+          NODE
+          )"
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip" > "$RUNNER_TEMP/candidate.zip"
+          mkdir release-evidence
+          unzip -q "$RUNNER_TEMP/candidate.zip" -d release-evidence
+      - id: verify
+        name: Verify imported source, package bytes, payload, and aggregate
+        env:
+          CANDIDATE_SHA: ${{ needs.identity.outputs.candidate_sha }}
+          CANDIDATE_VERSION: ${{ needs.identity.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/release-proof.mjs --candidate release-evidence/candidate-receipt.json
+          node scripts/release-payload.mjs verify-members \
+            --manifest release-evidence/payload-manifest.json > "$RUNNER_TEMP/payload.json"
+          node --input-type=module <<'NODE'
+          import crypto from 'node:crypto';
+          import fs from 'node:fs';
+          import path from 'node:path';
+          const receipt = JSON.parse(fs.readFileSync('release-evidence/candidate-receipt.json', 'utf8'));
+          const manifest = JSON.parse(fs.readFileSync('release-evidence/payload-manifest.json', 'utf8'));
+          const aggregate = JSON.parse(fs.readFileSync('release-evidence/aggregate-envelope.json', 'utf8'));
+          const payload = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + '/payload.json', 'utf8'));
+          if (receipt.sha !== process.env.CANDIDATE_SHA || receipt.version !== process.env.CANDIDATE_VERSION
+            || manifest.candidateSha !== process.env.CANDIDATE_SHA || manifest.version !== process.env.CANDIDATE_VERSION
+            || aggregate.sha !== process.env.CANDIDATE_SHA || aggregate.payloadId !== payload.payloadId
+            || aggregate.verdict !== 'PASS') throw new Error('imported preflight identity or verdict mismatch');
+          const relative = String(receipt.artifact?.path || '').replaceAll('\\', '/');
+          if (!relative.startsWith('release-evidence/') || relative.includes('../')) throw new Error('candidate artifact path escaped release-evidence');
+          const artifact = path.resolve(relative);
+          const digest = crypto.createHash('sha256').update(fs.readFileSync(artifact)).digest('hex');
+          if (digest !== String(receipt.artifact.sha256).replace(/^sha256:/, '')) throw new Error('candidate package digest mismatch');
+          fs.appendFileSync(process.env.GITHUB_OUTPUT,
+            `candidate_sha=${receipt.sha}\nartifact_sha256=${digest}\nversion=${receipt.version}\n`);
+          NODE
+      - name: Hand the verified candidate to this transaction
+        uses: actions/upload-artifact@v4
+        with:
+          name: verified-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-evidence/
+          if-no-files-found: error
+          retention-days: 7
+
+  seal-payload:
+    name: seal-immutable-payload
+    if: inputs.mode != 'corpus'
+    needs: verified-candidate
+    runs-on: ubuntu-latest
+    # Scoping, not approval: this job needs only the signing key, which the protected-branch-only
+    # `Production – corpus` environment already holds. Only `publish`, which carries NPM_TOKEN and
+    # contents:write, binds the `Production – ruvnet-brain` environment (no reviewer; no human pause).
+    environment: Production – corpus
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      payload_id: ${{ steps.seal.outputs.payload_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Restore the verified build-once candidate payload
+        uses: actions/download-artifact@v4
+        with:
+          name: verified-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-evidence
+      - name: Sign this run's exact payload once
+        id: seal
+        env:
+          RUVNET_SIGNING_KEY: ${{ secrets.RUVNET_SIGNING_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          unsigned_proof="$(node scripts/release-payload.mjs verify-members --manifest release-evidence/payload-manifest.json)"
+          payload_id="$(node -p "JSON.parse(process.argv[1]).payloadId" "$unsigned_proof")"
+          node scripts/sign-bundle.mjs --bundle release-evidence/ruvnet-brain.zip
+          node scripts/release-payload.mjs sign \
+            --manifest release-evidence/payload-manifest.json \
+            --out release-evidence/payload-manifest.sig
+          proof="$(node scripts/release-payload.mjs verify \
+            --manifest release-evidence/payload-manifest.json \
+            --signature release-evidence/payload-manifest.sig \
+            --public-key keys/ruvnet-brain-signing.pub.pem)"
+          node scripts/verify-bundle.mjs release-evidence/ruvnet-brain.zip release-evidence/ruvnet-brain.zip.sig
+          test "$(node -p "JSON.parse(process.argv[1]).payloadId" "$proof")" = "$payload_id"
+          echo "payload_id=$payload_id" >> "$GITHUB_OUTPUT"
+      - name: Persist this run's signed payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-payload-${{ steps.seal.outputs.payload_id }}
+          path: |
+            release-evidence/payload-manifest.json
+            release-evidence/payload-manifest.sig
+            release-evidence/ruvnet-brain-*.tgz
+            release-evidence/ruvnet-brain.zip
+            release-evidence/ruvnet-brain.zip.sig
+            release-evidence/ruvnet-brain.zip.sha256
+            release-evidence/corpus-seed.json
+            release-evidence/RVF-GENERATIONS.json
+            release-evidence/COVERAGE.json
+            release-evidence/retrieval-canary-plan.json
+            release-evidence/candidate-receipt.json
+            release-evidence/aggregate-envelope.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Hand the verified payload to this run's publisher
+        uses: actions/upload-artifact@v4
+        with:
+          # No run_attempt in the name: `gh run rerun --failed` must find the payload the (successful,
+          # not re-run) seal job uploaded. overwrite covers a re-run of the seal job itself.
+          name: publisher-payload-${{ github.run_id }}
+          overwrite: true
+          path: |
+            release-evidence/payload-manifest.json
+            release-evidence/payload-manifest.sig
+            release-evidence/ruvnet-brain-*.tgz
+            release-evidence/ruvnet-brain.zip
+            release-evidence/ruvnet-brain.zip.sig
+            release-evidence/ruvnet-brain.zip.sha256
+            release-evidence/corpus-seed.json
+            release-evidence/RVF-GENERATIONS.json
+            release-evidence/COVERAGE.json
+            release-evidence/retrieval-canary-plan.json
+            release-evidence/candidate-receipt.json
+            release-evidence/aggregate-envelope.json
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: protected-publisher
+    if: inputs.mode != 'corpus'
+    needs: [verified-candidate, seal-payload]
+    runs-on: ubuntu-latest
+    # Channel publication must be bounded. Public host proof runs in the parallel matrix below;
+    # it must never turn the publisher into a 90-minute release gate. 40, not 20: measured runs took 18-18.5 min
+    # (4.7.16, 4.7.17) and 4.7.18's was cancelled at 20:00 while npm was still processing the staged tarball
+    # (run 40128468312; the payload restore alone took 6 min). The transaction resumed cleanly on re-run.
+    timeout-minutes: 40
+    environment: Production – ruvnet-brain
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: https://registry.npmjs.org
+
+      - name: Install candidate and current host CLIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          npm install --global --prefix "$RUNNER_TEMP/host-clis" \
+            @anthropic-ai/claude-code@latest \
+            @openai/codex@latest
+          echo "$RUNNER_TEMP/host-clis/bin" >> "$GITHUB_PATH"
+
+      - name: Restore the persisted signed payload (never rebuild or resign)
+        uses: actions/download-artifact@v4
+        with:
+          name: publisher-payload-${{ github.run_id }}
+          path: release-evidence
+
+      - name: Publish the CI-sealed candidate through the one canonical transaction
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          RUVNET_SIGNING_KEY: ${{ secrets.RUVNET_SIGNING_KEY }}
+          RUVNET_RELEASE_MODE: stabilization
+          RUVNET_CANDIDATE_RECEIPT: release-evidence/candidate-receipt.json
+          RUVNET_CANDIDATE_PAYLOAD: release-evidence/payload-manifest.json
+          RUVNET_CANDIDATE_PAYLOAD_SIGNATURE: release-evidence/payload-manifest.sig
+          RUVNET_AGGREGATE_ENVELOPE: release-evidence/aggregate-envelope.json
+          RUVNET_EXPECTED_SHA: ${{ needs.verified-candidate.outputs.candidate_sha }}
+          RUVNET_EXPECTED_ARTIFACT_SHA256: ${{ needs.verified-candidate.outputs.artifact_sha256 }}
+          RUVNET_EXPECTED_VERSION: ${{ needs.verified-candidate.outputs.version }}
+          RUVNET_PUBLICATION_RECEIPT: release-evidence/publication-receipt.json
+          RUVNET_RELEASE_IDENTITY: release-evidence/release-identity.json
+          RUVNET_CHANNEL_RECEIPT: release-evidence/channels-converged-receipt.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          test "$(git rev-parse HEAD)" = "$RUVNET_EXPECTED_SHA"
+          test "$(git rev-parse origin/main)" = "$RUVNET_EXPECTED_SHA"
+          test -z "$(git status --porcelain --untracked-files=no)"
+          node scripts/release.mjs --publish
+
+      - name: Require the signed nonterminal channel receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s release-evidence/release-identity.json
+          test -s release-evidence/channels-converged-receipt.json
+          node --input-type=module <<'NODE'
+          import crypto from 'node:crypto';
+          import fs from 'node:fs';
+          import { canonicalJson } from './scripts/coverage-integrity.mjs';
+          import { verifyReceipt } from './scripts/release-transaction.mjs';
+          const identity = JSON.parse(fs.readFileSync('release-evidence/release-identity.json', 'utf8'));
+          const receipt = JSON.parse(fs.readFileSync('release-evidence/channels-converged-receipt.json', 'utf8'));
+          const publicKey = crypto.createPublicKey(fs.readFileSync('keys/ruvnet-brain-signing.pub.pem', 'utf8'));
+          verifyReceipt(receipt, publicKey);
+          if (receipt.schemaVersion !== 3 || receipt.state !== 'channels-converged'
+            || receipt.observation?.verdict !== 'PUBLISHED_NOT_VERIFIED'
+            || canonicalJson(receipt.identity) !== canonicalJson(identity)) {
+            throw new Error('publisher did not stop at signed PUBLISHED_NOT_VERIFIED state');
+          }
+          NODE
+
+      - name: Preserve both append-only receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: publication-evidence-${{ needs.verified-candidate.outputs.candidate_sha }}
+          path: release-evidence/
+          if-no-files-found: error
+          retention-days: 90
+
+  public-verification:
+    name: public-verification-${{ matrix.os_name }}
+    if: inputs.mode != 'corpus'
+    needs: [verified-candidate, publish]
+    runs-on: ${{ matrix.runner }}
+    # All three OS lanes start together. The native scheduler smoke inside each lane is bounded
+    # to ten minutes and uses the sealed candidate bytes, so a release cannot wait on an unbounded
+    # registry/latest resolution.
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest, os_name: linux }
+          - { runner: macos-latest, os_name: macos }
+          - { runner: windows-latest, os_name: windows }
+    steps:
+      - name: Preserve exact Git bytes before Windows checkout
+        if: runner.os == 'Windows'
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          git config --global core.autocrlf false
+          test "$(git config --global --get core.autocrlf)" = false
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Enable cron on disposable hosted Linux verifier
+        if: runner.os == 'Linux'
+        env:
+          NIGHTLY_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$NIGHTLY_RUNNER_ENVIRONMENT" = github-hosted
+          sudo apt-get update -qq
+          sudo apt-get install -y cron
+          sudo systemctl start cron
+          sudo systemctl is-active --quiet cron
+      - name: Install exact-source verifier and current host CLIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          host_cli_prefix="$RUNNER_TEMP/ruvnet-host-clis"
+          npm install --prefix "$host_cli_prefix" --no-save --package-lock=false --no-audit --no-fund \
+            @anthropic-ai/claude-code@latest \
+            @openai/codex@latest
+          if [[ "${{ matrix.os_name }}" == windows ]]; then
+            cygpath -w "$host_cli_prefix/node_modules/.bin" >> "$GITHUB_PATH"
+          else
+            echo "$host_cli_prefix/node_modules/.bin" >> "$GITHUB_PATH"
+          fi
+      - name: Restore published transaction and candidate evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: publication-evidence-${{ needs.verified-candidate.outputs.candidate_sha }}
+          path: release-evidence
+      - name: Execute all three loaders and retrieval canaries from actual public bytes
+        shell: bash
+        env:
+          RUVNET_CLAUDE_MARKETPLACE_SOURCE: ${{ github.workspace }}
+          GITHUB_TOKEN: ${{ github.token }}
+          RUVNET_PUBLIC_SCHEDULER_MODE: smoke
+        run: |
+          set -euo pipefail
+          test -s release-evidence/COVERAGE.json
+          test -s release-evidence/retrieval-canary-plan.json
+          node scripts/host-registry.mjs --out release-evidence/host-registry.json
+          mkdir -p public-lanes
+          node scripts/public-verification-lane.mjs \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --os "${{ matrix.os_name }}" \
+            --candidate release-evidence/candidate-receipt.json \
+            --identity release-evidence/release-identity.json \
+            --coverage release-evidence/COVERAGE.json \
+            --plan release-evidence/retrieval-canary-plan.json \
+            --registry release-evidence/host-registry.json \
+            --out "public-lanes/${{ matrix.os_name }}.json"
+      - name: Preserve the immutable OS lane
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-verification-${{ matrix.os_name }}-${{ needs.verified-candidate.outputs.candidate_sha }}
+          path: public-lanes/${{ matrix.os_name }}.json
+          if-no-files-found: warn
+          retention-days: 90
+
+  finalize-public-verification:
+    name: finalize-public-verification
+    if: inputs.mode != 'corpus'
+    needs: [verified-candidate, public-verification]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Scoping, not approval: this job needs only the signing key, which the protected-branch-only
+    # `Production – corpus` environment already holds. Only `publish`, which carries NPM_TOKEN and
+    # contents:write, binds the `Production – ruvnet-brain` environment (no reviewer; no human pause).
+    environment: Production – corpus
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm ci --no-audit --no-fund
+      - name: Restore the published transaction identity
+        uses: actions/download-artifact@v4
+        with:
+          name: publication-evidence-${{ needs.verified-candidate.outputs.candidate_sha }}
+          path: release-evidence
+      - name: Restore exactly three immutable OS lanes
+        uses: actions/download-artifact@v4
+        with:
+          pattern: public-verification-*-${{ needs.verified-candidate.outputs.candidate_sha }}
+          path: public-lanes
+          merge-multiple: true
+      - name: Sign the nine-leaf aggregate and append install-verified
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          RUVNET_SIGNING_KEY: ${{ secrets.RUVNET_SIGNING_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/public-verification-aggregate.mjs \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --lanes public-lanes \
+            --out release-evidence/public-verification-aggregate.json
+          node scripts/public-verification-finalizer.mjs \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --identity release-evidence/release-identity.json \
+            --aggregate release-evidence/public-verification-aggregate.json \
+            --out release-evidence/install-verified-receipt.json
+          test "$(node -p "require('./release-evidence/install-verified-receipt.json').state")" = install-verified
+      - name: Preserve terminal public verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: install-verification-evidence-${{ needs.verified-candidate.outputs.candidate_sha }}
+          path: |
+            release-evidence/public-verification-aggregate.json
+            release-evidence/install-verified-receipt.json
+          if-no-files-found: error
+          retention-days: 90
+
+  # ─────────────────────────────────────────────────────────────────────────────────────────────
+  # CORPUS-ONLY CHAIN (ADR-086 steps 9, 17, 18). Runs only when mode=corpus; every job above is
+  # gated off. This chain may sign and publish a corpus generation WITHOUT a human GO, and it may
+  # never publish code: it never binds `Production – ruvnet-brain` (the only environment that scopes
+  # NPM_TOKEN), never sets up an authenticated npm registry, and release.mjs refuses
+  # `--corpus-seed --publish` outright. Corpus routing cannot reach npm by CAPABILITY, not merely by
+  # code path — which is why it needs its own environment rather than reusing the code one.
+  # ─────────────────────────────────────────────────────────────────────────────────────────────
+  corpus-identity:
+    name: authorize-corpus-generation
+    if: inputs.mode == 'corpus'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20 # downloads the ~555 MB approved release archive to rebuild its pin
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      candidate_sha: ${{ steps.candidate.outputs.candidate_sha }}
+      version: ${{ steps.candidate.outputs.version }}
+      approved_tag: ${{ steps.approved.outputs.approved_tag }}
+      superseded: ${{ steps.approved.outputs.superseded }}
+      seed_tag: ${{ steps.seed.outputs.seed_tag }}
+      seed_sha256: ${{ steps.seed.outputs.seed_sha256 }}
+      seed_bytes: ${{ steps.seed.outputs.seed_bytes }}
+      seed_origin: ${{ steps.seed.outputs.seed_origin }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # This run's own commit: the workflow text and the scripts that judge the candidate agree.
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - id: candidate
+        name: Bind this corpus run to one approved-runtime source identity on main's history
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RELEASE_MODE" = corpus
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EXPECTED_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          # One network read, three bounded tries: a fetch blip is weather, not a failed night.
+          for attempt in 1 2 3; do git fetch --no-tags origin main && break; [ "$attempt" = 3 ] && exit 1; sleep $((15 * attempt)); done
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          # DECOUPLED FROM main HEAD (2026-09-29 nightly redesign). The corpus is built at the APPROVED
+          # runtime's source, which is on main's history but usually behind main HEAD: ANCESTRY, never
+          # equality. What equality protected against (an older runtime promoted over a newer live
+          # code release) is enforced at publish time by release.mjs --approved-tag (superseded).
+          git merge-base --is-ancestor "$EXPECTED_SHA" "$GITHUB_SHA"
+          test "$(git show "$EXPECTED_SHA:package.json" | node -e "process.stdout.write(JSON.parse(require('fs').readFileSync(0,'utf8')).version)")" = "$EXPECTED_VERSION"
+          # New workflow text must never drive a runtime older than the first pipeline that understands it.
+          node --input-type=module -e "import { compareVersions, MIN_PIPELINE_VERSION } from './scripts/corpus-dispatch-decision.mjs'; if (compareVersions(process.argv[1], MIN_PIPELINE_VERSION) < 0) { console.error('candidate ' + process.argv[1] + ' predates pipeline ' + MIN_PIPELINE_VERSION); process.exit(1); }" "$EXPECTED_VERSION"
+          test -z "$(git status --porcelain)"
+          printf 'candidate_sha=%s\nversion=%s\n' "$EXPECTED_SHA" "$EXPECTED_VERSION" >> "$GITHUB_OUTPUT"
+      - id: approved
+        name: Resolve the approved runtime from the newest install-verified code release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # ADR-0091 D3. Unattended corpus promotion ships the archive's executable surface (the forge-*
+          # module graph, package manifests, verify-bundle.mjs, the signing trust root) straight into
+          # every installed client, so it runs only on a runtime a machine-gated code release shipped AND
+          # install-verified on all three OSes. That approval is no longer a committed file (a committed
+          # pin could never match the release that committed it). It is RESOLVED here: the newest
+          # vX.Y.Z — only the newest; it never falls back to an older one — whose signed
+          # public-verification-aggregate.json verifies against the committed
+          # keys/ruvnet-brain-signing.pub.pem, whose bundleSha256 is that release's exact zip, and whose
+          # sourceSha is reachable from origin/main. The pin is rebuilt from that zip's own
+          # ARCHIVE-MANIFEST.json and never written into the checkout.
+          set +e
+          node scripts/approved-runtime.mjs --resolve --repo "$GITHUB_REPOSITORY" \
+            --out "$RUNNER_TEMP/approved-runtime.json" > "$RUNNER_TEMP/approved-release.json"
+          resolve_status=$?
+          set -e
+          if [[ "$resolve_status" -eq 3 ]]; then
+            # The dispatcher saw EXPECTED_VERSION verified; a newest release WITHOUT an aggregate is a
+            # newer code release published since. Building at the older runtime would be superseded.
+            echo 'superseded=true' >> "$GITHUB_OUTPUT"
+            echo "::warning title=Corpus superseded::a newer code release than $EXPECTED_VERSION was published after dispatch and is not install-verified yet; nothing is built tonight"
+            exit 0
+          fi
+          test "$resolve_status" -eq 0
+          approved_sha="$(node -p "require(process.env.RUNNER_TEMP + '/approved-release.json').sourceSha")"
+          approved_tag="$(node -p "require(process.env.RUNNER_TEMP + '/approved-release.json').tag")"
+          approved_version="$(node -p "require(process.env.RUNNER_TEMP + '/approved-release.json').version")"
+          order="$(node --input-type=module -e "import { compareVersions } from './scripts/corpus-dispatch-decision.mjs'; console.log(compareVersions(process.argv[1], process.argv[2]))" "$approved_version" "$EXPECTED_VERSION")"
+          if [[ "$order" = 1 ]]; then
+            echo 'superseded=true' >> "$GITHUB_OUTPUT"
+            echo "::warning title=Corpus superseded::$approved_tag became the approved runtime after this run was dispatched for $EXPECTED_VERSION; nothing is built tonight"
+            exit 0
+          fi
+          # The approved source must BE this run's candidate. The publisher (release.mjs --approved-tag)
+          # re-proves it, and that it is still the newest code release, at publish time.
+          if [[ "$approved_sha" != "$EXPECTED_SHA" || "$approved_version" != "$EXPECTED_VERSION" ]]; then
+            echo "::error::candidate $EXPECTED_SHA ($EXPECTED_VERSION) is not the approved runtime: the newest code release is $approved_tag @ $approved_sha."
+            exit 1
+          fi
+          {
+            echo "approved_tag=$approved_tag"
+            echo 'superseded=false'
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice::approved runtime $approved_tag @ $approved_sha (resolved from its signed install verification)"
+      - id: seed
+        name: Resolve the previous compatible verified generation as this round's seed
+        if: steps.approved.outputs.superseded != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # ADR-0091 D4: the seed is the newest COMPATIBLE generation, judged before its archive is
+          # downloaded -- per-store embedding model/dimensions from the receipt, and the detached
+          # .recall.json against the frozen fixture digest and repo-recall reader. Compatibility is
+          # judged by the runtime that will CONSUME the seed: corpus-prepare builds at the approved
+          # runtime's source (EXPECTED_SHA, usually older than main), so its readers and fixture are
+          # the ones loaded here. No runtime pin takes part in seed selection any more.
+          approved_source="$RUNNER_TEMP/approved-source"
+          git worktree add --detach "$approved_source" "$EXPECTED_SHA"
+          node scripts/corpus-next-seed.mjs --repo "$GITHUB_REPOSITORY" \
+            --runtime-root "$approved_source" --out "$RUNNER_TEMP/next-seed.json"
+          git worktree remove --force "$approved_source"
+          {
+            echo "seed_tag=$(node -p "require(process.env.RUNNER_TEMP + '/next-seed.json').tag")"
+            echo "seed_sha256=$(node -p "require(process.env.RUNNER_TEMP + '/next-seed.json').sha256")"
+            echo "seed_bytes=$(node -p "require(process.env.RUNNER_TEMP + '/next-seed.json').bytes")"
+            echo "seed_origin=$(node -p "require(process.env.RUNNER_TEMP + '/next-seed.json').origin")"
+          } >> "$GITHUB_OUTPUT"
+
+  corpus-prepare:
+    name: seal-exact-corpus-candidate
+    if: inputs.mode == 'corpus' && needs.corpus-identity.outputs.superseded != 'true'
+    needs: corpus-identity
+    uses: ./.github/workflows/corpus-seed.yml
+    permissions:
+      actions: read
+      contents: read
+    with:
+      candidate_sha: ${{ needs.corpus-identity.outputs.candidate_sha }}
+      seed_tag: ${{ needs.corpus-identity.outputs.seed_tag }}
+      seed_sha256: ${{ needs.corpus-identity.outputs.seed_sha256 }}
+      seed_bytes: ${{ needs.corpus-identity.outputs.seed_bytes }}
+    secrets:
+      RUVNET_GISTS_TOKEN: ${{ secrets.RUVNET_GISTS_TOKEN }}
+
+  corpus-no-change:
+    name: corpus-no-change-round
+    # Decided BEFORE anything was built: every knowledge input (source commits, gist versions, public
+    # prose, embedding model, sealed observation) equals the seed's (scripts/knowledge-input-digest.mjs).
+    # The old test compared the rebuilt archive's digest with the seed's, which a rebuild never reproduces.
+    if: inputs.mode == 'corpus' && needs.corpus-prepare.outputs.no_change == 'true'
+    needs: [corpus-identity, corpus-prepare]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Record a no-change round without inventing a content generation
+        env:
+          KNOWLEDGE_INPUT_SHA256: ${{ needs.corpus-prepare.outputs.knowledge_input_sha256 }}
+          ROUND_SEED_TAG: ${{ needs.corpus-identity.outputs.seed_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Every knowledge input equals the seed's (knowledge-input digest $KNOWLEDGE_INPUT_SHA256)."
+          echo "$ROUND_SEED_TAG remains the current generation; nothing was built, published, or minted."
+
+  corpus-authorize:
+    name: authenticate-corpus-preparation-provenance
+    if: inputs.mode == 'corpus' && needs.corpus-prepare.outputs.no_change != 'true'
+    needs: [corpus-identity, corpus-prepare]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.provenance.outputs.artifact_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Only for scripts/transient-gh.mjs below: the one retry rule, not a second copy of it.
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - id: provenance
+        name: Resolve this run's authentic corpus preparation artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ needs.corpus-identity.outputs.candidate_sha }}
+          PREPARATION_RUN_ID: ${{ github.run_id }}
+          PREPARATION_RUN_ATTEMPT: ${{ github.run_attempt }}
+          PREPARATION_ARTIFACT: ${{ needs.corpus-prepare.outputs.artifact_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Artifact names and receipt fields are not producer authentication. The preparation runs as
+          # a reusable workflow inside THIS run, so its artifact belongs to this run id and this
+          # attempt — and that is exactly what gets proved here, through GitHub-owned run metadata,
+          # before a single byte is downloaded.
+          artifact_id="$(node --input-type=module <<'NODE'
+          import { spawnSync } from 'node:child_process';
+          import { retryTransientResult } from './scripts/transient-gh.mjs';
+          const repo = process.env.GITHUB_REPOSITORY;
+          const sha = process.env.CANDIDATE_SHA;
+          const runId = Number(process.env.PREPARATION_RUN_ID);
+          const runAttempt = Number(process.env.PREPARATION_RUN_ATTEMPT);
+          // The run's own head is main at dispatch; the candidate is the approved runtime's source, an
+          // ancestor of it (corpus-identity proved that). The artifact is NAMED by the candidate.
+          const runHead = process.env.GITHUB_SHA;
+          if (!/^[0-9a-f]{40}$/.test(runHead || '')) throw new Error('untrusted corpus run head');
+          const workflowPath = '.github/workflows/protected-release.yml';
+          // Four GitHub-owned metadata reads; each retried on a transient failure, bounded, never on an answer.
+          const api = (endpoint) => {
+            const result = retryTransientResult(() => spawnSync('gh', ['api', `repos/${repo}/${endpoint}`], {
+              encoding: 'utf8', timeout: 30000, maxBuffer: 16 * 1024 * 1024,
+            }));
+            if (result.error || result.status !== 0) throw new Error(`gh api ${endpoint} failed: ${String(result.stderr || result.error?.message || '').trim().slice(0, 300)}`);
+            return JSON.parse(result.stdout);
+          };
+          if (!/^[0-9a-f]{40}$/.test(sha || '')) throw new Error('untrusted corpus candidate identity');
+          if (!Number.isSafeInteger(runId) || runId <= 0) throw new Error('untrusted corpus preparation run id');
+          if (!Number.isSafeInteger(runAttempt) || runAttempt <= 0) throw new Error('untrusted corpus preparation run attempt');
+          const workflow = api('actions/workflows/protected-release.yml');
+          if (!Number.isSafeInteger(workflow.id) || workflow.id <= 0 || workflow.path !== workflowPath) {
+            throw new Error('untrusted corpus workflow identity');
+          }
+          const trustedRun = (run) => Number.isSafeInteger(run.id) && run.id === runId
+            && run.workflow_id === workflow.id && run.path === workflowPath
+            && run.event === 'workflow_dispatch' && run.run_attempt === runAttempt
+            && run.head_sha === runHead && run.head_branch === 'main'
+            && Number.isSafeInteger(run.repository?.id) && run.repository.id > 0
+            && run.repository.full_name === repo && run.head_repository?.full_name === repo
+            && run.head_repository.id === run.repository.id;
+          const run = api(`actions/runs/${runId}`);
+          if (!trustedRun(run)) throw new Error('no trusted corpus preparation run');
+          const artifactName = `corpus-seed-prepared-${sha}`;
+          if (process.env.PREPARATION_ARTIFACT !== artifactName) throw new Error('untrusted corpus artifact name');
+          const trustedArtifact = (artifact) => Number.isSafeInteger(artifact.id) && artifact.id > 0
+            && artifact.name === artifactName && artifact.expired === false
+            && artifact.workflow_run?.id === run.id && artifact.workflow_run.head_sha === runHead
+            && artifact.workflow_run.head_branch === run.head_branch
+            && artifact.workflow_run.repository_id === run.repository.id
+            && artifact.workflow_run.head_repository_id === run.repository.id;
+          const listed = api(`actions/runs/${runId}/artifacts?per_page=100`);
+          const artifacts = (listed.artifacts || []).filter(trustedArtifact);
+          if (artifacts.length !== 1) throw new Error('expected one authentic corpus preparation artifact');
+          const artifact = api(`actions/artifacts/${artifacts[0].id}`);
+          if (artifact.id !== artifacts[0].id || !trustedArtifact(artifact)) throw new Error('corpus artifact provenance changed');
+          process.stdout.write(String(artifact.id));
+          NODE
+          )"
+          echo "artifact_id=$artifact_id" >> "$GITHUB_OUTPUT"
+
+  corpus-publish:
+    name: protected-corpus-publisher
+    if: inputs.mode == 'corpus' && needs.corpus-prepare.outputs.no_change != 'true'
+    needs: [corpus-identity, corpus-prepare, corpus-authorize]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Stages the candidate (it no longer moves releases/latest; corpus-promote does, after the customer
+    # canary). It stays in the release group because staging re-resolves the newest code release.
+    concurrency:
+      group: ruvnet-brain-release
+      cancel-in-progress: false
+    outputs:
+      outcome: ${{ steps.publish.outputs.outcome }}
+    # NOT `Production – ruvnet-brain`. That environment scopes NPM_TOKEN beside the signing key, so
+    # binding an unattended job to it would hand npm publication capability to a job no human
+    # approved. `Production – corpus` holds ONLY RUVNET_SIGNING_KEY, with its own main-only branch
+    # policy. Signing containment is preserved; npm is unreachable from here by construction.
+    environment: Production – corpus
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The candidate SHA -- the approved runtime's own source, never `main`. release.mjs requires
+          # --target to equal HEAD and the receipt's builderSourceSha, to be an ancestor of GITHUB_SHA,
+          # and to be the commit of --approved-tag, still the newest code release at publish time.
+          ref: ${{ needs.corpus-identity.outputs.candidate_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        # Deliberately no `registry-url:`. The code publisher configures an authenticated npm
+        # registry here; the corpus publisher must not, and has no token to use if it did.
+        with:
+          node-version: '20'
+      - name: Install the exact lockfile dependency graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          cd kb && npm ci --no-audit --no-fund
+      - name: Import the authenticated candidate into runner storage only
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CORPUS_ARTIFACT_ID: ${{ needs.corpus-authorize.outputs.artifact_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$CORPUS_ARTIFACT_ID" =~ ^[0-9]+$ ]]
+          # NEVER into the checkout. The code lane unzips into `release-evidence/` inside the
+          # workspace; doing that here would dirty the tracked tree this job then asserts is clean,
+          # and would put a ~500 MB payload inside a git repository for no reason. Three bounded tries: a reset
+          # mid-download of the sealed candidate must not throw away the ~3 h that produced it.
+          for attempt in 1 2 3; do
+            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$CORPUS_ARTIFACT_ID/zip" > "$RUNNER_TEMP/corpus-prepared.zip" && break
+            [ "$attempt" = 3 ] && exit 1
+            sleep $((15 * attempt))
+          done
+          rm -rf "$RUNNER_TEMP/corpus-import"
+          mkdir -p "$RUNNER_TEMP/corpus-import"
+          unzip -q "$RUNNER_TEMP/corpus-prepared.zip" -d "$RUNNER_TEMP/corpus-import"
+          test -z "$(git status --porcelain)"
+      - name: Re-verify the exact candidate identity, contents and shipped runtime
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ needs.corpus-identity.outputs.candidate_sha }}
+          APPROVED_TAG: ${{ needs.corpus-identity.outputs.approved_tag }}
+          EXPECTED_ARCHIVE_SHA256: ${{ needs.corpus-prepare.outputs.archive_sha256 }}
+          EXPECTED_RECEIPT_SHA256: ${{ needs.corpus-prepare.outputs.receipt_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          staged="$RUNNER_TEMP/corpus-import"
+          # The code that verifies, signs and publishes is the APPROVED runtime's own source -- owner-
+          # approved and install-verified -- on this protected run's history.
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          git merge-base --is-ancestor "$CANDIDATE_SHA" "$GITHUB_SHA"
+          test -s "$staged/ruvnet-brain.zip"
+          test -s "$staged/corpus-receipt.json"
+          test -s "$staged/corpus-preparation.identity"
+          test -s "$staged/source-coverage.json"
+          archive_sha256="$(sha256sum "$staged/ruvnet-brain.zip" | cut -d' ' -f1)"
+          receipt_sha256="$(sha256sum "$staged/corpus-receipt.json" | cut -d' ' -f1)"
+          test "$archive_sha256" = "$EXPECTED_ARCHIVE_SHA256"
+          test "$receipt_sha256" = "$EXPECTED_RECEIPT_SHA256"
+          grep -Fxq "candidate_sha=$CANDIDATE_SHA" "$staged/corpus-preparation.identity"
+          grep -Fxq "archive_sha256=$archive_sha256" "$staged/corpus-preparation.identity"
+          grep -Fxq "receipt_sha256=$receipt_sha256" "$staged/corpus-preparation.identity"
+          # ADR-0091 D6.2: the sealed coverage preparation staged beside the archive is published with it
+          # (CORPUS-COVERAGE.json + coverage-receipt.json); release.mjs binds it to this receipt first.
+          # Re-derive the whole candidate from the archive's own bytes. A forged per-store digest
+          # passes every identity check above and dies here.
+          node scripts/corpus-candidate.mjs --verify \
+            --bundle "$staged/ruvnet-brain.zip" \
+            --receipt "$staged/corpus-receipt.json" \
+            --coverage "$staged/source-coverage.json"
+          # RUNTIME BYTES. Independently re-resolve the pin for EXACTLY the release corpus-identity approved
+          # (its signed aggregate re-verified on this runner, not handed over as a job output), require it
+          # to name this candidate, then require the archive's executable surface to equal it byte for byte.
+          node scripts/approved-runtime.mjs --resolve --repo "$GITHUB_REPOSITORY" --tag "$APPROVED_TAG" \
+            --out "$RUNNER_TEMP/approved-runtime.json" > "$RUNNER_TEMP/approved-release.json"
+          test "$(node -p "require(process.env.RUNNER_TEMP + '/approved-release.json').sourceSha")" = "$CANDIDATE_SHA"
+          manifest_entry="$(unzip -Z1 "$staged/ruvnet-brain.zip" | grep -E '(^|/)ARCHIVE-MANIFEST\.json$' | head -1)"
+          test -n "$manifest_entry"
+          unzip -p "$staged/ruvnet-brain.zip" "$manifest_entry" > "$RUNNER_TEMP/archive-manifest.json"
+          node scripts/approved-runtime.mjs --verify --archive-manifest "$RUNNER_TEMP/archive-manifest.json" \
+            --pin "$RUNNER_TEMP/approved-runtime.json"
+          test -z "$(git status --porcelain)"
+      - name: Sign the exact archive with the corpus-scoped key
+        env:
+          RUVNET_SIGNING_KEY: ${{ secrets.RUVNET_SIGNING_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          staged="$RUNNER_TEMP/corpus-import"
+          # GitHub AUTO-CREATES an unknown environment on first reference, with no protection rules
+          # and no secrets — so a missing `Production – corpus` does not fail the job, it silently
+          # supplies an empty key. Say so in exactly the words the owner needs, rather than letting
+          # sign-bundle.mjs report a generic "no signing key" three lines later.
+          if [[ -z "${RUVNET_SIGNING_KEY:-}" ]]; then
+            echo '::error::The `Production – corpus` environment has no RUVNET_SIGNING_KEY.'
+            echo '::error::OWNER ACTION: create the environment `Production – corpus` with a branch policy'
+            echo '::error::limited to main, and add RUVNET_SIGNING_KEY to it — and ONLY that secret. It must'
+            echo '::error::hold no npm publication credential: binding the corpus job to the code environment'
+            echo '::error::instead would hand npm publication capability to an unattended job. The key value is'
+            echo '::error::not API-readable; it comes from the SOPS+age chain, so no automation can create it.'
+            exit 1
+          fi
+          node scripts/sign-bundle.mjs --bundle "$staged/ruvnet-brain.zip"
+          # The shipped verifier against the committed trust root — the same key kb/forge-update.mjs
+          # carries, so this proves the customer path can verify what is about to be published.
+          node scripts/verify-bundle.mjs "$staged/ruvnet-brain.zip" "$staged/ruvnet-brain.zip.sig"
+          test -z "$(git status --porcelain)"
+      - name: Stage the corpus generation (public prerelease, never latest) through the one canonical publisher
+        id: publish
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ needs.corpus-identity.outputs.candidate_sha }}
+          APPROVED_TAG: ${{ needs.corpus-identity.outputs.approved_tag }}
+          EXPECTED_ARCHIVE_SHA256: ${{ needs.corpus-prepare.outputs.archive_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          staged="$RUNNER_TEMP/corpus-import"
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          test -z "$(git status --porcelain)"
+          # THE PRODUCER CANNOT DECLARE SUCCESS UNLESS THE CONSUMER ACCEPTED. This step never moves
+          # releases/latest: it stages a signed, public prerelease. corpus-canary applies it through a
+          # clean customer install, and only corpus-promote -- with that PASS verdict -- moves latest.
+          set +e
+          node scripts/release.mjs --corpus-seed --stage-candidate \
+            --corpus-tag "corpus-sha256-$EXPECTED_ARCHIVE_SHA256" \
+            --corpus-bundle "$staged/ruvnet-brain.zip" \
+            --corpus-receipt "$staged/corpus-receipt.json" \
+            --corpus-coverage "$staged/source-coverage.json" \
+            --target "$CANDIDATE_SHA" \
+            --approved-tag "$APPROVED_TAG" \
+            --repo "$GITHUB_REPOSITORY"
+          status=$?
+          set -e
+          test -z "$(git status --porcelain)"
+          if [[ "$status" -eq 4 ]]; then
+            # CorpusSuperseded: a newer code release landed while this corpus was prepared. Not red --
+            # nothing was written, and the next night builds at the newer runtime.
+            echo 'outcome=superseded' >> "$GITHUB_OUTPUT"
+            echo "::warning title=Corpus superseded::a code release newer than $APPROVED_TAG was published during preparation; nothing was published tonight"
+            exit 0
+          fi
+          test "$status" -eq 0
+          echo 'outcome=staged' >> "$GITHUB_OUTPUT"
+      - name: Preserve the corpus publication evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: corpus-publication-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/corpus-import/corpus-receipt.json
+            ${{ runner.temp }}/corpus-import/corpus-preparation.identity
+            ${{ runner.temp }}/corpus-import/ruvnet-brain.zip.sha256
+            ${{ runner.temp }}/archive-manifest.json
+            ${{ runner.temp }}/approved-runtime.json
+            ${{ runner.temp }}/approved-release.json
+          if-no-files-found: warn
+          retention-days: 90
+
+  corpus-canary:
+    name: customer-canary
+    # THE CONSUMER'S QUESTION, asked the consumer's way (scripts/corpus-canary.mjs): install the approved
+    # runtime from npm exactly as a stranger does, into an isolated HOME, then apply the staged candidate
+    # with the updater INSIDE that install. A fresh runner: nothing from the publisher's workspace.
+    if: inputs.mode == 'corpus' && needs.corpus-publish.outputs.outcome == 'staged'
+    needs: [corpus-identity, corpus-prepare, corpus-publish]
+    runs-on: ubuntu-latest
+    # Three customer states, one after another, each a fresh install deleted before the next (peak disk is
+    # one install + one apply): clean, private-overlay, older-runtime (N-1 through `npx ruvnet-brain@latest
+    # --update`). Measured on a GitHub runner (ci-probe/canary-cases-4.5, run 36874885572, 2026-10-01):
+    # all three in 1227 s (20.5 min) against a real 199-store generation, inside this 60-minute budget.
+    timeout-minutes: 60
+    # NO environment and NO secrets: a customer holds neither. The automatic token is read-only here and
+    # is never handed to the customer install (corpus-canary.mjs builds the child environment from
+    # scratch). The canary downloads only public release assets, anonymously, as customers do.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # This run's own commit, like corpus-identity: the workflow text and the judge agree. The
+          # judge's verdict names the run, so a verdict from any other run cannot promote this one.
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install the approved runtime as a customer and apply the staged candidate through its own updater
+        env:
+          CANDIDATE_TAG: corpus-sha256-${{ needs.corpus-prepare.outputs.archive_sha256 }}
+          APPROVED_VERSION: ${{ needs.corpus-identity.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$CANDIDATE_TAG" =~ ^corpus-sha256-[0-9a-f]{64}$ ]]
+          [[ "$APPROVED_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          df -h "$RUNNER_TEMP" | tail -1
+          status=0
+          node scripts/corpus-canary.mjs --repo "$GITHUB_REPOSITORY" --tag "$CANDIDATE_TAG" \
+            --approved-version "$APPROVED_VERSION" --work "$RUNNER_TEMP/canary" \
+            --cases clean,private-overlay,older-runtime \
+            --verdict-out "$RUNNER_TEMP/canary-verdict/corpus-canary-verdict.json" | tee "$RUNNER_TEMP/canary.out" || status=$?
+          {
+            echo '### customer canary'
+            echo ''
+            echo '```'
+            cat "$RUNNER_TEMP/canary.out"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$status" -ne 0 ]]; then
+            echo "::error title=Customer canary refused::a clean customer install could not apply $CANDIDATE_TAG; it stays an unpromoted prerelease and customers keep the current latest"
+          fi
+          exit "$status"
+      - name: Preserve the canary verdict (the promotion's required consent)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: corpus-canary-verdict-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/canary-verdict/corpus-canary-verdict.json
+          if-no-files-found: error
+          retention-days: 90
+      - name: Preserve the canary log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: corpus-canary-log-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/canary/canary.log
+          if-no-files-found: warn
+          retention-days: 30
+
+  corpus-promote:
+    name: promote-canaried-corpus
+    # Runs only after the canary job SUCCEEDED; release.mjs --promote-staged re-proves the verdict itself.
+    if: inputs.mode == 'corpus' && needs.corpus-publish.outputs.outcome == 'staged' && needs.corpus-canary.result == 'success'
+    needs: [corpus-identity, corpus-prepare, corpus-publish, corpus-canary]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Moves releases/latest, so it serializes with code publication exactly as corpus-publish does.
+    concurrency:
+      group: ruvnet-brain-release
+      cancel-in-progress: false
+    outputs:
+      outcome: ${{ steps.promote.outputs.outcome }}
+    # No environment: promotion signs nothing and needs no secret. `contents: write` is the one
+    # capability required to flip a prerelease to latest; the signing key stays in `Production – corpus`.
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The approved runtime's own source, the same code that staged the candidate.
+          ref: ${{ needs.corpus-identity.outputs.candidate_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install the exact lockfile dependency graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          cd kb && npm ci --no-audit --no-fund
+      - name: Fetch this run's canary verdict (runner storage only)
+        uses: actions/download-artifact@v4
+        with:
+          name: corpus-canary-verdict-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/canary-verdict
+      - name: Promote the canaried generation through the one canonical publisher
+        id: promote
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ needs.corpus-identity.outputs.candidate_sha }}
+          APPROVED_TAG: ${{ needs.corpus-identity.outputs.approved_tag }}
+          EXPECTED_ARCHIVE_SHA256: ${{ needs.corpus-prepare.outputs.archive_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          git merge-base --is-ancestor "$CANDIDATE_SHA" "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+          set +e
+          node scripts/release.mjs --corpus-seed --promote-staged \
+            --corpus-tag "corpus-sha256-$EXPECTED_ARCHIVE_SHA256" \
+            --canary-verdict "$RUNNER_TEMP/canary-verdict/corpus-canary-verdict.json" \
+            --target "$CANDIDATE_SHA" \
+            --approved-tag "$APPROVED_TAG" \
+            --repo "$GITHUB_REPOSITORY"
+          status=$?
+          set -e
+          test -z "$(git status --porcelain)"
+          if [[ "$status" -eq 4 ]]; then
+            echo 'outcome=superseded' >> "$GITHUB_OUTPUT"
+            echo "::warning title=Corpus superseded::a code release newer than $APPROVED_TAG was published before promotion; the canaried prerelease stays unpromoted"
+            exit 0
+          fi
+          test "$status" -eq 0
+          echo 'outcome=published' >> "$GITHUB_OUTPUT"
+
+  corpus-terminal-outcome:
+    name: corpus-terminal-outcome
+    if: always() && inputs.mode == 'corpus'
+    needs: [corpus-identity, corpus-prepare, corpus-no-change, corpus-authorize, corpus-publish, corpus-canary, corpus-promote]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    env:
+      RUN_ID: ${{ github.run_id }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      RUN_EVENT: ${{ github.event_name }}
+      RUN_SHA: ${{ github.sha }}
+      RUN_BRANCH: ${{ github.ref_name }}
+      RUN_ATTEMPT: ${{ github.run_attempt }}
+      IDENTITY_RESULT: ${{ needs.corpus-identity.result }}
+      IDENTITY_SUPERSEDED: ${{ needs.corpus-identity.outputs.superseded }}
+      PUBLISH_OUTCOME: ${{ needs.corpus-publish.outputs.outcome }}
+      PREPARE_RESULT: ${{ needs.corpus-prepare.result }}
+      NO_CHANGE_RESULT: ${{ needs.corpus-no-change.result }}
+      AUTHORIZE_RESULT: ${{ needs.corpus-authorize.result }}
+      PUBLISH_RESULT: ${{ needs.corpus-publish.result }}
+      CANARY_RESULT: ${{ needs.corpus-canary.result }}
+      PROMOTE_RESULT: ${{ needs.corpus-promote.result }}
+      PROMOTE_OUTCOME: ${{ needs.corpus-promote.outputs.outcome }}
+    steps:
+      - name: Preserve this corpus run's terminal dependency state
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RUN_EVENT" = workflow_dispatch
+          test "$RUN_BRANCH" = main
+          [[ "$RUN_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$RUN_ATTEMPT" =~ ^[0-9]+$ ]]
+          node - <<'NODE' > corpus-release-outcome.json
+          const fs = require('node:fs');
+          const results = {
+            identity: process.env.IDENTITY_RESULT,
+            prepare: process.env.PREPARE_RESULT,
+            no_change: process.env.NO_CHANGE_RESULT,
+            authorize: process.env.AUTHORIZE_RESULT,
+            publish: process.env.PUBLISH_RESULT,
+            canary: process.env.CANARY_RESULT,
+            promote: process.env.PROMOTE_RESULT,
+          };
+          const allowed = new Set(['success', 'failure', 'cancelled', 'skipped']);
+          for (const [job, result] of Object.entries(results)) {
+            if (!allowed.has(result)) throw new Error(`invalid ${job} result: ${result}`);
+          }
+          let conclusion = 'success';
+          if (Object.values(results).includes('failure')) conclusion = 'failure';
+          else if (Object.values(results).includes('cancelled')) conclusion = 'cancelled';
+          // THE NIGHT'S OUTCOME, one word, read by the corpus watchdog workflow (it takes precedence over
+          // the job results there): published | no-change | superseded | canary-rejected | failed.
+          // `published` now means PROMOTED: staged, applied by a clean customer install, and moved to
+          // latest. A canary that refused the candidate is `canary-rejected` (red, pages): customers keep
+          // the previous latest. A cancelled run published nothing, so it is failed. A run whose jobs all
+          // "succeeded" without reaching an outcome is NOT a success -- it is failed.
+          let outcome = 'failed';
+          if (results.canary === 'failure') outcome = 'canary-rejected';
+          else if (conclusion === 'success') {
+            if (process.env.IDENTITY_SUPERSEDED === 'true' || process.env.PUBLISH_OUTCOME === 'superseded'
+              || process.env.PROMOTE_OUTCOME === 'superseded') outcome = 'superseded';
+            else if (results.no_change === 'success') outcome = 'no-change';
+            else if (results.publish === 'success' && process.env.PUBLISH_OUTCOME === 'staged'
+              && results.canary === 'success' && results.promote === 'success'
+              && process.env.PROMOTE_OUTCOME === 'published') outcome = 'published';
+          }
+          const record = {
+            run_id: Number(process.env.RUN_ID),
+            run_attempt: Number(process.env.RUN_ATTEMPT),
+            run_url: process.env.RUN_URL,
+            event: process.env.RUN_EVENT,
+            head_sha: process.env.RUN_SHA,
+            head_branch: process.env.RUN_BRANCH,
+            status: 'completed-dependencies',
+            conclusion,
+            outcome,
+            jobs: results,
+          };
+          fs.writeFileSync(1, `${JSON.stringify(record, null, 2)}\n`);
+          NODE
+          conclusion="$(node -p "require('./corpus-release-outcome.json').conclusion")"
+          outcome="$(node -p "require('./corpus-release-outcome.json').outcome")"
+          {
+            echo '### protected corpus terminal outcome'
+            echo ''
+            echo "- target run: [$RUN_ID]($RUN_URL)"
+            echo "- outcome: **$outcome**"
+            echo "- dependency conclusion: $conclusion"
+            echo "- run head: \`$RUN_SHA\`"
+            echo "- attempt: $RUN_ATTEMPT"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$outcome" = superseded ]]; then echo '::warning title=Corpus superseded::a newer code release landed; the next night builds at it'; fi
+          # Every dependency "succeeded" yet the night reached no outcome: that is a silent failure.
+          if [[ "$outcome" = failed && "$conclusion" = success ]]; then
+            echo '::error::the corpus run reached no terminal outcome (published, no-change or superseded)'
+            exit 1
+          fi
+      - name: Preserve the terminal outcome record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: corpus-release-outcome-${{ github.run_id }}-${{ github.run_attempt }}
+          path: corpus-release-outcome.json
+          if-no-files-found: error
+          retention-days: 90

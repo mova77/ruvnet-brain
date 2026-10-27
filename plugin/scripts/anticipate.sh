@@ -64,28 +64,67 @@ set +e
 SELF_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)
 [ -n "$SELF_DIR" ] || exit 0
 
-# <codeRoot>/plugin/scripts/anticipate.sh → <codeRoot>. Resolved from THIS file's own location, so
-# it is correct under the Stable Spine (an immutable ~/.cache/ruvnet-brain/versions/<gen> tree) and
-# in a dev checkout alike, without reading active.json — hook-shim.mjs has already chosen the tree
-# by the time it executes this body.
-CODE_ROOT=$(CDPATH='' cd -- "$SELF_DIR/../.." 2>/dev/null && pwd)
-[ -n "$CODE_ROOT" ] || exit 0
+# WHERE THE THREE MODULES LIVE — resolved by PROBE, not by assertion (2026-08-04).
+#
+# This block used to be one line — `CODE_ROOT=$SELF_DIR/../..` — justified by the claim, repeated in
+# the ADVOCACY_MODULE comment below, that a dev checkout and the Stable Spine "both keep `scripts/`
+# as a sibling of `plugin/`". MEASURED on a real install, that is FALSE in both shipped layouts, and
+# true only in the one layout that never reaches a user:
+#
+#   <plugin-cache>/ruvnet-brain/4.0.7/scripts/anticipate.sh  → ../.. = <plugin-cache>/ruvnet-brain
+#   ~/.cache/ruvnet-brain/versions/<gen>/scripts/anticipate.sh → ../.. = .../versions
+#   <src>/plugin/scripts/anticipate.sh                       → ../.. = <src>            ← only this
+#
+# Both distribution channels FLATTEN the `plugin/` level, so `../..` overshoots by one directory and
+# $CODE_ROOT/scripts/goal-match.mjs never existed. The `[ -f "$GOAL_MATCH" ] || exit 0` guard below
+# then did exactly what it promises — it stayed silent — so the L4 surface shipped permanently and
+# INVISIBLY inert. A hook whose only failure mode is silence cannot report its own breakage; that is
+# precisely why this needs a probe and not a comment.
+#
+# THE FIX IS TO ASK THE FILESYSTEM. Try each candidate directory and take the first that actually
+# holds the matcher. That is the same discipline the rest of this file already applies to the
+# machine's state: never render an assumption as a fact. Candidates, in order:
+#
+#   1. $SELF_DIR              — modules shipped as SIBLINGS of this script (the flattened plugin
+#                               zip and the Stable Spine, once packaging ships them; see below)
+#   2. $SELF_DIR/../../scripts — the source/dev layout <src>/plugin/scripts → <src>/scripts
+#   3. $SELF_DIR/../scripts   — a root that keeps scripts/ one level up from this file
+#
+# PACKAGING IS THE OTHER HALF, and neither half works alone. goal-match.mjs, capability-registry.mjs
+# and advocacy-outcomes.mjs currently live ONLY in the repo-root `scripts/`, which the plugin zip
+# does not carry; this resolver finds nothing until they are shipped into `plugin/scripts/` beside
+# this file. Fixing the path without the packaging leaves it silent, and vice versa.
+#
+# If NO candidate holds the matcher we deliberately fall through to the historical path, so the
+# "missing module" diagnostics below still name the location a maintainer would expect — and the
+# no-node fast path keeps this hook free. Silence on doubt, never a guess: rule 4, unchanged.
+resolve_module_dir() {
+  for _cand in "$SELF_DIR" "$SELF_DIR/../../scripts" "$SELF_DIR/../scripts"; do
+    _r=$(CDPATH='' cd -- "$_cand" 2>/dev/null && pwd) || continue
+    if [ -n "$_r" ] && [ -f "$_r/goal-match.mjs" ]; then printf '%s' "$_r"; return 0; fi
+  done
+  _r=$(CDPATH='' cd -- "$SELF_DIR/../.." 2>/dev/null && pwd) || return 1
+  [ -n "$_r" ] && printf '%s' "$_r/scripts"
+}
+MODULE_DIR=$(resolve_module_dir)
+[ -n "$MODULE_DIR" ] || exit 0
 
 # All THREE module paths are env-overridable, matching the RUVNET_LESSON_STORE / RUVNET_SETTINGS_FILE
 # idiom already used across this repo — so tests never load the real registry or touch a real user's
 # state, and a future relocation needs no edit here.
-GOAL_MATCH="${RUVNET_GOAL_MATCH:-$CODE_ROOT/scripts/goal-match.mjs}"
-CAP_REGISTRY="${RUVNET_CAPABILITY_REGISTRY:-$CODE_ROOT/scripts/capability-registry.mjs}"
+GOAL_MATCH="${RUVNET_GOAL_MATCH:-$MODULE_DIR/goal-match.mjs}"
+CAP_REGISTRY="${RUVNET_CAPABILITY_REGISTRY:-$MODULE_DIR/capability-registry.mjs}"
 # THE SINGLE SUPPRESSION POLICY (2026-07-23). Until this build this file decided "is X suppressed"
 # with its OWN local dismissed-Set in anticipate-state.json — one dismissal muted forever, no
 # severity, no budget — while advocacy-outcomes.mjs's shouldStillOffer()/DISMISSAL_BUDGET (a nag dies
 # on 1 dismissal, a high-severity finding needs 3, with a state-change reprieve) sat completely
 # uncalled. Two thresholds for one decision is the exact hazard named below for the confidence floor;
 # the fix is the same shape — wire this module the IDENTICAL env-var-with-a-default way as the two
-# above, NOT a hardcoded `../scripts` path, so it resolves correctly whether this file runs from a dev
-# checkout or the Stable Spine's `<gen>/plugin/scripts/anticipate.sh` (both keep `scripts/` as a
-# sibling of `plugin/`, per this file's own CODE_ROOT comment above).
-ADVOCACY_MODULE="${RUVNET_ADVOCACY_OUTCOMES_MODULE:-$CODE_ROOT/scripts/advocacy-outcomes.mjs}"
+# above, NOT a hardcoded `../scripts` path, so it resolves wherever this file actually runs from.
+# (CORRECTED 2026-08-04: this comment previously asserted that a dev checkout and the Spine "both
+# keep `scripts/` as a sibling of `plugin/`". They do not — see the measured table above. The three
+# modules now resolve through MODULE_DIR, which probes rather than assumes.)
+ADVOCACY_MODULE="${RUVNET_ADVOCACY_OUTCOMES_MODULE:-$MODULE_DIR/advocacy-outcomes.mjs}"
 
 # ── Subcommands (dismiss/undismiss/status) run the same node program in a different mode ─────────
 MODE="suggest"
@@ -156,6 +195,7 @@ import { pathToFileURL } from 'node:url';
 const MODE = process.env.RUVNET_ANTICIPATE_MODE || 'suggest';
 const ARG = process.env.RUVNET_ANTICIPATE_ARG || '';
 const SELF = process.env.RUVNET_ANTICIPATE_SELF || 'anticipate.sh';
+const SELF_DIR = path.dirname(SELF);
 
 // CANDIDATE MODE (ADR-040 / DDD-0004 "the enforcement chokepoint"). Set by unprompted-runtime.mjs on
 // every producer child. When on, this hook writes ZERO user-facing prose: it emits ONE advocacy
@@ -349,6 +389,10 @@ function advocacyLevel() {
     // version did) meant every real save through the console/CLI was invisible here and the dial
     // silently fell back to the default. Keep a top-level fallback for a hand-written/legacy file.
     const v = (parsed && parsed.settings && parsed.settings.advocacy) ?? (parsed && parsed.advocacy);
+    // The console's dial saves an INTEGER 1–5 (ADR-052). Level 1 is "Only when I ask" — silent here;
+    // 2–5 all let this hook's single high-bar nudge through (it has no severity axis to split on).
+    // Before this mapping every integer fell through to the speaking default (RNBC QA 2026-10-01).
+    if (Number.isInteger(v) && v >= 1 && v <= 5) return v === 1 ? 'off' : v >= 4 ? 'all' : 'important-only';
     return (v === 'off' || v === 'important-only' || v === 'all') ? v : 'important-only';
   } catch { return 'important-only'; }
 }
@@ -375,13 +419,18 @@ const sessions = st.sessions && typeof st.sessions === 'object' ? st.sessions : 
 const said = new Set(strings(sessions[sid]?.said));
 if (said.size >= MAX_PER_SESSION) quit();
 
-let auditAll, matchGoal, floor;
+let auditAll, matchGoal, floor, buildCapabilityRoutingReceipt, hasToolPreference;
 try { ({ auditAll } = await import(pathToFileURL(process.env.RUVNET_CAPABILITY_REGISTRY).href)); } catch { quit(); }
 try {
   const gm = await import(pathToFileURL(process.env.RUVNET_GOAL_MATCH).href);
   matchGoal = gm.matchGoal;
   floor = gm.CONFIDENCE_FLOOR;
 } catch { quit(); }
+try {
+  const routingPath = process.env.RUVNET_CAPABILITY_ROUTING_MODULE
+    || path.join(SELF_DIR, 'capability-routing.mjs');
+  ({ buildCapabilityRoutingReceipt, hasToolPreference } = await import(pathToFileURL(routingPath).href));
+} catch { /* older packed hosts predate the optional routing receipt */ }
 if (typeof auditAll !== 'function' || typeof matchGoal !== 'function') quit();
 const MIN_CONFIDENCE = typeof floor === 'number' && Number.isFinite(floor) ? floor : FALLBACK_CONFIDENCE_FLOOR;
 
@@ -419,6 +468,28 @@ if (!dormant.length) quit();
 let matches = [];
 try { matches = matchGoal(prompt, dormant) || []; } catch { quit(); }
 if (!Array.isArray(matches) || !matches.length) quit();
+
+// Only an evidence-bound route to an existing RuvNet building block may leave this hook.
+let routingReceipt;
+try {
+  routingReceipt = typeof buildCapabilityRoutingReceipt === 'function'
+    ? buildCapabilityRoutingReceipt({ prompt, matches, capabilities: rows }) : null;
+  // Test/host adapters may provide synthetic capabilities outside the shipped registry. Preserve
+  // their existing protocol; real RuvNet capabilities are fail-closed when no route receipt exists.
+  const knownRoute = typeof hasToolPreference === 'function' && matches.some((match) => {
+    const key = match?.capability?.key || match?.capability;
+    const liveRow = rows.find((row) => row?.key === key);
+    return hasToolPreference(key) && typeof liveRow?.evidence === 'string' && liveRow.evidence.trim()
+      && typeof liveRow?.evidenceDigest === 'string' && liveRow.evidenceDigest.length === 64;
+  });
+  if (!routingReceipt && knownRoute) quit();
+  if (!routingReceipt) routingReceipt = { receiptSha256: 'synthetic-adapter' };
+  const receiptFile = process.env.RUVNET_CAPABILITY_ROUTING_RECEIPTS;
+  if (receiptFile) {
+    fs.mkdirSync(path.dirname(receiptFile), { recursive: true });
+    fs.appendFileSync(receiptFile, `${JSON.stringify(routingReceipt)}\n`, { mode: 0o600 });
+  }
+} catch { quit(); }
 
 // The matcher is trusted to rank, never to assert existence: every match is re-resolved against the
 // dormant rows THIS audit produced. A capability the matcher names that is not dormant right now is
@@ -495,6 +566,7 @@ if (EMIT_CANDIDATES) {
     findingId: best.row.key,
     severity: best.row.severity || 'normal',
     observationHash: stateHashOf(best.row.evidence),
+    routingReceiptSha256: routingReceipt.receiptSha256,
   }));
   quit();
 }
@@ -525,10 +597,37 @@ NODE_PID=$!
 # 5s hook budget that ground-ruvnet.sh has already partly spent. A SIGKILL mid-write can at worst
 # truncate one advisory line — it can never fail the turn, and the state file was already committed
 # by then (see the persist-first ordering above).
-( sleep 2; kill -9 "$NODE_PID" 2>/dev/null ) >/dev/null 2>&1 &
+# THE SLEEP MUST BE OURS TO KILL (2026-08-06). This block used to be:
+#
+#     ( sleep 2; kill -9 "$NODE_PID" 2>/dev/null ) &
+#     WATCHDOG_PID=$!
+#     wait "$NODE_PID"; kill "$WATCHDOG_PID"
+#
+# `kill` signals the SUBSHELL. The `sleep` it forked is a separate process this script never had a
+# handle on, so it was simply ORPHANED and kept running for the remainder of its 2 seconds.
+# selfcheck.mjs measures exactly that (§5 PROCESS-TREE HYGIENE, WATCHDOG_GRACE_MS = 2000) and
+# reported it in BOTH the [valid] and [held] regimes as
+# "left descendants alive after SIGTERM to its process group".
+#
+# It is deterministic on Linux rather than flaky because the watchdog's lifetime and the grace
+# window are the SAME 2000ms, and the sleep starts marginally after the clock the checker uses — so
+# it always outlives the probe by the spawn delta. macOS passes; ubuntu fails every time.
+#
+# It had never fired before because it was UNREACHABLE. Until the payload boundary was fixed
+# (ADR-065) the `[ -f "$GOAL_MATCH" ] || exit 0` guard above returned first on every real install, so
+# this line only ever ran in a dev checkout. Making L4 work is what woke it up — the fix did not
+# create this leak, it revealed one that had been shipping dormant.
+#
+# FIX: fork the sleep as OUR OWN child so we hold its pid, and reap both. A `trap` inside the
+# subshell was tried first and MEASURED WORSE (it defeats the shell's exec optimisation and leaked
+# where the original did not) — hence the explicit two-pid form rather than anything cleverer.
+sleep 2 &
+SLEEP_PID=$!
+( wait "$SLEEP_PID" 2>/dev/null && kill -9 "$NODE_PID" 2>/dev/null ) >/dev/null 2>&1 &
 WATCHDOG_PID=$!
 wait "$NODE_PID" 2>/dev/null
-kill "$WATCHDOG_PID" 2>/dev/null
+kill "$SLEEP_PID" "$WATCHDOG_PID" 2>/dev/null
+wait "$SLEEP_PID" "$WATCHDOG_PID" 2>/dev/null
 
 # ALWAYS. Every failure above already routed to silence; this makes the guarantee unconditional.
 exit 0

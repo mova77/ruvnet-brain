@@ -11,6 +11,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { pathToFileURL } from 'node:url';
+import { CLAUDE_MODEL_IDS } from './route-cheap.mjs';
+import { isDirectInvocation } from '../plugin/scripts/entrypoint.mjs';
 
 export function receiptsPath() {
   return (
@@ -61,7 +63,7 @@ export function formatTable(rows) {
     r.source === 'claude-subagent' ? 'subagent' : r.source === 'calibration' ? 'calibrate' : 'openrouter',
     r.task_class || '?',
     r.model,
-    r.frontier_ref || 'claude-opus-4.8',
+    r.frontier_ref || CLAUDE_MODEL_IDS.opus,
     fmt$(r.est_cost ?? 0),
     fmt$(r.est_frontier_cost ?? 0),
     fmt$(r.saved),
@@ -79,7 +81,7 @@ export function formatTable(rows) {
   const pct = totalFrontier > 0 ? Math.round((totalSaved / totalFrontier) * 100) : 0;
 
   // Baselines now vary per row; name them all rather than picking one and implying it covers everything.
-  const baselines = [...new Set(rows.map((r) => r.frontier_ref || 'claude-opus-4.8'))].join(', ');
+  const baselines = [...new Set(rows.map((r) => r.frontier_ref || CLAUDE_MODEL_IDS.opus))].join(', ');
   const timedTotal = rows.reduce((s, r) => s + (typeof r.duration_ms === 'number' && r.duration_ms > 0 ? r.duration_ms : 0), 0);
   const timedRows = rows.filter((r) => typeof r.duration_ms === 'number' && r.duration_ms > 0).length;
   // TIME as a percentage, like cost — "20 seconds" is trivia; "~40% faster" is the message
@@ -105,8 +107,34 @@ export function formatTable(rows) {
   const withBar = totalFrontier > 0 ? Math.min(BAR, Math.max(1, Math.round(BAR * (totalCost / totalFrontier)))) : BAR;
   const drawBar = (n) => '█'.repeat(n) + '░'.repeat(BAR - n);
   const rule = '─'.repeat(70);
+  // ── IS THIS STILL HAPPENING, OR IS IT A SOUVENIR? (added 2026-08-08) ──────────────────────────
+  //
+  // This card reported "SAVED ~61% · 43 routed tasks" for FOURTEEN DAYS after routing had entirely
+  // stopped. Every number was true and every number was history: the newest receipt was 2026-07-24,
+  // and in the fortnight since — including three days of heavy work — not one task was routed. The
+  // card looked like a live dashboard and was actually a museum plaque.
+  //
+  // SKILL.md already records this exact failure once ("after two days, the receipts log held 3
+  // entries, all test pings, $0.018 saved — while real work was done inline in the most expensive
+  // model") and answered it by making the routing rule a floor rather than advice. That did not
+  // help, because nothing MEASURED whether the floor was being honoured. A silent zero reads
+  // identically to a healthy system, which is the same disease as every other defect fixed this
+  // week: a surface reporting something other than what it measured.
+  //
+  // So the card now leads with recency. Savings you earned last month are not savings you are
+  // earning, and a stale ledger must say so before it says anything else.
+  const newest = rows.map((r) => Date.parse(r.ts || r.date || r.at || 0)).filter(Boolean).sort().at(-1);
+  const idleDays = newest ? (Date.now() - newest) / 86_400_000 : Infinity;
+  const staleness = !Number.isFinite(idleDays)
+    ? '  ⚠ NO ROUTING RECEIPTS AT ALL — these numbers describe nothing that has happened.'
+    : idleDays >= 3
+      ? `  ⚠ STALE: nothing has been routed in ${Math.floor(idleDays)} days (newest receipt ${new Date(newest).toISOString().slice(0, 10)}).\n`
+        + '     The figures below are HISTORY, not current performance — mechanical work is running unrouted.'
+      : null;
+
   return [
     rule,
+    ...(staleness ? [staleness, ''] : []),
     `  💰 SAVED ~${pct}%${speedBadge}  ·  ~${ratio}× cheaper  ·  ${rows.length} routed task(s) (${subagents} subagent, ${rows.length - subagents} openrouter/calibration)`,
     '',
     `  without routing    ${drawBar(BAR)}  ${fmt$(totalFrontier)}`,
@@ -138,4 +166,4 @@ function main() {
   if (skipped) console.log(`(${skipped} corrupt line(s) skipped)`);
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main();
+if (isDirectInvocation(import.meta.url)) main();

@@ -1,184 +1,583 @@
-# Contributing to RuvNet Brain
+Updated: 2026-10-26 03:30:00 EDT | Version 1.5.2
+Created: 2026-07-07 09:22:01 EDT
 
-Updated: 2026-07-22
-Created: 2026-07-07
+# Contributing to RuvNet Brain — the one rulebook
 
-Thanks for helping improve the brain. This guide is the practical map of how the repo is built,
-tested, versioned, and published. Everything here is accurate to the scripts in `scripts/` and
-`kb/` — when in doubt, read the script (each one has a header comment explaining exactly what it does).
+This file is the **only** place that says how to version, release, update the knowledge corpus,
+and what the hooks do. `CLAUDE.md`, `AGENTS.md`, skills and memory point here instead of restating
+it. ADRs in `docs/adr/` record *why* a decision was made; they are history, not operating
+instructions. `npm run single-source:check` fails CI if a second, conflicting instruction appears.
 
-## Prerequisites
+## The rules at a glance
 
-- **Node.js ≥ 18** (see `engines` in `package.json`).
-- **git** and, for publishing, the **`gh`** GitHub CLI.
-- A **local ONNX model cache** for the embedders. Point `KB_MODEL_CACHE` at a warm cache dir to
-  avoid a first-run download of `Xenova/all-MiniLM-L6-v2` (384-dim) and the bge-768 model:
-  ```bash
-  export KB_MODEL_CACHE=/path/to/models-cache
-  ```
-  If unset, the build scripts default to a repo-local `kb/models-cache` and download on demand.
-
-The heavy vector artifacts (`kb/*.rvf`, `kb/*.big.rvf`) ship via GitHub Releases, **not** git — a
-fresh clone is lightweight, and end users get the ~512 MB bundle through `npx ruvnet-brain`.
-
-## What the pieces are
-
-| Area | Where | Purpose |
+| Job | The only way | Proof it worked |
 |---|---|---|
-| The brain (query-time) | `kb/` | Per-repo `.rvf` (MiniLM-384) + `.big.rvf` (bge-768) stores, full-passage sidecars, symbol indexes, primers, the concepts store, and the `forge-*` query tools (CLI `forge-ask-all.mjs` + MCP `forge-mcp-all.mjs` / `search_ruvnet`). |
-| The plugin | `plugin/` | Claude Code plugin: MCP server, grounding skill, the three hooks (`session-start.sh`, `ground-ruvnet.sh`, `hijack-ruvnet.sh`), marketplace manifest, and the test suite. |
-| Build / publish tooling | `scripts/` | The pipeline below. |
-| Coverage registry | `data/registry.tiers.json`, `data/manifest.json` | Which repos are in scope (T0–T3) and what was actually built (per-repo commit SHA, coverage counts). |
-| Nightly LaunchAgent | `deploy/com.ruvnet.brain-nightly.plist` | The macOS scheduler that runs the nightly evergreen + publish. |
+| Change code or docs | Work on a branch; land it on a `release/X.Y.Z` branch. Nothing is pushed to `main` directly. | `release-candidate-preflight` green on that SHA |
+| Set the version | `npm run version:set -- X.Y.Z` (first commit of the release branch) | `npm run version:check` exits 0 |
+| Release code | Preflight → fast-forward `main` → dispatch `protected-release.yml mode=code` → the workflow's machine gates carry it across `Production – ruvnet-brain` (no human approval step) | Terminal receipt `install-verified` on Linux, macOS, Windows; npm `latest` = GitHub `releases/latest` = `main` |
+| Build the customer corpus | CI only: `corpus-seed.yml` → `scripts/corpus-reconcile.mjs` | Sealed candidate + receipt artifact |
+| Publish the corpus | `protected-release.yml mode=corpus` (nightly dispatcher), armed unless repository variable `CORPUS_NIGHTLY` is `off` (the owner's kill switch) **and** the newest code release is `install-verified` (resolved at run time, `scripts/approved-runtime.mjs --resolve`; never a committed file, never a fallback to an older release); the corpus is built at that release's source commit, and `main` being ahead of it does not matter; a night with no upstream change publishes nothing | `corpus-sha256-*` release promoted to `releases/latest` |
+| Update a user's machine | One coordinator and shared lock; the Brain schedule invokes it at 03:30 local time, and existing managed ownership remains explicit | `SOURCE.json` `releaseTag` equals the plugin version; latest `~/.cache/ruvnet-brain/refresh-runs/*.json` is PASS |
 
-## Building the brain (scripts/ overview)
+Nothing else publishes. `scripts/release-authority.mjs` fails CI if any file other than
+`scripts/release.mjs` / `scripts/release-transaction-provider.mjs` contains a publish operation, and
+`prepublishOnly` refuses `npm publish` outside the protected workflow.
 
-The expensive work happens **once, at build time**. The pipeline, in the order it runs:
+## Versioning
 
-1. **Embed a repo** — `kb/forge-build.mjs` deep-walks a cloned repo (whole files, full function
-   bodies) and embeds it into the MiniLM-384 store; `kb/forge-big.mjs both` re-embeds the same
-   passages into the bge-768 (`*.big.rvf`) store. `scripts/build-symbols.mjs` adds a symbol index.
-2. **Concepts / capability layer** — `scripts/build-concepts.mjs` (capability cards + L2), plus
-   `scripts/build-primer.mjs` and `scripts/build-l2.mjs` for per-repo prose. These let the model
-   ground *capability* claims and route a described need to the right repo, not just do file lookups.
-3. **Stamp** — `scripts/brain-stamp.mjs` writes `data/manifest.json` (build date + per-repo commit
-   SHA + coverage counts) and injects the stamp into the primer header and each store's `SOURCE.json`.
-4. **Assemble the shippable bundle** — `scripts/build-bundle.mjs` copies the query-time artifacts
-   into `dist/ruvnet-brain/`, applying the private-store fence (see below).
-5. **Prove it** — the test/grading scripts (`scripts/gate.sh`, `scripts/prove.mjs`,
-   `scripts/behavioral-l1-l4.mjs`, `scripts/brain-capability-check.mjs`,
-   `scripts/brain-grade-groundtruth.mjs`, and `plugin/test/run-tests.mjs`).
+- The one hand-set number is `plugin/.claude-plugin/plugin.json` `version`; set it only with
+  `npm run version:set -- X.Y.Z`, which also rewrites every generated surface (package.json, lockfile,
+  manifest, kb/package.json, primer, explainer, README badge) and runs `version:check`.
+- Only plain `X.Y.Z` versions can be published (`scripts/protected-release-invocation.mjs`).
+- Why `main` never moves except by release: the Claude Code plugin installs from `./plugin` on the
+  default branch (`.claude-plugin/marketplace.json`). Every commit on `main` must therefore be a
+  released version, or plugin users receive changes with no version signal.
 
-`scripts/gen-images.mjs` regenerates the explainer/diagram assets. `scripts/version.mjs` /
-`scripts/sync-version.mjs` handle versioning (see below).
-
-## Adding a repo to the brain
-
-To pull any `github.com/ruvnet/<name>` repo (or a rUv-collaborator org repo) into the brain **on
-demand**:
+## Releasing code (step by step)
 
 ```bash
-node scripts/ingest-repo.mjs --name <repo> [--org <github-org>]
+git switch -c release/X.Y.Z origin/main
+npm run version:set -- X.Y.Z && npm run convergence:write      # commit these first
+# …merge the reviewed work for this release onto the branch…
+npm run release:qualify -- --suite source --report /tmp/source-qualification-UNIQUE.json
+npm run release:qualify -- --suite integration --report /tmp/integration-qualification-UNIQUE.json
+npm test && npm run single-source:check                    # distinct grounding and rule checks
+# before the FIRST push, run what preflight runs first (the ADR-0103 review row is the usual first-push red):
+node --check scripts/release.mjs && npm run version:check && npm run release:authority && node scripts/architecture-review-lock.mjs
+git push origin release/X.Y.Z                                # triggers release-candidate-preflight
 ```
 
-`--org` defaults to `ruvnet`; pass it to ingest an ecosystem repo that lives in a collaborator org
-(e.g. `--name agentic-qe --org proffesor-for-testing`). This clones (shallow), embeds both variants
-(MiniLM-384 then bge-768), and builds the symbol index. The new `<name>.rvf` is discovered at query
-time by `search_ruvnet` / `forge-ask-all`, so it is **searchable immediately — no server restart**.
+1. Wait for `release-candidate-preflight` to pass on the exact SHA. Any source change repeats it.
+2. Open a PR `release/X.Y.Z → main` for review and required checks. **Never click Merge, Squash or
+   Rebase** — each creates a new SHA the publisher will refuse.
+3. Promote with a normal fast-forward: confirm `origin/main` is an ancestor, then
+   `git push origin "$SHA:refs/heads/main"` and confirm the remote ref equals `$SHA`. Never force.
+4. Dispatch: `gh workflow run protected-release.yml -f mode=code -f candidate_sha=$SHA -f version=X.Y.Z`.
+5. There is no approval step. The `Production – ruvnet-brain` environment has no reviewer; it is a scoping
+   boundary (it alone holds `NPM_TOKEN`, deployable from protected branches only, admins cannot bypass). The
+   `publish` job starts by itself once the machine gates below pass, and the dispatching agent watches the run
+   to its terminal conclusion (every job, not just the first green one). Nobody is asked to open GitHub.
+6. Done means the terminal `install-verified` receipt: all public OS × host combinations verified.
+   Anything short of that is "published, not verified". Recovery/abandon rails:
+   `recover-public-verification.yml`, `abandon-public-verification.yml` (manual `repository_dispatch`),
+   `npm run release-abort-stale`.
 
-For full capability-confidence on the new repo (so it's never wrongly doubted), also build its
-primer + refresh the concepts store afterward:
+`npm run release:qualify` is the one definition of "qualified"; CI and local checks both use it.
+
+### What replaces a human approval (the machine gates)
+
+Publishing is allowed only when every one of these holds, each enforced in code, none waived by a person:
+
+- **Exact candidate.** `protected-release.yml` `identity`: `GITHUB_SHA` = `origin/main` = the dispatched
+  `candidate_sha`, `package.json` version = the dispatched version, clean tree. `publish` re-asserts
+  `HEAD` = `origin/main` = the verified SHA before it touches anything.
+- **Preflight green on that exact SHA.** `verified-candidate` accepts only a successful
+  `release-candidate-preflight` push run for that SHA on a `release/*` branch of this repository, with exactly
+  one authentic artifact, then verifies the receipt, payload members and aggregate verdict `PASS`.
+- **Zero open `release-blocker` issues.**
+- **One sealed payload.** Signed once, never rebuilt; the sole publisher (`scripts/release.mjs --publish`)
+  stages npm under a candidate tag and GitHub as non-latest, then promotes both, and
+  restores the prior npm `latest` if promotion fails (`scripts/release-transaction-provider.mjs`).
+- **Install verification.** Linux, macOS and Windows install the public bytes; only then is
+  `install-verified` signed. Anything short of it is "published, not verified" and goes to the recovery rails.
+  The corpus nightly refuses to run on a release that is not `install-verified`.
+
+What this gives up, stated once: anyone with write access who can dispatch on protected `main` (today the
+release agent and the owner's account) can publish to npm without a second person confirming it. The control is
+that only an already-preflighted head of `main` can be published, and `main` moves only by fast-forward through
+required checks that admins cannot bypass. Strengthening a gate is a code change to the workflow, never a person
+in the loop.
+
+The same holds for the two recovery rails. `recover-public-verification.yml` and `abandon-public-verification.yml`
+are started by `repository_dispatch`, which any token with write access can send, and both bind
+`Production – ruvnet-brain` (the environment holding `RUVNET_SIGNING_KEY` and `NPM_TOKEN`) with no human pause.
+Recover re-runs public verification on an already-published release and, if all three OS lanes pass, signs its
+`install-verified` aggregate — the receipt that arms the corpus nightly. Abandon records a published release as
+not verified. Neither can publish new bytes: both act only on a release `protected-release.yml` already sealed
+and published from a preflighted head of `main`.
+
+**Search deadlines in host verification.** The retrieval canaries each lane runs take a per-OS first-pass
+bound, `canarySearchDeadlineMs()` in `scripts/host-install-matrix.mjs`: the worst measured first-pass query on
+that OS's GitHub runner (`CANARY_WORST_FIRST_PASS_MS`, with its run IDs beside it) times 1.5, never below
+`RELEASE_SEARCH_DEADLINE_MS`. Today only macOS rises above the floor. Changing a bound means changing that
+evidence. This bounds a small CI runner's cold search so the gate fails on a broken search, not on a slow VM; it
+is **not** a product latency target. How long a customer's first answer takes on a small Mac is a separate,
+open 4.5 improvement, measured on its own and never loosened through this constant. Lanes keep one warm search
+worker; a case that times out fails alone and the next case gets a fresh, re-warmed worker
+(`createRestartingMcpSession`), and the three installed doctors run one at a time (`runHostDoctors`).
+
+## The knowledge corpus
+
+**Built in CI only.** `corpus-seed.yml` observes every public rUv repository (exclusions are
+recorded in `data/source-coverage.json`), reconciles changed repos against the previous published
+generation with `scripts/corpus-reconcile.mjs`, and seals a candidate. It cannot publish. Gists are
+captured by `scripts/gist-receipts.mjs` (the single gist pipeline). The job needs the repository
+secret `RUVNET_GISTS_TOKEN` (a GitHub token with no scopes) — without it, gist listing falls back
+to anonymous API calls and is rate-limited.
+
+**Published nightly.** `corpus-nightly-dispatch.yml` (05:17 UTC, 1:17 a.m. EDT) dispatches
+`protected-release.yml mode=corpus`, which signs and promotes a `corpus-sha256-*` release. It is armed
+unless the repository variable `CORPUS_NIGHTLY` is exactly `off` (the owner's kill switch; flipping it
+needs no code release) and it stands down (green, not failed) until an approved runtime resolves. A
+night whose upstream inputs are unchanged since the newest generation ends `no-change` and publishes
+nothing. `corpus-watchdog.yml` (17:17 UTC) turns red, and pages through `ntfy-alerts`, when no night has
+ended `published` or `no-change` in 48 hours, so a silent stand-down cannot go unnoticed. Why 05:17 (moved from
+07:17 on 2026-10-24): a night publishes 45-75 minutes after dispatch, and at 07:17 it landed about 4:00-4:35 a.m. ET,
+after the 3:30 a.m. local Brain nightly on every US machine, so those nightlies always installed the previous night's
+corpus and a session start had to catch up.
+The approved runtime is never committed: `node scripts/approved-runtime.mjs --resolve` takes the newest
+`vX.Y.Z` release only, requires its signed `public-verification-aggregate.json` to verify against
+`keys/ruvnet-brain-signing.pub.pem`, and rebuilds the runtime pin from that release's own zip
+(ADR-0091 D3). It never falls back to an older release: promoting an older runtime over the live code
+release breaks fresh installs. No aggregate yet = the nightly stands down (exit 3); an aggregate that
+does not verify = a loud failure. The corpus is built at that release's source commit (`main` may be ahead of it), its
+executables are the install-verified ones byte for byte, and if a newer code release appears before the
+corpus publishes, the night ends `superseded` (a warning, not a failure). Never commit `data/approved-runtime.json`; `single-source:check`
+C1 fails if one appears.
+**One bad source never stops the night (ADR-0091 D5).** A store whose refresh fails is carried at its last
+verified bytes (`STALE` + a `carry` record naming the missed upstream commit) or, with no prior bytes, recorded
+`MISSING` + `failure`; up to max(3, 5% of eligible) such stores, the generation is sealed and published like any
+other, with every carried or missing store named in `CORPUS-COVERAGE.json`, a `::warning` in the run, and a
+`corpus-watchdog` WARNING (RED once a store has been carried more than 7 days; the watchdog also reports, from the
+newest code release's signed aggregate, how many eligible stores that release ships CURRENT, which install
+verification requires to be all of them). Above that bound, or on any integrity failure (carried bytes that no longer match the
+ledger), the night fails loudly. Whether installed clients accept the generation is proven by the
+`customer-canary` job on every publish (its `store-freshness` check names each carried store and still fails an
+unrecorded stale one), never by a hand-set constant: the former ADR-0091 D10 transition constant was removed on
+2026-10-17 after it withheld the one publishable night it ever decided (run 39069376585) past its own soak. A
+generation still a prerelease (never promoted by the canary) is never a seed. A **code** release ships only an
+all-CURRENT corpus: `scripts/corpus-next-seed.mjs --require-coverage` skips a degraded generation (without
+spending the 5-generation search bound on it) and takes the newest all-CURRENT one, because install verification
+requires every eligible store CURRENT. An external source GitHub reports gone (HTTP 404/410)
+is carried at the commit its `kb/external-sources.json` `ifGone` entry records; an external source that is still
+unreadable after the bounded retry (rate limit, 5xx, a reset) is carried for one night at the seed ledger's own
+commit, its row saying so, and read again the next night; one with no prior bytes still fails the observation.
+**Three fault classes, one policy each (2026-10-20; measured on 38 nights, 24 failed, 22 in one stage).**
+*GLOBAL-INVARIANT* -- identity, ancestry, signature, digest, receipt, ledger schema, the recall gate, the
+degraded bound, the customer canary's verdict -- fails closed, is never retried and is never carried; nothing
+here loosened one. *PER-SOURCE* -- one store's source gone, unreadable, rate-limited, failing QA or build -- is
+carried at its last verified bytes with a `carry`/`failure` record, inside max(3, 5% of eligible). *TRANSIENT* --
+a rate limit, HTTP 429/5xx, a reset, a timeout, a DNS or TLS blip, git's credential prompt on an anonymous
+fetch -- is retried inside the step, bounded (3 tries, 15 s then 30 s; `scripts/transient-gh.mjs` is the one
+classifier) at every GitHub, API and git read in dispatch, identity, prepare, seal, publisher, canary and
+promote; a write (`gh release create`) runs exactly once. The night itself is retried once: the dispatcher's
+second schedule (09:17 UTC, `RETRY_CRON`) re-dispatches only when every run of the night ended `failed` (or
+reached no outcome), none is running, and no retry has happened (`decideRetry`); a published, no-change,
+superseded or canary-rejected night is an answer and is never redone, the kill switch and the approved-runtime
+resolution still apply, and a content-addressed tag that already exists is refused, so nothing is published
+twice. A source that stays unreadable after the retry is pinned at the seed commit as STALE with a `carry`
+(`missedUpstream` null: unread, not invented), counts toward the bound, and is refused a second consecutive
+carry. The watchdog's first line is the night's verdict, result first, in Eastern time (`summarizeNight`):
+published, no-change, degraded with the stores named, or failed with the stage named. When each piece takes
+effect: the dispatcher, retry slot, `corpus-authorize`, canary, watchdog and the YAML retries run from `main` and
+take effect on merge; the script-level retries and carries in `source-coverage.mjs`, `corpus-reconcile.mjs`,
+`gist-receipts.mjs`, `corpus-next-seed.mjs`, `approved-runtime.mjs` and `release.mjs` take effect only once a
+code release containing them is the approved (install-verified) runtime, because prepare, publish and promote
+check out that release's commit.
+**Releasing code that carries the newest corpus (ADR-0091 D6) — three rules learned the hard way (4.3.37).**
+1. *Stamp the census before you push.* `release-qe` requires the committed claim surfaces (README, `explainer/*`)
+   to state the candidate KB's exact chunk and public-store counts. Assemble the candidate the way `release-qe`
+   does (`scripts/corpus-next-seed.mjs --require-coverage`, then `scripts/code-release-corpus.mjs assemble`, ~1
+   minute locally), run `RUVNET_BRAIN_KB=<dist/ruvnet-brain> node scripts/sync-census.mjs`, commit the four files.
+   Set the repository variable `CORPUS_NIGHTLY=off` for the release window: a nightly that publishes generation
+   G+1 mid-release invalidates the stamp (and `release.mjs` refuses to ship after G+1); turn it back on once the
+   release is install-verified.
+2. *The fixture is frozen; identity is by content.* `data/retrieval-query-evidence.json` pins each expected
+   passage by `digest(row)` including the row's build-dependent `id`; its digest is what `corpus-next-seed`
+   judges a generation's recall report against, so editing it orphans every published generation. Content
+   identity comes from `data/retrieval-passage-content-digests.json` (`scripts/retrieval-passage-identity.mjs`),
+   derived mechanically by `scripts/derive-passage-content-map.mjs` from a corpus built with ordinal ids and bound
+   to the fixture bytes by a test. Re-derive it if the fixture ever changes.
+3. *The release canary proves integrity, not corpus quality.* It samples ~10% of the fixture stores and asks the
+   real installed search for them (recall@10 ≥ 0.98 of the sample). With the generation's own repo-recall report
+   (`--baseline-recall`, bound to the exact archive and fixture) it samples only stores that report retrieved, so
+   it detects a packaging, index, model or runtime break; stores the generation missed, and stores whose sealed
+   passage upstream has since rewritten, are named in the log and never hidden. Whole-corpus quality is the recall
+   report's number (Hit@5 was 162/182 = 89.0% on 2026-09-29 against the owner's ≥98% target) and belongs to
+   retrieval work, not to a gate edit.
+
+**Local ingestion is for development.** `node scripts/ingest-repo.mjs --name <repo> [--org <org>]`
+makes a repo searchable on *this* machine immediately. It never reaches users; a repo reaches users
+by being in scope of the CI build above. `ingest-repo.mjs` itself now stamps
+`updateManaged:false` + `origin:'local-ingest'` into the store's own `SOURCE.json` entry, via
+`scripts/private-overlay.mjs`'s writer (`--from` pointed at the same root the bytes already landed
+in, which degenerates the writer to registry-stamping only) — so a repo pulled in this way survives
+the updater exactly like a genuinely private store, instead of reading as an ordinary public store
+that the next `--apply` silently deletes because it is absent from the incoming bundle. It also adds
+the store to `kb/PRIVATE-STORES.json`'s fence (required for that stamp — see below) and, in the same
+pass, retroactively re-stamps any OTHER name `kb/local-ingests.json`'s own recipe ledger already
+recorded but that predates this fix. Private stores that arrive as pre-built sidecars are still
+installed the same way: `npm run private-overlay -- --root <kbDir> --from <dir> --store <name>`.
+`scripts/self-update.mjs` / `scripts/nightly-wrapper.sh` are manual author diagnostics in a clean
+linked worktree; they never publish.
+
+**How a user's machine updates.** The existing `ruvnet-brain --update` command runs the signed updater
+(`kb/forge-update.mjs --apply`): it verifies the bundle signature and preserves private/local-ingest
+stores through `restorePrivateFilesIntoCandidate` — the ONE place production code copies a private
+overlay onto a candidate tree, shared by the normal update path and the authenticated staged-recovery
+rail (`applyVerifiedStagedRelease`, `--staged-release`) a failed normal update falls back to for a
+private-overlay install rather than the unconditional fresh reinstall that used to refuse outright on
+one. Currency is ONE recorded verdict (`kb/forge-update.mjs`'s `currencyVerdict()`): CURRENT (nothing
+to do), UPDATE_AVAILABLE (a genuinely newer code or corpus release), UNKNOWN (no verifiable ordering
+key — apply is allowed, never blocked, never claimed current; today's pre-generation-stamp installs
+read this way), or REFUSED (rollback protection — the offered corpus generation is strictly OLDER
+than the one installed; no download, live untouched, clean exit). `--check`, `--apply`,
+`bin/install.mjs`'s update path, and the SessionStart banner's install-alarm all read this SAME
+recorded verdict rather than each re-deriving their own comparison.
+
+### Coordinated developer updates (4.6.0)
+
+RNBC's **Keep all tools updated** control uses `plugin/scripts/developer-update.mjs`, also
+exposed by the installed `ruvnet-brain-update` command (`bin/developer-update.mjs` in an explicit
+developer checkout). Manual checks, applies
+and the native Brain scheduler use that coordinator. The scheduler runs at **03:30 user-local
+time**, with one `com.ruvnet.brain-update` owner on macOS; native platform adapters retain their
+own registration semantics. `--host-sync-only` repairs host wiring and does not update knowledge.
+
+The canonical user choice is `~/.cache/ruvnet-brain/developer-update-config.json`:
+`schemaVersion:1`, `channel` (`latest` or `alpha`), `scope` (`ruvnet` or `all`), optional boolean
+`homebrew`, `uv`, `cargo`, `native`, `cleanup`, and an optional existing `managedCallback`.
+Public defaults are Latest and the RuvNet suite, with optional maintenance disabled. All-tools
+scope and extra managers require explicit opt-in; one machine's wider private configuration is
+not the public default. Run-local CLI overrides do not silently rewrite the saved choice:
 
 ```bash
-node scripts/build-primer.mjs --name <name> --variant big
-node scripts/build-concepts.mjs && node kb/forge-big.mjs both --dir kb --name concepts
+ruvnet-brain-update --check --channel latest --scope ruvnet
+ruvnet-brain-update --apply --channel alpha --scope all
 ```
 
-> If the repo you ingest is **private**, you must also add its store name to `kb/PRIVATE-STORES.json`
-> before building any publishable bundle — see the private fence section.
+**Keeping a package at the version you chose (#319).** There is no separate notify-only mode; three
+existing controls cover it:
 
-## Version: single source of truth
+- `preservePackages` (npm package names) in the same config file. Manual applies and the 03:30 schedule
+  never install over a listed package: the coordinator still looks up the newer tag and records the step
+  as `local-modification-preserved` (listed under `coverage.preservedLocalModification` in
+  `nightly-suite-update.json`). Unlisted packages, host plugins and the signed knowledge corpus still
+  update as configured. A corpus update runs the installed `ruvnet-brain` package's own installer
+  (`<npm root -g>/ruvnet-brain/bin/install.mjs --update`), not `npx …@latest`, and its corpus checks still apply.
+- `ruvnet-brain-update --check` changes nothing and reports each package as `current`,
+  `update-available` or preserved: that is the notify-only run, on demand.
+- `ruvnet-brain --update-source installed` makes the remaining legacy (unconfigured) automatic paths use
+  the installed package instead of unattended npx (`docs/AUTOMATIC-UPDATE-SOURCE.md`).
 
-There is **exactly one** hand-edited version number: the `version` field in
-`plugin/.claude-plugin/plugin.json`. Every other surface inherits it.
+```json
+{ "schemaVersion": 1, "channel": "latest", "scope": "ruvnet", "preservePackages": ["ruflo", "ruvnet-brain"] }
+```
 
-1. Bump `version` in `plugin/.claude-plugin/plugin.json` (that is the only place you type it).
-2. Run:
-   ```bash
-   node scripts/sync-version.mjs
-   ```
-   This writes the version into `package.json`, `data/manifest.json` (`brainVersion`), and
-   `kb/package.json`. Code paths read it at runtime via `getVersion()` in `scripts/version.mjs` —
-   never hardcode a version string anywhere else.
-3. CI (and you, before a PR) verify no surface has drifted:
-   ```bash
-   node scripts/sync-version.mjs --check   # exits 1 on any drift; also npm run version:check
-   ```
-   `--check` also fails if a code path carries a stray hardcoded `vX.Y.Z-dev` literal instead of
-   calling `getVersion()`.
+The coordinator discovers existing npm prefix/root and command ownership, then updates in
+place. It does not install absent tools, move a tool to another manager, alter host plugin
+scopes, or replace local development sources. Latest/Alpha selection never downgrades an
+installed version; Alpha falls back to Latest when appropriate. Agentic Kit retains its
+existing next/latest contract. Legitimate project dependencies, active leased runtime versions,
+signed applications' embedded runtimes, pinned compiler toolchains and local Python wheels are
+preserved. Hosted MCP server software remains provider-owned: a reachable connection is not
+proof of the provider's software version.
 
-The README's blue version badge and heading are regenerated by the nightly publisher; do not
-hand-edit the badge line.
+Enabled maintenance stages use the existing Homebrew formula, uv registry-tool, Cargo
+registry-tool and supported native owners. Homebrew casks need their application owner; a
+managed callback must return success with before/after snapshots. Disabled stages, source/pin
+exclusions, unknown targets and failures remain visible. Cleanup is separately enabled and
+limited to proven inactive installer-cache copies; it is not a general duplicate deletion rule.
 
-## Running the tests
+`~/.cache/ruvnet-brain/developer-update.lock/owner.json` records the live PID and token shared by
+cooperating updater paths. The source-bound run receipt is
+`~/.cache/ruvnet-brain/nightly-suite-update.json`: mode, source digest, owner token, before/after
+snapshots, stage results, exclusions and failure details. `checked` is a check; `completed` is
+an apply. Neither implies every possible tool or remote provider is current. RNBC Activity
+reads this receipt instead of presenting a static success recommendation.
+
+Managed installs keep their current owner. An older Agentic Kit release may still have a
+competing updater or stale ownership comment; this Brain release does not claim to fix that
+upstream release. Integration must share the coordinator's policy and lock, and prove its
+actual run. Existing session-triggered signed knowledge checks remain separate triggers for
+the same Brain knowledge contract; an open session and its next restart still bound when a
+new server timer becomes active.
+
+**What makes a newly published corpus reach every install (ADR-098 §5).** Not age: identity. With no
+scheduler, at most once per 60 min per machine, SessionStart — and, inside a session left open for days,
+the MCP server's 15-min timer — launches the one detached updater worker in check mode
+(`host-update.mjs --knowledge … --if-newer`): the installed `kb/forge-update.mjs --check` reads
+`releases/latest` and only `UPDATE_AVAILABLE`/`UNKNOWN` requests an update through its recorded automatic source; `CURRENT`
+stops and `REFUSED` (published corpus older) never downgrades. The worker respawns on the new knowledge at
+the next search. Exact limits: nothing runs on a machine with no open session; a running session gains the
+timer only after its next restart (`server.mjs` is boot-frozen); `RUVNET_AUTO_UPDATE=off`, a recorded "no", or
+agentic-kit ownership proven within 36h turn it off. When the canonical coordinator is configured
+or registered, automatic invocation joins that owner using its channel/scope and shared token; an
+active but unready coordinator refuses work. Canonical invocation selects its owner without
+reading legacy `updateSource` settings. Only unconfigured legacy and proof paths resolve that
+preference for target selection. See
+`docs/AUTOMATIC-UPDATE-SOURCE.md` for that compatibility boundary. Proof: `tests/integration/corpus-auto-update-e2e.test.mjs`.
+
+**Putting the Brain on another disk.** `npx ruvnet-brain --move-brain <dir>` (for example
+`/Volumes/SanDisk/ruvnet-brain`) checks the target has room, copies the whole Brain there, proves the copy
+byte-identical, and leaves `~/.cache/ruvnet-brain` as a symlink to it; `--move-brain --back` brings it home, and
+moving again to a new directory works the same way. That symlink is the one supported layout: every reader, hook,
+the MCP server and the nightly keep using the default path, so nothing else is configured (an environment
+variable would not reach GUI-launched hosts or launchd). If that disk is unplugged, install, `--update`,
+`--doctor`, SessionStart and `search_ruvnet` each say in one line that the Brain's disk is not mounted, and
+nothing re-creates a brain in `~/.cache` over the link. The knowledge root is always
+`realpath(~/.cache/ruvnet-brain/kb)`. Every install and update also measures free space first and refuses,
+naming the exact shortfall, rather than running out half-way.
+
+**Provenance (one ledger, one projection).** `kb/RVF-GENERATIONS.json` is the one per-store
+provenance record; `kb/SOURCE.json` is generated as a projection of it, never written
+independently. Before this, two incompatible "schemaVersion 2" ledger shapes existed side by
+side: **Schema A** (`scripts/rvf-generation.mjs`'s own pre-existing shape — no `kind`, no
+`sourceSnapshot`) and **Schema B** (`scripts/build-bundle.mjs`'s release-time `projectStoreViews`
+shape — `kind` + `sourceSnapshot`, already required by `plugin/scripts/coverage-integrity.mjs`'s
+release validation). Schema B was picked as canonical (it was already load-bearing for release
+validation); `scripts/rvf-generation.mjs` now emits it directly
+(`RUNTIME_LEDGER_KIND = 'ruvnet-brain-runtime-generation-ledger'`, `sourceSnapshot` carried
+forward or `null` until a release stamps it for real). `scripts/rvf-generation.mjs`'s
+`projectSourceStore(name, generation, updater)` is the one place identity fields
+(`sourceRepo`/`sourceCommit`/`sourceDescribe`/`builtUtc`) are read FROM the ledger; all four
+SOURCE.json writers (`kb/forge-build.mjs`, `kb/forge-refresh.mjs`, `scripts/corpus-reconcile.mjs`,
+`scripts/private-overlay.mjs`) call it rather than restating those facts as their own object
+literals. `tests/unit/one-source-projection.test.mjs` enforces this by census (grep) and by an
+exact ledger-to-SOURCE.json equality proof. The old one-shot migration
+`scripts/stamp-existing-rvf-generations.mjs` went dead as a result and was deleted.
+
+## Footprint guarantees (what a user's machine holds — ADR-098)
+
+**One knowledge base, current, in use, nothing building up.** `plugin/scripts/brain-footprint.mjs` is the
+one classifier of everything the Brain owns: the brain home (`RUVNET_BRAIN_HOME`, symlinks resolved), KB
+siblings (`kb.bak-*`, `kb.install-preserved-*`, `kb.install-prior-*`, `kb.pre-update-*`, `kb.next-/rollback-/
+failed-*`, `*-quarantine-*`), the Claude (`CLAUDE_CONFIG_DIR`) and Codex (`CODEX_HOME`) plugin caches, npm
+`_npx` copies of `ruvnet-brain`, ruflo scratch, logs and lifecycle receipts. Each is **must-exist**,
+**may-exist (bounded)**, **must-not-exist**, or **unowned** (reported, never removed). Add a new on-disk
+artifact only together with its classification there, or `--doctor` will report it as cruft.
+
+- **Removal is proof-gated.** A KB copy is deleted only when `plugin/scripts/kb-copy-proof.mjs` shows nothing
+  in it is unique: every private-store file (fence of live AND copy, plus `updateManaged:false`) byte-identical
+  in live; every other file a public release file or installer-written. A file byte-identical at the same path
+  in a copy that stays (one kept earlier in the same sweep, or a `kb.archive/` tree) is accounted for too, so
+  duplicate preserved copies release down to one (#335). Anything else keeps the copy and is
+  named. `npx ruvnet-brain --clean --archive` (explicit, never automatic) copies exactly those named files into
+  `kb.archive/<stamp>/<copy>/`, verifies each byte-for-byte, writes `<copy>.json` beside it, and only then
+  releases the copy; a link, unsafe path or unreadable metadata still keeps it. `kb.archive/` is never removed
+  automatically, counts toward the footprint budget, and the updater's `reclaimBackups` treats a copy whose
+  every byte survives in live or in an archive as accounted for. The one exception is operational files (top-level `update.log`, `forge-update.log`,
+  `forge-guard-injection.log`, and ruflo's `.claude-flow/` scratch, each at most 2 MiB, 16 MiB per copy):
+  they do not keep a copy, they are copied to `kb-copy-rescued/<copy>/` in the brain home and verified
+  before the copy goes (kept for the newest five released copies), and a failed rescue keeps the copy.
+  For a copy inside a quarantine, `<copy>` is `<quarantine>--<child>` in both `kb.archive/` and `kb-copy-rescued/`.
+  An archive is written to a dot-named temp beside it and renamed into place only once every file verifies;
+  a dot-named entry is never treated as an archive.
+  Links are never followed; trees of an in-progress storage transaction, a foreign refresh lock, an
+  install that is activating (`.kb.install-activation.lock` with a live pid), and live leases are kept; plugin generations go only through `prunePluginGenerations` (lease-aware).
+- **Enforced automatically**: after install/forced reinstall (the installer releases its own preserved
+  generation once the new one validates), before and after every `--update` (incl. the SessionStart
+  knowledge self-heal), and by a detached SessionStart sweep at most every 6h when the name-only scan
+  finds cruft. By hand: `npx ruvnet-brain --clean`.
+- **Bounds**: ledgers in `LOG_FILES` rotate to `<name>.1` past 2 MiB; `.last-*.log` files are truncated to
+  their tail past 512 KiB; one npx installer copy, never older than the current version; lifecycle receipts
+  by lifecycle-evidence-v1 (16 MiB). Budget = live KB + models + 512 MiB.
+- **Positive confirmation** after every install/update and in `npx ruvnet-brain --doctor`: Software = npm
+  latest, Hosts = runtime, Knowledge = exactly one copy, built < 48h, signature verified (bound to the live
+  COVERAGE.json), corpus tag; In use = the search worker opened that copy, last answer; Footprint vs budget;
+  No cruft. `--doctor` text, `--doctor --json` (the same doctor; JSON on stdout) and the exit code are ONE
+  verdict (`doctorVerdict` in `plugin/scripts/brain-confirmation.mjs`): exit 0 iff no ✗ line, counting the
+  doctor's own checks too. Structural problems are ✗ (a second KB copy, a signature record that is unreadable
+  or does not match the live COVERAGE.json, a worker on another copy, footprint, cruft, install, identity,
+  grounding, Codex, nightly, host sync, ruflo); currency is `!` and advisory (Software behind npm latest, a
+  host plugin ≠ runtime, Knowledge built ≥ 48h), so a correctly installed older build still passes install
+  verification. A MISSING signature record is provenance unknown, not provably broken (an install from a
+  local sealed artifact, as the release's install verification does, and older installs never wrote one): it
+  is `!` and advisory too (4.5.1). Every ✗ and ! names one command; a missing signature record is written by a
+  verified install or update, and `--update` restores it from this machine's receipt of a verified apply of
+  the same bytes. SessionStart prints one `[RuvNet Brain — FOOTPRINT …]` line only
+  when the footprint is wrong.
+- **Proof it holds**: `tests/integration/footprint-three-updates.test.mjs` (real install, forced reinstall,
+  three updates, planted cruft, all lines green, and the same run with the sweep cut out goes red);
+  `tests/unit/brain-footprint.test.mjs` (classification, safety, BREAK-IT mutants). The corpus canary's
+  three-update footprint check is opt-in: `scripts/corpus-canary.mjs --footprint-updates`.
+
+## Hooks (what runs automatically)
+
+### Shared development obligations
+
+These obligations apply equally to Codex and Claude. A hook registration is an event
+entry point, not proof that a rule is enforced. Use shared implementations and thin native
+adapters; place worker admission and task verification in their existing controllers.
+Never infer native execution, completion, publication or fresh knowledge from registration.
+
+The required coverage is: current project restoration; relevant recall before consequential
+decisions; ongoing useful learning; exact canonical persistence; applicable lesson delivery;
+compaction and interruption recovery; knowledge freshness; grounded decisions; architecture
+compliance; verified model routing; safe parallel work and resource admission; writer ownership;
+end-to-end acceptance; independent review; evidence-bound completion; authorized continuation;
+privacy and consent; foreign-hook preservation; cross-host semantic parity; measured improvement
+and rollback; exact-artifact publication; and clear user communication.
+
+Before execution, maintain the complete authorized task list with explicit scope, dependencies
+and acceptance checks. Track each item through definition, implementation, relevant testing,
+independent validation and source-bound closeout. A repair of one discovered defect does not
+complete an end-to-end review: finish the stated boundary inventory, including consumers,
+configuration, native adapters and affected dependencies, and list any unexamined boundary.
+
+A blocked path gets one bounded diagnostic attempt. Repeated unchanged failure triggers
+reassessment rather than another identical retry; within three minutes report the observed
+blocker, exact missing action and unaffected work that can continue. Long-running productive
+work is not a blocker, but requires observed progress and a deadline. Do not wait on an idle
+agent or report registration as execution. These are required controller/reporting behaviors;
+unimplemented enforcement remains visible in the audit inventory.
+
+For each obligation, retain its shared rule, implementation paths, native adapter differences,
+positive and negative acceptance checks, source-bound reviewer findings and actual execution
+evidence. A missing check, timeout, queued write, unavailable source or unobserved native event
+stays explicitly unresolved. No review of old bytes transfers silently to changed code.
+
+Learning observations are not ratified user instructions. Useful project facts and decisions
+must retain their source and scope; inferred lessons remain nonauthoritative until the existing
+review/ratification boundary accepts them. Context restoration does not replace fresh recall
+at a later consequential decision. Compaction recovery must preserve pending work and disclose
+incomplete capture rather than claim lossless recovery without evidence.
+
+The hook audit inventory records current coverage and gaps. This rulebook defines the obligations;
+it does not claim all of them are implemented or native-verified. Updates require the affected
+requirement, source, test and adapter mapping plus new-source review and relevant execution proof.
+
+
+Consent-eligible learning writes one fixed-vocabulary observation per successful Bash/Write/Edit inside
+the `session-snapshot` PostToolUse boundary, directly with `ruflo memory store` into namespace
+`learning-observations` of the resolved project's `.swarm/memory.db`, proven by exact `ruflo memory retrieve`.
+There is no local queue, flush worker or replay (owner ruling 2026-10-12): a refused or unverified write is
+one row in `hook-failures.jsonl`, summarized at the next SessionStart. Persisted OFF, malformed consent,
+Brain OFF, or an unadopted project prevent capture. User scope requires explicit persisted consent and an
+existing adopted `~/.claude/global-memory/.swarm/memory.db`. Structural distillation is an explicit
+`ruflo memory backup` followed by `ruflo memory distill run`; it ratifies no lessons. Registration and
+manual invocation do not prove native event delivery.
+
+Project-level hooks are empty. The installed plugin registers exactly the hooks in
+`plugin/hooks/hooks.json` (Codex: `plugin/hooks/codex-hooks.json`; Grok: `plugin/hooks/grok-hooks.json`), all dispatched through
+`plugin/scripts/hook-shim.mjs` (ADR-106: one registration per role; 13 on Claude and on Codex, 9 on Grok, which
+deliberately omits session-start, ground-ruvnet, unprompted-speech and capacity-aware-parallel-work):
+SessionStart restore; UserPromptSubmit grounding + advisories;
+PreToolUse `decision-gate` on file writes (the only hook that refuses a tool call — `unprompted-speech` is the
+other exit-2 path, an opted-in lesson block at UserPromptSubmit on Claude and Codex — for rUv-product code
+without a fresh `search_ruvnet`; for a new ADR or an ADR status change in an adopted project without
+a `decision-record.mjs --consult` receipt younger than two hours, refused once per path per session,
+`RUVNET_DECISION_RECALL_GATE=off` disables it; or — in this checkout — a new code file or large new export that
+duplicates existing code: refused once per path per session, allowed by a header line
+`// DISTINCT-FROM: <path> — <reason>`, `RUVNET_DUPLICATE_GATE=off` disables it); PostToolUse grounding stamp; Stop continuation and grounding
+check; ruflo memory writes on Stop/PreCompact/SessionEnd. The Stop grounding check (`grounding-turn-gate`)
+asks for a `search_ruvnet` call only when the final answer asserts what a rUv product does, can, cannot,
+requires or says (`ruvCapabilityClaims` in `grounding-turn-evidence.mjs`) — a status report, git/CI check
+or memory write on a rUv-named prompt is never corrected; when the transcript tail cannot see the turn's
+start it falls back to the grounding stamps, never to a silent pass. It
+also asks for ONE correction when the prompt asked what a tool or platform can do (or for an
+architecture) and the final answer asserts a capability without a relevant source read this turn —
+a file, command, `search_ruvnet` hit or raw page, read after any small-model WebFetch summary about the
+same subject (`node scripts/grounding-turn-replay.mjs` measures it on real transcripts; ADR-0030 gates #2/#3
+are shadow-logged only). The Stop continuation body also asks for ONE
+correction when a final answer claims work is done without a check run after the last change this
+turn, a named check, and a NOT-verified disclosure. When all three are present and only the task
+scope cannot be qualified (the audit recognizes check-scoped sentences only), the verdict stays
+UNKNOWN, closes nothing, and is reported as a `completion-scope-advisory` rather than a correction
+(#425). It also records first-person promises ("I'll do X
+next") in the project's work ledger until a later evidenced completion claim closes them (Claude
+only; `npm run completion-claim:replay` measures both on real transcripts). It also asks ONCE when a
+Claude turn created an ADR in an adopted project and no successful `decision-record.mjs --record` ran
+after it (ADR-105 §8; `RUVNET_DECISION_RECORD_CHECK=off` disables it; Codex is not enforced). A
+decision record is committed only by an exact readback; a refused or unverified write returns `refused`, writes one hook-failures row and prints `NOT recorded` (nothing is kept on disk for a replay); `--supersedes` must name an existing decision record of the project and also writes a
+`supersession-<key>` tombstone that recall honors even when the superseding record is not retrieved.
+It also asks ONCE (`no-deferral`, Claude only) when the final answer ends by asking permission for,
+or postponing, work a standing instruction or open promise already authorized and names no genuine
+blocker class (credential, hardware-key tap, out-of-authority write, irreversible action, evidenced
+outage, running background work, owner-only action, purchase, choice between named options); a
+deferral that survives the continued stop is recorded once as "deferral not resolved"
+(`npm run deferral:replay` measures it on real transcripts; `RUVNET_NO_DEFERRAL=off` disables it).
+Lifecycle memory only CALLS ruflo (owner ruling 2026-10-12, ADR-106): no hand-rolled store, queue,
+journal or outbox exists. Prompt and pre-tool boundaries record nothing. SessionStart restores the newest
+`project-state-current-*` checkpoint (and a newer `project-state-auto-*` one) and lists `lessons` keys,
+each by exact key through `ruflo memory list|retrieve`. PreCompact and SessionEnd store one append-only
+`project-state-auto-<ms>` checkpoint and read it back by exact key. On Claude the shim stops any
+body 1.5 s before its registered timeout and writes nothing partial. It records
+`timed-out-internally`, and SessionStart reports it once. Under Codex the stable wrapper owns the
+kill (ADR-106).
+An advisory hook that fails (nonzero exit, signal, spawn error) still exits 0 to the host; the shim
+records it and SessionStart prints one `[RuvNet Brain — HOOK FAILURES]` summary of new failures. SessionStart prints one
+`[RuvNet Brain — KNOWLEDGE …]` line when the installed knowledge cannot be proven current (older than
+48h, or the latest refresh receipt FAILED) and names the fix. The same boundary records each turn's
+outcome at Stop (final assistant text, files changed, command descriptions — never user text), redacted
+with the shared credential/private-key scanner before truncation, with one bounded `ruflo memory store
+--no-upsert --append-only` into namespace `turns` of the canonical project's `.swarm/memory.db` (a linked
+worktree uses the primary repository store) and an exact key/content `ruflo memory retrieve`. There is no
+journal, outbox or replay: a refused write (for example Ruflo's WAL guard) is one `turn-capture` row in
+`hook-failures.jsonl`, reported at the next SessionStart, and SessionStart/`--doctor` show recent failed
+receipts. There is no automatic global fallback. An existing project store is eligible by default; a project
+without one records nothing until explicitly opted in. `RUVNET_TURN_CAPTURE=off` disables it.
+
+Persisted consent lives in `<Brain home>/turn-capture/policy.json` (Brain home defaults to
+`~/.cache/ruvnet-brain`), and is reread at every capture boundary without restarting the host:
+`{"schemaVersion":1,"projects":{"/absolute/canonical/repository":"off"},"paths":{"/absolute/checkout/or/subdirectory":"off"}}`.
+A path entry overrides a canonical project entry; `on` explicitly opts in and permits creating the
+canonical project store directory, `off` disables both capture and distillation. A malformed consent
+file fails closed. An environment `force` does not override persisted opt-out. Existing historical
+records are not rewritten. The global Ruflo CLI currently accepts stored content through `--value`;
+only redacted content is passed there. Filesystem paths still have to be passed to the OS/CLI; avoid
+putting credentials in repository directory names. Receipt paths and project identifiers are redacted.
+
+The product is the only writer of project turn history; a user-level hook is never evidence of
+capture and is never deferred to (ADR-105 §7, ADR-106). Material events (decisions, lessons, open items)
+are recorded explicitly with `/ruvnet-brain:rnb-brief`, which runs `ruflo memory store` into namespace
+`continuity-events` and confirms by exact `ruflo memory retrieve`; there is no automatic event journal.
+`npm run hooks:check` and `npm run wired:check` fail on any hook or module that is registered-but-missing
+or present-but-unwired.
+
+## Tests
 
 ```bash
-npm test                              # plugin QA over real JSON-RPC (plugin/test/run-tests.mjs)
-npm run version:check                 # fail if any surface drifted from plugin.json's version
-bash scripts/gate.sh                  # rebuild concepts + the three pass/fail routing gates
-node scripts/behavioral-l1-l4.mjs     # the 4-level behavioral harness (route/recall/implement/orchestrate)
+npm run release:qualify -- --suite source --report /tmp/source-qualification-UNIQUE.json
+npm run release:qualify -- --suite integration --report /tmp/integration-qualification-UNIQUE.json
+npm test                        # plugin battery over real JSON-RPC
+npm run qa:release              # distinct packed-artifact release QE
+npm run single-source:check     # one version of every rule and fact
+npm run wired:check             # every module has a caller or a stated reason
 ```
 
-- `npm test` verifies manifests/structure, that the grounding hook fires on RuvNet prompts (and
-  stays silent otherwise — the always-on status footer is expected, not a leak), the MCP launcher
-  (`initialize` / `tools/list`), and the capability battery. Sections that need the brain skip
-  cleanly if it isn't installed at `$RUVNET_BRAIN_KB` or `~/.cache/ruvnet-brain/kb`.
-- `scripts/gate.sh` is designed to be **able to fail** (SEC-0010 #1): each gate's real exit code is
-  captured via `PIPESTATUS`, so a miss makes the whole script exit non-zero. Reports land in
-  `DESCRIBED-PROOF.md`, `PROOF.md`, and `HELIX-DEMO-NOHELIX.md`.
+The reviewed requirement-to-test inventory in `scripts/release-qualification-contract.mjs` is
+the candidate gate. Each retained test must be read against the changed architecture before
+running it; changed behaviors and their failure cases must join that inventory. Integration
+qualification runs on Linux/POSIX with the global Ruflo, native Codex and KB dependencies present;
+missing prerequisites or skipped cases fail qualification. Use new receipt paths for every run.
+The historical whole suite (`npx vitest run` / `scripts/full-suite-gate.mjs`) remains an explicit
+developer diagnostic, not a second release gate. Public, signed-artifact, native-host and OS
+verification remain required independently; a local subset never means shipped.
 
-Set `KB_MODEL_CACHE` before running the grading scripts to avoid a first-run model download.
-
-## How the nightly publish works
-
-The nightly evergreen keeps the shipped bundle current and pushes it out to users automatically.
-
-- **Driver:** `scripts/self-update.mjs` compares each in-scope repo's live `git ls-remote HEAD`
-  against the SHA stamped in `data/manifest.json`, then rebuilds only what changed.
-  - Dry-run (prints the rebuild plan, writes nothing): `node scripts/self-update.mjs`
-  - Apply: `node scripts/self-update.mjs --apply` — rebuilds stale/changed **already-built** repos
-    serially (embedding is CPU-bound), re-stamps, and re-assembles `dist/ruvnet-brain`.
-  - Scope flags: `--tier T0`, `--repo ruflo`. Building **brand-new** repos is a supervised,
-    multi-hour job and is gated behind `--include-new` so the cron can't silently deep-walk 40+
-    repos on its first run. T3 is deep-walked on demand, not nightly.
-- **Publish (the last mile):** `node scripts/self-update.mjs --apply --publish`. Only when
-  something was actually rebuilt this run, it bumps `plugin/.claude-plugin/plugin.json` (patch),
-  regenerates the README version badge, zips `dist/ruvnet-brain` → `dist/ruvnet-brain.zip`, runs
-  `gh release create <tag>` (so `releases/latest` advances), then commits the version bump +
-  stamped manifests and pushes `main`. One product version — plugin and knowledge bundle ship
-  under a single tag, and users' session-start heartbeats pick both up. It is fail-loud: any error
-  exits non-zero into the nightly log; nothing is half-published.
-- **Scheduler:** `deploy/com.ruvnet.brain-nightly.plist` runs
-  `node scripts/self-update.mjs --apply --publish` at **03:15** local time. It is **NOT
-  auto-installed** — system schedulers require explicit owner approval. To enable / disable:
-  ```bash
-  cp deploy/com.ruvnet.brain-nightly.plist ~/Library/LaunchAgents/
-  launchctl load  ~/Library/LaunchAgents/com.ruvnet.brain-nightly.plist   # enable
-  launchctl unload ~/Library/LaunchAgents/com.ruvnet.brain-nightly.plist  # disable
-  ```
-  Output goes to `logs/nightly*.log`.
-
-> The primer / L2 / concepts layer and answer-quality grading are **supervised** steps — the
-> nightly refreshes deep source + re-assembles the bundle, but re-run those by hand when a repo
-> changes materially.
+The 500-line source ceiling is enforced by `tests/unit/lesson-gate.test.mjs` for `lesson-gate`, `lesson-command-scope`, `lesson-presentation`, `lesson-store`, `lesson-bridge`, `decision-gate` and `decision-outcomes` (lines are counted with `split('\n')`). Shrink such a file by moving cohesive code out; never by trimming blank lines.
 
 ## The fail-closed private fence
 
-Some KBs are built from **private** source (the `cognitum-one` org) and must never ship in a public
-bundle. `kb/PRIVATE-STORES.json` is the allow-list-inverse: it names those stores, and
-`scripts/build-bundle.mjs` drops them (and their raw L2 `.md` files) during assembly.
-
-The fence is **fail-closed** (security-critical, SEC-0010 #4). `build-bundle.mjs` **aborts the
-build** if `PRIVATE-STORES.json` is:
-
-- **missing** — unless you explicitly opt out with `ALLOW_NO_PRIVATE_FENCE=1` (the escape hatch a
-  genuine no-private public fork needs, never the silent default);
-- **present but unparseable/corrupt**; or
-- **missing a valid `privateStores` array**.
-
-A fence that degraded to an empty set on error would silently ship every store, including private
-source — so it refuses to build instead. **When you ingest a private repo, add its store name to
-`kb/PRIVATE-STORES.json` in the same change.** Zero-leak is verified in the assembled + zipped
-bundle on every publish.
-
-## Pull requests
-
-- Keep changes surgical. Run `npm run version:check` and `npm test` before opening a PR.
-- **Do not** hand-edit generated version surfaces (README badge line, `package.json`,
-  `data/manifest.json` `brainVersion`, `kb/package.json`) — bump `plugin.json` and run
-  `sync-version.mjs` instead.
-- If you touch a doc, version it per the header convention used across `docs/`.
+`kb/PRIVATE-STORES.json` names stores built from private source; `scripts/build-bundle.mjs` drops
+them and **aborts** if the file is missing (unless `ALLOW_NO_PRIVATE_FENCE=1`), unparseable, or lacks
+a `privateStores` array. When you ingest a private repo, add its store name in the same change.
 
 ## Principles
 
-Every design decision in this project is governed by [`docs/PRINCIPLES.md`](docs/PRINCIPLES.md). Read it before proposing an architecture; a change that contradicts a principle is wrong, and the contradiction is the finding.
+Every design decision is governed by [`docs/PRINCIPLES.md`](docs/PRINCIPLES.md). A change that
+contradicts a principle is wrong, and the contradiction is the finding.
+
+### Automatic memory observations and their limits (4.5.4 candidate)
+
+The policy uses native AgentDB through the global Ruflo CLI only (`ruflo memory store|retrieve|list|search`),
+canonical project identity and explicit namespaces. Every write is acknowledged only after exact-key
+readback; a failed write is reported in `hook-failures.jsonl` and is not retried by any local queue
+(owner ruling 2026-10-12). Observation writes are idempotent (a key already holding the identical bytes is
+success, not a failure) and load-shed: at most two detached writers per Brain home, an identical observation is
+not re-sent within ten minutes, and dropped observations are one aggregated ledger row per ten minutes, never
+a queue. Explicit project/path opt-out and content exclusions win. A project without a
+store records nothing until it adopts one (persisted opt-in, or `ruflo memory store` creating it).
+Prompt recall supplies bounded relevant untrusted evidence through one `ruflo memory list` per curated
+namespace, exact `ruflo memory retrieve` reads and at most ONE supplementary `ruflo memory search`, and
+honors the current privacy policy. No automatic semantic detector turns a model conclusion into ratified
+user policy; explicit checkpoints (`/ruvnet-brain:checkpoint`) remain required. Prompt, pre-tool and
+child-completion boundaries record nothing. Native lifecycle delivery and restart proof are separate from
+configured hook declarations.
+
+Canonical recall checks nonempty human prompts, including acknowledgements, from nested directories
+and worktrees. It prioritizes useful lessons and patterns, retrieves exact values and delivers
+bounded untrusted evidence again on repeated prompts. Empty/harness messages, explicit opt-out and
+honest no-match remain quiet. Native Grok prompt-first recall is not supported by the measured hook
+context surfaces. Fail-open capture does not satisfy every ADR-073 clause; that acceptance remains open. Unknown secrets and every semantically useful lesson are not guaranteed
+by the bounded classifier/redactor.

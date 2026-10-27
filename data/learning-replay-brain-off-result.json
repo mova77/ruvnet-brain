@@ -2,16 +2,14 @@
   "invariant": "LEARNING-REPLAY",
   "verdict": "FAIL",
   "why": "0/1 runs passed — below the 1/1 bar",
-  "sha": "522133dba3ade8de28cf2f2821244908fa7430c0",
-  "reboundFromSha": "535c6ec866683c48c2d1950f5cba5dafe9a0a824",
-  "reboundReason": "PR #73 squash changed ancestry; all LOAD_BEARING files are byte-identical",
-  "at": "2026-07-31T05:50:53.156Z",
+  "sha": "0eb0b6bd686df0fcf48655987bd1aeabb880ae20",
+  "at": "2026-10-03T17:24:41.906Z",
   "host": "codex",
-  "model": "gpt-5.6-sol",
-  "modelResolved": "gpt-5.6-sol",
+  "model": "gpt-6.1-sol",
+  "modelResolved": "gpt-6.1-sol",
   "mutant": "brain-off-treated",
   "trap": "memory-search-query",
-  "task": "Earlier in this project someone recorded a note about the caching strategy. Recall it from this project's agent memory with the ruflo CLI. Run the recall command now, then tell me what you ran.",
+  "taskHash": "0308cccebda651705b12b6494468fc06be96fee9d85d05bf9d72b328b174f4ca",
   "n": 1,
   "passes": 0,
   "fails": 1,
@@ -27,7 +25,7 @@
   "rate": 0,
   "threshold": ">=2/3",
   "costUsd": 0,
-  "wallSeconds": 29,
+  "wallSeconds": 20.8,
   "premise": {
     "verified": true,
     "evidence": "-q, --query               Search query (required)"
@@ -54,8 +52,8 @@
     "ok": true
   },
   "refresh": {
-    "generation": "d4-refresh-1785477023290",
-    "codeRoot": ".ruvnet-brain/learning-replay/run-xqMri4/brain-home/versions/d4-refresh-1785477023290",
+    "generation": "d4-refresh-1791048260229",
+    "codeRoot": ".ruvnet-brain/learning-replay/run-IMDTOF/brain-home/versions/d4-refresh-1791048260229",
     "distillExit": 0,
     "backupExit": 0,
     "lessonSurvived": true
@@ -65,34 +63,8 @@
       "i": 1,
       "verdict": "FAIL",
       "why": "treated arm produced \"positional\", not the token",
+      "error": null,
       "treated": {
-        "class": "positional",
-        "subcommandCorrect": true,
-        "command": "~/.npm-global/bin/ruflo memory search \"caching strategy\" --path .swarm/memory.db",
-        "forcedCommand": false,
-        "exec": {
-          "ran": true,
-          "argv": [
-            "ruflo",
-            "memory",
-            "search",
-            "caching strategy",
-            "--path",
-            ".swarm/memory.db"
-          ],
-          "exit": 1,
-          "exitOk": false,
-          "retrieved": false,
-          "why": "exit 1; the command's own output matched a known FAILURE shape /Required option missing/i",
-          "output": "[ERROR] Required option missing: --query\n"
-        },
-        "lessonIndex": -1,
-        "firstToolIndex": 0,
-        "lessonBeforeFirstToolCall": false,
-        "model": "gpt-5.6-sol",
-        "transcript": ".ruvnet-brain/learning-replay/run-xqMri4/transcripts/run1-treated.stream.jsonl"
-      },
-      "control": {
         "class": "positional",
         "subcommandCorrect": true,
         "command": "~/.npm-global/bin/ruflo memory search \"caching strategy\" --path \"$PWD/.swarm/memory.db\"",
@@ -108,12 +80,48 @@
           "exit": 1,
           "exitOk": false,
           "retrieved": false,
-          "why": "exit 1; the command's own output matched a known FAILURE shape /Required option missing/i",
+          "why": "exit 1; output matched failure shape /Required option missing/i",
           "output": "[ERROR] Required option missing: --query\n"
         },
+        "model": "gpt-6.1-sol",
+        "forcedCommand": false,
+        "lessonIndex": -1,
+        "firstToolIndex": 0,
+        "lessonBeforeFirstToolCall": false,
+        "transcript": {
+          "path": "data/learning-replay-transcripts/0eb0b6bd686df0fcf48655987bd1aeabb880ae20/a0328251a49b5491ddd4a07f3bfea91fbe4f2371c3617377fc3517ec1a1c27bc.json",
+          "sha256": "a0328251a49b5491ddd4a07f3bfea91fbe4f2371c3617377fc3517ec1a1c27bc",
+          "sourceSha": "0eb0b6bd686df0fcf48655987bd1aeabb880ae20",
+          "mutant": "brain-off-treated"
+        }
+      },
+      "control": {
+        "class": "positional",
+        "subcommandCorrect": true,
+        "command": "ruflo memory search \"caching strategy\" --path \"$PWD/.swarm/memory.db\"",
+        "exec": {
+          "ran": true,
+          "argv": [
+            "ruflo",
+            "memory",
+            "search",
+            "caching strategy",
+            "--path"
+          ],
+          "exit": 1,
+          "exitOk": false,
+          "retrieved": false,
+          "why": "exit 1; output matched failure shape /Required option missing/i",
+          "output": "[ERROR] Required option missing: --query\n"
+        },
+        "model": "gpt-6.1-sol",
         "lessonDelivered": false,
-        "model": "gpt-5.6-sol",
-        "transcript": ".ruvnet-brain/learning-replay/run-xqMri4/transcripts/run1-control.stream.jsonl"
+        "transcript": {
+          "path": "data/learning-replay-transcripts/0eb0b6bd686df0fcf48655987bd1aeabb880ae20/775cfdd23873dea8e7ae2d2ef4ff62f1f8c6bf987b457d05573aa1b5a2148056.json",
+          "sha256": "775cfdd23873dea8e7ae2d2ef4ff62f1f8c6bf987b457d05573aa1b5a2148056",
+          "sourceSha": "0eb0b6bd686df0fcf48655987bd1aeabb880ae20",
+          "mutant": "brain-off-treated"
+        }
       }
     }
   ]

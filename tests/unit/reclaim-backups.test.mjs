@@ -20,12 +20,16 @@ const mk = (dir, files) => {
   return dir;
 };
 
+const writeGenerations = (dir, stores) => {
+  fs.writeFileSync(path.join(dir, 'RVF-GENERATIONS.json'), JSON.stringify({ stores }));
+};
+
 beforeEach(() => { root = fs.mkdtempSync(path.join(os.tmpdir(), 'reclaim-test-')); });
 afterEach(() => { fs.rmSync(root, { recursive: true, force: true }); });
 
 describe('reclaimBackups (issue #35)', () => {
-  it('deletes a rollback copy whose stores all exist in the new KB', () => {
-    const kb = mk(path.join(root, 'kb'), { 'a.rvf': 64, 'b.rvf': 64 });
+  it('deletes a rollback copy whose full bytes survive in the new KB', () => {
+    const kb = mk(path.join(root, 'kb'), { 'a.rvf': 2048, 'b.rvf': 2048 });
     const bak = mk(path.join(root, 'kb.bak-2026-07-01'), { 'a.rvf': 2048, 'b.rvf': 2048 });
 
     const { removed, kept, freed } = reclaimBackups({ kbDir: kb, backupsMade: [bak], env: {} });
@@ -50,7 +54,60 @@ describe('reclaimBackups (issue #35)', () => {
     expect(kept[0][1]).toMatch(/cognitum-seed\.rvf/);
   });
 
-  it('reclaims public stores intentionally removed by a selected profile but still keeps private stores', () => {
+  it('keeps only-copy stores declared with opaque or nested generation files', () => {
+    const kb = mk(path.join(root, 'kb'), { 'public.rvf': 64 });
+    writeGenerations(kb, { public: { file: 'public.rvf' } });
+    const opaque = mk(path.join(root, 'kb.bak-2026-07-01'), {
+      'public.rvf': 64,
+      'opaque-store.bin': 128,
+    });
+    writeGenerations(opaque, {
+      public: { file: 'public.rvf' },
+      privateOpaque: { file: 'opaque-store.bin' },
+    });
+    const nested = mk(path.join(root, 'kb.bak-2026-07-02'), { 'public.rvf': 64 });
+    fs.mkdirSync(path.join(nested, 'nested'));
+    fs.writeFileSync(path.join(nested, 'nested', 'private.rvf'), Buffer.alloc(256, 2));
+    writeGenerations(nested, {
+      public: { file: 'public.rvf' },
+      privateNested: { file: 'nested/private.rvf' },
+    });
+
+    const { removed, kept } = reclaimBackups({ kbDir: kb, backupsMade: [opaque, nested], env: {} });
+
+    expect(removed).toEqual([]);
+    expect(kept).toHaveLength(2);
+    expect(kept.map(([, reason]) => reason).join('\n')).toContain('opaque-store.bin');
+    expect(kept.map(([, reason]) => reason).join('\n')).toContain(path.join('nested', 'private.rvf'));
+    expect(fs.existsSync(opaque)).toBe(true);
+    expect(fs.existsSync(nested)).toBe(true);
+  });
+
+  it('a removed logical name alone cannot authorize deleting unique opaque bytes', () => {
+    const kb = mk(path.join(root, 'kb'), { 'public.rvf': 64 });
+    writeGenerations(kb, { public: { file: 'public.rvf' } });
+    const backup = mk(path.join(root, 'kb.bak-2026-07-01'), {
+      'public.rvf': 64,
+      'opaque-store.bin': 128,
+    });
+    writeGenerations(backup, {
+      public: { file: 'public.rvf' },
+      privateOpaque: { file: 'opaque-store.bin' },
+    });
+
+    const { removed, kept } = reclaimBackups({
+      kbDir: kb,
+      backupsMade: [backup],
+      env: {},
+      intentionallyRemovedStores: ['privateOpaque'],
+    });
+
+    expect(removed).toEqual([]);
+    expect(kept[0][1]).toMatch(/PRESERVED_UNCLASSIFIED/);
+    expect(fs.existsSync(path.join(backup, 'opaque-store.bin'))).toBe(true);
+  });
+
+  it('preserves unique retired artifacts and private stores without complete disposal evidence', () => {
     const kb = mk(path.join(root, 'kb'), { 'ruvector.rvf': 64 });
     const publicOnly = mk(path.join(root, 'kb.bak-2026-07-01'), {
       'ruvector.rvf': 64,
@@ -69,13 +126,14 @@ describe('reclaimBackups (issue #35)', () => {
       intentionallyRemovedStores: ['ruflo'],
     });
 
-    expect(removed).toEqual([publicOnly]);
+    expect(removed).toEqual([]);
+    expect(fs.existsSync(publicOnly)).toBe(true);
     expect(fs.existsSync(withPrivate)).toBe(true);
-    expect(kept[0][1]).toMatch(/private-research\.rvf/);
+    expect(kept.find(([dir]) => dir === withPrivate)[1]).toMatch(/private-research\.rvf/);
   });
 
   it('sweeps copies stranded by EARLIER runs, not just this one (Mark had seven)', () => {
-    const kb = mk(path.join(root, 'kb'), { 'a.rvf': 64 });
+    const kb = mk(path.join(root, 'kb'), { 'a.rvf': 1024 });
     const old1 = mk(path.join(root, 'kb.bak-2026-06-29'), { 'a.rvf': 1024 });
     const old2 = mk(path.join(root, 'kb.bak-2026-07-02'), { 'a.rvf': 1024 });
     const fresh = mk(path.join(root, 'kb.bak-2026-07-20'), { 'a.rvf': 1024 });
@@ -85,6 +143,22 @@ describe('reclaimBackups (issue #35)', () => {
 
     expect(removed.sort()).toEqual([old1, old2, fresh].sort());
     for (const d of [old1, old2, fresh]) expect(fs.existsSync(d)).toBe(false);
+  });
+
+  it('sweeps every historical full-KB backup naming convention under the same one-copy budget', () => {
+    const kb = mk(path.join(root, 'kb'), { 'a.rvf': 1024 });
+    const backups = [
+      'kb.pre-reset-backup-2026-07-01',
+      'kb.agent-harness-generator-backup-2026-07-02',
+      'kb-pre-gap-rebuild-backup-2026-07-03',
+    ].map((name) => mk(path.join(root, name), { 'a.rvf': 1024 }));
+
+    const { removed, kept, retentionPolicy } = reclaimBackups({ kbDir: kb, backupsMade: [], env: {} });
+
+    expect(removed.sort()).toEqual(backups.sort());
+    expect(kept).toEqual([]);
+    expect(retentionPolicy.observedSnapshots).toBe(0);
+    for (const backup of backups) expect(fs.existsSync(backup)).toBe(false);
   });
 
   it('RUVNET_KEEP_BACKUP=1 keeps everything, for anyone who wants the old behaviour', () => {
@@ -114,5 +188,20 @@ describe('reclaimBackups (issue #35)', () => {
     const kb = mk(path.join(root, 'kb'), { 'a.rvf': 64 });
     const { removed, kept, freed } = reclaimBackups({ kbDir: kb, backupsMade: [], env: {} });
     expect(removed).toEqual([]); expect(kept).toEqual([]); expect(freed).toBe(0);
+  });
+
+  it('keeps a backup when generation metadata is corrupt and an opaque artifact is unclassified', () => {
+    const kb = mk(path.join(root, 'kb'), { 'public.rvf': 64 });
+    const backup = mk(path.join(root, 'kb.bak-2026-07-01'), {
+      'public.rvf': 64,
+      'private-opaque.bin': 128,
+    });
+    fs.writeFileSync(path.join(backup, 'RVF-GENERATIONS.json'), '{not-json');
+
+    const { removed, kept } = reclaimBackups({ kbDir: kb, backupsMade: [backup], env: {} });
+
+    expect(removed).toEqual([]);
+    expect(kept).toHaveLength(1);
+    expect(fs.existsSync(path.join(backup, 'private-opaque.bin'))).toBe(true);
   });
 });

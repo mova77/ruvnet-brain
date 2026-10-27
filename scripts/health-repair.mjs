@@ -24,10 +24,22 @@ import path from 'node:path';
 import os from 'node:os';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { findStores, diagnose } from './memory-doctor.mjs';
+import { distillLearning } from '../plugin/scripts/learning-store.mjs';
+import { learningContext } from '../plugin/scripts/runtime-preferences.mjs';
+import { resolveRuflo, rufloInvocation } from '../plugin/scripts/ruflo-bin.mjs';
+import { projectDirectory } from '../plugin/scripts/project-identity.mjs';
+import { newestSnapshot, snapshotInventory, MTIME_GRACE_MS } from './snapshot-freshness.mjs';
 
 const HOME = os.homedir();
+// The SAME project root the learning hook computes, by the same rule — the two halves of the flush
+// have to agree about which project they mean or they address different queues (issue #104).
+// RESIDUAL of #134: RUVNET_BRAIN_PROJECT_DIR is never set by real hook dispatch on either host, so
+// consult `projectDirectory()` (project-identity.mjs) — the CLAUDE_PROJECT_DIR-with-containment
+// rule #85/#107 already established, reused rather than trusting the variable unconditionally.
 const argv = process.argv.slice(2);
 const has = (f) => argv.includes(f);
+const requestedProject = has('--project') ? argv[argv.indexOf('--project') + 1] : undefined;
+const PROJECT = learningContext({ cwd: requestedProject || process.env.RUVNET_BRAIN_PROJECT_DIR || projectDirectory() }).projectDir;
 
 /**
  * Find ruflo HONESTLY.
@@ -41,15 +53,8 @@ const has = (f) => argv.includes(f);
  * Rule 21 still holds — ONE ruflo, the global one, never `npx ruflo@latest`. This resolves WHERE
  * that one global binary is rather than assuming a path.
  */
-function resolveRuflo() {
-  const preferred = path.join(HOME, '.npm-global/bin/ruflo');
-  if (fs.existsSync(preferred)) return preferred;
-  const which = spawnSync('sh', ['-lc', 'command -v ruflo'], { encoding: 'utf8', timeout: 10_000 });
-  const found = String(which.stdout || '').trim().split('\n')[0];
-  return found && fs.existsSync(found) ? found : null;
-}
 const RUFLO = resolveRuflo();
-const RUFLO_ENV = { ...process.env, RUFLO_DAEMON_AUTOSTART: '0' };
+const RUFLO_ENV = { ...process.env, RUFLO_DAEMON_AUTOSTART: '0', CLAUDE_FLOW_AUTO_UPDATE: 'false' };
 
 const sqlite = (db, sql) => execFileSync('sqlite3', [db, sql], { encoding: 'utf8', timeout: 120_000 }).trim();
 
@@ -93,34 +98,20 @@ function repairMemory() {
   return { ok: true, log: `repaired — integrity ok, ${rowsAfter} entries intact (was ${rowsBefore}). Backup: ${backup.replace(HOME, '~')}`, backup };
 }
 
-/** Drain the capture queue into rUv's learner — his tool, not ours. */
-function flushLearning() {
-  const flusher = path.join(HOME, '.claude', 'plugins', 'marketplaces', 'ruvnet-brain', 'plugin', 'scripts', 'learn-flush.mjs');
-  const local = path.join(process.cwd(), 'plugin', 'scripts', 'learn-flush.mjs');
-  const script = fs.existsSync(flusher) ? flusher : (fs.existsSync(local) ? local : null);
-  if (!script) return { ok: false, log: 'learn-flush.mjs not found — cannot drain the queue' };
-
-  const queueDir = path.join(HOME, '.cache', 'ruvnet-brain', 'learn');
-  const depth = () => {
-    try {
-      return fs.readdirSync(queueDir).filter((f) => f.endsWith('.jsonl'))
-        .reduce((n, f) => n + fs.readFileSync(path.join(queueDir, f), 'utf8').split('\n').filter(Boolean).length, 0);
-    } catch { return 0; }
-  };
-  const before = depth();
-  try { execFileSync(process.execPath, [script], { stdio: 'ignore', timeout: 600_000 }); }
-  catch (e) { return { ok: false, log: `flush failed: ${e.message} — the queue is preserved for retry` }; }
-  const after = depth();
-  return { ok: true, log: `fed ${Math.max(0, before - after)} captured events into the learner (queue ${before} → ${after})` };
-}
-
-/** One training cycle, via rUv's own CLI, in the GLOBAL (cross-project) learner. */
+/** One explicit training cycle in the same learner the Console measures. */
 function trainLearning() {
+  const context = learningContext({ cwd: PROJECT });
+  if (!context.enabled) return { ok: true, noop: true, log: 'learning is switched off — queued evidence and learner are untouched' };
   if (!RUFLO) return { ok: false, log: 'ruflo is not on this machine — install it with `npm i -g ruflo@latest` to enable learning' };
   try {
-    execFileSync(RUFLO, ['hooks', 'intelligence', '--train'], { cwd: HOME, env: RUFLO_ENV, stdio: 'ignore', timeout: 600_000 });
-  } catch (e) { return { ok: false, log: `training cycle failed: ${e.message}` }; }
-  return { ok: true, log: 'ran one training cycle in the cross-project learner' };
+    const evidence = distillLearning(RUFLO, context, { deadline: Date.now() + 18_000, allowed: () => {
+      const current = learningContext({ cwd: PROJECT }); return current.enabled && current.scope === context.scope && current.queueDir === context.queueDir;
+    } });
+    const verified = evidence.completed && evidence.patternDelta > 0;
+    return { ok: verified, log: verified
+      ? `verified ${evidence.patternDelta} new structural patterns in ${evidence.db}; no ratified lessons claimed; snapshot ${evidence.snapshot}`
+      : `distillation returned without measurable pattern progress in ${evidence.db}; recorded observations remain separate; snapshot retained` };
+  } catch { return { ok: false, log: 'canonical distillation unavailable; observations and pending queue retained' }; }
 }
 
 /**
@@ -144,35 +135,22 @@ function distillFleet() {
   if (!RUFLO) return { ok: false, log: 'ruflo is not on this machine — install it with `npm i -g ruflo@latest` to distill' };
 
   const scope = argv.includes('--root') ? path.resolve(argv[argv.indexOf('--root') + 1]) : null;
-  const roots = scope ? [scope] : [path.join(HOME, 'Code'), path.join(HOME, 'Projects'), HOME];
-
-  const seen = new Set();
   const targets = [];
   const corrupt = [];
-  for (const root of roots) {
-    let found = [];
-    try { found = findStores(root); } catch { continue; }
-    for (const db of found) {
-      const resolved = path.resolve(db);
-      // findStores() ALWAYS appends ~/.claude and ~/cognitum-trader regardless of the root it was
-      // given (deliberately — a one-level glob once missed 32 real stores). That is right for a
-      // survey and wrong for a scoped run: passing --root pointed at a scratch directory still
-      // distilled a real store outside it. Caught live 2026-07-21 by actually running this rather
-      // than trusting it. If a scope was asked for, it is enforced HERE.
-      if (scope && !resolved.startsWith(scope + path.sep)) continue;
-      if (seen.has(resolved)) continue;
-      seen.add(resolved);
-      let d;
-      try { d = diagnose(resolved); } catch { continue; }
-      if (d.unreadable || d.schemaless || !d.total) continue;
-      if (d.cover < 0.5 || (d.patterns ?? 0) > 0) continue;
-      // A corrupt store CANNOT be distilled — ruflo refuses it outright ("memory DB reports
-      // corruption — run recoverMemoryDatabase first"). Attempting anyway burns minutes, writes
-      // nothing, and returns a zero that reads as "distillation doesn't work". The honest answer is
-      // that repair comes FIRST, so name these instead of silently failing on them.
-      if (d.integrity && d.integrity !== 'ok') { corrupt.push(d.name); continue; }
-      targets.push({ db: resolved, name: d.name, before: d.patterns ?? 0 });
-    }
+  let found = [];
+  try { found = scope ? findStores(scope) : findStores(); } catch { found = []; }
+  for (const db of found) {
+    const resolved = path.resolve(db);
+    let d;
+    try { d = diagnose(resolved); } catch { continue; }
+    if (d.unreadable || d.schemaless || !d.total) continue;
+    if (d.cover < 0.5 || (d.patterns ?? 0) > 0) continue;
+    // A corrupt store CANNOT be distilled — ruflo refuses it outright ("memory DB reports
+    // corruption — run recoverMemoryDatabase first"). Attempting anyway burns minutes, writes
+    // nothing, and returns a zero that reads as "distillation doesn't work". The honest answer is
+    // that repair comes FIRST, so name these instead of silently failing on them.
+    if (d.integrity && d.integrity !== 'ok') { corrupt.push(d.name); continue; }
+    targets.push({ db: resolved, name: d.name, before: d.patterns ?? 0 });
   }
   const corruptNote = corrupt.length
     ? ` ${corrupt.length} store${corrupt.length === 1 ? ' was' : 's were'} skipped as corrupt and must be repaired before ${corrupt.length === 1 ? 'it' : 'they'} can be distilled: ${corrupt.slice(0, 5).join(', ')}${corrupt.length > 5 ? '…' : ''}.`
@@ -186,22 +164,39 @@ function distillFleet() {
   const receiptPath = argv.includes('--receipt') ? argv[argv.indexOf('--receipt') + 1] : null;
   const receipt = [];
   const writeReceipt = () => {
-    if (!receiptPath) return;
+    if (!receiptPath) return true;
     try {
       fs.mkdirSync(path.dirname(receiptPath), { recursive: true });
       fs.writeFileSync(receiptPath, JSON.stringify({ at: new Date().toISOString(), stores: receipt }, null, 2));
-    } catch { /* the receipt is for undo; failing to write it must not fail the repair itself */ }
+      return true;
+    } catch { return false; }
   };
 
   for (const t of targets) {
     const dir = path.join(path.dirname(t.db), 'backups');
+    const backupStartedAt = Date.now();
+    let priorSnapshots;
+    try { priorSnapshots = snapshotInventory(dir); }
+    catch (error) { failed.push(`${t.name}: refused to distill — ${error.message}`); continue; }
     try { execFileSync(RUFLO, ['memory', 'backup', '--db', t.db, '--dir', dir], { env: RUFLO_ENV, stdio: 'ignore', timeout: 300_000 }); }
     catch (e) { failed.push(`${t.name}: refused to distill — snapshot failed (${String(e.message).slice(0, 80)})`); continue; }
+    // `memory backup` exiting 0 is not proof a NEW file landed in `dir` — a stale snapshot from a
+    // prior fleet run sitting there already would otherwise be silently accepted as this run's undo
+    // (the exact gap `distill-project.mjs` was fixed for in PR #192, applied here to fleet's own,
+    // separate call site — see the 2026-08-29 Dream Cycle report, "Next steps #1").
+    const snapshot = newestSnapshot(dir, backupStartedAt, MTIME_GRACE_MS, priorSnapshots);
+    if (!snapshot) {
+      failed.push(`${t.name}: refused to distill — snapshot reported success but no fresh file landed in ${dir}`);
+      continue;
+    }
     // Record the snapshot BEFORE distilling, and flush after every store. If the process is killed
     // mid-fleet, the receipt still names every store already modified — a partial receipt is
     // recoverable, a missing one is not.
-    receipt.push({ db: t.db, name: t.name, backupDir: dir });
-    writeReceipt();
+    receipt.push({ db: t.db, name: t.name, backupDir: dir, snapshot });
+    if (!writeReceipt()) {
+      failed.push(`${t.name}: refused to distill — requested undo receipt could not be written`);
+      continue;
+    }
 
     try {
       execFileSync(RUFLO, ['memory', 'distill', 'run', '--db', t.db, '--judge', 'structural', '--budget-usd', '0'],
@@ -231,7 +226,6 @@ function distillFleet() {
 }
 
 const action = has('--repair-memory') ? repairMemory
-  : has('--flush-learning') ? flushLearning
     : has('--train-learning') ? trainLearning
       : has('--distill-fleet') ? distillFleet
         : null;

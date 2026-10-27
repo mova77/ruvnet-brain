@@ -7,7 +7,7 @@ name: stranger-matrix
 #
 # Five images, each asserting the SAME three things (scripts/ci/stranger-scenario.mjs is the one
 # shared driver — reused across all five, not reimplemented per OS):
-#   (a) healthy        -> exit 0 AND at least one hook FIRED through the INSTALLED registration
+#   (a) healthy        -> exit 0 AND automatic-hook retirement through the INSTALLED registries
 #                          (fires the REAL plugin/ tree at this SHA, via the REAL external
 #                          process-group watchdog scripts/selfcheck.mjs already ships)
 #   (b) seeded-broken   -> forge-mcp-all.mjs deleted from the fixture bundle -> exit NON-ZERO (M-D8a)
@@ -17,7 +17,7 @@ name: stranger-matrix
 #
 # The hostile cell ALSO runs a `strict-ungrounded` scenario proving RUVNET_STRICT_INSTALL=1 (the one
 # place a normally non-fatal grounding-smoke failure becomes fatal) is real, and the ubuntu cell
-# ADDITIONALLY proves M-D8c (a hook that sleeps past its declared timeout makes the battery go red)
+# ADDITIONALLY proves M-D8c (a forbidden automatic registration is rejected without execution)
 # against the real installed surface.
 #
 # THE FINDING THIS GATE CAUGHT FIRST, AND ITS CLOSURE (kept as the record, not deleted — the point
@@ -41,37 +41,81 @@ name: stranger-matrix
 # named — "wait until the stdout-budget finding has a real fix" — is now discharged; what remains
 # is the admin action and the rest of items 2-9.
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  workflow_dispatch: {}
+  workflow_call:
+    inputs:
+      candidate_sha:
+        description: Exact 40-character candidate SHA
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  CANDIDATE_RUN_ID: ${{ github.run_id }}
+  CANDIDATE_SHA: ${{ inputs.candidate_sha || github.sha }}
 
 jobs:
+  # ── THE GUARD: one condition, read by every cell below ──────────────────────────────────────────
+  #
+  # WHY. This workflow triggers on `workflow_run: [ci] types: [completed]`, and `completed` fires
+  # REGARDLESS OF CONCLUSION and regardless of branch. So it also ran on:
+  #   - ci runs that FAILED, where release-qe never uploaded the sealed candidate; and
+  #   - pull_request ci runs, where ci uploads `release-evidence-${{ github.sha }}` under the MERGE
+  #     commit while this workflow asks for `workflow_run.head_sha` — two different names.
+  # In both cases every cell died instantly on
+  #   "Unable to download artifact(s): Artifact not found for name: release-evidence-<sha>"
+  # — all five OS jobs red together, which reads like a five-platform outage and is actually one
+  # missing file.
+  #
+  # MEASURED 2026-08-05: stranger-matrix passed 9 of 20 runs on main (45%). The then-separate
+  # release-aggregate workflow required ci AND stranger AND integration-linux AND ux-qe green on
+  # the SAME sha, so at 0.70 x 0.45 x 0.70 x 0.95 a release attempt succeeded about ONE TIME IN
+  # FIVE. This gate was the dominant term, and almost none of its failures were real findings.
+  # (That workflow was deleted 2026-09-04 and consolidated into protected-release.yml plus
+  # release-candidate-preflight.yml, which now perform this same aggregate check — see ADR-0072.)
+  #
+  # The condition lives ONCE here and the five cells read it through `needs:`. Repeating an `if:`
+  # five times is how the two host harnesses drifted apart; one fact, one place.
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Why this run is eligible
+        run: |
+          echo "trigger:    protected-release"
+          echo "candidate:  $CANDIDATE_SHA"
+          echo "ci run:     $CANDIDATE_RUN_ID"
   # ── shared prep, three POSIX-shaped jobs (ubuntu / macos share the exact same steps) ─────────────
   ubuntu:
+    needs: gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: npm pack the candidate SHA
-        run: npm pack --silent --pack-destination "$RUNNER_TEMP"
+      - name: Download the one CI-sealed candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: release-evidence-${{ env.CANDIDATE_SHA }}
+          path: ${{ runner.temp }}
       - name: npm install FROM the tarball into a fresh project (never the checkout)
         run: |
           mkdir -p "$RUNNER_TEMP/proj"
           cd "$RUNNER_TEMP/proj"
           echo '{}' > package.json
           npm install --no-audit --no-fund "$RUNNER_TEMP"/ruvnet-brain-*.tgz
-      - name: (a)+(c) healthy image — exit 0, >=1 real hook fire, no author-local settings.json
+      - name: (a)+(c) healthy image — exit 0, verified zero automatic registrations, no author-local settings.json
         run: |
           node scripts/ci/stranger-scenario.mjs \
             --scenario healthy \
             --installed "$RUNNER_TEMP/proj/node_modules/ruvnet-brain" \
             --home "$RUNNER_TEMP/home-healthy" \
-            --plugin-src "$GITHUB_WORKSPACE/plugin"
-      - name: M-D8c — a hook that sleeps past its declared timeout makes the battery go RED
+            --plugin-src "$RUNNER_TEMP/proj/node_modules/ruvnet-brain/plugin"
+      - name: M-D8c — a forbidden installed hook is rejected without executing its body
         if: always()
         run: |
           node scripts/ci/mutate-hook-timeout.mjs \
@@ -84,30 +128,36 @@ jobs:
             --scenario seeded-broken \
             --installed "$RUNNER_TEMP/proj/node_modules/ruvnet-brain" \
             --home "$RUNNER_TEMP/home-broken" \
-            --plugin-src "$GITHUB_WORKSPACE/plugin"
+            --plugin-src "$RUNNER_TEMP/proj/node_modules/ruvnet-brain/plugin"
 
   macos:
+    needs: gate
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: npm pack the candidate SHA
-        run: npm pack --silent --pack-destination "$RUNNER_TEMP"
+      - name: Download the one CI-sealed candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: release-evidence-${{ env.CANDIDATE_SHA }}
+          path: ${{ runner.temp }}
       - name: npm install FROM the tarball into a fresh project (never the checkout)
         run: |
           mkdir -p "$RUNNER_TEMP/proj"
           cd "$RUNNER_TEMP/proj"
           echo '{}' > package.json
           npm install --no-audit --no-fund "$RUNNER_TEMP"/ruvnet-brain-*.tgz
-      - name: (a)+(c) healthy image — exit 0, >=1 real hook fire, no author-local settings.json
+      - name: (a)+(c) healthy image — exit 0, verified zero automatic registrations, no author-local settings.json
         run: |
           node scripts/ci/stranger-scenario.mjs \
             --scenario healthy \
             --installed "$RUNNER_TEMP/proj/node_modules/ruvnet-brain" \
             --home "$RUNNER_TEMP/home-healthy" \
-            --plugin-src "$GITHUB_WORKSPACE/plugin"
+            --plugin-src "$RUNNER_TEMP/proj/node_modules/ruvnet-brain/plugin"
       - name: (b) seeded-broken image (M-D8a) — forge-mcp-all.mjs deleted -> exit NON-ZERO
         if: always()
         run: |
@@ -115,7 +165,7 @@ jobs:
             --scenario seeded-broken \
             --installed "$RUNNER_TEMP/proj/node_modules/ruvnet-brain" \
             --home "$RUNNER_TEMP/home-broken" \
-            --plugin-src "$GITHUB_WORKSPACE/plugin"
+            --plugin-src "$RUNNER_TEMP/proj/node_modules/ruvnet-brain/plugin"
 
   # ── windows, Git-Bash shell — this repo has already been bitten by /bin/bash not existing on
   # Windows runners and by cmd.exe mangling quoted arguments (scripts/selfcheck.mjs's own
@@ -128,30 +178,36 @@ jobs:
   # under Git Bash (MSYS2 unzip receiving native backslash paths through cmd.exe), and the product
   # now extracts in-process with node:zlib via kb/zip-extract.mjs.
   windows-gitbash:
+    needs: gate
     runs-on: windows-latest
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: npm pack the candidate SHA
-        run: npm pack --silent --pack-destination "$RUNNER_TEMP"
+      - name: Download the one CI-sealed candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: release-evidence-${{ env.CANDIDATE_SHA }}
+          path: ${{ runner.temp }}
       - name: npm install FROM the tarball into a fresh project (never the checkout)
         run: |
           mkdir -p "$RUNNER_TEMP/proj"
           cd "$RUNNER_TEMP/proj"
           echo '{}' > package.json
           npm install --no-audit --no-fund "$RUNNER_TEMP"/ruvnet-brain-*.tgz
-      - name: (a)+(c) healthy image — exit 0, >=1 real hook fire, no author-local settings.json
+      - name: (a)+(c) healthy image — exit 0, verified zero automatic registrations, no author-local settings.json
         run: |
           node scripts/ci/stranger-scenario.mjs \
             --scenario healthy \
             --installed "$RUNNER_TEMP/proj/node_modules/ruvnet-brain" \
             --home "$RUNNER_TEMP/home-healthy" \
-            --plugin-src "$GITHUB_WORKSPACE/plugin"
+            --plugin-src "$RUNNER_TEMP/proj/node_modules/ruvnet-brain/plugin"
       - name: (b) seeded-broken image (M-D8a) — forge-mcp-all.mjs deleted -> exit NON-ZERO
         if: always()
         run: |
@@ -159,22 +215,28 @@ jobs:
             --scenario seeded-broken \
             --installed "$RUNNER_TEMP/proj/node_modules/ruvnet-brain" \
             --home "$RUNNER_TEMP/home-broken" \
-            --plugin-src "$GITHUB_WORKSPACE/plugin"
+            --plugin-src "$RUNNER_TEMP/proj/node_modules/ruvnet-brain/plugin"
 
   # ── windows, PowerShell shell — the OTHER real Windows path (default terminal for most Windows
   # users who never installed Git Bash). Same driver script; only the wrapping shell differs.
   windows-powershell:
+    needs: gate
     runs-on: windows-latest
     defaults:
       run:
         shell: pwsh
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: npm pack the candidate SHA
-        run: npm pack --silent --pack-destination "$env:RUNNER_TEMP"
+      - name: Download the one CI-sealed candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: release-evidence-${{ env.CANDIDATE_SHA }}
+          path: ${{ runner.temp }}
       - name: npm install FROM the tarball into a fresh project (never the checkout)
         run: |
           New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP/proj" | Out-Null
@@ -182,13 +244,13 @@ jobs:
           '{}' | Set-Content -Path package.json
           $tgz = Get-ChildItem "$env:RUNNER_TEMP" -Filter 'ruvnet-brain-*.tgz' | Select-Object -First 1
           npm install --no-audit --no-fund $tgz.FullName
-      - name: (a)+(c) healthy image — exit 0, >=1 real hook fire, no author-local settings.json
+      - name: (a)+(c) healthy image — exit 0, verified zero automatic registrations, no author-local settings.json
         run: |
           node scripts/ci/stranger-scenario.mjs `
             --scenario healthy `
             --installed "$env:RUNNER_TEMP/proj/node_modules/ruvnet-brain" `
             --home "$env:RUNNER_TEMP/home-healthy" `
-            --plugin-src "$env:GITHUB_WORKSPACE/plugin"
+            --plugin-src "$env:RUNNER_TEMP/proj/node_modules/ruvnet-brain/plugin"
       - name: (b) seeded-broken image (M-D8a) — forge-mcp-all.mjs deleted -> exit NON-ZERO
         if: always()
         run: |
@@ -196,7 +258,7 @@ jobs:
             --scenario seeded-broken `
             --installed "$env:RUNNER_TEMP/proj/node_modules/ruvnet-brain" `
             --home "$env:RUNNER_TEMP/home-broken" `
-            --plugin-src "$env:GITHUB_WORKSPACE/plugin"
+            --plugin-src "$env:RUNNER_TEMP/proj/node_modules/ruvnet-brain/plugin"
 
   # ── the hostile container: no jq, no gh, sh-only, HOME containing a space, network denied ────────
   # node:20-alpine is chosen deliberately: busybox's default shell is `sh` (no bash at all unless
@@ -213,6 +275,7 @@ jobs:
   # calls, verified: the only two network functions in bin/install.mjs, resolveRelease's fetchJson and
   # download(), are both skipped in --local mode) fails FAST instead of silently succeeding or hanging.
   hostile:
+    needs: gate
     runs-on: ubuntu-latest
     container:
       image: node:20-alpine
@@ -233,19 +296,22 @@ jobs:
       - name: apk add zip/unzip ONLY — explicitly no jq, no gh
         run: apk add --no-cache zip unzip
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
       # No actions/setup-node here: the alpine image's own node/npm are what a musl-based hostile
       # box actually has; actions/setup-node downloads a glibc build that will not run on it.
-      - name: npm pack the candidate SHA
-        run: |
-          mkdir -p /tmp/ci-out
-          npm pack --silent --pack-destination /tmp/ci-out
+      - name: Download the one CI-sealed candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: release-evidence-${{ env.CANDIDATE_SHA }}
+          path: /tmp/ci-out
       - name: npm install FROM the tarball into a fresh project (never the checkout)
         run: |
           mkdir -p /tmp/ci-out/proj
           cd /tmp/ci-out/proj
           echo '{}' > package.json
           npm install --no-audit --no-fund /tmp/ci-out/ruvnet-brain-*.tgz
-      - name: (a)+(c) healthy image — HOME contains a space, exit 0, >=1 real hook fire, no author settings.json
+      - name: (a)+(c) healthy image — HOME contains a space, exit 0, verified zero automatic registrations, no author settings.json
         env:
           HTTPS_PROXY: http://127.0.0.1:9
           HTTP_PROXY: http://127.0.0.1:9
@@ -255,7 +321,7 @@ jobs:
             --scenario healthy \
             --installed /tmp/ci-out/proj/node_modules/ruvnet-brain \
             --home "/tmp/virgin home/healthy" \
-            --plugin-src "$GITHUB_WORKSPACE/plugin"
+            --plugin-src /tmp/ci-out/proj/node_modules/ruvnet-brain/plugin
       - name: (b) seeded-broken image (M-D8a) — forge-mcp-all.mjs deleted -> exit NON-ZERO
         env:
           HTTPS_PROXY: http://127.0.0.1:9
@@ -266,7 +332,7 @@ jobs:
             --scenario seeded-broken \
             --installed /tmp/ci-out/proj/node_modules/ruvnet-brain \
             --home "/tmp/virgin home/broken" \
-            --plugin-src "$GITHUB_WORKSPACE/plugin"
+            --plugin-src /tmp/ci-out/proj/node_modules/ruvnet-brain/plugin
       - name: RUVNET_STRICT_INSTALL=1 — an unproven grounding smoke IS fatal here, though never by default
         env:
           HTTPS_PROXY: http://127.0.0.1:9
@@ -277,4 +343,48 @@ jobs:
             --scenario strict-ungrounded \
             --installed /tmp/ci-out/proj/node_modules/ruvnet-brain \
             --home "/tmp/virgin home/strict" \
-            --plugin-src "$GITHUB_WORKSPACE/plugin"
+            --plugin-src /tmp/ci-out/proj/node_modules/ruvnet-brain/plugin
+
+  evidence-receipt:
+    name: stranger-evidence-receipt
+    needs: [ubuntu, macos, windows-gitbash, windows-powershell, hostile]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Download the exact candidate exercised by every stranger cell
+        uses: actions/download-artifact@v4
+        with:
+          name: release-evidence-${{ env.CANDIDATE_SHA }}
+          path: release-evidence
+      - name: Bind the stranger matrix to its source run and payload
+        env:
+          SOURCE_CI_RUN_ID: ${{ env.CANDIDATE_RUN_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/release-payload.mjs verify-members --manifest release-evidence/payload-manifest.json > "$RUNNER_TEMP/payload.json"
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          const payload = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + '/payload.json', 'utf8'));
+          fs.writeFileSync('stranger-evidence.json', JSON.stringify({
+            schemaVersion: 1,
+            sha: process.env.CANDIDATE_SHA,
+            payloadId: payload.payloadId,
+            sourceCiRunId: process.env.SOURCE_CI_RUN_ID,
+            strangerRunId: process.env.GITHUB_RUN_ID,
+            verdict: 'PASS',
+            jobs: ['ubuntu', 'macos', 'windows-gitbash', 'windows-powershell', 'hostile'],
+          }, null, 2));
+          NODE
+      - name: Persist exact stranger evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: stranger-evidence-${{ inputs.candidate_sha || github.sha }}
+          path: stranger-evidence.json
+          if-no-files-found: error
+          retention-days: 90

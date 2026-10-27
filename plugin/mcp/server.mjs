@@ -33,7 +33,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import readline from 'node:readline';
-import { callManagedCli, MANAGED_CLI_TOOLS } from './managed-cli-interface.mjs';
+import { fileURLToPath } from 'node:url';
+import { writeOwn as writeOwnReadiness } from '../scripts/mcp-readiness.mjs';
+import { MANAGED_CLI_TOOLS } from './managed-cli-interface.mjs';
+import { dispatchManagedCli } from './managed-cli-generation.mjs';
+import { unmountedNotice } from '../scripts/brain-location.mjs';
 
 const BRAIN_HOME = process.env.RUVNET_BRAIN_HOME || path.join(os.homedir(), '.cache', 'ruvnet-brain');
 const KB = process.env.RUVNET_BRAIN_KB || path.join(BRAIN_HOME, 'kb');
@@ -41,14 +45,15 @@ const CHILD_MCP = process.env.RUVNET_BRAIN_CHILD_MCP || path.join(KB, 'forge-mcp
 const ACTIVE = path.join(BRAIN_HOME, 'active.json');
 const LEASES = path.join(BRAIN_HOME, 'leases');
 const LEASE = path.join(LEASES, `mcp-${process.pid}.json`);
+const READINESS = path.join(BRAIN_HOME, 'mcp-readiness.json');
 
 const PROTOCOL_VERSION = '2024-11-05';
 const SERVER_INFO = { name: 'ruvnet-brain', version: '2.0.0' };
-// Local frozen tool declarations. search_ruvnet is only a fallback: a live child's declaration wins
-// so its description can refresh. The two managed-CLI schemas are owned by this protocol shell.
+// Stable declarations belong to this protocol shell. Capability discovery must never wait for a
+// model or vector store; the first operation that needs the worker joins its readiness promise.
 const SEARCH_TOOL = {
   name: 'search_ruvnet',
-  description: 'Source-grounded knowledge base for the RuvNet ecosystem. (Brain bundle not installed on this machine — calls will return install guidance.)',
+  description: 'Source-grounded knowledge base for the RuvNet ecosystem. The first call may wait while the local search worker becomes ready.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -57,30 +62,84 @@ const SEARCH_TOOL = {
     },
     required: ['query'],
   },
+  // ── WHY THIS TOOL IS DECLARED READ-ONLY ───────────────────────────────────────────────────────
+  // Its three siblings below (MANAGED_CLI_TOOLS) have carried annotations since they shipped; this
+  // one did not, and a host that must assume the worst therefore assumed it. Observed 2026-09-11:
+  // Claude Code's plan mode REFUSED search_ruvnet three times in one session ("Cannot call
+  // search_ruvnet while in plan mode") — so the one tool whose entire purpose is grounding a plan
+  // in rUv's real source was unavailable at exactly the moment a plan is written. An unannotated
+  // tool is not a neutral default; it is a claim of "may mutate", made by omission.
+  //
+  // The claim is checked, not asserted. Every write reachable from a search_ruvnet call was walked
+  // (kb/forge-mcp-all.mjs meterLog + markGroundingProven, kb/brain-alarm.mjs health.json,
+  // kb/telemetry-ping.mjs stamp/queue, and this file's refreshLease): all of them land under
+  // ~/.cache/ruvnet-brain — or $XDG_CACHE_HOME/ruvnet-brain — plus $RUVNET_BRAIN_STATE_DIR for the
+  // off-switch READ. Nothing is written into the user's project tree, nothing is deleted, and
+  // nothing outside this cache is touched; that property is not incidental, it is the fix issue #36
+  // (mamd69) landed after three writers had scattered hidden directories through project trees.
+  // Internal receipt/cache/telemetry writes under the user's cache dir are exactly what
+  // readOnlyHint is meant to tolerate — the hint is about the caller's world, not about whether the
+  // process ever calls write(2).
+  //
+  // idempotentHint: the same question over the same immutable corpus snapshot returns the same
+  // ranked documents — the cross-encoder is byte-for-byte deterministic for a fixed batch
+  // (evals/runs/2026-07-27-cross-encoder-pool-cap.md) and the pool order is stable by construction.
+  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
 };
 const FALLBACK_TOOLS = [SEARCH_TOOL, ...MANAGED_CLI_TOOLS];
-
-function withLocalTools(tools) {
-  const merged = new Map();
-  for (const tool of Array.isArray(tools) ? tools : []) {
-    if (tool?.name) merged.set(tool.name, tool);
-  }
-  for (const tool of FALLBACK_TOOLS) {
-    if (!merged.has(tool.name)) merged.set(tool.name, tool);
-  }
-  return [...merged.values()];
-}
 
 const out = (obj) => process.stdout.write(JSON.stringify(obj) + '\n');
 const clientOk = (id, result) => out({ jsonrpc: '2.0', id, result });
 const clientErr = (id, code, message) => out({ jsonrpc: '2.0', id, error: { code, message } });
 const readJSON = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } };
 
+/**
+ * ISSUE #133 (second half). This used to write ONE shared file, last writer wins — so a second MCP
+ * shell's `degraded` overwrote this one's `ready`, and `--doctor` reported the state of whichever
+ * process wrote last as the state of the machine. A process now owns only its own record; the
+ * machine-level answer is DERIVED from the live ones by mcp-readiness.mjs. Same fix as everything
+ * else closed today: one producer per fact.
+ */
+function writeReadiness(value) {
+  try {
+    writeOwnReadiness(BRAIN_HOME, value);
+  } catch (error) {
+    console.error(`[ruvnet-brain] could not persist MCP readiness: ${error.message}`);
+  }
+}
+
+function recordStartupFailure({ phase, startedAt, generation, error }) {
+  const now = Date.now();
+  const fields = {
+    state: 'degraded', phase, generation, elapsedMs: now - startedAt,
+    retryable: true, retryState: 'next-search-retries',
+    error: String(error?.message || error || 'unknown startup failure').slice(0, 500),
+  };
+  writeReadiness(fields);
+  const healthPath = path.join(BRAIN_HOME, 'health.json');
+  try {
+    fs.mkdirSync(BRAIN_HOME, { recursive: true });
+    const tmp = `${healthPath}.${process.pid}.${now}.tmp`;
+    fs.writeFileSync(tmp, `${JSON.stringify({
+      status: 'down', source: 'mcp-parent-startup', phase,
+      error: fields.error, elapsedMs: fields.elapsedMs, generation,
+      retryState: fields.retryState, ts: new Date(now).toISOString(),
+    })}\n`, { mode: 0o600 });
+    fs.renameSync(tmp, healthPath);
+  } catch (writeError) {
+    console.error(`[ruvnet-brain] could not persist startup health: ${writeError.message}`);
+  }
+}
+
 function currentGeneration() {
   const a = readJSON(ACTIVE);
   let brainMtime = 0;
   try { brainMtime = fs.statSync(CHILD_MCP).mtimeMs; } catch { /* brain absent */ }
-  return `${a?.generation ?? 0}:${brainMtime}`;
+  // The KB's own identity record: every knowledge update (corpus-only included) rewrites SOURCE.json, so a
+  // swapped knowledge base respawns the worker even when its code file is byte- and mtime-identical.
+  let knowledgeMtime = 0;
+  try { knowledgeMtime = fs.statSync(path.join(KB, 'SOURCE.json')).mtimeMs; } catch { /* brain absent */ }
+  return `${a?.generation ?? 0}:${brainMtime}:${knowledgeMtime}`;
 }
 function refreshLease() {
   try {
@@ -124,6 +183,7 @@ function killChild(reason) {
   clearChildIdleTimer();
   if (!child) return childRetirement;
   const c = child; child = null;
+  c.intentionalStop = true;
   for (const [, p] of c.pending) p.reject(new Error(`brain worker ${reason}`));
   c.pending.clear();
   childRetirement = new Promise((resolve) => {
@@ -157,20 +217,41 @@ async function ensureChild() {
 
   if (!childStartup) {
     childStartup = (async () => {
+      const startedAt = Date.now();
+      let phase = 'initialize';
       const env = { ...process.env, KB_DIR: KB };
       if (!env.KB_MODEL_CACHE) env.KB_MODEL_CACHE = path.join(BRAIN_HOME, 'models');
       const proc = spawn(process.execPath, [CHILD_MCP], { stdio: ['pipe', 'pipe', 'inherit'], env });
-      const c = { proc, generation: currentGeneration(), nextId: 1, pending: new Map() };
+      const c = { proc, generation: currentGeneration(), nextId: 1, pending: new Map(), intentionalStop: false };
       const rl = readline.createInterface({ input: proc.stdout });
       rl.on('line', (line) => {
         let msg; try { msg = JSON.parse(line); } catch { return; }
         const waiter = c.pending.get(msg.id);
         if (waiter) { c.pending.delete(msg.id); waiter.resolve(msg); }
       });
-      proc.on('exit', () => {
+      proc.on('exit', (code, signal) => {
         if (child === c) child = null;
         for (const [, p] of c.pending) p.reject(new Error('brain worker exited'));
         c.pending.clear();
+        // A CLEAN EXIT IS NOT A CRASH (issue #133, the sibling of the #122 idle-exit fix).
+        //
+        // #122 gave the worker a 15-minute idle retirement so a quiet session stops holding 3-15GB.
+        // It exits deliberately, with process.exit(0). This handler only knew about
+        // `intentionalStop`, which the PARENT sets when IT kills the child — so the worker retiring
+        // ITSELF was recorded as `degraded / worker-exit … exited unexpectedly`, and --doctor then
+        // exited 1 on a machine where nothing was wrong and the next search would respawn it by
+        // design. A fix that frees memory should not make the product report itself broken.
+        //
+        // Exit 0 with no signal is a deliberate stop — the idle retirement, or stdin EOF when the
+        // host goes away. A crash carries a non-zero code or a signal, and still degrades.
+        const cleanExit = code === 0 && !signal;
+        if (!c.intentionalStop && !cleanExit) {
+          writeReadiness({
+            state: 'degraded', phase: 'worker-exit', generation: c.generation,
+            elapsedMs: Date.now() - startedAt, retryable: true,
+            retryState: 'next-search-retries', error: 'brain worker exited unexpectedly',
+          });
+        }
       });
       proc.on('error', () => { if (child === c) child = null; });
       child = c;
@@ -180,8 +261,9 @@ async function ensureChild() {
           protocolVersion: PROTOCOL_VERSION,
           capabilities: {},
           clientInfo: { name: 'ruvnet-brain-shell', version: SERVER_INFO.version },
-        }, CHILD_INIT_TIMEOUT_MS);
-        const warmed = await childRequest(c, 'brain/warmup', {}, CHILD_INIT_TIMEOUT_MS);
+        }, CHILD_INIT_TIMEOUT_MS, { reportTimeout: false });
+        phase = 'warmup';
+        const warmed = await childRequest(c, 'brain/warmup', {}, CHILD_INIT_TIMEOUT_MS, { reportTimeout: false });
         // Rolling-upgrade compatibility: 4.0.1 workers predate the private warmup extension. The
         // stable shell is installed before the 700MB KB swap completes, so rejecting -32601 here
         // makes every query fail during the exact in-place upgrade window the shell exists to hide.
@@ -194,8 +276,18 @@ async function ensureChild() {
         }
       } catch (e) {
         await killChild('failed initialize');
+        recordStartupFailure({ phase, startedAt, generation: c.generation, error: e });
         throw new Error(`brain worker failed to initialize: ${e.message}`);
       }
+      // kbDir: WHICH knowledge base this worker opened (ADR-0098 positive confirmation "In use") — the
+      // physical path, so a worker still serving a replaced or second copy is visible, not assumed.
+      let openedKb = KB;
+      try { openedKb = fs.realpathSync(KB); } catch { /* reported as spelled */ }
+      writeReadiness({
+        state: 'ready', phase, generation: c.generation,
+        workerPid: c.proc.pid, elapsedMs: Date.now() - startedAt,
+        retryable: false, retryState: 'none', kbDir: openedKb,
+      });
       armChildIdleTimer(c);
       return c;
     })();
@@ -236,13 +328,13 @@ async function onChildTimeout(method, timeoutMs) {
 // Steady-state latency remains a separate release gate; this budget prevents a permanent cold loop.
 const CALL_TIMEOUT_MS = Number(process.env.RUVNET_BRAIN_CALL_TIMEOUT_MS) || 240_000;
 
-function childRequest(c, method, params, timeoutMs = CALL_TIMEOUT_MS) {
+function childRequest(c, method, params, timeoutMs = CALL_TIMEOUT_MS, { reportTimeout = true } = {}) {
   return new Promise((resolve, reject) => {
     const id = c.nextId++;
     const timer = setTimeout(() => {
       c.pending.delete(id);
       reject(new Error(`brain worker timeout on ${method}`));
-      void onChildTimeout(method, timeoutMs); // after the reject — the caller must not wait on the alarm
+      if (reportTimeout) void onChildTimeout(method, timeoutMs); // caller never waits on the alarm
     }, timeoutMs);
     c.pending.set(id, { resolve: (m) => { clearTimeout(timer); resolve(m); }, reject: (e) => { clearTimeout(timer); reject(e); } });
     try { c.proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n'); }
@@ -266,24 +358,12 @@ async function handleClient(msg) {
     case 'ping':
       return clientOk(id, {});
     case 'tools/list': {
-      try {
-        const c = await ensureChild();
-        if (c) {
-          try {
-            const r = await childRequest(c, 'tools/list', {}, 15_000);
-            if (r.result?.tools?.length) {
-              armChildIdleTimer(c);
-              return clientOk(id, { ...r.result, tools: withLocalTools(r.result.tools) });
-            }
-          }
-          catch { /* fall through to the static declaration */ }
-        }
-      } catch { /* fall through to the static declaration during a transient startup outage */ }
       return clientOk(id, { tools: FALLBACK_TOOLS });
     }
     case 'tools/call': {
-      if (params?.name === 'ruvnet_cli_help' || params?.name === 'ruvnet_cli_run') {
-        return clientOk(id, await callManagedCli(params.name, params.arguments || {}));
+      if (params?.name === 'ruvnet_cli_help' || params?.name === 'ruvnet_cli_run'
+        || params?.name === 'ruvnet_registry_latest') {
+        return clientOk(id, await dispatchManagedCli(params.name, params.arguments || {}));
       }
       if (params?.name !== 'search_ruvnet') return clientErr(id, -32602, `unknown tool: ${params?.name}`);
       refreshLease();
@@ -297,7 +377,10 @@ async function handleClient(msg) {
         });
       }
       if (!c) {
-        return clientOk(id, { content: [{ type: 'text', text: `search_ruvnet error: the brain bundle is not installed at ${KB}. Install it with: npx github:stuinfla/ruvnet-brain  (or set RUVNET_BRAIN_KB to your brain's kb dir).` }], isError: true });
+        // Moved to a disk that is not plugged in: one plain line, never 'diagnose the installation'.
+        const unmounted = unmountedNotice({ brainHome: BRAIN_HOME });
+        return clientOk(id, { content: [{ type: 'text', text: unmounted ? `search_ruvnet error: ${unmounted}`
+          : `search_ruvnet error: the brain bundle is unavailable at ${KB}. Diagnose the active installation and KB path before choosing a repair.` }], isError: true });
       }
       pendingCount++;
       try {
@@ -316,9 +399,39 @@ async function handleClient(msg) {
   }
 }
 
+// KNOWLEDGE CURRENCY TIMER (2026-10-02). A session can stay open for days and SessionStart never fires
+// again, so this process — alive for the whole session on Claude Code and Codex alike — runs the SAME
+// throttled newer-published check SessionStart runs (session-start-update-plane.mjs knowledgeAutoUpdate:
+// per-machine throttle, shared O_EXCL lock, one detached updater). Unref'd (never keeps this process
+// alive), skipped while a query is in flight or the worker is starting, skipped when the brain is off.
+// The new knowledge reaches the worker through currentGeneration() above: the next call after the swap
+// respawns it between requests. announce:false — the once-per-session UPDATED line is SessionStart's.
+const CORPUS_CHECK_INTERVAL_MS = Number(process.env.RUVNET_CORPUS_CHECK_INTERVAL_MS) || 15 * 60_000;
+const SCRIPTS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'scripts');
+const corpusTimer = setInterval(() => {
+  if (pendingCount > 0 || childStartup) return;
+  Promise.all([import('../scripts/session-start-update-plane.mjs'), import('../scripts/session-start-health.mjs')])
+    .then(([plane, health]) => {
+      const home = os.homedir();
+      if (health.brainState(process.env, home).off) return;
+      plane.knowledgeAutoUpdate({ env: process.env, home, now: Date.now(), hookDir: SCRIPTS_DIR, announce: false });
+    })
+    .catch((e) => console.error(`[ruvnet-brain] knowledge currency check skipped: ${e.message}`));
+}, CORPUS_CHECK_INTERVAL_MS);
+corpusTimer.unref();
+
 const clientRl = readline.createInterface({ input: process.stdin });
 clientRl.on('line', (line) => {
   let msg; try { msg = JSON.parse(line); } catch { return; } // malformed line: ignore, never crash
   handleClient(msg).catch((e) => { if (msg.id !== undefined && msg.id !== null) clientErr(msg.id, -32603, e.message); });
 });
-clientRl.on('close', () => { killChild('client disconnected'); process.exit(0); });
+let shuttingDown = false;
+async function shutdown(reason) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  await killChild(reason);
+  process.exit(0);
+}
+clientRl.on('close', () => { void shutdown('client disconnected'); });
+process.once('SIGTERM', () => { void shutdown('parent received SIGTERM'); });
+process.once('SIGINT', () => { void shutdown('parent received SIGINT'); });

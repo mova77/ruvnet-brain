@@ -1,0 +1,148 @@
+---
+id: ADR-067
+title: One decision, one reason — and a ledger that can report bad news
+status: Accepted
+reviewed_digest: ac2c46a7cfa1
+date: 2026-08-10
+updated: 2026-10-24
+updated_source: derived-from-git
+authors: [Stuart Kerr, Claude Code]
+tags: [hooks, architecture, enforcement, measurement, simplification]
+supersedes: []
+relates: [ADR-040, ADR-054, ADR-063, ADR-065, ADR-066, ADR-0012]
+governs:
+  - plugin/scripts/decision-gate.mjs
+  - plugin/scripts/decision-outcomes.mjs
+  - plugin/scripts/degradation-watch.mjs
+  - plugin/scripts/identifier-preflight.mjs
+  - plugin/scripts/adr-currency-gate.mjs
+  - plugin/scripts/mcp-readiness.mjs
+  - plugin/hooks/hooks.json
+  - plugin/hooks/codex-hooks.json
+  - tests/unit/decision-gate.test.mjs
+  - tests/unit/decision-outcomes.test.mjs
+  - tests/integration/bridge-to-model-e2e.test.mjs
+---
+
+# ADR-067 — One decision, one reason
+
+**Status**: Accepted
+
+## The measurement
+
+Read from `hooks.json`'s own matchers, 2026-08-10:
+
+```
+Write | Edit  →  hijack-ruvnet · ground-before-write · protect-state · unprompted-speech
+Bash          →  hijack-ruvnet · design-wall · unprompted-speech
+```
+
+**Four independent processes could refuse the same Write.** Five `exit 2` sites across four bash
+scripts, no precedence, no shared context, no way for any of them to know what the others thought.
+Whichever exited first won; the user got that one's reason and no hint that a second wall stood
+behind it. Fix the first, re-run, hit the second — one round-trip per wall.
+
+That is the concrete form of the owner's own words: *"not just a bunch of constraints rules that
+break and collapse on each other."* Nothing owned the decision, so everything had an opinion.
+
+## Decision 1 — the refusal chokepoint
+
+**Every refusal of a tool call passes through ONE gate that consults every policy and alone decides.**
+
+Not a new mechanism: this is ADR-040's invariant for *speech* (`unprompted-runtime.mjs` — "ONE runtime
+alone decides whether bytes reach the user") applied to the other half. One pattern used twice keeps
+the codebase learnable; inventing a parallel vocabulary here would repeat exactly what ADR-066
+records.
+
+**The policies do not change.** Each already speaks a precise contract — `exit 0` allow, `exit 2` +
+stderr refuse — documented identically in all four files. That contract *is* a verdict function; it
+was only ever missing a caller. The gate runs each as a captured child and reads `(code, stderr)`.
+Zero edits to four working guards, zero new protocol to keep in sync, every existing per-policy test
+still exercising the real thing.
+
+What the user gains: one message naming the policy that refused **and every other that also would
+have**; declared precedence (consent → correctness → grounding → taste); one process on the hot path
+under one deadline.
+
+**Fail-open, deliberately.** Any failure of the *gate itself* allows. `lesson-gate.mjs` states the
+rule this repo paid for: a gate that blocks because it cannot read a config file "would be worse than
+no gate, and would be switched off within a day, which is how every over-eager gate dies."
+
+## Decision 2 — measure whether a refusal teaches
+
+ADR-066's honesty boundary said it plainly: *"Delivery is proven; obedience is not measured."* And
+`lesson-stamps-prove-ceremony-not-obedience` — itself a bridged lesson — names that exact failure.
+
+**What is NOT observable:** whether the model obeyed an advisory. It reaches the context and what
+happens next is unconstrained prose. Claiming to measure it would be the inflated-score failure.
+
+**What IS observable**, from the one gate that sees every Write/Edit/Bash — what happened after a
+refusal:
+
+| outcome | meaning |
+|---|---|
+| `corrected` | the same target was retried and ALLOWED — the reason landed |
+| `repeated` | retried and refused again — the reason did **not** land |
+| `abandoned` | never retried. Ambiguous on purpose, never counted as a win |
+
+**The one way to fabricate this is to record only `corrected`.** So the invariant is not "record
+outcomes" but **every refusal produces exactly one record**, and `abandoned` is what an unresolved
+refusal becomes — swept from the gate on activity, not at SessionEnd, because SessionEnd does not
+fire on a crash, a kill, or a compact (ADR-027 already paid for that with 1,884 undelivered events).
+An empty ledger reports `null`, never 0% or 100%: both are claims about a measurement that has not
+happened.
+
+## Decision 3 — the bridge reads both tiers
+
+`lesson-bridge` read only global memory. A project's own `.swarm/memory.db` holds the lessons learned
+*here*, and 35 of them reached nothing. Both tiers now bridge, distinguished only by SCOPE: a global
+row is unscoped (it won twice, it may travel), a project row carries its own directory so
+`lesson-gate`'s existing `isHome()` keeps it home. Ten were tagged; the rest are reported unbridged
+by name, most because they duplicate a native or global lesson and a second copy teaches skimming.
+
+## What this cost to learn
+
+1. **`skipNoBash` is not a predicate.** It is a one-time notice emitter that returns 0 and writes to
+   stderr — which on this hot path *is* the refusal channel. Calling it would have injected an install
+   hint into the middle of a refusal. Read the signature; do not infer it from the name.
+2. **A `const` arrow used by a top-level block is in the temporal dead zone.** The first live refusal
+   threw `Cannot access 'speechEventFor' before initialization`.
+3. **Severity had to outrank enforcement class.** Bridging ten project `checklist` lessons displaced
+   issue #122's high-severity `inject` lesson from `write-code` — the *second* time in one day that
+   lesson lost its slot. With `limit: 3`, selection is the scarce resource: what matters more must not
+   lose to what merely acts more forcefully. The prior test asserting the old rule was updated with
+   the reason, not silently flipped, and a case still proves enforcement decides at equal severity.
+
+## Honesty boundary
+
+- **MAY claim**: exactly one hook can refuse a given tool call, pinned by a test that reads
+  `hooks.json` and fails if a second refuser ever appears; and refusal outcomes are now recorded with
+  `abandoned` inside the denominator.
+- **May NOT claim**: that advisory lessons change behaviour. That remains unobservable and unmeasured,
+  and is stated rather than estimated.
+- **Coverage is partial and deliberately so**: this measures the blocking path. Advisories are counted
+  as surfaced for coverage and never scored.
+
+## Currency log
+| 2026-10-26 | Review (4.7.21): decision unchanged. `plugin/scripts/decision-gate.mjs` moved `reportBudget`/`reportSelfSkipped` into `decision-outcomes.mjs` (453 lines, ledger rows and stderr conditions identical); `decision-recall-gate.mjs` records a Git-identity timeout as a `policy-skipped` row (exit 3) instead of a silent allow. | `plugin/scripts/decision-gate.mjs`, `plugin/scripts/decision-outcomes.mjs`, `plugin/scripts/decision-recall-gate.mjs`, `tests/unit/decision-record.test.mjs`. |
+| 2026-10-24 | Review `ac2c46a7cfa1` (4.7.18): decision unchanged. `plugin/scripts/degradation-watch.mjs` moved | The durability probe ran `ruflo memory store|retrieve` in the caller's project with no env, so ruflo could leave `.claude/`, `ruvector.db` and its self-update's `node_modules` there on every `git push`. It now runs in a private scratch dir (`rufloRunDir`), removed after each call, with `RUFLO_DAEMON_AUTOSTART=0` and `CLAUDE_FLOW_AUTO_UPDATE=false`. Same store → retrieve proof, same verdicts, same fail-open on a missing binary; still the one process that refuses. Source: `plugin/scripts/degradation-watch.mjs`. |
+| 2026-10-24 | Review `2f5b4d331e6c`: decision unchanged. `plugin/hooks/hooks.json` moved in 4.7.17 (07ef530d) | Only the plane's `description` string changed: it now says unprompted-speech may also exit 2 for an opted-in lesson block at UserPromptSubmit, which was already true. No registration, matcher, policy, refusal path or ledger schema changed; decision-gate is still the one process that refuses a write. Source: `plugin/hooks/hooks.json`. |
+| 2026-10-15 | Review `5611bb22f011`: decision unchanged. `plugin/scripts/decision-gate.mjs` moved in 4.7.8 | The budget-exhausted and policy-skipped stderr lines print only when the action was refused or `RUVNET_STOP_NUDGES=full`; every outcome is still appended to the ledger, so a timeout-allow is still recorded as one and still counts as `budget-exceeded`, never as a verdict. No policy, applicability rule, budget, refusal or ledger schema changed. Source: `plugin/scripts/decision-gate.mjs`. |
+| 2026-09-27 | Currency review: decision unchanged. Motion: decision-gate.mjs's dead-route removal and two new hooks.json entries for capacity-aware parallel work. The one-decision-one-reason ledger mechanism is unchanged; dead-code removal only. | Reviewed `plugin/scripts/decision-gate.mjs`, `plugin/scripts/decision-outcomes.mjs`, `plugin/scripts/degradation-watch.mjs`, `plugin/scripts/identifier-preflight.mjs`, `plugin/scripts/adr-currency-gate.mjs`, `plugin/scripts/mcp-readiness.mjs` against the commits listed above; reviewed_digest ecd9518d306e. |
+
+| Date | What changed | Why (with referents) |
+|---|---|---|
+| 2026-09-30 | **A fifth policy on the write route, and still exactly one refuser.** `duplicate-code` (`plugin/scripts/duplicate-gate.mjs`) is last in precedence: it refuses a new code file, or a ≥15-line new export, that matches existing code in this checkout, at most once per path per session, and fails open on every error including its own index budget. No manifest entry changed. | Owner, 2026-09-30: "is it the simplest version of the code that works, that doesn't create duplicates or replication across the project?" Tuned on replayed history by `scripts/duplicate-gate-replay.mjs` (same scoring functions, read-only); `tests/unit/duplicate-gate.test.mjs` fires it through `decision-gate.mjs write` end to end and fails if the registration is removed. |
+| 2026-09-12 | **The write route's shared PreToolUse matcher now includes Codex's raw write-tool name, and the route is registered on Codex too.** The 2026-09-11 row above said "Claude only... Codex PreToolUse delivery is unobserved." That was measured with `codex exec "reply OK"` — a prompt that never invokes a tool, so of course nothing fired. Re-measured 2026-09-12 against codex-cli 0.154.0 with a prompt that actually calls `apply_patch`: PreToolUse and PostToolUse both FIRED, `tool_name:"apply_patch"`. The matcher becomes `^(Write|Edit|MultiEdit|NotebookEdit|apply_patch)$` (Claude's four tool names untouched — `apply_patch` is a dead branch on that host), shared byte-for-byte between `plugin/hooks/hooks.json` and the new `plugin/hooks/codex-hooks.json` PreToolUse group. codex-hook-adapter.mjs normalizes `apply_patch` to the same `Edit` shape decision-gate.mjs's policies already read on Claude, so REFUSAL_POLICIES itself is unchanged. The BASH route stays unregistered — this measurement covered a write, not `exec_command`, and extending on unexercised evidence would repeat the exact mistake this row corrects. | `continuity-hook-policy.mjs` + `hook-contracts.json` v7 carry the dual-host registration; `npm run hooks:check` PASS lists `PreToolUse:decision-gate[claude+codex]`; live, through the real `codex-hook-wrapper.mjs → codex-hook-adapter.mjs → hook-shim.mjs` chain: a raw `apply_patch` write naming `metaharness` with no stamp → Codex `{"decision":"deny", ...}` (adapter-translated exit-2 refusal, `blockingHooks` already listed `decision-gate`); the equivalent Claude `Edit` payload → exit 2, byte-identical reason. Claude-side behavior re-verified unchanged in the same run (no regression). |
+| 2026-09-11 | **The write route is registered again — automatic, in the lifecycle plane, WITH its key.** 00526b12 (2026-09-07) retired every automatic gate, so this ADR's one-refuser design has had no caller since; ground-before-write (ADR-0012) sat in hook-shim's table and nothing ran it. Re-registered by Stuart's mandate after the failure ADR-0012 prevents recurred on 2026-09-11. `PreToolUse ^(Write|Edit|MultiEdit|NotebookEdit)$ → decision-gate write`, timeout 5 (the 2026-08-19 budget); `PostToolUse ^(?:.*__)?search_ruvnet$ → grounding-stamp`, the receipt that opens the gate. Claude only. The BASH route stays unregistered: not in the mandate, and Codex PreToolUse delivery is unobserved. | continuity-hook-policy.mjs + hook-contracts.json v5 carry the registrations; `npm run hooks:check` PASS lists them; live, in this change's commit: a Write of a `.mjs` naming `agentdb` with no stamp → exit 2 with the policy's own reason; after grounding-stamp minted the stamp from a successful-search payload → exit 0; `RUVNET_SKIP_GROUNDING_CHECK=1` with no stamp → exit 0 (recency disarmed; the substance stage never blocks on absence). |
+| 2026-08-22 | Re-read the decision-gate, outcome ledger, degradation, identifier, readiness, and host-manifest changes at convergence tip `ddae606`; the system still emits one policy decision and one reason per protected action. | `9d06cb5` narrows only the spend-guard parser's false `ruflo swarm` match, while `adeba05` adds session-start progression restoration as a lifecycle action rather than a competing PreToolUse decision. Exact-tip host and decision-focused gates remain green; this row does not promote advisory readiness into authorization or suppress negative outcomes. |
+| 2026-08-19 | **The 10s ceiling was narrowed back to 5s. The invariant is unchanged; the numbers under it are.** | The row below states "hooks.json declares 10s", and as of today that is false. The widening was earned on 2026-08-14 — six of fourteen audited runs really were killed by the host. What made it stale was the adr-currency-gate two-pass fix, which stopped the gate reading all 83 ADR bodies on every tool call. Re-measured through the FULL registered path (`hook-shim.mjs decision-gate write`): 424 405 405 415 417 416 411 415ms in a stranger project, 438 416 412 416 412 436ms here — ~415ms against a 5000ms ceiling, twelve times the headroom. Three unit tests were red asserting `PreToolUse <= 5`, and they were RIGHT: the USER waits behind this hook on every Write and Bash, and a 10s stall is the /rvbc hang class. DEFAULT_BUDGET_MS 4000 -> 2000, MIN_HEADROOM_MS 5000 -> 3000, summing to exactly the 5000ms manifest value the test still DERIVES rather than restates. The rule this encodes, now written into decision-gate.mjs: a budget widened by evidence must be narrowed again when that evidence expires, or every emergency ratchets the ceiling up one notch permanently and nothing ratchets it back. |
+| 2026-08-14 | **The gate's budget and the host's timeout are now ONE number instead of two that were never compared.** | 4000ms of policy work plus the shim's node boot, this gate's node boot and the outcome-ledger writes does not fit inside a 5000ms manifest timeout — and nothing anywhere compared them. Six of fourteen audited runs were killed by the host. decision-gate now exports DEFAULT_BUDGET_MS and MIN_HEADROOM_MS, hooks.json declares 10s, and the test DERIVES the manifest value from hooks.json rather than restating 5000 (restating it would only re-create the drift). Also added: spend-guard, which refuses an agent fleet inheriting ANTHROPIC_API_KEY / OPENAI_API_KEY — the $1,600 of agentic-qe#557, where ~374 headless agents billed per-token for 11 hours while the Max subscription sat unused. Built and 8/8; registry wiring lands next, and the impl ladder says `built` not `wired` until it does. |
+| 2026-08-13 | **Both hooks I added today misbehaved in OTHER people's projects — found by an adversarial hook audit, not by a test.** | The owner reported "a ton of hook errors" opening this plugin in another project; an independent audit reproduced the causes. (1) `degradation-watch` probed `process.cwd()/.swarm/memory.db`, so machine-wide it ran `ruflo memory store` against WHATEVER REPO you were standing in — creating a `.swarm` directory and writing a probe row into projects that never asked for it. The audit named it "unrelated-project mutation"; it is the plainest violation of ADR-058 D5 (never touch what we do not own), shipped in the hook whose purpose is preventing silent damage. The fix was not tighter scoping but noticing the question was mis-framed: "does ruflo durably persist?" is a property of the SQLite driver and its ABI against the running node, which is MACHINE-wide. It now probes a scratch db in tmpdir — mutates nothing, and additionally closes the separately-flagged hole where an absent store had to be skipped, making the store-CREATING first write the one write the guard could never falsify. A scratch path is always absent, so the first-write case is now the ONLY case. (2) `identifier-preflight` treated the single `model` in ~/.codex/config.toml as the complete allowlist — a false-refusal waiting to happen, since an account accepts several models. It now refuses only a NEAR MISS of the configured name (a typo, which is what actually happened: `gpt-5.6` for `gpt-5.6-sol`) and passes anything genuinely different as unknown. 82/82 across the three gate suites. STILL OPEN from the same audit, ranked: Codex does not load the shipped hook manifest; `signal-watch` emits invalid Codex hook output; Claude has the new decision gate while Codex still has the old one; `continuation-gate` treats this repo's open PRs as "work you committed to" in EVERY project; a missing KB renders as a global emergency. |
+| 2026-08-13 | **degradation-watch's cache DELETED, and its absent-store exemption closed — both found by two independent audits that could not see each other.** | The cache was keyed `/tmp/ruvnet-degradation-$USER.json` while the probe targets a PER-PROJECT path, and each audit found a different half: a degraded project cached `ok:false` and refused `git push` in a HEALTHY project for five minutes citing another repo's evidence; a healthy project cached `ok:true` so a BROKEN project shipped inside the TTL without ever being probed — the direction that actually loses data. Two blind models finding two different bugs in one cache is the signal that the cache, not its key, was the defect, so it is gone: the probe runs only on `git push` / `npm publish` / `ruflo memory store`, where one second is invisible and a wrong answer is expensive. Separately, `proveMemoryDurable` returned `{ok:true, skipped:true}` for an absent DB — which, as one audit put it, means the first `ruflo memory store`, THE OPERATION THAT CREATES THE STORE, was precisely the write the guard could not falsify: a hole shaped exactly like a fresh machine's first write. Ship detection also corrected in BOTH files that define it (they shipped already disagreeing on day one): `git -C <abs> push` matched nothing, while `grep -n "npm publish" docs/` matched, so reading ABOUT shipping counted as shipping. Quoted regions are now stripped before matching in both, and a parity test asserts the two definitions agree in both directions. 61/61 lesson-gate, 12/12 decision-gate. |
+| 2026-08-13 | **The new gate was itself dead on every shipped install, and the payload test caught it in the commit that cited ADR-065.** | `adr-currency-gate.mjs` statically imported `../../scripts/doc-currency.mjs`. Only `plugin/` reaches a user (marketplace.json `"source": "./plugin"`), so that specifier resolves in a checkout and throws ERR_MODULE_NOT_FOUND on every real layout — a gate that would have been silently absent for every user, which is the exact class ADR-065 exists to stop and the class I had spent the day fixing elsewhere. `payload-self-contained.test.mjs` failed on it immediately. The fix is not an exemption: doc-currency IS correctly repo-only, because a user's install has no `docs/adr/` and this gate has nothing to say there. So it resolves at runtime and its absence is a CLEAN SKIP rather than an error. Also corrected in the same pass: the brain-score README guard was flagging past-tense narrative ("the console USED TO … score it 49/100") because the line contains "now" — a guard that flags correct prose gets deleted, and then protects nothing. And the public README's "Current baseline" line, which asserted a 2026-07-10 measurement as today's, is now dated from the artifact's own `recorded` field. Census drift (139,373 -> 139,519 across four surfaces) regenerated through `claims:fix`; the diff was audited to confirm only the chunk count moved, since `sync-census` is known to rewrite role-blind when the org total shifts. 55/55 across the four suites. |
+| 2026-08-13 | **A fourth policy joined the WRITE path, and it exists to move a gate earlier rather than to add one.** | `adr-currency` refuses a write to code governed by a document that is ALREADY stale. The rule is not new and the logic is not new — it calls `scripts/doc-currency.mjs`, never a second copy, because one fact implemented twice is the defect this repo has paid for at least five times. What changed is WHEN. Earlier today three commits left ADR-055, 065, 066 and 067 all describing a world the code had left; the pre-push gate refused, correctly, but only after the files were written and I had moved on, and my own word for the reconciliation was "skipped". The owner quoted that back as the exhibit for a larger complaint — that the right thing only ever happens because a hook forces it at the last second — and he is right about the shape: a gate at the end cannot influence work, only penalise it, and it trains running at the wall. So this refuses DEBT rather than change: governed code may be edited freely, but not while a governing document is still unreconciled. Measured before writing, not after: `evaluateDoc` costs ~200ms per document via git and there are 83, so a naive loop would put ~19s on every Write and become the gate everyone disables; a frontmatter-only first pass over all 83 costs 40ms, and only the 1-4 documents that actually govern the file are evaluated — 981ms on a governed file, 146ms otherwise. Mutation-proved, and the first run FAILED: it reported "STALE ADR -> DID NOT FIRE" while all three allow-cases passed, because `fs.readFileSync` was hardcoded where the test needed a seam. A suite of allow-cases only would have shipped a green unfireable guard — the fourth instance of that class in one day. 9/9 now, `decision-gate` still 12/12 including the second-refuser mutation. |
+| 2026-08-13 | **Two policies joined the registry. The invariant holds: still exactly one process refuses.** | `degradation-watch` (2nd in precedence) and `identifier-preflight` (3rd) are new verdict functions on the `bash` event, added because both failures they close were SILENT. (1) AgentDB had not durably persisted a write since 2026-08-10: `better_sqlite3.node` was built for NODE_MODULE_VERSION 141 against a node needing 137, ruflo fell back to sql.js, and three days of lessons and checkpoints evaporated while the CLI printed `[OK] Data stored successfully`. The warning printed on EVERY write and was read; a warning is text and text is skimmable, so this is a refusal — and it probes only commands whose truth DEPENDS on durable memory, so ordinary Bash pays nothing. (2) `codex exec --model gpt-5.6` (correct: `gpt-5.6-sol`) printed a 400 and EXITED 0 into a redirected file, so a 50-minute audit produced nothing and there was no exit code to catch. Both refuse only on a POSITIVELY-known-bad state and allow every unknown: an adversarial review the same day found the first one turning a missing `sqlite3` into a confident claim about a different subsystem, which is worse than no check because it spends the credibility the channel runs on. `decision-gate.test.mjs` still passes 12/12, including the mutation case that fails if a second refuser appears. OPEN, from that same review and not yet fixed: degradation-watch's cache is keyed by `$USER` while it probes a per-project path, so one project's verdict can leak into another; and its probe shares the gate's 4000ms budget, where a timeout-kill reads as allow. |
+| 2026-08-12 | **The decision is unchanged; the file got shorter and its Windows behaviour got stated.** | Two changes to `decision-gate.mjs`, neither touching the invariant. (1) Its header had grown to 54 lines of prose before the first import, and the six new modules averaged 40-51% comment — the owner asked whether this was becoming elegant or convoluted, and on that metric it was drifting convoluted. The measurements were never the problem, their LOCATION was: they already live in this ADR, so the header now carries only what surprises a reader at the call site (the policies are unchanged verdict functions; one decision names every refuser; fail-open is deliberate). 54 -> 17 lines, no fact lost. (2) The real-gate cases now require bash. Every refusal policy is a `.sh` file, so on a Windows runner without Git Bash `resolveBash()` returns nothing, no policy contributes a verdict, and the gate correctly FAILS OPEN — the same behaviour those four walls always had on a bashless host. The product was right and the assertion demanded a refusal that cannot occur there; it turned PR #137 red while looking like a dependency problem. The pure `decide()` / `policiesFor()` cases carrying precedence and composition still run on every platform. |
+| 2026-08-10 | **Decisions 4 and 5 landed: the end-to-end proof, and promotion that reports whether it acted.** | (4) `tests/integration/bridge-to-model-e2e.test.mjs` walks the WHOLE chain with real processes — tagged AgentDB row → bridge → lessons.json → lesson-gate → unprompted-runtime → decision-gate → the model's additionalContext — in a hermetic HOME. Every prior test covered ONE hop, which is how two excellent halves stayed unconnected for 18 days. Mutation-proved: disabling the bridge turns 2 of 3 cases red, and two TEETH cases prove the trigger is load-bearing (an untagged row travels no further than the store; a lesson tagged for `ship` does not fire at `write-code`). (5) `lesson-promote --apply` now prints a DERIVED firing status — "31 of 34 machine-wide lessons reach a decision point" — and names the inert ones. It deliberately does NOT auto-assign a trigger: guessing the moment is the keyword-classifier mistake ADR-065 recorded in its own numbers, and a test asserts the store is untouched by a report. |
+| 2026-08-10 | Accepted as built: `decision-gate.mjs`, `decision-outcomes.mjs`, `hooks.json` rewired from 7 PreToolUse entries (4 able to refuse) to 4 (1 able to refuse). | Live-fired both paths: allow → exit 0, 1525B advisory forwarded, byte-empty stderr; refuse → exit 2, the policy's own words, byte-empty stdout. Obedience loop proven end-to-end: refuse → retry → scored `repeated`; a dead session's debt → `abandoned`. 152/152 across the six affected suites, and the structural invariant is mutation-proved (re-adding a second refuser fails two cases). |

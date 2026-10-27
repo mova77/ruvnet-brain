@@ -7,29 +7,39 @@ import { spawnSync } from 'node:child_process';
 const ROOT = path.resolve(import.meta.dirname, '../..');
 const read = (rel) => fs.readFileSync(path.join(ROOT, rel), 'utf8');
 
-describe('manual release channel contract', () => {
-  it('builds and signs before creating the GitHub Release, then publishes npm, then verifies', () => {
-    const src = read('scripts/release.mjs');
-    const build = src.indexOf("runOrDie('build release bundle'");
-    const sign = src.indexOf("runOrDie('sign release bundle'");
-    const github = src.indexOf("runOrDie('create signed GitHub Release'");
-    const npm = src.indexOf("runOrDie('npm publish'");
-    const verify = src.indexOf("runOrDie('verify-channels'");
+describe('protected release channel contract', () => {
+  it('consumes a signed payload, promotes GitHub and npm, then stops at channel convergence', () => {
+    const release = read('scripts/release.mjs');
+    const transaction = read('scripts/release-transaction.mjs');
+    const verifyPayload = release.indexOf('verifiedPayload = verifyPayload');
+    const transactionStart = release.indexOf('const finalReceipt = await runReleaseTransaction');
+    const github = transaction.indexOf('adapter.publishDraftNonLatest');
+    const npm = transaction.indexOf('adapter.promoteNpm');
+    const channelsConverged = transaction.indexOf("append('channels-converged'", npm);
+    const publicFinalizer = read('scripts/public-verification-finalizer.mjs');
 
-    expect(build).toBeGreaterThanOrEqual(0);
-    expect(sign).toBeGreaterThan(build);
-    expect(github).toBeGreaterThan(sign);
+    expect(verifyPayload).toBeGreaterThanOrEqual(0);
+    expect(transactionStart).toBeGreaterThan(verifyPayload);
+    expect(release).not.toContain("runOrDie('build release bundle'");
+    expect(release).not.toContain("runOrDie('sign release bundle'");
+    expect(github).toBeGreaterThanOrEqual(0);
     expect(npm).toBeGreaterThan(github);
-    expect(verify).toBeGreaterThan(npm);
+    expect(channelsConverged).toBeGreaterThan(npm);
+    expect(transaction).not.toContain('adapter.finalize');
+    expect(publicFinalizer).toContain('finalizeReleaseTransaction');
   });
 
   it('fails closed on tag/SHA mismatch and requires all signed assets', () => {
-    const src = read('scripts/release.mjs');
-    expect(src).toContain('release tag already identifies different bytes');
-    expect(src).toContain('published GitHub Release tag is not candidate HEAD');
-    expect(src).toContain('`${zip}.sig`');
-    expect(src).toContain('`${zip}.sha256`');
-    expect(src).toContain("'release', 'upload', tag, ...assets, '--clobber'");
+    const release = read('scripts/release.mjs');
+    const transaction = read('scripts/release-transaction.mjs');
+    const provider = read('scripts/release-transaction-provider.mjs');
+    expect(transaction).toContain("snapshot.github.sha !== identity.candidateSha");
+    expect(provider).toContain('refusing to replace staged asset with different bytes');
+    expect(transaction).toContain('pending release ${competing[0].transactionId} blocks');
+    expect(transaction).toContain('release receipt chain conflict');
+    expect(release).toContain("'ruvnet-brain.zip.sig'");
+    expect(release).toContain("'ruvnet-brain.zip.sha256'");
+    expect(provider).not.toContain("'--clobber'");
   });
 });
 
@@ -41,6 +51,7 @@ describe('package-lock participates in version synchronization', () => {
         'scripts/sync-version.mjs',
         'scripts/version.mjs',
         'plugin/.claude-plugin/plugin.json',
+        'plugin/scripts/entrypoint.mjs',
       ]) {
         const dst = path.join(tmp, rel);
         fs.mkdirSync(path.dirname(dst), { recursive: true });

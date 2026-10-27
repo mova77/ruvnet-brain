@@ -9,6 +9,12 @@
 # proxy-verify.mjs check 3), so there is nothing to undo.
 set -uo pipefail
 
+# Every `ruflo` invocation auto-starts a project background daemon unless this is set (verified
+# live: ~/.npm-global/lib/node_modules/ruflo/node_modules/@claude-flow/cli/dist/src/services/
+# daemon-autostart.js:85). A teardown script has no business leaving one running.
+export RUFLO_DAEMON_AUTOSTART=0
+export CLAUDE_FLOW_AUTO_UPDATE=false
+
 echo "Reverting the Meta LLM Proxy trial..."
 echo
 

@@ -4,10 +4,12 @@ node_modules/
 
 # build artifacts (regenerable in seconds via scripts/build-bundle.mjs)
 dist/
+/release-evidence/
 
 # external source clones (themselves git repos; regenerable via self-update --include-new)
 clones/
 data/adrs-cache/
+data/memory/
 
 # Helix removed from the brain (it's a separate consumer app); kept locally, not committed
 kb/_excluded-helix/
@@ -38,6 +40,7 @@ node_modules
 # including, on 2026-07-21, live API keys echoed by a buggy diagnostic. It was only fenced by a
 # GLOBAL gitignore, which does not travel to a clone or another machine. Fenced here now.
 .swarm/
+.qa/
 .env
 .env.*
 !.env.example
@@ -65,11 +68,22 @@ data/described-baseline-results.json
 # vitest coverage output (build artifact)
 coverage/
 
+# Agentic-QE receipts and reports are run-local evidence, uploaded per CI job.
+.qe/
+
 # metaharness evolve artifacts (variants/runs/archive) — machine-local, regenerated
 .metaharness/
 
 # gist ingest fetch-cache (machine-local; the index in docs/ is the tracked artifact)
 kb/.ruv-gists.cache.json
+kb/.ruv-gists.capture-cache.json
+
+# The public-input selection receipt a STANDALONE `node scripts/build-bundle.mjs` (corpus === kb/)
+# seals into kb/ as a side effect of self-materializing. It is per-run scratch, never source: a
+# committed copy would be a stale receipt that a later run could be tricked into "trusting".
+# build-bundle.mjs never trusts a checkout copy (standalone always re-materializes), and this rule
+# makes sure one can never reach a commit either (Step 5 remediation, 2026-09-13).
+kb/PUBLIC-INPUT-SELECTION.json
 
 # ruflo flywheel: the locally-applied signed retrieval-config champion (per-install state)
 .claude/proven-config.json
@@ -108,3 +122,15 @@ kb/ruv-meetings-*.md
 kb/models-cache/
 .env*
 .claude/worktrees/
+
+# The 529MB knowledge bundle — a release ASSET, never repo content.
+ruvnet-brain.zip
+ruvnet-brain.zip.sha256
+ruvnet-brain.zip.sig
+
+# Pasted screenshots, netlify-cli local state, session scratch — never repo content.
+# 13 screenshots reached the public repo on 2026-09-11 before this rule existed.
+.docs/
+.netlify/
+.stage1-execution-checkpoint.md
+claude-flow.config.json

@@ -1,4 +1,4 @@
-Updated: 2026-07-28 21:50:00 EDT | Version 1.0.1
+Updated: 2026-08-22 12:15:00 EDT | Version 1.1.0
 Created: 2026-07-22 11:05:00 EDT
 
 # The Architecture Map — what the pieces ARE, and what you lose if you take only some
@@ -81,7 +81,7 @@ corpus built 2026-07-21. Your machine will differ; the commands are the point, n
 | 5 | **Console** | `console/*` + `scripts/onboarding-console.mjs` | Yes | Local page: what's installed, what's dormant, one-click reversible fixes |
 | 6 | **Capability registry** | `scripts/capability-registry.mjs` | Yes | 11-row audit of what you own and whether it's switched on |
 | 7 | **Lesson store** | `~/.config/ruvnet-brain/lessons.json` | Yes | Your recorded corrections, replayed at the moment they apply |
-| 8 | **Nightly refresh** | launchd `com.ruvnet.brain-nightly` | Yes | Rebuilds the corpus so it doesn't rot |
+| 8 | **Evergreen + Dream evaluation** | `com.ruvnet.brain-update` + Dream Machine | Yes | Updates installed bytes and evaluates repo changes without writing the primary checkout |
 | 9 | **Commands & skills** | `plugin/commands/` (4), `plugin/skills/` (5) | Yes | `/rvbc`, `/configure`, and the behavioral skills |
 
 Pieces 2–9 are all genuinely optional. Piece 1 is the substrate: remove it and the MCP server still
@@ -212,12 +212,12 @@ Six Claude Code events, 14 invocations, 10 distinct scripts. All but two route t
 | UserPromptSubmit | `ground-ruvnet.sh` | advisory | Three independent gates on your prompt text: **RUVNET** (you named the stack → ground before asserting), **DRIFT** (you reached for a classical default → name the rUv replacement), **BUILD** (a build request → apply the playbook). Plus an always-on status footer. |
 | UserPromptSubmit | `lesson-hooks.sh assert-fact/recommend-architecture` | advisory | Surfaces your own recorded corrections that apply to stating a fact or proposing an architecture. |
 | PreToolUse `Write\|Edit\|Bash` | `hijack-ruvnet.sh` | advisory (`permissionDecision: defer`) | Scans the payload for four categories of classical default — vector stores (`pinecone\|pgvector\|chroma\|weaviate\|faiss\|milvus\|qdrant\|hnswlib\|annoy`), paid embedding APIs, RAG/agent frameworks (`langchain\|llamaindex\|autogen\|crewai\|semantic-kernel`), memory glue (`mem0\|zep\|redis+memory`) — and injects the rUv replacement. **Never blocks.** `DECISION="defer"` is on line 12 and a one-word edit makes it `deny`; it ships as `defer` because a false-positive deny would brick legitimate work. |
-| PreToolUse `Task` | `route-dispatch.sh` | **blocking** | Refuses a subagent dispatch that would silently inherit your main-loop model. **Opt-in only**: no `~/.claude/model-router/profile.json` → the hook does nothing, not even a warning. |
+| PreToolUse `Task\|Agent` | `route-dispatch.sh` | advisory audit | Records declared versus inherited model use. Claude Code 2.1.220 consumes this hook after dispatch, so it always exits 0 and never claims a late refusal. **Opt-in only**: no `~/.claude/model-router/profile.json` → no receipt. |
 | PreToolUse `Bash` | `verify-interface.sh` | advisory | Points legacy raw-shell callers to the structured `ruvnet_cli_help` → `ruvnet_cli_run` boundary. It never blocks: issue #48 retired authorization decisions derived from reconstructed shell structure. |
 | PreToolUse `Bash` | `design-wall.sh` | **blocking** | Refuses shipping/committing/opening a visual surface without a fresh design-grade stamp. **Repo-scoped since issue #17** — it checks the plugin manifest's own name and stays silent everywhere else, after a plain `git commit` in an unrelated project got blocked demanding a ruvnet-brain ritual. |
 | PreToolUse `Write\|Edit\|MultiEdit` / `Bash` | `lesson-hooks.sh write-code` / `mutate-machine` | advisory | Your recorded corrections for writing code / changing the machine. |
 | PostToolUse `Write\|Edit\|MultiEdit\|Bash` | `learn-capture.sh` | advisory | Appends one compact step to the session's learning queue: the command *verb* or a file's *basename*. Never content, never full paths, never secrets. |
-| SessionEnd | `learn-flush.mjs` | advisory | Drains the queue into the SONA learner. |
+| SessionEnd | `the former learning flusher (deleted 2026-10-12)` | advisory | Drains the queue into the SONA learner. |
 | Stop | `continuation-gate.mjs` | advisory | Fires on *stopping*, because stopping is the absence of an action and every other gate needs a tool call to intercept. Checks the work ledger for committed-to items still unfinished. |
 | Stop | `lesson-hooks.sh report-status/claim-done` | advisory | Your recorded corrections about reporting progress and claiming done. |
 
@@ -273,7 +273,7 @@ which only fires inside this repo. In practice a new user is subject to exactly 
   failed *for days, invisibly*, returning empty results that read as "nothing exists." The four
   structural checks in `session-start.sh` exist because of that, and they are the only thing that
   tells you the brain has died rather than gone quiet.
-- **No learning capture.** `learn-capture.sh` → `learn-flush.mjs` → SONA is how "the way you work"
+- **No learning capture.** `learn-capture.sh` → `the former learning flusher (deleted 2026-10-12)` → SONA is how "the way you work"
   accumulates across all your projects. Without it the learner starves. (It already did: the flush
   originally fired only on a clean `SessionEnd`, so sessions that compacted, crashed, or resumed
   never reached it — the queue grew to 1,884 undelivered events over days while the learner sat at 5
@@ -432,36 +432,34 @@ store currently records one lesson you have had to give **6 times across 1 proje
 
 ---
 
-## 8 · The nightly refresh
+## 8 · Evergreen updates and nightly evaluation
 
-**What it is.** A macOS LaunchAgent (`com.ruvnet.brain-nightly`) running
-`scripts/nightly-wrapper.sh` at 03:15. It is launchd, not cron. It compares upstream commits,
-keeps unchanged chunks/vectors, and embeds only additions and modifications before publishing a
-staged, gated release. The separate optional end-user LaunchAgent
-(`com.ruvnet.brain-update`, 03:47) only downloads the newest signed release.
+**What it is.** Two non-overlapping paths: the optional end-user LaunchAgent
+(`com.ruvnet.brain-update`, 03:47) downloads and verifies the newest published release, while the
+Dream Machine evaluates repository changes and proposes evidence without merging. The former
+`com.ruvnet.brain-nightly` author-source writer was retired on 2026-08-22 after it accumulated
+generated changes in the primary developer checkout.
 
 **What it gives you.** A corpus that doesn't rot. rUv ships fast — Ruflo went 3.26 → 3.28 inside an
 18-hour window.
 
-**Its operating discipline** (the owner's standing order, 2026-07-12): no noise for success or a
-no-op. Run once → on failure wait and retry **once** (the only class a blind retry can fix) → on a
-second failure, a loud phone alert **plus a durable marker file** that `session-start.sh` surfaces
-unprompted at the top of the very next session. A single-instance lock prevents a very large change,
-slow model, or stalled gate from overlapping the next 03:15 fire.
-Exit 75 is reserved for "skipped, previous run still going" so a skip is never recorded as a failure.
+**Its operating discipline.** Installed-cache updates never build or publish source. Dream cycles
+never merge. A maintainer may run `scripts/nightly-wrapper.sh` manually, but the shared mutation
+boundary refuses primary, nested, non-linked, and dirty worktrees and verifies afterward that the
+primary HEAD, index, tracked diff, and untracked-file set did not change.
 
-**What it costs.** A LaunchAgent plist — a real machine mutation, which is why the installer asks
-for the end-user updater behind its own flag and `-y` cannot silently accept it. Normal no-op nights
-do not embed the corpus; changed repositories consume local CPU, disk I/O, and network proportional
-to their changed chunks.
+**What it costs.** The end-user LaunchAgent is a real machine mutation, so the installer keeps it
+behind explicit consent. Author rebuilds consume local CPU, disk, and network only when explicitly
+started in an isolated worktree.
 
 **What you lose without it.** Corpus freshness, degrading continuously. The in-band staleness line on
 every `search_ruvnet` response tells you how bad it has become (`newest store Nd old, oldest Nd`), so
 this degrades *visibly* — which is the design. You can also refresh by hand:
-`node ~/.cache/ruvnet-brain/kb/forge-update.mjs`.
+`npx ruvnet-brain@latest --update` (it upgrades the updater before applying; never run the installed
+`forge-update.mjs --apply` directly — an old updater can fail the guard on a newer bundle).
 
-The full runbook and the rationale for keeping the publisher on a trusted build machine rather than
-a public-repo self-hosted runner are in [Nightly refresh and publish](NIGHTLY-REFRESH.md).
+The full separation and author-worktree contract are in
+[CONTRIBUTING.md § The knowledge corpus](../CONTRIBUTING.md#the-knowledge-corpus).
 
 ---
 
@@ -553,7 +551,7 @@ you'd be turning off.
 | `~/.cache/ruvnet-brain/console-undo.jsonl` | console apply | the inverse of every change, journalled first |
 | `~/.config/ruvnet-brain/lessons.json` | lesson-ratify | your ratified corrections |
 | `~/.claude/ruvnet-brain/config.json` | console save | your console preferences |
-| launchd plists | **only if you say yes** | nightly refresh and friends |
+| launchd plists | **only if you say yes** | installed-cache updates and other explicitly enabled jobs |
 
 **Nothing is written into your project directories.** That is load-bearing and it was once false —
 see the issue #36 note in §2.

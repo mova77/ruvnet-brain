@@ -60,6 +60,7 @@ import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseHookEvent, toolName } from './hook-input.mjs';
+import { isDirectInvocation } from './entrypoint.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -532,7 +533,7 @@ function main() {
   const ev = parseHookEvent(raw);
   if (!ev) return 0;                                        // malfunction is not a decision
   const tool = toolName(ev);
-  if (!/^(Write|Edit|MultiEdit)$/.test(tool)) return 0;
+  if (!/^(Write|Edit|MultiEdit)$/.test(tool)) return 0;   // toolName() is canonical: Grok's write arrives as Write
 
   const filePath = typeof ev.tool_input?.file_path === 'string' ? ev.tool_input.file_path : '';
   const added = addedText(ev);
@@ -585,7 +586,7 @@ function main() {
 // stdin here is a pipe bash has already drained and re-fed (`printf '%s' "$INPUT" | node …`), so the
 // held-open-stdin hole ADR-055 F20 found in unprompted-runtime.mjs cannot occur on this path: there
 // is no interactive terminal on the other end, ever.
-if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+if (isDirectInvocation(import.meta.url)) {
   let code = 0;
   try { code = main(); } catch (e) {
     try { process.stderr.write(`[grounding-substance] degraded (${e && e.message}) — write permitted\n`); } catch { /* never */ }

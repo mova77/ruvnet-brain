@@ -3,7 +3,10 @@ id: ADR-053
 title: Experience-level QA — test the journey a user actually has, on every host, OS, and install path
 status: Accepted
 date: 2026-07-26
-updated: 2026-07-30
+updated: 2026-10-05
+updated_source: derived-from-git
+version: 1.1.4
+reviewed_digest: 4f28f1641ac0
 authors: [Stuart Kerr, Claude Code]
 tags: [qa, testing, experience, cross-platform, codex, agentic-qe, ci]
 supersedes: []
@@ -12,11 +15,52 @@ governs:
   - tests/experience/*.json
   - tests/experience/*.mjs
   - .github/workflows/ci.yml
+  - .github/workflows/ux-qe.yml
   - scripts/qe/*.mjs
   - tests/ux/*.mjs
 ---
 
+
+## Current source review — 2026-10-05
+
+Reviewed candidate source `1ccc1e633772c549e4a23596a1ce3c743e797315`. The scenario-list
+architecture remains accepted; built declarations and locally available fixtures are not a
+blanket statement that every journey passed on the current public package.
+
+`tests/experience/report.mjs` now resolves an explicit producer suite through
+`qualification-invocation.mjs` and `scripts/release-qualification.mjs::qualificationPlan`.
+This binds a declared scenario to the executable files selected by a literal workflow run
+command. The adapter rejects comments, echo text, embedded fixtures, unknown/omitted suites,
+and ambiguous shell declarations. It proves declared invocation coverage, **not execution,
+reachability of arbitrary shell, a successful workflow, or installed user behavior**.
+`tests/experience/scenarios.json` remains the scenario inventory, and the report retains
+classification, owner, and invocation requirements rather than manufacturing coverage from
+job names. Governed report tests were read alongside the producer adapter.
+
+`.github/workflows/ci.yml` retains the sealed-candidate capability battery;
+`.github/workflows/ux-qe.yml` is now a reusable, exact-candidate workflow with Linux/macOS/Windows
+jobs and real UX driver commands. `scripts/qe` and `tests/ux` remain component producers with
+explicit budgets. Historical July rollout numbers and individual self-check findings below
+are dated design/incident records, not a current inventory of shipped or failing hooks. In
+particular the old universal 5-second prompt-path statement is superseded by the actual
+per-event deadlines in the owned hook registry; it must not be used to diagnose current hooks.
+The oldest-runtime coverage requirement remains unmet: package support declares Node >=18,
+but the checked-in workflow lanes use Node20/22. This review does not establish Node18 runtime
+compatibility or silently remove that requirement.
+No new latency distribution, hostile-home sweep, cross-platform native turn, or published-byte
+matrix was run in this review. Publication remains governed by CONTRIBUTING.md and the
+protected exact-artifact verification path; source review cannot promote `install-verified`.
+
 # ADR-053: Experience-level QA
+
+## Currency log
+| 2026-10-05 | Reviewed current source and recorded remaining limitations; no verification or implementation-status promotion. | reviewed_digest 4f28f1641ac0; inspected `tests/experience/scenarios.json` and all expanded governs against source 5d9ea4df. Independent review preserved incident dates, Proposed/expired states and historical evidence; notification and oldest-runtime limits are explicit. |
+| 2026-10-01 | Currency review (4.5 retrieval): decision unchanged. `.github/workflows/ci.yml` gains one release-qe step, "Capability selection battery against the exact candidate bundle". It runs plugin/test/run-tests.mjs with REQUIRE_BRAIN=1 on an unzip of the sealed ruvnet-brain.zip. warm-brain's embedder warm-up moved to `scripts/ci/warm-brain-models.mjs`. The QA architecture is unchanged; the battery now runs where a brain is present. reviewed_digest 959c358e8ce4. | Reviewed `.github/workflows/ci.yml`; probe runs 36889499709 (58/58) and 36889505309 (57/58, red on the old reader) in `evals/runs/2026-10-01-retrieval-4.5/capability-battery/`. |
+| 2026-09-27 | Currency review: decision unchanged. RECONCILED (real drift, not just re-review): governs: named .github/workflows/qe-4-3.yml, deleted at commit 40166baf ("collapse check-only mode onto the one CI-enforced qualification gate") as legacy/manual-only, with its behavior superseded by .github/workflows/ux-qe.yml (already passing repeatedly in this session's CI). governs: updated to point at ux-qe.yml. Other motion since last review (release-pipeline CI hardening, QE gate consolidation) does not change the architecture. | Reviewed `tests/experience/scenarios.json`, `tests/experience/report.mjs`, `tests/experience/report.test.mjs`, `.github/workflows/ci.yml`, `.github/workflows/ux-qe.yml`, `scripts/qe/agentic-qe-4.3.mjs` against the commits listed above; reviewed_digest b49b737eabfc. |
+| 2026-09-11 | Currency review at commit 2eef2024: decision unchanged. Both drift commits (`0edb270d`, `987a3571`) add only CI environment-variable wiring to `.github/workflows/ci.yml` (absolute module-resolution paths for the bundled embedder, so the worker and warm-up probe resolve identical bytes from an immutable seed) — no scenario, lane, or gate logic changed. | Reviewed both diffs directly (5 and 8 line additions, `.github/workflows/ci.yml` only). reviewed_digest a366894a3c4c. |
+| 2026-09-09 | Reviewed the experience scenario and CI contract after the North Star D2/D1 repairs; the 24-scenario report and the exact REQUIRE_BRAIN lane remain aligned with this decision. | Source digest a5aa86ebf57b; tests/experience/scenarios.json; tests/experience/report.mjs; .github/workflows/ci.yml. |
+| 2026-09-07 | Reviewed full macOS unit qualification and reconciled public verification ordering with ADR-072; source digest 951b7750a27a. | `.github/workflows/ci.yml`; exact-SHA hosted and public results remain pending. |
+| 2026-08-31 | Reconciled the Windows unit lane after the hosted process fix added a cross-platform external watchdog; the complete unit surface remains unchanged and now invokes Vitest through Node for shell-independent execution. | `.github/workflows/ci.yml`; `scripts/ci/step-watchdog.mjs`; PR #211. |
 
 **Status**: Accepted (adversarially duel-verified 2026-07-26 — record below)
 **Date**: 2026-07-26
@@ -132,21 +176,23 @@ The single highest user-pain surface. A required CI job (ubuntu + windows) and a
 
 ### 3. Artifact-first, extended to PUBLISHED bytes
 
-`npm pack` on the checkout proved unable to represent registry reality (prepack/publish-env/
-dist-tag/propagation). The ship flow becomes: publish to a **candidate dist-tag** → clean-container
-install of that exact integrity on all three OSes → doctor + Codex wire + MCP round trip + one
-grounded answer → only then promote the SAME integrity to `latest`. A scheduled live probe re-runs
-the install nightly and files an issue on failure, so "walk every channel" has a machine, not a
-memory.
+`npm pack` on the checkout cannot establish registry reality (publish environment, dist-tags,
+or propagation). ADR-072 defines the current ordering: qualify the sealed candidate, publish its
+exact signed artifacts through the protected workflow, then verify downloaded public bytes and
+clean installations on all three operating systems. Channel convergence remains
+`PUBLISHED_NOT_VERIFIED` until public verification permits `install-verified`. The dual-host public
+leaf on each OS also requires two native scheduled installed updates, exact installed coverage,
+and measured second-run no-op storage. Imported corpus evidence does not prove a new upstream build.
+A local source pass or a published dist-tag alone is never the completed release verdict.
 
 ### 4. Gate C++ v2 — exact SHA, every required workflow
 
 v1's gate read the LATEST completed run of ci.yml only: it verified the parent commit, not the one
 shipping, and was blind to integration-linux — re-opening the 5-day hole one release at a time.
 v2: push the release commit, capture its SHA, WAIT for every required workflow on that exact SHA,
-refuse on missing/skipped/cancelled/stale; authenticated API (rate-limit 403s otherwise train the
-override into muscle memory); `--ci-override` reasons go into the release LOG and a required line
-in the next release's notes — a printed-once diagnostic nobody reads is the ADR-050 failure shape.
+refuse on missing/skipped/cancelled/stale evidence. The protected publisher authenticates the exact
+preflight producer and consumes its sealed artifacts. There is no CI override on this publication
+path. Required macOS, Windows, and Linux evidence must pass before promotion.
 
 ### 5. agentic-qe: on-demand generator only — off the critical path
 
@@ -200,9 +246,40 @@ budgets (500ms vs 1s prompt-path), the stricter number won. v1's matrix section 
 §1 above; everything else in v1 stands.
 
 ## Currency log
+| 2026-08-31 | The canonical QA runner now executes independent lanes concurrently and collects every lane receipt before producing the aggregate verdict. | `scripts/qa-runner.mjs` removes fail-fast serial execution so independent failures are visible in one run; the experience dimensions and release-gate requirements remain unchanged. |
+| 2026-08-31 | Removed the duplicate `canonical-qa` job from `ci.yml`; `.github/workflows/canonical-qa.yml` is now the single PR entrypoint for the bounded QA contract. | Two workflows were running the same named check against different GitHub checkout refs, allowing a merge-ref convergence false failure to block a head-commit candidate. |
+
+
+| 2026-08-30 | Re-read after `abc1731` changed the release-QE provenance path; experience scenarios and thresholds are unchanged. | `scripts/retrieval-canary.mjs`, `tests/unit/retrieval-canary.test.mjs`; focused retrieval suite passed 11/11. |
+
+| 2026-08-30 | Re-read the canonical QA workflow after the release-QE coverage-plane correction; the release candidate now consumes a sealed-seed projection and no longer performs an Actions-token gists query. | Issue #201; `.github/workflows/ci.yml`; `scripts/release-projection.mjs`. |
+
+| 2026-08-30 | The PR quality path now uses one bounded canonical runner; the legacy QE matrix is manual-only diagnostic coverage. | `scripts/qa-runner.mjs`, `.github/workflows/ci.yml`, and `.github/workflows/qe-4-3.yml` preserve the governed experience checks while removing duplicate automatic gates. |
+
+| 2026-08-30 | Release QA is now one bounded canonical runner with explicit contract lanes and exact-SHA receipts. | `scripts/qa-runner.mjs` and `.github/workflows/ci.yml` define the deterministic PR gate; `npm run qa:release` retains publication checks. |
+| 2026-08-30 | The release candidate workflow now restores the source-bound coverage projection before archive sealing. | `.github/workflows/ci.yml` runs `scripts/release-projection.mjs` and rebuilds the archive with the projection, so release-QE validates the same coverage files that ship. |
 
 | Date | What changed | Why (with referents) |
 |---|---|---|
+| 2026-08-23 | The aggregate now downloads merged receipts into its canonical `.qe/receipts` directory, and Vitest steps retain verbose diagnostics alongside JSON. | The workflow fix prevents successful uploads from being misclassified as missing, while commit `4b2b340`'s bounded tails make a hosted parser or timeout actionable without rerunning unrelated lanes. |
+| 2026-08-23 | The Windows candidate lane adds a fast direct import probe for the shared installer boundary before Vitest. | Hosted run `32654608558` showed the two installer-import suites failing to parse while five suites passed 33 tests; the next receipt will identify the exact module boundary without rerunning unrelated lanes. |
+| 2026-08-23 | QE lane steps now stop at the first failed step and retain the partial receipt. | A failed focused step cannot trigger later unrelated suites; this enforces the fail-fast contract while preserving the evidence needed to resume. |
+| 2026-08-23 | Windows installer-import suites run as separate bounded processes, and the hosted conformance step has a 240-second evidence bound. | The exact receipts isolated the Windows failures to two suites and measured hosted conformance at 133 seconds; the split preserves every assertion while preventing cross-suite contamination. |
+| 2026-08-23 | Receipt diagnostics now retain bounded stdout/stderr tails for hosted parser failures. | Commit `1310fb6` makes the exact failing-process evidence available in the uploaded receipt without rerunning unrelated lanes; the zero-spend and exact-SHA boundaries remain unchanged. |
+| 2026-08-23 | QE receipts now retain skipped-test identities and suite-level errors, not just aggregate counts. | Commit `cc25c24` makes the cross-platform failure contract diagnosable from the uploaded artifact before any rerun. |
+| 2026-08-23 | Candidate resources no longer treats live-precondition skips as release evidence, and Windows invokes Vitest through Node rather than `npm.cmd`. | Commit `0e30d68` keeps unavailable live checks out of the deterministic candidate denominator and removes the hosted PowerShell launcher failure; live qualification remains a separate required regime when explicitly run. |
+| 2026-08-23 | Failure receipts now preserve failed test identities and upload on failed lanes; release-QE waits for every required behavior/resource lane. | Commit `b570e25` closes the first hosted-run observability gap in the new workflow: a red lane remains diagnosable, and downstream artifact work cannot begin after Windows/resources failure. |
+| 2026-08-23 | Replaced the legacy auto-triggered CI/integration/UX matrix with `.github/workflows/qe-4-3.yml`: fail-fast preflight, isolated behavior/artifact/resource lanes, zero-spend enforcement, and exact-SHA machine receipts. The legacy workflows remain manual-only for recovery. | The prior monolithic integration gate spent ~16 minutes before failing a detached-fixture cleanup race after seven other lanes had passed. The new workflow implements this ADR's required separation and refuses missing, skipped, stale, or non-PASS evidence through `scripts/qe/aggregate-4.3.mjs`; Agentic-QE remains on-demand and off the release critical path. |
+| 2026-08-21 | Re-read the exact release-QE and integration changes after the emergency seed repair; the user-journey contract is unchanged. | `.github/workflows/ci.yml` now runs `rvf-index-audit.mjs --repair` before strict bundle assembly, and the integration fixture now supplies the generation receipt production requires. The real Linux integration lane passed on `c2b9fb0`; no experience scenario, threshold, or host path was removed. |
+| 2026-08-21 | Removed the #145 quarantine after replacing the Linux procfs fixture that blocked Node 20 collection. | `.github/workflows/ci.yml` again runs the complete unit suite. `tests/unit/decision-outcomes.test.mjs` now produces the same write failure with a regular-file parent, while `.github/workflows/diag-145-hang.yml` retains a bounded Ubuntu diagnostic. No experience scenario or threshold was weakened. |
+| 2026-08-19 | **ci.yml quarantines one unit test; no scenario or grader threshold is affected.** | `check`'s nine-day hang now has a NAME: `tests/unit/decision-outcomes.test.mjs`, identified by construction rather than guessed. `--no-file-parallelism` makes completion order equal execution order, and vitest sequences by file size DESCENDING — verified, not assumed: the 129 files that completed are EXACTLY the largest 129 by size, zero mismatches, so the file that started and never finished is the 130th. It converges with the independently-derived regression window (main last green 2026-08-10T11:06, first red 16:23), which contains the two ADR-067 decision-gate commits — and this is a decision-gate test. The file is QUARANTINED via `--exclude`, not fixed: it passes locally in 1.8s WITH coverage, so the cause is ubuntu-specific and unknown. #145 stays open; the exclusion comes out when the mechanism is understood, because a quarantine that quietly becomes permanent is deleted coverage. Nothing in `tests/experience/*` changed. |
+| 2026-08-19 | **ci.yml gained a temporary verbose-reporter diagnostic; no scenario or grader threshold is affected.** | A temporary `--reporter=verbose` diagnostic was added to the `check` job's vitest step (#145). The step hangs DETERMINISTICALLY on ubuntu — two runs 38 minutes apart went silent after the same file, with the same six files before it and the same orphan signature at cleanup — and it survived every one of today's twelve unit-test fixes, so the failing tests were not the cause. The default reporter prints on file COMPLETION only, so a file that starts and never finishes is structurally invisible; verbose prints start events. Diagnostic only, to be removed once the file is named. Nothing in `tests/experience/*` changed. |
+| 2026-08-19 | **Re-read after ci.yml gained job timeouts; the experience-level contract is unchanged.** | The only governed path that moved is `.github/workflows/ci.yml`, which gained `timeout-minutes` on all four jobs after EIGHT consecutive main runs wedged on the vitest step for up to three hours (see ADR-058's 2026-08-19 row). No scenario, no report shape, and no grader threshold in this document is affected: the change bounds how long a job may hang, not what it asserts. `tests/experience/scenarios.json` and `report.mjs` are untouched. |
+| 2026-08-07 | **Re-read after the experience-QA surface moved; the decision is unchanged and is now more nearly true than when written.** | `.github/workflows/ux-qe.yml` is a real 43-line workflow running on push, pull_request and dispatch across an OS matrix, and `tests/experience/{scenarios.json,report.mjs,report.test.mjs}` moved with the merges of #119/#120/#121. This ADR argues that experience-level QA must execute rather than exist as a listed-but-uninvoked suite — the same lesson ADR-058 §D7 records about a mutation corpus that sat in `include` for days with no CI step ever running it. A governed suite gaining its own CI lane implements that requirement; it contradicts nothing here. Verified the lane is reachable (it reported success at `886eeb5`) rather than assuming a workflow file means a workflow runs — the distinction this ADR exists to make. |
+| 2026-08-02 | Re-read the governed CI surface after the 4.0.8 evidence-DAG change; experience-level QA remains a required exact-SHA input. | Commit `8608cfd` builds the immutable npm and bundle artifacts once in `.github/workflows/ci.yml`, runs candidate host evidence from those bytes, and makes the derived aggregate the sole publication input. It does not weaken the UX or session-start gates. |
+| 2026-08-02 | Re-read the final 4.0.7 browser probe after Console provenance and inventory landed; the 4,000ms gate and three-OS journey architecture remain unchanged. | Commit `3668b1b` updates `tests/ux/render-probe.mjs` to observe the new runtime identity and owner-only issue inventory exposed by the shipped Console. It does not weaken the click path, timing oracle, OS-derived controls, or failure conditions. Exact-SHA CI remains the cross-platform authority. |
+| 2026-08-02 | Re-read the real Console Fix All journey after making the timing oracle account for the actual user click rather than a harness-only trial click. The 4,000ms hard gate and the three-OS journey architecture are unchanged. | Commits `7b8b41d`, `57bbe0b`, and `d7bed73` make `tests/ux/render-probe.mjs` report response/render/verification phases, prohibit `trial: true`, and perform exactly one real Fix All click. Commit `8f06287` replaces test `HOME`/`USERPROFILE` overrides with an explicit absolute `RUVNET_CONSOLE_ROOT` fixture plus named config/state files; `tests/unit/console-root.test.mjs` rejects relative traversal input at startup. Three macOS browser trials passed Fix All in 2325ms, 2453ms, and 2294ms; this local evidence does not replace the required cross-platform scheduled probes. |
+| 2026-08-01 | Re-read the governed experience surfaces after the clean recovery candidate added a serialized `release-qe` job; the journey architecture and its remaining limitations are unchanged. | `.github/workflows/ci.yml` now runs `scripts/release-authority.mjs`, `npm run version:check`, and the exact-artifact release-QE configuration in one named job. No governed scenario, report, UX probe, or performance budget changed, and this local candidate still lacks exact-SHA remote CI and published-byte proof. |
 | 2026-07-30 | Updated the cross-platform Console acceptance oracle to the shipped 4.0.2 controls and made platform-conditional absence an explicit, OS-derived contract. | PR #68’s exact-SHA UX jobs proved `tests/ux/render-probe.mjs` still expected only provider/advocacy plus seven unsupported controls. The product has eight universally owned controls and a ninth nightly control on macOS; the oracle derives that expectation from `process.platform`, never from the product output it is grading. `HOME` and `USERPROFILE` now share the same fixture root so Windows must surface the known npx defect and exercise real save/reload, Fix All, and undo paths rather than silently accepting zero recommendations. |
 | 2026-07-29 | Re-read the governed experience and QE surfaces after the 4.0.0 Agentic-QE expansion; the journey architecture remains valid and now has additional stored adversarial coverage. | Commit `e20cdf2` adds `tests/qe/gpt56/*.test.mjs` and release/security suites while preserving the governed contracts in `tests/experience/scenarios.json`, `scripts/qe/card-lane-gate.mjs`, `scripts/qe/session-start-gate.mjs`, and `.github/workflows/ci.yml`; the focused and full gates recorded in `docs/qe/AGENTIC-QE-4.0-MASTER-PLAN.md` pass. |
 | 2026-07-29 | Added opt-in, builtin-only stage tracing to the cold SessionStart measurement after the first corrected Windows run still exceeded the declared timeout. The trace is silent outside the isolated QE environment and identifies the product stage to fix; it does not relax the budget. | PR #58 run `30423370117`, Windows job `90484507774`; governed paths `plugin/scripts/session-start.sh`, `scripts/qe/session-start-gate.mjs`, and `scripts/qe/ux-suite.mjs`. |

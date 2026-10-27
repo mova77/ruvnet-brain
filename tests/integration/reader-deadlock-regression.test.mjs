@@ -16,38 +16,44 @@ import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import fs from 'node:fs';
+import { chooseModelCache } from '../../kb/resolve-deps.mjs';
+import { createReaderDeadlockFixture } from '../helpers/reader-deadlock-fixture.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..', '..');
 const SCRIPT = path.join(ROOT, 'tests', 'regression', 'reader-deadlock-pr0p.mjs');
 const KB = path.join(ROOT, 'kb');
+const KB_DEPS = path.join(KB, 'node_modules');
 
-const run = (mode, timeoutMs) =>
-  spawnSync('node', [SCRIPT, mode, '--dir', KB], {
+const run = (fixture, mode, timeoutMs) =>
+  spawnSync(process.execPath, [SCRIPT, mode, '--dir', fixture.kb, '--fixture-root', fixture.root], {
     timeout: timeoutMs,        // OS-level (libuv) — fires even if the child's event loop is frozen
     killSignal: 'SIGKILL',
     encoding: 'utf8',
-    env: { ...process.env },
+    env: fixture.env,
   });
 
 describe('issue #29 — a corrupted CE cache must never deadlock a repeat load (Jan Lafko / @lafinak)', () => {
   it('primes, then survives a truncated cache across two calls in a fresh process', () => {
-    // Prime may download the CE model on a cold cache; allow generous time. Offline → SKIP LOUDLY.
-    const prime = run('prime', 180_000);
-    if (prime.status !== 0) {
-      console.warn(
-        `[reader-deadlock #29] SKIP — could not prime the CE model (offline / model unavailable): ` +
-        `${(prime.stderr || prime.stdout || '').slice(-200)}`,
-      );
-      return; // loud skip, never a silent pass
+    // A checkout without kb deps cannot load the cross-encoder at all; prime then fails with "fallback is
+    // not a successful model load", which hides the cause. Say it plainly, as a failure, not a skip.
+    expect(fs.existsSync(KB_DEPS), `kb/node_modules missing: cd kb && npm ci (looked at ${KB_DEPS})`).toBe(true);
+    const fixture = createReaderDeadlockFixture({ kbDir: KB, modelCache: chooseModelCache({ kbDir: KB }) });
+    try {
+      // Prime may fetch into the disposable cache. Missing dependencies or failed prime are failures,
+      // never successful returns from a test that did not exercise the corruption path.
+      const prime = run(fixture, 'prime', 180_000);
+      expect(prime.status, `could not prime disposable CE model:\n${prime.stdout}\n${prime.stderr}`).toBe(0);
+      const res = run(fixture, 'test', 120_000);
+      // status 0 → both calls produced finite scores. A timeout is a failure, not a skip.
+      expect(
+        res.status,
+        `#29 deadlock regression — child did not exit 0 (status=${res.status}, signal=${res.signal}):\n` +
+        `${(res.stdout || '')}\n${(res.stderr || '')}`,
+      ).toBe(0);
+    } finally {
+      fs.rmSync(fixture.root, { recursive: true, force: true });
     }
-    const res = run('test', 120_000);
-    // status 0  → both calls completed: the self-heal worked, no deadlock.
-    // status null → spawnSync's OS timeout SIGKILLed a frozen child: the #29 deadlock is back.
-    expect(
-      res.status,
-      `#29 deadlock regression — child did not exit 0 (status=${res.status}, signal=${res.signal}):\n` +
-      `${(res.stdout || '')}\n${(res.stderr || '')}`,
-    ).toBe(0);
   }, 300_000); // outer vitest budget only; the real guard is spawnSync's timeout above
 });

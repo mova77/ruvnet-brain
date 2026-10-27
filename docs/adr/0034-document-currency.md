@@ -3,8 +3,11 @@ id: ADR-034
 title: A document's status is a claim about code — derive it, stamp it with something you cannot type from memory
 status: Proposed
 date: 2026-07-22
-updated: 2026-07-28
-impl: unbuilt
+updated: 2026-09-27
+updated_source: derived-from-git
+version: 1.2.0
+reviewed_digest: 1ab15b7012c1
+impl: wired
 governs:
   - scripts/doc-currency.mjs
   - scripts/git-hooks/pre-push
@@ -16,6 +19,44 @@ relates: [ADR-009, ADR-020, ADR-024, ADR-030]
 
 **Status**: Proposed
 
+## Current implementation boundary — reviewed 2026-09-11
+
+The decision below retains its historical proposal and incident record. It is not a claim that
+every proposed invariant is implemented. The current authority is `scripts/doc-currency.mjs`:
+
+- **CODE DRIFTED, 2026-09-11.** Commit `00526b12` ("retire automatic hooks") gutted
+  `scripts/git-hooks/pre-push` from 169 lines to a 5-line delegator that runs ONLY
+  `scripts/development-push-check.mjs` (a credential scan) — it no longer calls
+  `scripts/doc-currency.mjs` at all. §6's claim below, *"The push boundary is
+  `scripts/git-hooks/pre-push`,"* and the bullet earlier in this section naming "the actual
+  pre-push hook," describe a mechanism that no longer exists for a local `git push`. The
+  currency decision itself is not abandoned: enforcement moved to the EDIT boundary
+  (`plugin/scripts/adr-currency-gate.mjs`, governed by ADR-067) and to the release-qualification
+  boundary (`scripts/release-vector.mjs --changed`, governed by ADR-058), both of which still call
+  `scripts/doc-currency.mjs` directly (confirmed by reading both files, 2026-09-11). `governs:`
+  keeps `scripts/git-hooks/pre-push` so a future regression there is still tracked by this ADR, but
+  this document no longer claims that file is where the check runs.
+
+- Implementation is derived per governed path and the weakest member wins, not the original
+  at-least-one-member formula in §2. A caller reference is reachability evidence, not execution proof.
+- The default check blocks presumed drift except for Rejected, Superseded, and Deprecated decisions.
+  Proposed is not exempt. This differs from the original warning-only proposal in §§5–6; ADR-056
+  describes the later blocking boundary. Neither document's Proposed status is promoted here.
+- A `reviewed_digest` plus a dated source-linked review row records examination of the exact
+  normative body and governed working bytes using the existing digest recipe. It suppresses only
+  the inference that nobody reviewed those bytes. Historical drift stays visible. Further source or
+  normative-body changes expire the review. It does not establish agreement, acceptance, correctness,
+  or `impl: verified`, and it cannot suppress another blocking finding.
+- The proposed per-claim verification ledger is not validated by the current tool; the illustrated
+  `--verify` command is not implemented. No verification stamp is being created by this review.
+- Creation-date disagreement and missing/unreferenced currency-log entries are diagnostic warnings
+  in the default evaluator, not the unconditional blocks proposed below. Strict mode promotes
+  unreferenced existing log rows, but not creation-date disagreement or an absent Currency log.
+- The actual pre-push hook has no `RUVNET_SKIP_CURRENCY_GATE` escape hatch. Do not use the historical
+  example below as an operational instruction.
+
+These distinctions are explicit open implementation differences, not silent claims of conformance.
+
 <!-- The two axes are deliberately on SEPARATE lines. rUv's ADR tooling parses `**Status**: X` and
      accepts exactly one of Proposed/Accepted/Implemented/Superseded/Deprecated — putting the
      implementation and verification state on that same line breaks the ecosystem's parser, which
@@ -23,9 +64,9 @@ relates: [ADR-009, ADR-020, ADR-024, ADR-030]
      modelled as a SECOND axis alongside rUv's, never as a replacement for it (anti-corruption
      boundary, DDD-0008). -->
 
-**Decision date**: 2026-07-22 · **Last updated**: 2026-07-27 · **Why**: this document had drifted from
-its own implementation — see the currency log; corrected under ADR-056
-**Implementation**: built (derived) · **Verified in sync**: never
+**Decision date**: 2026-07-22 · **Last updated**: 2026-09-05 · **Why**: reconcile the actual working-byte
+digest and shared edit-gate resolver; the currency log records the bounded recovery review.
+**Implementation**: wired (derived) · **Verified in sync**: never
 
 This document proposes a schema and then wears it. Its own `impl:` is derived, not asserted, and on
 2026-07-27 that derivation caught this file lying about itself.
@@ -43,6 +84,9 @@ This document proposes a schema and then wears it. Its own `impl:` is derived, n
 > documents are its subjects, not its implementation.** `governs:` is now the two files that
 > implement it. The gate itself lands in `scripts/git-hooks/pre-push` per ADR-056 §5, not in the
 > separate `doc-currency-gate.sh` this document originally imagined.
+
+
+> **Reviewed 2026-08-04 (4.0.10).** Governed code moved: scripts/doc-currency.mjs now understands a PINNED date. A blanket "make the stamp match the last commit" rule cannot tell a currency stamp from a historical record, and it silently rewrote ADR-050's incident cutoff — putting this gate into direct contradiction with tests/unit/fix-workstream-guidance, which asserts that exact date, with no way to satisfy both. Documents now declare it with `updated_pinned: true`; pinned dates WARN instead of BLOCK and --fix is forbidden from rewriting them. Checked against this decision: it preserves every currency guarantee stated here and closes a case where the fixer corrupted the record it exists to protect. No clause superseded.
 
 ## The critique this exists to answer
 
@@ -214,15 +258,17 @@ verified_digest: 1a8c4c9600fe
 verified_by: node scripts/doc-currency.mjs --verify ADR-034
 ```
 
-The digest is the git object id of the governed set — one line, no new machinery, verified working
-before being written into this ADR:
+The authoritative recipe is `resolveGoverned()` plus `computeDigest()` in
+`scripts/doc-currency.mjs`, not the original illustrative HEAD-only shell pipeline. HEAD establishes
+tracked blob membership and the index expands explicit globs; the resolver hashes each regular
+file's **actual working bytes** using Git's blob identity. Clean unchanged files retain their prior
+identity, while staged or unstaged changes expire it. Missing files, directories, untracked inputs,
+empty globs, and symlinked files or parents make verification uncomputable, never placeholder-green.
+The sorted blob manifest, document normative-body hash, and recipe identifier are SHA-256 hashed
+and shortened to twelve hexadecimal characters. Changing the document's claims also expires proof.
 
-```sh
-for p in $(governs); do git rev-parse "HEAD:$p"; done | sort | git hash-object --stdin | cut -c1-12
-#   scripts/lesson-gate.mjs + scripts/lesson-store.mjs  →  1a8c4c9600fe
-```
-
-**The check:** recompute the digest at HEAD. Match → the governed code has not moved since a reader
+**The check:** recompute against the current document and governed working bytes. Match → neither
+the normative document nor the governed code has moved since a reader
 said the document described it. Mismatch → `impl:` reads `verification-expired` **as a derived
 value**, regardless of what the file says. Nobody un-verifies by hand. The artifact does it, which
 is ADR-024's law applied where we never applied it.
@@ -306,9 +352,17 @@ what is true, and is why the resolution is a verification pass — not an edit.
 
 ### 6. The gate: blocks four things, warns about everything else
 
-`plugin/scripts/doc-currency-gate.sh`, built to the contract its five siblings already use
-(`version-bump-gate.sh:20`): **exit 0 = allow · exit 2 + stderr = BLOCK · FAILS OPEN on anything
-unparseable**, opt-in via the router profile.
+The original proposal named `plugin/scripts/doc-currency-gate.sh`; that shell gate was never built.
+The push boundary WAS `scripts/git-hooks/pre-push` under ADR-056, until commit `00526b12`
+(2026-09-07) reduced that file to a 5-line delegator that runs only a credential scan — see the
+"CODE DRIFTED, 2026-09-11" note above. The currency check's boundary today is the release
+qualification pass, `scripts/release-vector.mjs --changed <base>` (governed by ADR-058), not a
+local `git push`. The existing edit boundary is `plugin/scripts/adr-currency-gate.mjs`: **exit 0 =
+allow · exit 2 = BLOCK · FAILS OPEN on unreadable or unavailable currency tooling**. It reuses the
+canonical resolver and blocking findings, selects only existing stale debt for the exact edited
+file, and does not recursively invent directory ownership. Superseded-document warnings do not
+become blocking findings. This describes current wiring, not new host activation or acceptance of
+this Proposed decision.
 
 **BLOCKS** — only where the check is mechanical, the false-positive rate is zero, and the fix takes
 seconds:
@@ -377,9 +431,19 @@ profile check, and it holds here for the same reason.
    the same session family*, in two different shapes. Worth fixing; not worth coupling to this.
 
 ## Currency log
+| 2026-09-27 | Currency review: decision unchanged. Motion: audit-cache scoping and the exit-0 silent-guard closure in doc-currency.mjs itself. Both harden the checker; the currency model this ADR describes is unchanged (and this very review is produced by that model). | Reviewed `scripts/doc-currency.mjs`, `scripts/git-hooks/pre-push` against the commits listed above; reviewed_digest 1ab15b7012c1. |
+
+| 2026-09-11 | Currency review at commit 2eef2024: code drifted, corrected in the text above (not the status). `scripts/git-hooks/pre-push` no longer calls `scripts/doc-currency.mjs` — commit `00526b12` reduced it to a credential-only scan; the currency decision itself survives, relocated to `plugin/scripts/adr-currency-gate.mjs` (edit-time, ADR-067) and `scripts/release-vector.mjs --changed` (release-time, ADR-058). | Reviewed `scripts/doc-currency.mjs` and `scripts/git-hooks/pre-push`; also read `scripts/development-push-check.mjs`, `plugin/scripts/adr-currency-gate.mjs`, and `scripts/release-vector.mjs` to confirm where enforcement actually runs now. reviewed_digest bf6225c58ce2. |
+| 2026-09-05 | Reviewed source aad901b08c28; findings recorded, not semantic verification. | `scripts/doc-currency.mjs` and `scripts/git-hooks/pre-push` were fully examined by the assigned audit reviewer; root inspected the implementation/review/drift paths and tested the integrated changes. The current-boundary section records unimplemented claim-ledger validation and default-policy differences. This review closes only missing-review inference, not those implementation gaps. |
+
+| 2026-09-05 | Corrected the description of the implemented boundary and added source-bound review semantics. | `scripts/doc-currency.mjs` derives weakest-member implementation and independently evaluates review, drift, and verification. `tests/unit/doc-currency-review.test.mjs` proves dirty edits alone do not clear drift, real byte-bound reviews expire, and implementation overclaims still block. The proposal's unimplemented claim-ledger, CLI, and default-warning claims are disclosed above. |
+
+| 2026-09-05 | Reconciled working-byte verification and corrected the remaining stored `impl: unbuilt` contradiction to the live derived `wired`; decision status remains Proposed and no verification stamp was minted. | `scripts/doc-currency.mjs` now binds staged and unstaged governed bytes while preserving clean blob identities; `plugin/scripts/adr-currency-gate.mjs` shares exact scalar/list/glob resolution and authoritative findings. Unsafe or missing sources remain uncomputable. `tests/unit/adr-currency-gate-parity.test.mjs` exercises real temporary Git repositories. This is a local recovery-source review, not longitudinal adoption or release proof. Version 1.0.0 starts explicit document revision tracking; historical log entries are retained. |
 
 | Date | What changed | Why |
 |---|---|---|
+| 2026-08-22 | Re-read `scripts/doc-currency.mjs` and `scripts/git-hooks/pre-push`; no decision change. | Commit `b1172a7` added the already-declared `sync-census.mjs --check` and `sync-commands.mjs --check` authorities to the same pre-push boundary that invokes document currency. The additions strengthen the boundary's single-purpose checks without changing this ADR's derivation, drift, or fail-open rules. |
+| 2026-08-30 | Re-read the document-currency and pre-push paths after the gate gained convergence-manifest validation; the new check preserves this ADR's fail-closed push boundary. | `scripts/git-hooks/pre-push`; `scripts/convergence-manifest.mjs`; exact hosted QA failure on stale generated identity. |
 | 2026-07-28 | Re-read `scripts/doc-currency.mjs` and `scripts/git-hooks/pre-push`; no decision change. | The adversarial release run at SHA `879b928` correctly blocked on six stale governed documents. This row is committed with the repaired documents and code, proving the chokepoint remains fail-closed rather than bypassing its findings. |
 | 2026-07-27 | **Corrected this document's drift from its own implementation**, under ADR-056. `impl:` claim `unbuilt` → derived `built`; removed `plugin/scripts/doc-currency-gate.sh` from `governs:` (never built — one unresolvable path dragged the whole weakest-member-wins derivation to `unbuilt`, so the honest mechanism reported the dishonest answer for an honest reason); replaced the `docs/adr/` + `docs/ddd/` **directories** — which this document's own §6 forbids — not with globs (the set expanded to all 67 docs and went permanently `presumed-stale`) but with the two files that actually implement it. The gate now lives in `scripts/git-hooks/pre-push` per ADR-056 §5 | The body asserted *"`scripts/doc-currency.mjs` does not exist"* for five days while that file sat beside it at 780 lines with 43KB of tests, committed the same day. Found 2026-07-27 by the owner's third rule; `wired-check` had also been reporting the script `wired` because `package.json:35` DEFINED an npm alias for it — now `wired` for real, caller `scripts/git-hooks/pre-push` |
 | 2026-07-22 | Created | Owner, 2026-07-22: *"Is it VERIFIED TO BE IN SYNC with the resulting output?"* — measured the same day: 12 of 32 ADRs in `docs/adr/` carry no status or date, and 4 of the 20 stamped ones already carry an `updated:` older than their own last commit |

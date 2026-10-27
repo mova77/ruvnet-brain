@@ -1,0 +1,351 @@
+import { describe, expect, it } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { artifactEvidence, buildCoverage, canonicalGistRows, canonicalJson, canonicalRepositoryRows, classifyGist,
+  classifyRepository, digest, gistVersion, observeExternalRepositories, observeGists, observeSourceUniverse,
+  sealCoverage, sourceObservationDigest } from '../../scripts/source-coverage.mjs';
+
+const repo = {
+  databaseId: 1, name: 'ruflo', url: 'https://github.com/ruvnet/ruflo', isFork: false,
+  isArchived: false, isDisabled: false, diskUsage: 1, updatedAt: '2026-08-21T00:00:00Z',
+  pushedAt: '2026-08-21T00:00:00Z',
+  defaultBranchRef: { target: { oid: 'a'.repeat(40), committedDate: '2026-08-21T00:00:00Z' } },
+};
+const evidence = { rvfPresent: true, bytesVerified: true, passagesPresent: true, cardPresent: true,
+  receipt: { sourceCommit: 'a'.repeat(40), sha256: 'b'.repeat(64), builtUtc: '2026-08-21T01:00:00Z' } };
+
+describe('artifact-bound source coverage', () => {
+  it('canonicalizes objects independently of insertion order', () => {
+    expect(canonicalJson({ b: 2, a: 1 })).toBe(canonicalJson({ a: 1, b: 2 }));
+    expect(digest({ b: 2, a: 1 })).toBe(digest({ a: 1, b: 2 }));
+  });
+
+  it('calls a matching verified artifact current and clone state is not an input', () => {
+    expect(classifyRepository(repo, evidence)).toMatchObject({ status: 'CURRENT', artifact: { sourceCommit: 'a'.repeat(40) } });
+  });
+
+  it('binds an explicit no-corpus exclusion into an ineligible repository row', () => {
+    // ADR-086 Step 12: an active exclusion must carry source-file evidence bound to the observed head
+    // (tests/unit/source-coverage-completeness.test.mjs pins the throw when it is missing).
+    const exclusion = { reason: 'heading-only repository has no functional corpus', pushedAt: repo.pushedAt,
+      evidence: { method: 'gh api repos/ruvnet/ruflo/git/trees/HEAD?recursive=1', headSha: 'a'.repeat(40),
+        inspectedAt: '2026-09-13T00:00:00Z', truncated: false, files: [{ path: 'README.md', size: 15 }] } };
+    expect(classifyRepository(repo, { ...evidence, rvfPresent: false }, exclusion)).toMatchObject({
+      status: 'INELIGIBLE',
+      disposition: 'excluded-no-corpus',
+      reasons: [exclusion.reason],
+    });
+  });
+
+  it('expires no-corpus evidence when the repository changes or the measured revision is absent', () => {
+    const stale = { reason: 'previously empty', pushedAt: '2026-08-20T00:00:00Z' };
+    expect(classifyRepository(repo, { ...evidence, rvfPresent: false }, stale)).toMatchObject({
+      disposition: 'eligible', status: 'MISSING',
+    });
+    expect(classifyRepository(repo, { ...evidence, rvfPresent: false }, { reason: 'unbound' })).toMatchObject({
+      disposition: 'eligible', status: 'MISSING',
+    });
+  });
+
+  it('cardPresent resolves through repo-aliases.json the same way the router does (metaharness via agent-harness-generator)', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'source-coverage-alias-'));
+    try {
+      fs.writeFileSync(path.join(dir, 'capability-cards.md'), '## agent-harness-generator\ncard body\n');
+      fs.writeFileSync(path.join(dir, 'repo-aliases.json'),
+        JSON.stringify({ 'agent-harness-generator': ['metaharness'] }));
+      const cardStores = new Set(['agent-harness-generator']);
+      expect(artifactEvidence(dir, { stores: {} }, cardStores, 'metaharness').cardPresent).toBe(true);
+      // The canonical name itself, and an unrelated store with no alias and no card, are unaffected.
+      expect(artifactEvidence(dir, { stores: {} }, cardStores, 'agent-harness-generator').cardPresent).toBe(true);
+      expect(artifactEvidence(dir, { stores: {} }, cardStores, 'ruflo').cardPresent).toBe(false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('enumerates configured public sources outside the primary owner with their explicit store names', () => {
+    const replies = new Map([
+      ['repos/stuinfla/ruvnet-brain', {
+        id: 42, name: 'ruvnet-brain', full_name: 'stuinfla/ruvnet-brain', html_url: 'https://github.com/stuinfla/ruvnet-brain',
+        fork: false, archived: false, disabled: false, size: 10, updated_at: 'u', pushed_at: 'p', default_branch: 'main',
+      }],
+      ['repos/stuinfla/ruvnet-brain/commits/main', {
+        sha: 'c'.repeat(40), commit: { committer: { date: '2026-08-21T00:00:00Z' } },
+      }],
+    ]);
+    const gh = (args) => JSON.stringify(replies.get(args[1]));
+    const observed = observeExternalRepositories([{ store: 'brain-self', repository: 'stuinfla/ruvnet-brain' }], { gh });
+    expect(observed).toMatchObject({ expected: 1, rows: [{ fullName: 'stuinfla/ruvnet-brain', storeName: 'brain-self' }] });
+    expect(classifyRepository(observed.rows[0], { ...evidence, receipt: { ...evidence.receipt, sourceCommit: 'c'.repeat(40) } }))
+      .toMatchObject({ key: 'repo:stuinfla/ruvnet-brain', artifact: { store: 'brain-self' }, status: 'CURRENT' });
+  });
+
+  it('seals complete paginated repositories and gists into one immutable SourceObservation', () => {
+    const page1 = { data: { user: { repositories: { pageInfo: { hasNextPage: true, endCursor: 'next' },
+      nodes: [{ ...repo, name: 'alpha' }] } } } };
+    const page2 = { data: { user: { repositories: { pageInfo: { hasNextPage: false, endCursor: null },
+      nodes: [{ ...repo, databaseId: 2, name: 'beta' }] } } } };
+    const gist = { id: 'gist-1', updated_at: '2026-08-21T00:00:00Z', html_url: 'https://gist.github.com/gist-1', files: {} };
+    const gh = (args) => {
+      if (args[1] === 'graphql') return JSON.stringify(args.includes('cursor=next') ? page2 : page1);
+      if (args[1] === 'users/ruvnet') return JSON.stringify({ public_repos: 2, public_gists: 1 });
+      if (String(args[1]).startsWith('users/ruvnet/gists')) return JSON.stringify([[gist]]);
+      throw new Error(`unexpected gh call: ${args.join(' ')}`);
+    };
+    const first = observeSourceUniverse({ owner: 'ruvnet', externalSources: [], gh,
+      observedAt: '2026-08-21T12:00:00.000Z' });
+    const second = observeSourceUniverse({ owner: 'ruvnet', externalSources: [], gh,
+      observedAt: '2026-08-21T12:00:00.000Z' });
+    expect(first).toMatchObject({ schemaVersion: 1, kind: 'ruvnet-brain-source-observation',
+      repositories: { expected: 2 }, gists: { expected: 1 } });
+    expect(first.repositories.pages).toEqual([{ index: 1, responseDigest: digest(first.repositories.rows),
+      count: 2, terminal: true }]);
+    expect(first.gists.pages.at(-1)).toMatchObject({ terminal: true });
+    expect(first.observationSha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(second.observationSha256).toBe(first.observationSha256);
+  });
+
+  it('seals source facts independently of clocks, transport receipts, page partitions, and array order', () => {
+    const gist = { id: 'abc', updated_at: '2026-08-21T00:00:00Z', html_url: 'https://gist.github.com/abc',
+      files: { z: { filename: 'z.md', raw_url: `https://gist.example/raw/${'d'.repeat(40)}/z.md`, size: 3,
+        type: 'text/plain', language: 'Markdown' } } };
+    const observation = ({ repositories, gists, observedAt, pages }) => ({
+      schemaVersion: 1, kind: 'ruvnet-brain-source-observation', owner: 'ruvnet', observedAt,
+      repositories: { rows: repositories, expected: repositories.length, pages },
+      gists: { rows: gists, expected: gists.length, pages: [...pages].reverse() },
+    });
+    const first = observation({ repositories: [repo, { ...repo, databaseId: 2, name: 'beta' }], gists: [gist],
+      observedAt: '2026-08-21T01:00:00Z', pages: [{ cursor: 'opaque-a', responseDigest: 'transport-a' }] });
+    const second = observation({ repositories: [{ ...repo, databaseId: 2, name: 'beta' }, repo],
+      gists: [{ ...gist, comments: 99, description: 'irrelevant', owner: { avatar_url: 'changed' } }],
+      observedAt: '2026-08-22T01:00:00Z', pages: [{ cursor: 'opaque-b', responseDigest: 'transport-b' }] });
+    expect(canonicalRepositoryRows(first.repositories.rows)).toEqual(canonicalRepositoryRows(second.repositories.rows));
+    expect(canonicalGistRows(first.gists.rows)).toEqual(canonicalGistRows(second.gists.rows));
+    expect(sourceObservationDigest(first)).toBe(sourceObservationDigest(second));
+  });
+
+  it('preserves top-level gist inventory truncation as a sealed source fact', () => {
+    const base = { id: 'abc', updated_at: '2026-08-21T00:00:00Z', files: {} };
+    expect(canonicalGistRows([{ ...base, truncated: true }])[0].truncated).toBe(true);
+    expect(canonicalGistRows([{ ...base, truncated: false }])[0].truncated).toBe(false);
+    const obs = (truncated) => ({ schemaVersion: 1, kind: 'ruvnet-brain-source-observation', owner: 'ruvnet',
+      repositories: { rows: [], expected: 0 }, gists: { rows: [{ ...base, truncated }], expected: 1 } });
+    expect(sourceObservationDigest(obs(true))).not.toBe(sourceObservationDigest(obs(false)));
+    expect(canonicalGistRows([{ ...base }])[0]).not.toHaveProperty('truncated');
+  });
+
+  it.each([
+    ['repository HEAD', (base) => ({ ...base, repositories: { ...base.repositories, rows: [
+      { ...base.repositories.rows[0], defaultBranchRef: { ...base.repositories.rows[0].defaultBranchRef,
+        target: { ...base.repositories.rows[0].defaultBranchRef.target, oid: 'f'.repeat(40) } } },
+    ] } })],
+    ['repository pushedAt', (base) => ({ ...base, repositories: { ...base.repositories,
+      rows: [{ ...base.repositories.rows[0], pushedAt: '2026-08-22T00:00:00Z' }] } })],
+    ['gist revision', (base) => ({ ...base, gists: { ...base.gists, rows: [{ ...base.gists.rows[0],
+      files: { a: { ...base.gists.rows[0].files.a,
+        raw_url: `https://gist.example/raw/${'e'.repeat(40)}/a.md` } } }] } })],
+  ])('changes source identity for a meaningful %s change', (_label, mutate) => {
+    const gist = { id: 'abc', updated_at: '2026-08-21T00:00:00Z', html_url: 'https://gist.github.com/abc',
+      files: { a: { filename: 'a.md', raw_url: `https://gist.example/raw/${'d'.repeat(40)}/a.md` } } };
+    const base = { schemaVersion: 1, kind: 'ruvnet-brain-source-observation', owner: 'ruvnet', observedAt: 'now',
+      repositories: { rows: [repo], expected: 1, pages: [] }, gists: { rows: [gist], expected: 1, pages: [] } };
+    expect(sourceObservationDigest(mutate(base))).not.toBe(sourceObservationDigest(base));
+  });
+
+  it('rejects duplicate repository identities and case-folded store collisions before sealing', () => {
+    const primary = { data: { user: { repositories: { pageInfo: { hasNextPage: false, endCursor: null },
+      nodes: [{ ...repo, name: 'Alpha' }] } } } };
+    const externalRepo = { id: 2, name: 'external', full_name: 'else/external', html_url: 'https://github.com/else/external',
+      fork: false, archived: false, disabled: false, size: 1, updated_at: 'u', pushed_at: 'p', default_branch: 'main' };
+    const gh = (args) => {
+      if (args[1] === 'graphql') return JSON.stringify(primary);
+      if (args[1] === 'users/ruvnet') return JSON.stringify({ public_repos: 1, public_gists: 0 });
+      if (String(args[1]).startsWith('users/ruvnet/gists')) return JSON.stringify([[]]);
+      if (args[1] === 'repos/else/external') return JSON.stringify(externalRepo);
+      if (args[1] === 'repos/else/external/commits/main') return JSON.stringify({ sha: 'c'.repeat(40), commit: {} });
+      throw new Error(`unexpected gh call: ${args.join(' ')}`);
+    };
+    expect(() => observeSourceUniverse({ owner: 'ruvnet', gh,
+      externalSources: [{ repository: 'else/external', store: 'alpha' }] })).toThrow(/colliding store name/);
+  });
+
+  it.each([
+    [{ ...evidence, receipt: { ...evidence.receipt, sourceCommit: null } }, 'UNVERIFIED'],
+    [{ ...evidence, receipt: { ...evidence.receipt, sourceCommit: 'c'.repeat(40) } }, 'STALE'],
+    [{ ...evidence, bytesVerified: false }, 'FAILED'],
+    [{ ...evidence, cardPresent: false }, 'CURRENT'],
+    [{ ...evidence, rvfPresent: false }, 'MISSING'],
+  ])('fails closed for incomplete artifact evidence', (input, status) => {
+    expect(classifyRepository(repo, input).status).toBe(status);
+  });
+
+  it('requires a complete version-bound per-gist receipt before calling a gist current, never a timestamp cache', () => {
+    const gist = { id: 'g', updated_at: '2026-08-21T00:00:00Z', html_url: 'https://gist.github.com/g', truncated: false,
+      files: { a: { filename: 'a.md', raw_url: `https://gist.githubusercontent.com/ruvnet/g/raw/${'d'.repeat(40)}/a.md` } } };
+    expect(gistVersion(gist)).toBe('d'.repeat(40));
+    const base = { rvfPresent: true, bytesVerified: true, passagesBound: true, receipt: {} };
+    expect(classifyGist(gist, base).status).toBe('UNVERIFIED');
+    // 2026-09-13 (Step 4, rule 2): a bare flat-file timestamp cache entry (`.ruv-gists.cache.json`,
+    // modeled here as `cache`) is NOT sufficient evidence of currency on its own -- only the real
+    // per-gist source receipt's own `updatedAt` field may establish CURRENT. Before this fix, the
+    // cache entry alone made this exact row CURRENT even though the receipt row carries no
+    // `updatedAt` at all.
+    expect(classifyGist(gist, { ...base, cache: { g: gist.updated_at }, sources: { gists: { g: {
+      versionSha: 'd'.repeat(40), ingestedAt: gist.updated_at, contentDigest: 'x', files: [{}], complete: true,
+    } } } }).status).toBe('STALE');
+    // A source row present but whose OWN updatedAt does not match the live list is still stale.
+    expect(classifyGist(gist, { ...base, sources: { gists: { g: {
+      versionSha: 'd'.repeat(40), updatedAt: '2020-01-01T00:00:00Z', ingestedAt: gist.updated_at, contentDigest: 'x', files: [{}], complete: true,
+    } } } }).status).toBe('STALE');
+    // Only the receipt's own matching updatedAt establishes CURRENT.
+    expect(classifyGist(gist, { ...base, sources: { gists: { g: {
+      versionSha: 'd'.repeat(40), updatedAt: gist.updated_at, ingestedAt: gist.updated_at, contentDigest: 'x', files: [{}], complete: true,
+    } } } }).status).toBe('CURRENT');
+    expect(classifyGist({ ...gist, truncated: true }, { ...base, sources: { gists: { g: {
+      versionSha: 'd'.repeat(40), updatedAt: gist.updated_at, ingestedAt: gist.updated_at, contentDigest: 'x', files: [{}], complete: true,
+    } } } })).toMatchObject({ status: 'UNVERIFIED', upstream: { truncated: true } });
+    const { truncated: _flag, ...unknownInventory } = gist;
+    expect(classifyGist(unknownInventory, base).status).toBe('UNVERIFIED');
+  });
+
+  it('binds enumeration evidence and every ordered row into one stable generation', () => {
+    const repositories = { expected: 1, pages: [{ count: 1, terminal: true }] };
+    const gists = { expected: 0, pages: [{ count: 0, terminal: true }] };
+    const row = classifyRepository(repo, evidence);
+    const sourceObservationSha256 = 'd'.repeat(64);
+    const a = sealCoverage({ owner: 'ruvnet', repositories, gists, rows: [row], generatorSourceSha: 'x',
+      sourceObservationSha256, snapshotRoot: 'y', observedAt: 'z' });
+    const b = sealCoverage({ owner: 'ruvnet', repositories, gists, rows: [row], generatorSourceSha: 'x',
+      sourceObservationSha256, snapshotRoot: 'y', observedAt: 'z' });
+    expect(a.coverageGeneration).toBe(b.coverageGeneration);
+    expect(a.sourceObservationSha256).toBe(sourceObservationSha256);
+    expect(a.enumerationReceipt.duplicateKeys).toBe(0);
+  });
+
+  it('classifies candidate bytes from a supplied observation without re-enumerating GitHub', () => {
+    const kb = fs.mkdtempSync(path.join(os.tmpdir(), 'coverage-observation-'));
+    try {
+      const rvf = 'alpha-rvf';
+      const rvfSha = digest(rvf);
+      fs.writeFileSync(path.join(kb, 'alpha.big.rvf'), rvf);
+      fs.writeFileSync(path.join(kb, 'alpha.passages.jsonl'), '{}\n');
+      fs.writeFileSync(path.join(kb, 'capability-cards.md'), '## alpha\nCapability.\n');
+      fs.writeFileSync(path.join(kb, 'external-sources.json'), JSON.stringify({ sources: [] }));
+      fs.writeFileSync(path.join(kb, 'no-corpus-repos.json'), '{}');
+      fs.writeFileSync(path.join(kb, 'RVF-GENERATIONS.json'), JSON.stringify({ stores: { alpha: {
+        file: 'alpha.big.rvf', sha256: rvfSha, bytes: Buffer.byteLength(rvf), sourceCommit: 'a'.repeat(40),
+        builtUtc: '2026-08-21T01:00:00Z',
+      } } }));
+      const observationBase = { schemaVersion: 1, kind: 'ruvnet-brain-source-observation', owner: 'ruvnet',
+        observedAt: '2026-08-21T12:00:00Z',
+        repositories: { rows: [{ ...repo, name: 'alpha' }], expected: 1, pages: [{ terminal: true }] },
+        gists: { rows: [], expected: 0, pages: [{ terminal: true }] } };
+      const observation = { ...observationBase, observationSha256: sourceObservationDigest(observationBase) };
+      const coverage = buildCoverage({ owner: 'ruvnet', kbDir: kb, policyDir: kb, observation,
+        gh: () => { throw new Error('must not re-enumerate'); } });
+      expect(coverage).toMatchObject({ sourceObservationSha256: observation.observationSha256,
+        rows: [{ name: 'alpha', status: 'CURRENT' }] });
+    } finally {
+      fs.rmSync(kb, { recursive: true, force: true });
+    }
+  });
+});
+
+// Found live 2026-09-13 running corpus-seed.yml for real: Actions' GITHUB_TOKEN is a GitHub App
+// token and the gists list API is closed to those ("Resource not accessible by integration", HTTP
+// 403) -- corpus-reconcile.mjs's first-ever run failed here. observeGists() had no fallback (unlike
+// scripts/ingest-gists.mjs's already-working listGists/listGistsPublic split, which this project
+// hit the same wall on before). Fixed with a synchronous curl-based fallback on that exact error.
+describe('observeGists — falls back to the unauthenticated API on the Actions gists 403 (#corpus-seed)', () => {
+  it('RED->GREEN: retrieves every gist via the unauthenticated fallback when gh fails with the Actions 403', () => {
+    const gists = Array.from({ length: 5 }, (_, i) => ({ id: `g${i}`, files: {} }));
+    const gh = (args) => {
+      if (String(args[1]).includes('gists')) {
+        throw new Error('gh api users/ruvnet/gists?per_page=100 failed: Resource not accessible by integration (HTTP 403)');
+      }
+      return JSON.stringify({ public_gists: gists.length });
+    };
+    // ADR-086 Step 12 (A1): a short page is no longer the end — only an EMPTY page terminates the
+    // fallback (a partial page followed by more must not stop early), so the real API's empty page 2
+    // is modelled here and curl is called exactly twice.
+    const requested = [];
+    const curl = (url) => {
+      const page = Number(new URL(url).searchParams.get('page'));
+      requested.push(page);
+      return JSON.stringify(page === 1 ? gists : []);
+    };
+    const result = observeGists('ruvnet', { gh, curl });
+    expect(requested).toEqual([1, 2]);
+    expect(result.rows).toHaveLength(5);
+    expect(result.rows.map((g) => g.id)).toEqual(['g0', 'g1', 'g2', 'g3', 'g4']);
+    expect(result.expected).toBe(5);
+    expect(result.pages.map((page) => page.count)).toEqual([5, 0]);
+  });
+
+  it('control: a gh failure for any OTHER reason still throws (after the bounded transient retry), not silently falling back', () => {
+    let calls = 0;
+    const gh = () => { calls += 1; throw new Error('gh api users/ruvnet/gists?per_page=100 failed: net/http: TLS handshake timeout'); };
+    const curl = () => { throw new Error('must not be called'); };
+    expect(() => observeGists('ruvnet', { gh, curl, sleep: () => {} })).toThrow(/TLS handshake timeout/);
+    expect(calls, 'a TLS blip is retried, bounded, before it is allowed to fail the observation').toBe(3);
+  });
+
+  it('control: when gh succeeds, the unauthenticated fallback is never invoked', () => {
+    const gists = [{ id: 'only-one', files: {} }];
+    const gh = (args) => (String(args[1]).includes('gists')
+      ? JSON.stringify(gists)
+      : JSON.stringify({ public_gists: 1 }));
+    const curl = () => { throw new Error('must not be called'); };
+    const result = observeGists('ruvnet', { gh, curl });
+    expect(result.rows).toEqual(gists);
+  });
+});
+
+describe('observeExternalRepositories — an upstream that is gone must not stop the night', () => {
+  const SHA = 'b1762a71bb1ad58b9175e2ae78ed454fed47b655';
+  const ifGone = { sourceCommit: SHA, committedAt: '2026-07-02T11:14:33Z', pushedAt: '2026-09-10T12:41:13Z',
+    updatedAt: '2026-09-10T19:25:36Z', description: 'packaging pipeline' };
+  const source = { store: 'cognitum-ruos', repository: 'cognitum-one/ruOS', ifGone };
+  const failing = (message) => () => { throw new Error(`gh api repos/cognitum-one/ruOS failed: ${message}`); };
+
+  it('carries the last ingested commit on 404/410 and classifies the stored content CURRENT with an honest reason', () => {
+    for (const code of [404, 410]) {
+      const { rows, expected } = observeExternalRepositories([source], { gh: failing(`gh: Gone (HTTP ${code})`) });
+      expect(expected).toBe(1);
+      const [row] = canonicalRepositoryRows(rows);
+      expect(row.upstreamUnavailable).toBe(true);
+      expect(row.defaultBranchRef.target.oid).toBe(SHA);
+      const classified = classifyRepository(row, { receipt: { sourceCommit: SHA, sha256: 'x', builtUtc: 't' },
+        rvfPresent: true, bytesVerified: true, passagesPresent: true, cardPresent: false });
+      expect(classified.status).toBe('CURRENT');
+      expect(classified.upstreamUnavailable).toBe(true);
+      expect(classified.reasons.join(' ')).toMatch(/no longer reachable/);
+    }
+  });
+
+  it('is deterministic: two observations of a gone source are byte-identical (sealed hashes must agree)', () => {
+    const a = canonicalRepositoryRows(observeExternalRepositories([source], { gh: failing('gh: Not Found (HTTP 404)') }).rows);
+    const b = canonicalRepositoryRows(observeExternalRepositories([source], { gh: failing('gh: Not Found (HTTP 404)') }).rows);
+    expect(canonicalJson(a)).toBe(canonicalJson(b));
+  });
+
+  it('still fails closed: no ifGone, a 403, a rate limit (retried, bounded, with no seed commit to carry), or a malformed commit all throw', () => {
+    const bare = { store: 'cognitum-ruos', repository: 'cognitum-one/ruOS' };
+    expect(() => observeExternalRepositories([bare], { gh: failing('gh: Not Found (HTTP 404)') })).toThrow(/404/);
+    expect(() => observeExternalRepositories([source], { gh: failing('gh: Forbidden (HTTP 403)') })).toThrow(/403/);
+    expect(() => observeExternalRepositories([source], { gh: failing('API rate limit exceeded (HTTP 429)'), sleep: () => {} })).toThrow(/429/);
+    const bad = { ...source, ifGone: { ...ifGone, sourceCommit: 'main' } };
+    expect(() => observeExternalRepositories([bad], { gh: failing('gh: Not Found (HTTP 404)') })).toThrow(/40-hex/);
+  });
+
+  it('never masks a live repository: when GitHub answers, the live row is used and ifGone is ignored', () => {
+    const gh = (args) => JSON.stringify(args[1].endsWith('/commits/main')
+      ? { sha: 'a'.repeat(40), commit: { committer: { date: '2026-10-01T00:00:00Z' } } }
+      : { id: 7, name: 'ruOS', full_name: 'cognitum-one/ruOS', html_url: 'https://github.com/cognitum-one/ruOS',
+        default_branch: 'main', fork: false, archived: false, disabled: false, size: 1 });
+    const { rows } = observeExternalRepositories([source], { gh });
+    expect(rows[0].upstreamUnavailable).toBeUndefined();
+    expect(rows[0].defaultBranchRef.target.oid).toBe('a'.repeat(40));
+  });
+});

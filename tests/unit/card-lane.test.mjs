@@ -32,6 +32,7 @@ import {
   renderCardHit,
   routeReposFromCards,
 } from '../../kb/card-lane.mjs';
+import { verifyGrounding } from '../../kb/verify-citation.mjs';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const KB = path.join(REPO, 'kb');
@@ -100,6 +101,45 @@ describe('loadCards — reads capability-cards.md from a bundle dir, honestly ab
   });
 });
 
+describe('routeReposFromCards — cardVocabulary must contain real tokens, not Set objects', () => {
+  // THE BUG THIS CATCHES. `cards.flatMap((card) => card.tokenSet)` does not flatten a Set (only
+  // arrays) -- it silently produces an array of whole Set objects, so `cardVocabulary` never held
+  // a single real token string, for any card, since the line was written. Every query with two or
+  // more capitalized terms outside a tiny neutral list was declined "outside the card catalogue"
+  // REGARDLESS of what any card's own text said -- found live 2026-09-12 when a query using a
+  // real repo's own documented terminology ("Neuro-Divergent") was refused.
+  //
+  // CORRECTED 2026-09-12 after Dual (Fable 5.1 + GPT-6-Astra) independently proved the original
+  // version of this test vacuous: naming "widget-forge" in the query makes hasKnownProductIdentity
+  // true (card-lane.mjs:368-370), which skips the vocabulary-decline branch ENTIRELY regardless of
+  // cardVocabulary's contents -- the test passed on both the broken and the fixed flatMap. A real
+  // test must name NO repository, so routing depends only on cardVocabulary actually containing the
+  // card's own tokens. A negative control (unrelated capitalized terms) must still decline.
+  let tmp;
+  it('does not decline a DESCRIBED query (no repo named) whose terms the card itself documents', () => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'card-lane-vocab-'));
+    fs.writeFileSync(path.join(tmp, 'capability-cards.md'),
+      '## widget-forge\nBuilds Quantum-Fizzbuzz pipelines end to end. Reach for widget-forge whenever '
+      + 'you need Quantum-Fizzbuzz processing.\n');
+    const route = routeReposFromCards('What Quantum-Fizzbuzz throughput is supported?', tmp, ['widget-forge']);
+    expect(route.confidence).not.toBe('none');
+    expect(route.reason || '').not.toMatch(/outside the card catalogue/);
+    expect(route.repos).toContain('widget-forge');
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it('control: an unrelated described query with no matching vocabulary still declines', () => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'card-lane-vocab-control-'));
+    fs.writeFileSync(path.join(tmp, 'capability-cards.md'),
+      '## widget-forge\nBuilds Quantum-Fizzbuzz pipelines end to end. Reach for widget-forge whenever '
+      + 'you need Quantum-Fizzbuzz processing.\n');
+    const route = routeReposFromCards('What Django Stripe throughput is supported?', tmp, ['widget-forge']);
+    expect(route.confidence).toBe('none');
+    expect(route.reason || '').toMatch(/outside the card catalogue/);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+});
+
 describe('answerFromCards — capability claims require implementation evidence', () => {
   const results = QUESTION_SETS.map((q) => ({ q, hit: answerFromCards(q.query, KB) }));
 
@@ -127,6 +167,14 @@ describe('answerFromCards — capability claims require implementation evidence'
     const hit = answerFromCards('What is dspy.ts and what does it do?', KB);
     expect(hit.hit).toBe(false);
     expect(hit.reason).toMatch(/implementation evidence/i);
+  });
+
+  it('keeps single-document guide answers but routes multi-document requests to source retrieval', () => {
+    const query = 'How do I open the settings screen?';
+    expect(answerFromCards(query, KB, { allowGuideAnswers: true, k: 1 }).hit).toBe(true);
+    expect(answerFromCards(query, KB, { allowGuideAnswers: true, k: 10 })).toEqual({
+      hit: false, reason: 'multiple documents require source retrieval',
+    });
   });
 
   it('allows bounded guide answers only when the caller explicitly enables the guide lane', () => {
@@ -374,6 +422,16 @@ describe('answerFromCards — NEGATIVE: silence-or-fallthrough, NEVER a fabricat
     }
   });
 
+  it('never lets a named source path terminate in the generic repository card', () => {
+    const hit = answerFromCards(
+      'ruvnet-brain scripts/nightly-wrapper.sh run_once ingest-new-repos self-update primary checkout worktree',
+      KB,
+      { allowGuideAnswers: true },
+    );
+    expect(hit.hit).toBe(false);
+    expect(hit.reason).toMatch(/exact path|file query|source retrieval/i);
+  });
+
   it('no card in this bundle ever cites a privately-fenced repo, even under adversarial phrasing', () => {
     for (const term of PRIVATE_STORES) {
       const hit = answerFromCards(`what does ${term} do and how do I use it`, KB);
@@ -388,14 +446,72 @@ describe('renderCardHit — the answer must be usable and cited on its own', () 
     expect(hit.hit).toBe(true);
     const text = renderCardHit(hit);
     expect(text).toMatch(/FAST LANE/);
-    expect(text).toContain('capability-cards.md');
+    // The header names the card's own repo; the path is the REAL stored card passage path
+    // (<repo>/CARD/<repo>-card), not the card's source markdown file — `capability-cards.md` is never
+    // a passage path on disk.
+    expect(text).toContain('#1  repo=ruflo  evidence=curated-capability-card\n');
+    expect(text).toContain('path : ruflo/CARD/ruflo-card\n');
     expect(text).toContain('ruflo');
     expect(text).toBe(text); // sanity: renders without throwing
     expect(text.length).toBeGreaterThan(hit.text.length); // more than just the bare card body
   });
+
+  // RED FIRST: the card content lives in `concepts.passages.jsonl` under `<repo>/CARD/<repo>-card`
+  // (scripts/corpus-aggregates.mjs). The pre-fix `path: <subject>/kb/capability-cards.md#<subject>`
+  // could never resolve, so verifyGrounding() reported `grounded: false` for every fast-lane answer.
+  // Fails on the pre-fix code with `reason: 'citations-do-not-resolve'`.
+  it('is grounded end-to-end: its own citation resolves against the real concepts store', async () => {
+    const kbDir = fs.mkdtempSync(path.join(os.tmpdir(), 'card-lane-ground-'));
+    try {
+      const passage = { id: 0, text: 'x', path: 'ruvector/CARD/ruvector-card', title: 'ruvector — Capability' };
+      fs.writeFileSync(path.join(kbDir, 'concepts.passages.jsonl'), `${JSON.stringify(passage)}\n`);
+      const hit = {
+        repo: 'ruvector', path: 'capability-cards.md#ruvector',
+        text: 'ruvector is RuvNet’s vector database.', namedRepo: true, bodyOverlap: 2, coverage: 1,
+      };
+      const result = await verifyGrounding(renderCardHit(hit), kbDir);
+      expect(result).toMatchObject({ grounded: true, reason: 'ok' });
+      // Routing credit stays with the card's own repo; the evidence is the concepts store's passage.
+      expect(result.receipt).toMatchObject({ repo: 'ruvector', file: 'concepts.passages.jsonl', storedPath: 'ruvector/CARD/ruvector-card' });
+    } finally {
+      fs.rmSync(kbDir, { recursive: true, force: true });
+    }
+  });
+
+  it('the concepts lookup is narrow: a card nobody built, or a non-CARD path, never resolves there', async () => {
+    const kbDir = fs.mkdtempSync(path.join(os.tmpdir(), 'card-lane-ground-neg-'));
+    try {
+      const passages = [
+        { id: 0, text: 'x', path: 'ruvector/CARD/ruvector-card', title: 'ruvector — Capability' },
+        { id: 1, text: 'y', path: 'ruvector/L2/hnsw', title: 'hnsw' },
+      ];
+      fs.writeFileSync(path.join(kbDir, 'concepts.passages.jsonl'), `${passages.map((p) => JSON.stringify(p)).join('\n')}\n`);
+      const noCard = renderCardHit({ repo: 'madeup', path: 'x', text: 'body', namedRepo: true });
+      expect(await verifyGrounding(noCard, kbDir)).toMatchObject({ grounded: false, reason: 'citations-do-not-resolve' });
+      // A real concepts passage that is not a card is not reachable under another repo's name.
+      const notCardPath = '#1  repo=ruvector  kind=doc\npath : ruvector/L2/hnsw\ntitle: t\n';
+      expect(await verifyGrounding(notCardPath, kbDir)).toMatchObject({ grounded: false });
+    } finally {
+      fs.rmSync(kbDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('routeReposFromCards — routing never masquerades as a card answer', () => {
+  it('routes the original ordinary meaning-search request without naming a product', () => {
+    const available = ['ruvector', 'rupixel', 'ruvnet', 'ruflo', 'agentdb', 'rulake', 'concepts'];
+    for (const query of [
+      'search these docs by meaning instead of exact keywords',
+      'search these docs by meaning',
+      'please search these docs by meaning',
+    ]) {
+      const result = routeReposFromCards(query, KB, available);
+      expect(result.repos[0], query).toBe('ruvector');
+      expect(result.namedRepos, query).toEqual([]);
+      expect(result.confidence, query).toBe('described');
+    }
+  });
+
   it('routes the Brain product name to its own RVF store', () => {
     const route = routeReposFromCards(
       'How does RuvNet Brain open its Console in Claude Code and Codex?',
@@ -478,6 +594,21 @@ describe('routeReposFromCards — routing never masquerades as a card answer', (
       .toEqual(expect.arrayContaining(['ruvector', 'agentdb']));
   });
 
+  it('routes RVF class names to RuVector and distinguishes the fully named Cognitum ruOS', () => {
+    const stores = [...available, 'cognitum-ruos', 'ruos'];
+    expect(routeReposFromCards(
+      'How do I call RvfStore.telepathicQuantumSync() to synchronize my vector database?',
+      KB,
+      stores,
+    ).repos).toContain('ruvector');
+    expect(routeReposFromCards('What is cognitum ruOS?', KB, stores).repos)
+      .toEqual(['cognitum-ruos']);
+    expect(routeReposFromCards('What is ruvnet/ruos?', KB, stores).repos)
+      .toEqual(['ruos']);
+    expect(routeReposFromCards('What is ruos?', KB, stores).repos)
+      .not.toContain('cognitum-ruos');
+  });
+
   it('routes an exact scoped package through the shipped ownership registry', () => {
     const route = routeReposFromCards(
       'What does the @claude-flow/neural package implement — which algorithms?',
@@ -552,6 +683,19 @@ describe('routeReposFromCards — routing never masquerades as a card answer', (
     expect(routeReposFromCards('How do I center a div?', KB, available).repos).toEqual([]);
   });
 
+  it('refuses arbitrary product routing when multiple proper nouns are outside the catalogue', () => {
+    expect(routeReposFromCards(
+      'How do I verify Stripe webhook signatures in Django?',
+      KB,
+      available,
+    )).toMatchObject({ confidence: 'none', repos: [] });
+    expect(routeReposFromCards(
+      "How does Unity's DOTS ECS differ from classic GameObjects?",
+      KB,
+      available,
+    )).toMatchObject({ confidence: 'none', repos: [] });
+  });
+
   it('does not add the aggregate concepts store to an explicitly named repository', () => {
     const route = routeReposFromCards(
       'How does Ruflo initialize and coordinate a hierarchical agent swarm?',
@@ -614,5 +758,44 @@ describe('routeReposFromCards — routing never masquerades as a card answer', (
       repos: expect.arrayContaining(['sparc']),
     });
     expect(route.repos[0]).toBe('sparc');
+  });
+});
+
+describe('routeReposFromCards — namesRepo hyphen-safety (issue #284)', () => {
+  // THE BUG THIS CATCHES. `namesRepo` folds hyphens to spaces before a phrase match, on BOTH the
+  // repo name and the query, so a bare store name matches INSIDE its own hyphen-prefixed compound
+  // sibling ("widget" reads as present in "widget forge" once "widget-forge" is folded). This is
+  // currently shielded for the specific ruvnet/ruvnet-brain pair by `primaryBrainScope`, but that
+  // mechanism only prunes siblings AWAY from an already-misnamed 'ruvnet-brain' -- it does not fix
+  // namesRepo itself, and does nothing for any other hyphen-prefixed pair. Synthetic fixture (not
+  // one of the issue's own named pairs) so the fix is proven general, not hardcoded to those five.
+  const cardsFor = (tmp) => fs.writeFileSync(path.join(tmp, 'capability-cards.md'), [
+    '## widget',
+    'A small standalone gadget utility, unrelated to any pipeline builder.',
+    '## widget-forge',
+    'Builds Quantum-Fizzbuzz pipelines end to end.',
+  ].join('\n'));
+
+  it('does not let a bare store name match merely because it is a substring inside a hyphen-prefixed compound sibling', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'card-lane-hyphen-'));
+    try {
+      cardsFor(tmp);
+      const route = routeReposFromCards('What does widget-forge do?', tmp, ['widget', 'widget-forge']);
+      expect(route.namedRepos).toContain('widget-forge');
+      expect(route.namedRepos).not.toContain('widget');
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('control: a genuinely bare mention still names the bare store on its own', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'card-lane-hyphen-control-'));
+    try {
+      cardsFor(tmp);
+      const route = routeReposFromCards('What does widget do?', tmp, ['widget', 'widget-forge']);
+      expect(route.namedRepos).toEqual(['widget']);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
 });

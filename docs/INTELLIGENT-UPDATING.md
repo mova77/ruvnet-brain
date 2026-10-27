@@ -1,4 +1,4 @@
-Updated: 2026-07-18 11:20:00 EDT | Version 2.0.0
+Updated: 2026-10-10 04:39:18 EDT | Version 2.0.2
 Created: 2026-07-18 10:55:00 EDT
 
 # Intelligent Updating — how RuvNet Brain stays current without ever trapping you
@@ -13,6 +13,15 @@ Created: 2026-07-18 10:55:00 EDT
 > mandatory for **unattended** applies; explicit one-restart migration. Rejected with reasons: per-session
 > epoch pinning (finding 14) — it would resurrect the trapped-session disease; we use per-invocation
 > atomicity plus a forward-compat contract on hook output formats instead.
+
+## 4.6.0 trigger coordination
+
+The developer-tool coordinator sits above this Brain runtime mechanism: it preserves each
+installed tool's owner and calls the signed knowledge updater rather than replacing this
+transaction protocol. Its saved channel/scope, 03:30 local schedule, shared owner lock,
+maintenance exclusions and receipts are specified only in `CONTRIBUTING.md` under
+"Coordinated developer updates (4.6.0)". RNBC displays live choices and run evidence separately;
+a registered schedule or successful check does not prove a completed apply.
 
 ## 0. The one-paragraph version
 
@@ -83,7 +92,7 @@ one Node shim with an explicit table:
 
 ```
 command: node "${CLAUDE_PLUGIN_ROOT}/scripts/hook-shim.mjs" ground-ruvnet     (advisory entries keep `|| true`)
-command: node "${CLAUDE_PLUGIN_ROOT}/scripts/hook-shim.mjs" route-dispatch    (blocking entry — NO `|| true`)
+command: node "${CLAUDE_PLUGIN_ROOT}/scripts/hook-shim.mjs" route-dispatch || true  (advisory on the host's async Agent/Task boundary)
 ```
 
 `hook-shim.mjs` (part of the frozen shell, designed to never need changing) carries a dispatch

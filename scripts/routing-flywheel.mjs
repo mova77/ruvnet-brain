@@ -53,7 +53,9 @@ import {
   canon,
 } from '@metaharness/flywheel';
 import { effectivePrices, loadLabelledRows, OUTCOMES } from './metaharness-router.mjs';
+import { assertEvolutionAllowed } from './metaharness-gate.mjs';
 import { loadCatalog, applyProfile, loadProfile } from './model-router-engine.mjs';
+import { isDirectInvocation } from '../plugin/scripts/entrypoint.mjs';
 
 // ─── HARD CAPS — the self-DDoS fence. Clamped, never raised by flags. ─────────────────────────────
 export const HARD_MAX_GENERATIONS = 6;
@@ -398,6 +400,10 @@ export async function runRoutingFlywheel(opts = {}) {
   let proposer;
   let dataSource;
   if (mode === 'live') {
+    // A live proposer is the only path that can spend metered credits. Require an external,
+    // measured score/OIA/drift receipt and its explicit spend opt-in before constructing it.
+    // Synthetic replay remains available without this gate and never makes a paid call.
+    assertEvolutionAllowed(opts.gateReceipt);
     if (!opts.apiKey) throw new Error('--live requires OPENROUTER_API_KEY');
     const model = opts.proposerModel ?? LIVE_PROPOSER_MODEL;
     const entry = catalog.find((c) => c.id === model);
@@ -440,9 +446,14 @@ export async function runRoutingFlywheel(opts = {}) {
   const fp = gateFingerprint(meetsPromotionRule);
   const verdict = verifyReplayBundle(result.replayBundle, { pinnedGateFingerprint: fp, promotionRule: meetsPromotionRule });
   const promoted = result.promotions.filter((c) => c.verdict === 'PROMOTED');
+  // If a caller supplied the measured MetaHarness preflight, its promotion decision is an
+  // additional fail-closed wall. Live evolution may run only after explicit spend consent, but
+  // it never self-promotes; synthetic replay can be promoted only when the caller's receipt says
+  // so. The historical no-receipt path remains compatible for the $0 unit harness.
+  const promotionGate = opts.gateReceipt ? opts.gateReceipt.promotion?.allowed === true : true;
 
   let candidatePath = null;
-  if (promoted.length) {
+  if (promoted.length && promotionGate) {
     const provenance = {
       ts: runIso,
       mode,
@@ -483,6 +494,7 @@ export async function runRoutingFlywheel(opts = {}) {
     lift_curve: result.replayBundle.lift_curve,
     milestone_reached: result.milestoneReached,
     candidate_path: candidatePath,
+    promotion_gate: opts.gateReceipt ? { allowed: promotionGate, reason: opts.gateReceipt.promotion?.reason || null } : null,
     signer_public_key: signer.publicKey(),
   };
   appendReceipt(opts.receiptsFile ?? RECEIPTS_PATH_DEFAULT, receipt);
@@ -588,7 +600,7 @@ async function main() {
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isDirectInvocation(import.meta.url)) {
   main().catch((e) => {
     process.stderr.write(`routing-flywheel: ${e.stack || e.message}\n`);
     process.exit(1);

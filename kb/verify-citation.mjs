@@ -24,31 +24,88 @@ import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
 
-/** Parse the reader's stdout into structured citations. Never throws; unparseable input → []. */
+/**
+ * Parse the reader's stdout into structured citations. Never throws; unparseable input → [].
+ *
+ * STRUCTURE, NOT TEXT PATTERNS (ADR-0102 G-004, #236). The reader dumps each hit's full document body
+ * inline, and a retrieved document can contain text shaped exactly like a hit header — including a forged
+ * "#N+1 repo=…" block that predicts the next rank, which the old next-header/next-rank guards could not
+ * stop ("not airtight"). The reader prints, before each body, `chars: <exact body length>`; the parser
+ * consumes the body BY THAT COUNT and requires the 67-'=' terminator right after it, so nothing inside a
+ * body is ever scanned for headers. A declared length that does not land on the terminator fails closed:
+ * that hit keeps no body and nothing after it is trusted. Legacy bodies without `chars:` also stop
+ * parsing: their header metadata is retained, but their body and everything after it are untrusted.
+ * Metadata-only headers remain supported. `path`/`title`/scores come only from the header lines between
+ * a hit's header and its body, never from a body, and hits are numbered #1, #2, … strictly in order.
+ */
+const SEPARATOR = '='.repeat(67);
 export function parseCitations(stdout) {
   const out = [];
   const text = String(stdout ?? '');
-  const blockRe = /^#(\d+)\s+repo=(\S+)(?:\s+ce=(-?[\d.]+))?(?:\s+vec=(-?[\d.]+))?(?:\s+kind=(\S+))?/gm;
+  const headerRe = /^#(\d+)[ \t]+repo=(\S+)([^\r\n]*)/gm;
+  const nextHeaderRe = /^#\d+\s+repo=\S+/gm;
+  // Recognize marker-shaped lines too: malformed framing must not expose body headers as metadata.
+  const markerRe = /^[ \t]*-{3,}[ \t]*full[ \t]+document[ \t]*-{3,}[^\r\n]*(?:\r?\n|$)/gm;
   let m;
-  while ((m = blockRe.exec(text)) !== null) {
-    const rest = text.slice(m.index);
-    const pathM = /^path\s*:\s*(.+)$/m.exec(rest);
-    const titleM = /^title\s*:\s*(.+)$/m.exec(rest);
+  let expectedRank = 1;
+  while ((m = headerRe.exec(text)) !== null) {
+    const rank = Number(m[1]);
+    if (rank !== expectedRank) continue; // out-of-sequence header: a look-alike, not a real hit
+    const headStart = m.index + m[0].length;
+    nextHeaderRe.lastIndex = headStart;
+    const next = nextHeaderRe.exec(text);
+    const nextAt = next ? next.index : text.length;
+    markerRe.lastIndex = headStart;
+    const marker = markerRe.exec(text);
+    const markerAt = marker && marker.index < nextAt ? marker.index : -1;
+    const head = text.slice(headStart, markerAt >= 0 ? markerAt : nextAt);
+    const pathM = /^path\s*:\s*(.+)$/m.exec(head);
+    const titleM = /^title\s*:\s*(.+)$/m.exec(head);
+    const charsM = /^chars:[ \t]*(\d+)(?:[ \t]*\|[ \t]*chunks:[ \t]*\d+(?:[ \t]+\(truncated\))?)?[ \t]*\r?$/m.exec(head);
+    const bodyLength = charsM ? Number(charsM[1]) : null;
+    const canonicalMarker = marker && /^----- full document -----\r?\n$/.test(marker[0]);
+    // A pathless match does not fill (or burn) its rank: real reader output never omits path, and a
+    // look-alike fragment consuming the slot would reject the real citation that fills it later.
     if (!pathM) continue;
+    let returnedText = null;
+    let stop = false;
+    if (Number.isSafeInteger(bodyLength) && bodyLength >= 0 && markerAt >= 0 && canonicalMarker) {
+      const bodyStart = markerAt + marker[0].length;
+      const bodyEnd = bodyStart + Number(charsM[1]);
+      const terminator = text.startsWith(`\n${SEPARATOR}`, bodyEnd) ? 1 + SEPARATOR.length
+        : text.startsWith(`\r\n${SEPARATOR}`, bodyEnd) ? 2 + SEPARATOR.length : 0;
+      if (terminator) {
+        returnedText = text.slice(bodyStart, bodyEnd);
+        headerRe.lastIndex = bodyEnd + terminator; // resume AFTER the body: its contents are never parsed
+      } else stop = true; // the declared body does not end where it says: its boundary, and all after it, is unknown
+    } else if (markerAt >= 0) {
+      stop = true; // missing/invalid length or noncanonical marker: later body boundaries are untrusted
+    }
+    expectedRank = rank + 1;
     const repo = m[2];
+    // Metadata comes only from the header, never from a retrieved document body.
+    // A proof label is descriptive; consumers must independently validate its evidence.
+    const field = (name) => new RegExp(`(?:^|[ \\t])${name}=([^ \\t]+)`).exec(m[3])?.[1] ?? null;
+    const score = (name) => {
+      const value = field(name);
+      return value !== null && /^-?\d+(?:\.\d+)?$/.test(value) ? Number(value) : null;
+    };
     const fullPath = pathM[1].trim();
     // Strip the repo prefix the reader adds, so the remainder can be matched against the store.
     const docPath = fullPath.startsWith(`${repo}/`) ? fullPath.slice(repo.length + 1) : fullPath;
     out.push({
-      rank: Number(m[1]),
+      rank,
       repo,
-      ce: m[3] !== undefined ? Number(m[3]) : null,
-      vec: m[4] !== undefined ? Number(m[4]) : null,
-      kind: m[5] ?? null,
+      ce: score('ce'),
+      vec: score('vec'),
+      kind: field('kind'),
+      proofMethod: field('proof'),
+      returnedText,
       fullPath,
       docPath,
       title: titleM ? titleM[1].trim() : null,
     });
+    if (stop) break;
   }
   return out;
 }
@@ -70,7 +127,20 @@ function samePath(stored, docPath) {
  * takes to reach the hit. A malformed JSON line is skipped, never fatal.
  */
 export async function citationResolves(citation, kbDir) {
-  const files = passagesFilesFor(citation.repo, kbDir);
+  const own = await resolveIn(passagesFilesFor(citation.repo, kbDir), citation.docPath);
+  if (own.resolved) return own;
+  // A capability card is cited under its OWN repo (`repo=ruvector`, `path : ruvector/CARD/ruvector-card`,
+  // kb/card-lane.mjs renderCardHit) but is stored only in the derived `concepts` aggregate, under
+  // `<repo>/CARD/<repo>-card` (scripts/corpus-aggregates.mjs). Look exactly that path up there. Narrow
+  // on purpose: only a `CARD/` path, only in `concepts`, and only the exact stored path.
+  if (/^CARD\/[^/#]+-card$/.test(String(citation.docPath)) && citation.repo !== 'concepts') {
+    const card = await resolveIn(passagesFilesFor('concepts', kbDir), `${citation.repo}/${citation.docPath}`);
+    if (card.resolved) return card;
+  }
+  return own;
+}
+
+async function resolveIn(files, docPath) {
   if (!files.length) return { resolved: false, reason: 'no-store', file: null, storedPath: null };
   for (const file of files) {
     const rl = readline.createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity });
@@ -79,7 +149,7 @@ export async function citationResolves(citation, kbDir) {
         if (!line) continue;
         let rec;
         try { rec = JSON.parse(line); } catch { continue; }
-        if (typeof rec?.path === 'string' && samePath(rec.path, citation.docPath)) {
+        if (typeof rec?.path === 'string' && samePath(rec.path, docPath)) {
           return { resolved: true, reason: 'ok', file: path.basename(file), storedPath: rec.path };
         }
       }

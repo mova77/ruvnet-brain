@@ -5,14 +5,61 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import { isDirectInvocation } from '../../../scripts/entrypoint.mjs';
 
-export const REQUIRED_CHECKS = ['ci', 'integration-linux', 'stranger-matrix', 'ux-qe'];
+export const REQUIRED_CHECKS = ['ci', 'integration-linux', 'stranger-matrix', 'ux-qe', 'release-qe'];
 
 const fail = (code, detail) => ({ code, detail });
 const cleanHex = (value, length) => new RegExp(`^[a-f0-9]{${length}}$`, 'i').test(String(value || ''));
 const digestOf = (receipt) => String(receipt?.artifact?.sha256 || '').replace(/^sha256:/, '');
+const versionField = (value) => typeof value === 'string' && value.length > 0 ? value : null;
+
+function versionIdentityFailures(expectedVersion, expectedTag, fields) {
+  const mismatches = [];
+  if (!versionField(expectedVersion)) mismatches.push('version is missing');
+  if (expectedTag !== `v${expectedVersion}`) mismatches.push(`tag=${expectedTag ?? 'missing'}`);
+  for (const [name, value, expected = expectedVersion] of fields) {
+    if (value !== expected) mismatches.push(`${name}=${value ?? 'missing'}`);
+  }
+  return mismatches;
+}
+
+export function evaluateStabilizationCandidateReceipt(receipt) {
+  const failures = [];
+  const sha = String(receipt?.sha || '');
+  const digest = digestOf(receipt);
+  if (receipt?.schemaVersion !== 1 || receipt?.phase !== 'stabilization-candidate' || receipt?.mode !== 'stabilization') {
+    failures.push(fail('INVALID_STABILIZATION_RECEIPT', 'schemaVersion=1, phase=stabilization-candidate, and mode=stabilization are required'));
+  }
+  if (receipt?.targetScore !== 95 || receipt?.scoreClaimed !== false) {
+    failures.push(fail('STABILIZATION_SCORE_MISREPRESENTED', 'stabilization must preserve the 95 target and explicitly make no 95 claim'));
+  }
+  if (!cleanHex(sha, 40) || !cleanHex(receipt?.tree, 40) || receipt?.dirty !== false) {
+    failures.push(fail('INVALID_LINEAGE', 'clean candidate SHA and tree are required'));
+  }
+  if (!cleanHex(digest, 64) || receipt?.artifact?.sourceSha !== sha) {
+    failures.push(fail('INVALID_ARTIFACT_DIGEST', 'sealed package digest must be bound to the candidate SHA'));
+  }
+  const version = versionField(receipt?.version);
+  const identityMismatches = versionIdentityFailures(version, receipt?.tag, [
+    ['source package', receipt?.sourceVersions?.package],
+    ['source Claude plugin', receipt?.sourceVersions?.claudePlugin],
+    ['source Codex plugin', receipt?.sourceVersions?.codexPlugin],
+    ['packed npm artifact', receipt?.artifact?.version],
+  ]);
+  if (identityMismatches.length) failures.push(fail('VERSION_IDENTITY_MISMATCH', identityMismatches.join(', ')));
+  if (receipt?.security?.status !== 'PASS' || receipt?.security?.critical !== 0 || receipt?.security?.high !== 0) {
+    failures.push(fail('SECURITY_NOT_PASS', 'stabilization requires zero critical/high dependency findings'));
+  }
+  if (!(receipt?.qe?.total > 0) || receipt?.qe?.status !== 'PASS' || receipt?.qe?.failed !== 0
+    || receipt?.qe?.skipped !== 0 || receipt?.qe?.passed !== receipt?.qe?.total) {
+    failures.push(fail('QE_NOT_PASS', 'release QE must execute nonzero work with zero failed/skipped tests'));
+  }
+  return { verdict: failures.length === 0 ? 'PASS' : 'FAIL', sha, artifactSha256: digest, failures };
+}
 
 export function evaluateCandidateReceipt(receipt) {
+  if (receipt?.phase === 'stabilization-candidate') return evaluateStabilizationCandidateReceipt(receipt);
   const failures = [];
   const sha = String(receipt?.sha || '');
   const digest = digestOf(receipt);
@@ -22,6 +69,22 @@ export function evaluateCandidateReceipt(receipt) {
   if (receipt?.dirty !== false) failures.push(fail('DIRTY_WORKTREE', 'release candidates must come from a clean worktree'));
   if (!cleanHex(digest, 64)) failures.push(fail('INVALID_ARTIFACT_DIGEST', 'artifact SHA-256 is missing or malformed'));
   if (receipt?.artifact?.sourceSha !== sha) failures.push(fail('ARTIFACT_SOURCE_MISMATCH', 'packed artifact is not bound to the candidate SHA'));
+
+  const version = versionField(receipt?.version);
+  const tag = version ? `v${version}` : null;
+  const identityMismatches = versionIdentityFailures(version, receipt?.tag, [
+    ['source package', receipt?.sourceVersions?.package],
+    ['source Claude plugin', receipt?.sourceVersions?.claudePlugin],
+    ['source Codex plugin', receipt?.sourceVersions?.codexPlugin],
+    ['packed npm artifact', receipt?.artifact?.version],
+    ['bundle brainVersion', receipt?.artifact?.bundle?.brainVersion],
+    ['bundle releaseTag', receipt?.artifact?.bundle?.releaseTag, tag],
+    ['installed Claude host', receipt?.hosts?.claude?.version],
+    ['installed Codex host', receipt?.hosts?.codex?.version],
+  ]);
+  if (identityMismatches.length > 0) {
+    failures.push(fail('VERSION_IDENTITY_MISMATCH', `candidate surfaces must identify one generation: ${identityMismatches.join(', ')}`));
+  }
 
   const vector = receipt?.releaseVector || {};
   if (vector.verdict !== 'PASS' || vector.sha !== sha || vector.unknown !== 0 || vector.skipped !== 0) {
@@ -83,18 +146,48 @@ export function evaluatePublicationReceipt(candidate, publication) {
   const failures = [...candidateResult.failures];
   const sha = candidateResult.sha;
   const digest = candidateResult.artifactSha256;
-  if (publication?.schemaVersion !== 1 || publication?.phase !== 'publication') failures.push(fail('INVALID_PUBLICATION_RECEIPT', 'schemaVersion=1 and phase=publication are required'));
+  if (publication?.schemaVersion !== 2 || publication?.phase !== 'publication') failures.push(fail('INVALID_PUBLICATION_RECEIPT', 'schemaVersion=2 and phase=publication are required'));
   if (publication?.sha !== sha || publication?.artifactSha256 !== digest) failures.push(fail('PUBLICATION_SEAL_MISMATCH', 'publication does not reference candidate seal'));
+  if (!cleanHex(publication?.payloadId, 64) || !cleanHex(publication?.bundleArtifactSha256, 64)) {
+    failures.push(fail('PUBLIC_PAYLOAD_BINDING_MISSING', 'signed payload and public bundle digests are required'));
+  }
+  const version = versionField(candidate?.version);
+  const tag = version ? `v${version}` : null;
+  const identityMismatches = versionIdentityFailures(version, candidate?.tag, [
+    ['publication version', publication?.version],
+    ['npm version', publication?.npm?.version],
+    ['GitHub release tag', publication?.githubRelease?.tag, tag],
+    ['bundle brainVersion', publication?.bundle?.brainVersion],
+    ['bundle releaseTag', publication?.bundle?.releaseTag, tag],
+    ['Claude-only host', publication?.installed?.claudeOnly?.version],
+    ['Codex-only host', publication?.installed?.codexOnly?.version],
+    ['dual host', publication?.installed?.dual?.version],
+  ]);
+  if (identityMismatches.length > 0) {
+    failures.push(fail('PUBLIC_VERSION_IDENTITY_MISMATCH', `public surfaces must identify candidate ${version ?? 'UNKNOWN'}: ${identityMismatches.join(', ')}`));
+  }
   for (const surface of ['npm', 'githubRelease']) {
     const item = publication?.[surface];
     if (item?.sha !== sha || item?.artifactSha256 !== digest) failures.push(fail('PUBLIC_ARTIFACT_MISMATCH', `${surface} differs from candidate seal`));
   }
-  for (const hostName of ['claude', 'codex']) {
+  const stabilization = publication?.acceptancePolicy === 'stabilization-public-deadline-v1';
+  const deadline = Number(publication?.brain?.deadlineMs);
+  if (publication?.acceptancePolicy !== undefined && !stabilization) {
+    failures.push(fail('PUBLIC_ACCEPTANCE_POLICY', 'unknown public acceptance policy'));
+  }
+  const withinDeadline = (value) => typeof value === 'number' && Number.isFinite(value) && value >= 0
+    && Number.isFinite(deadline) && deadline > 0
+    && (!stabilization || deadline === 30_000)
+    && value <= deadline * (stabilization ? 1 : 0.8);
+  for (const hostName of ['claudeOnly', 'codexOnly', 'dual']) {
     const host = publication?.installed?.[hostName];
-    if (host?.status !== 'PASS' || host?.artifactSha256 !== digest) failures.push(fail('PUBLIC_HOST_NOT_PASS', `${hostName} is not running sealed public artifact`));
+    if (host?.status !== 'PASS' || host?.doctorExit !== 0 || host?.artifactSha256 !== digest
+      || host?.functionalSearch !== true || !withinDeadline(host?.searchMs)) {
+      failures.push(fail('PUBLIC_HOST_NOT_PASS', `${hostName} is not running a doctor-clean functional sealed public artifact`));
+    }
   }
   const brain = publication?.brain || {};
-  if (brain.status !== 'PASS' || brain.selfStore !== true || !(brain.broadMs <= Number(brain.deadlineMs) * 0.8)) failures.push(fail('PUBLIC_BRAIN_NOT_PASS', 'public installed Brain acceptance failed'));
+  if (brain.status !== 'PASS' || brain.selfStore !== true || !withinDeadline(brain.broadMs)) failures.push(fail('PUBLIC_BRAIN_NOT_PASS', 'public installed Brain acceptance failed'));
   const probes = Array.isArray(publication?.postPublicationChecks) ? publication.postPublicationChecks : [];
   const probe = probes.find((check) => check?.name === 'published-surface-probe' && check?.sha === sha);
   if (probe?.status !== 'completed' || probe?.conclusion !== 'success') failures.push(fail('POST_PUBLICATION_CHECK_NOT_GREEN', 'published-surface-probe is not green'));
@@ -103,24 +196,42 @@ export function evaluatePublicationReceipt(candidate, publication) {
 
 export function evaluateLivePreflight(observed) {
   const failures = [];
+  const incomplete = [];
   if (observed?.dirty !== false) failures.push(fail('DIRTY_WORKTREE', 'local worktree is dirty'));
   if (observed?.localSha !== observed?.remoteSha) failures.push(fail('REMOTE_SHA_MISMATCH', 'local HEAD is not origin/main'));
-  if (!Array.isArray(observed?.openIssues) || observed.openIssues.length > 0) failures.push(fail('OPEN_ISSUES', `${observed?.openIssues?.length ?? 'unknown'} issue(s) open`));
-  if (!Array.isArray(observed?.failedRuns) || observed.failedRuns.length > 0) failures.push(fail('GITHUB_FAILURES', `${observed?.failedRuns?.length ?? 'unknown'} recent failed run(s)`));
+  const blockers = observed?.releaseBlockers;
+  if (!Array.isArray(blockers)) failures.push(fail('RELEASE_BLOCKERS_UNKNOWN', 'could not verify open issues labeled release-blocker'));
+  else if (blockers.length > 0) failures.push(fail('RELEASE_BLOCKERS_OPEN', `${blockers.length} release-blocker issue(s) remain open`));
+  const requiredChecks = observed?.requiredChecks;
+  if (!Array.isArray(requiredChecks) || requiredChecks.length === 0) {
+    failures.push(fail('REQUIRED_CHECKS_UNKNOWN', 'could not verify the required main-branch checks on the exact remote SHA'));
+  } else {
+    for (const check of requiredChecks) {
+      if (check?.status !== 'PASS') failures.push(fail('REQUIRED_CHECK_NOT_GREEN', `${check?.context || 'unknown'} is ${check?.status || 'UNKNOWN'} on the exact remote SHA`));
+    }
+  }
   if (observed?.activeSelfStore !== true) failures.push(fail('BRAIN_SELF_STORE_MISSING', 'installed active registry lacks ruvnet-brain'));
   if (observed?.branchEnforceAdmins !== true) failures.push(fail('ADMIN_BYPASS_ENABLED', 'main protection does not enforce required checks for admins'));
-  if (observed?.productionProtected !== true) failures.push(fail('PRODUCTION_ENV_UNPROTECTED', 'production environment has no required reviewer protection'));
-  if (observed?.releaseVector !== 'PASS') failures.push(fail('RELEASE_VECTOR_NOT_PASS', `release vector is ${observed?.releaseVector ?? 'UNKNOWN'}`));
-  return { verdict: failures.length === 0 ? 'PASS' : 'FAIL', observed, failures };
+  if (observed?.productionProtected !== true) failures.push(fail('PRODUCTION_ENV_UNPROTECTED', 'production environment lacks an enforced protection rule'));
+  if (observed?.releaseVector === 'NOT_EVALUATED') incomplete.push(fail('RELEASE_VECTOR_NOT_EVALUATED', 'quick status skipped the release vector; run full status for that evidence'));
+  else if (observed?.releaseVector !== 'PASS') failures.push(fail('RELEASE_VECTOR_NOT_PASS', `release vector is ${observed?.releaseVector ?? 'UNKNOWN'}`));
+  return {
+    verdict: failures.length > 0 ? 'FAIL' : incomplete.length > 0 ? 'INCOMPLETE' : 'PASS',
+    observed,
+    failures,
+    incomplete,
+  };
 }
 
-export function latestRunsByWorkflow(runs) {
-  const latest = new Map();
-  for (const run of Array.isArray(runs) ? runs : []) {
-    const prior = latest.get(run.workflowName);
-    if (!prior || Number(run.databaseId || 0) > Number(prior.databaseId || 0)) latest.set(run.workflowName, run);
-  }
-  return [...latest.values()];
+export function resolveRequiredChecks(requiredContexts, checkRuns, statuses) {
+  if (!Array.isArray(requiredContexts) || !Array.isArray(checkRuns) || !Array.isArray(statuses)) return null;
+  return requiredContexts.map(({ context, app_id: appId }) => {
+    const checkRun = checkRuns.find((row) => row.name === context && (appId == null || row.app?.id === appId));
+    const status = appId == null ? statuses.find((row) => row.context === context) : null;
+    const passed = (checkRun?.status === 'completed' && checkRun.conclusion === 'success') || status?.state === 'success';
+    const pending = checkRun?.status === 'queued' || checkRun?.status === 'in_progress' || status?.state === 'pending';
+    return { context, appId, status: passed ? 'PASS' : pending ? 'PENDING' : checkRun || status ? 'FAIL' : 'MISSING' };
+  });
 }
 
 function command(cmd, args, options = {}) {
@@ -143,15 +254,21 @@ export function collectLivePreflight({ root = process.cwd(), repo = 'stuinfla/ru
   const git = (args) => command('git', args, { cwd: root });
   const localSha = git(['rev-parse', 'HEAD']).stdout.trim();
   const dirty = Boolean(git(['status', '--porcelain']).stdout.trim());
-  git(['fetch', '--quiet', 'origin', 'main']);
-  const remoteSha = git(['rev-parse', 'origin/main']).stdout.trim();
-  const openIssues = jsonCommand('gh', ['issue', 'list', '--repo', repo, '--state', 'open', '--limit', '100', '--json', 'number,title,url']) ?? null;
-  const runs = jsonCommand('gh', ['run', 'list', '--repo', repo, '--limit', '50', '--json', 'databaseId,workflowName,headSha,status,conclusion,url']) ?? null;
-  const failedRuns = Array.isArray(runs)
-    ? latestRunsByWorkflow(runs.filter((run) => run.headSha === remoteSha))
-      .filter((run) => run.status !== 'completed' || run.conclusion !== 'success')
-    : null;
+  const fetched = git(['fetch', '--quiet', 'origin', 'main']);
+  const remoteSha = fetched.status === 0 ? git(['rev-parse', 'origin/main']).stdout.trim() : null;
+  const releaseBlockers = jsonCommand('gh', ['issue', 'list', '--repo', repo, '--state', 'open', '--label', 'release-blocker', '--limit', '100', '--json', 'number,title,url']) ?? null;
   const protection = jsonCommand('gh', ['api', `repos/${repo}/branches/main/protection`]);
+  const requiredChecksConfig = protection?.required_status_checks?.checks;
+  const requiredContexts = Array.isArray(requiredChecksConfig)
+    ? requiredChecksConfig
+    : protection?.required_status_checks?.contexts?.map((context) => ({ context, app_id: null }));
+  const checkRuns = remoteSha
+    ? jsonCommand('gh', ['api', `repos/${repo}/commits/${remoteSha}/check-runs?per_page=100`])?.check_runs
+    : null;
+  const statuses = remoteSha
+    ? jsonCommand('gh', ['api', `repos/${repo}/commits/${remoteSha}/status`])?.statuses
+    : null;
+  const requiredChecks = resolveRequiredChecks(requiredContexts, checkRuns, statuses);
   const environments = jsonCommand('gh', ['api', `repos/${repo}/environments`]);
   const production = environments?.environments?.find((environment) => environment.name === 'Production – ruvnet-brain');
   let activeSelfStore = false;
@@ -164,13 +281,13 @@ export function collectLivePreflight({ root = process.cwd(), repo = 'stuinfla/ru
   if (includeVector) {
     const vector = jsonCommand(process.execPath, [path.join(root, 'scripts/release-vector.mjs'), '--json'], { cwd: root });
     releaseVector = vector?.verdict || 'UNKNOWN';
-  }
+  } else releaseVector = 'NOT_EVALUATED';
   return {
     localSha,
     remoteSha,
     dirty,
-    openIssues,
-    failedRuns,
+    releaseBlockers,
+    requiredChecks,
     activeSelfStore,
     branchEnforceAdmins: protection?.enforce_admins?.enabled === true,
     productionProtected: Array.isArray(production?.protection_rules) && production.protection_rules.length > 0 && production.can_admins_bypass === false,
@@ -188,7 +305,7 @@ export function main(args = process.argv.slice(2)) {
   if (args.includes('--status')) {
     const result = evaluateLivePreflight(collectLivePreflight({ includeVector: !args.includes('--quick') }));
     console.log(JSON.stringify(result, null, 2));
-    return result.verdict === 'PASS' ? 0 : 1;
+    return result.verdict === 'PASS' ? 0 : result.verdict === 'INCOMPLETE' ? 2 : 1;
   }
   const candidatePath = argument(args, '--candidate');
   const publicationPath = argument(args, '--publication');
@@ -207,4 +324,4 @@ export function main(args = process.argv.slice(2)) {
   }
 }
 
-if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) process.exitCode = main();
+if (isDirectInvocation(import.meta.url)) process.exitCode = main();

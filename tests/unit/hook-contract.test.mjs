@@ -30,12 +30,20 @@
  *   - `stop_hook_active` is true once Claude Code is already continuing because of a stop hook.
  *     Returning success while it is true is the documented way to avoid trapping the turn.
  */
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { continuationProjectIdentity } from '../../plugin/scripts/continuation-objective.mjs';
+
+// Current contract: only explicitly scoped continuation preferences authorize objective requests;
+// legacy ledger items and observed backlog are not authority. These subprocess tests prove the
+// request envelope, not native host re-engagement. Pin observations away from the developer's state.
+const NO_ISSUES = path.join(os.tmpdir(), 'ruvnet-hook-contract-no-such-open-issues.json');
+const fixtureRoots = [];
+afterEach(() => { for (const dir of fixtureRoots.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const CONTINUATION_GATE = path.join(ROOT, 'plugin/scripts/continuation-gate.mjs');
@@ -45,7 +53,8 @@ const PLUGIN_HOOKS_JSON = path.join(ROOT, 'plugin/hooks/hooks.json');
 /** Invoke a hook exactly as the harness does: subprocess, JSON on stdin, streams kept apart. */
 function fireHook(cmd, args, payload, env = {}) {
   const r = spawnSync(cmd, args, {
-    input: JSON.stringify(payload),
+    input: JSON.stringify(args[0] === CONTINUATION_GATE
+      ? { hook_event_name: 'Stop', cwd: path.dirname(env.RUVNET_WORK_LEDGER), ...payload } : payload),
     encoding: 'utf8',
     // A FRESH lesson gate-state per call: lesson-hooks runs the frequency cap (3.9.28-29), and without
     // isolation these invocations wrote the user's REAL ~/.config gate-state and accumulated a fixture
@@ -61,48 +70,56 @@ function fireHook(cmd, args, payload, env = {}) {
   return { code: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
 }
 
-function tempLedger(items) {
-  const p = path.join(os.tmpdir(), `hook-contract-${process.pid}-${Math.random().toString(36).slice(2)}.json`);
+function tempLedger(items, sessionId) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hook-contract-'));
+  fixtureRoots.push(dir);
+  const p = path.join(dir, 'ledger.json');
   // Default a FRESH `at` on every item unless the test sets one — mirrors reality (--commit-to always
   // stamps `at`), so the freshness TTL (which now treats a missing/invalid `at` as stale) doesn't
   // silently make an unstamped fixture non-forceable.
   const stamped = items.map((i) => ({ at: new Date().toISOString(), ...i }));
-  fs.writeFileSync(p, JSON.stringify({ items: stamped }));
+  const item = stamped.find((row) => !row.done);
+  const identity = continuationProjectIdentity(dir);
+  const objective = item ? { schemaVersion: 1, kind: 'continuation-preferences', authoritative: false,
+    id: 'hook-contract-objective', text: item.text, at: item.at, state: 'active',
+    projectId: identity.projectId, worktreeIds: [identity.worktreeId], sessionIds: [sessionId],
+    authorization: { kind: 'user', reference: 'fixture-explicit-user-request' } } : null;
+  fs.writeFileSync(p, JSON.stringify({ items: stamped, objective }));
   return p;
 }
 
 describe('Stop-hook loop protection (the 2026-07-22 regression)', () => {
   it('goes SILENT when stop_hook_active is true — the documented loop guard', () => {
-    const ledger = tempLedger([{ text: 'unfinished work', done: false }]);
+    const ledger = tempLedger([{ text: 'unfinished work', done: false }], 'sess-guard');
     const r = fireHook('node', [CONTINUATION_GATE],
       { stop_hook_active: true, session_id: 'sess-guard' },
-      { RUVNET_WORK_LEDGER: ledger });
+      { RUVNET_WORK_LEDGER: ledger, RUVNET_OPEN_ISSUES_FILE: NO_ISSUES });
 
     // The whole incident in one assertion: outstanding work AND already-continuing must yield silence.
     expect(r.stdout).toBe('');
     expect(r.code).toBe(0);
   });
 
-  it('emits a valid additionalContext envelope when work is genuinely outstanding', () => {
-    const ledger = tempLedger([{ text: 'ship the fix', done: false }]);
+  it('emits a native Stop continuation decision when work is genuinely outstanding', () => {
+    const ledger = tempLedger([{ text: 'ship the fix', done: false }], 'sess-fresh');
     const r = fireHook('node', [CONTINUATION_GATE],
       { stop_hook_active: false, session_id: 'sess-fresh' },
-      { RUVNET_WORK_LEDGER: ledger });
+      { RUVNET_WORK_LEDGER: ledger, RUVNET_OPEN_ISSUES_FILE: NO_ISSUES });
 
     expect(r.code).toBe(0);
     const parsed = JSON.parse(r.stdout);            // throws if the envelope is malformed
-    expect(parsed.hookSpecificOutput.hookEventName).toBe('Stop');
-    expect(parsed.hookSpecificOutput.additionalContext).toContain('ship the fix');
+    expect(parsed.decision).toBe('block');
+    expect(parsed.reason).toContain('ship the fix');
   });
 
   it('delivers on STDOUT, never stderr — exit-0 stderr reaches nobody', () => {
-    const ledger = tempLedger([{ text: 'visible item', done: false }]);
+    const ledger = tempLedger([{ text: 'visible item', done: false }], 'sess-stream');
     const r = fireHook('node', [CONTINUATION_GATE],
       { stop_hook_active: false, session_id: 'sess-stream' },
-      { RUVNET_WORK_LEDGER: ledger });
+      { RUVNET_WORK_LEDGER: ledger, RUVNET_OPEN_ISSUES_FILE: NO_ISSUES });
 
     // The original bug: 922 bytes of intervention written to a stream the harness does not read.
-    expect(r.stdout).toContain('additionalContext');
+    expect(r.stdout).toContain('"decision":"block"');
     expect(r.stderr).not.toContain('visible item');
   });
 
@@ -116,19 +133,19 @@ describe('Stop-hook loop protection (the 2026-07-22 regression)', () => {
     // not by re-engaging — so re-engagement is safe while that guard is live.
     // Cooldown disabled here so the two rapid fires test PURE re-engagement; the cooldown is proven
     // separately below. In production the two stops are minutes apart and the cooldown never bites.
-    const ledger = tempLedger([{ text: 'repeat me', done: false }]);
-    const env = { RUVNET_WORK_LEDGER: ledger, RUVNET_CONTINUATION_COOLDOWN_MS: '0' };
+    const ledger = tempLedger([{ text: 'repeat me', done: false }], 'sess-reengage');
+    const env = { RUVNET_WORK_LEDGER: ledger, RUVNET_OPEN_ISSUES_FILE: NO_ISSUES, RUVNET_CONTINUATION_COOLDOWN_MS: '0' };
     const first = fireHook('node', [CONTINUATION_GATE], { stop_hook_active: false, session_id: 'sess-reengage' }, env);
     const second = fireHook('node', [CONTINUATION_GATE], { stop_hook_active: false, session_id: 'sess-reengage' }, env);
 
-    expect(first.stdout).toContain('additionalContext');
-    expect(second.stdout).toContain('additionalContext');   // was `toBe('')` — the once-per-session bug ADR-043 fixes
+    expect(first.stdout).toContain('"decision":"block"');
+    expect(second.stdout).toContain('"decision":"block"');   // was `toBe('')` — the once-per-session bug ADR-043 fixes
   });
 
   it('does NOT force when the stdin payload is unreadable — an EAGAIN must not launder into a loop (ADR-043)', () => {
     // Fable red-team #1: the old readHookInput returned {} on a parse failure, which under a forcing
     // gate reads as "fresh stop" → a machine-wide loop. Garbage on stdin must yield silence, not force.
-    const ledger = tempLedger([{ text: 'real open work', done: false }]);
+    const ledger = tempLedger([{ text: 'real open work', done: false }], 'sess-unreadable');
     const r = spawnSync('node', [CONTINUATION_GATE], {
       input: '}{ not json at all',
       encoding: 'utf8',
@@ -141,11 +158,11 @@ describe('Stop-hook loop protection (the 2026-07-22 regression)', () => {
 
   it('suppresses a second force within the cooldown window — the self-owned loop cap (ADR-043)', () => {
     // Belt-and-braces beyond stop_hook_active: two forces cannot land inside COOLDOWN_MS (default 20s).
-    const ledger = tempLedger([{ text: 'cooldown me', done: false }]);
+    const ledger = tempLedger([{ text: 'cooldown me', done: false }], 'sess-cd');
     const env = { RUVNET_WORK_LEDGER: ledger };   // default cooldown, no override
     const first = fireHook('node', [CONTINUATION_GATE], { stop_hook_active: false, session_id: 'sess-cd' }, env);
     const second = fireHook('node', [CONTINUATION_GATE], { stop_hook_active: false, session_id: 'sess-cd' }, env);
-    expect(first.stdout).toContain('additionalContext');   // first forces, records lastForcedAt
+    expect(first.stdout).toContain('"decision":"block"');   // first forces, records lastForcedAt
     expect(second.stdout).toBe('');                        // second within the window → suppressed
   });
 
@@ -165,18 +182,18 @@ describe('Stop-hook loop protection (the 2026-07-22 regression)', () => {
     // answer. Unknown age (missing/unparseable `at`) is still refused — that was always the real
     // guard, and it is covered by tests/unit/continuation-gate.test.mjs.
     const old = new Date(Date.now() - 48 * 3600 * 1000).toISOString();
-    const ledger = tempLedger([{ text: 'ancient abandoned item', done: false, at: old }]);
+    const ledger = tempLedger([{ text: 'ancient abandoned item', done: false, at: old }], 'sess-stale');
     const r = fireHook('node', [CONTINUATION_GATE],
       { stop_hook_active: false, session_id: 'sess-stale' },
       { RUVNET_WORK_LEDGER: ledger, RUVNET_CONTINUATION_COOLDOWN_MS: '0' });
-    expect(r.stdout, 'a real open commitment must never expire on a timer').toContain('additionalContext');
+    expect(r.stdout, 'a real open commitment must never expire on a timer').toContain('"decision":"block"');
     expect(r.stdout, 'its age must be stated, not hidden').toMatch(/committed 2d ago/);
     expect(r.stdout, 'clearing must be offered as the honest alternative to faking it').toMatch(/CLEAR it/);
   });
 
   it('does NOT force on an empty {} payload — not a real Stop payload (GPT-5.6-Sol review)', () => {
     // An empty-but-parseable {} passes the __source check; a real Stop payload carries session_id.
-    const ledger = tempLedger([{ text: 'real open work', done: false }]);
+    const ledger = tempLedger([{ text: 'real open work', done: false }], 'sess-empty-payload');
     const r = spawnSync('node', [CONTINUATION_GATE], {
       input: '{}',
       encoding: 'utf8',
@@ -189,19 +206,40 @@ describe('Stop-hook loop protection (the 2026-07-22 regression)', () => {
 
   it('does NOT force on an item with a MISSING timestamp — unknown age must not force forever (GPT-5.6-Sol)', () => {
     // A row without a valid `at` is now treated as STALE, not fresh — closes the TTL-bypass GPT-5.6-Sol found.
-    const p = path.join(os.tmpdir(), `hc-noat-${process.pid}-${Math.random().toString(36).slice(2)}.json`);
-    fs.writeFileSync(p, JSON.stringify({ items: [{ text: 'no timestamp', done: false }] }));  // NO `at`
+    const p = tempLedger([{ text: 'no timestamp', done: false, at: undefined }], 'sess-noat');
     const r = fireHook('node', [CONTINUATION_GATE],
       { stop_hook_active: false, session_id: 'sess-noat' },
-      { RUVNET_WORK_LEDGER: p, RUVNET_CONTINUATION_COOLDOWN_MS: '0' });
+      { RUVNET_WORK_LEDGER: p, RUVNET_OPEN_ISSUES_FILE: NO_ISSUES, RUVNET_CONTINUATION_COOLDOWN_MS: '0' });
     expect(r.stdout).toBe('');   // missing/invalid `at` → stale → no force
   });
 
   it('stays silent when nothing is outstanding — a guard that always fires carries no information', () => {
-    const ledger = tempLedger([{ text: 'all done', done: true }]);
+    const ledger = tempLedger([{ text: 'all done', done: true }], 'sess-empty');
     const r = fireHook('node', [CONTINUATION_GATE],
       { stop_hook_active: false, session_id: 'sess-empty' },
-      { RUVNET_WORK_LEDGER: ledger });
+      { RUVNET_WORK_LEDGER: ledger, RUVNET_OPEN_ISSUES_FILE: NO_ISSUES });
+    expect(r.stdout).toBe('');
+  });
+
+  it.each([{ cancelled: true }, { interrupted: true }, { session_id: 'different-session' },
+    { hook_event_name: 'UnknownEvent' }])('never restarts cancellation or accepts an out-of-scope payload: %j', (override) => {
+    const ledger = tempLedger([{ text: 'authorized work', done: false }], 'sess-authorized');
+    const r = fireHook('node', [CONTINUATION_GATE],
+      { stop_hook_active: false, session_id: 'sess-authorized', ...override },
+      { RUVNET_WORK_LEDGER: ledger, RUVNET_OPEN_ISSUES_FILE: NO_ISSUES });
+    expect(r.code).toBe(0);
+    expect(r.stdout).toBe('');
+  });
+
+  it('does not turn legacy open items into objective authorization', () => {
+    const ledger = tempLedger([{ text: 'observed unfinished item', done: false }], 'sess-advisory');
+    const value = JSON.parse(fs.readFileSync(ledger, 'utf8'));
+    delete value.objective;
+    fs.writeFileSync(ledger, JSON.stringify(value));
+    const r = fireHook('node', [CONTINUATION_GATE],
+      { stop_hook_active: false, session_id: 'sess-advisory' },
+      { RUVNET_WORK_LEDGER: ledger, RUVNET_OPEN_ISSUES_FILE: NO_ISSUES });
+    expect(r.code).toBe(0);
     expect(r.stdout).toBe('');
   });
 });
@@ -296,7 +334,10 @@ describe('registry hygiene', () => {
     for (const [event, cap] of [['UserPromptSubmit', 10], ['PreToolUse', 5]]) {
       for (const m of reg.hooks[event] ?? []) {
         for (const h of m.hooks ?? []) {
-          expect(h.timeout, `${event} "${m.matcher}" timeout ${h.timeout}s exceeds the ${cap}s prompt-path budget`).toBeLessThanOrEqual(cap);
+          // Canonical observation capture was added with its own 10s boundary in 0b486659.
+          // Keep the historical 5s cap on all other PreToolUse handlers.
+          const limit = event === 'PreToolUse' && h.command.includes('session-snapshot PreToolUse') ? 10 : cap;
+          expect(h.timeout, `${event} "${m.matcher}" timeout ${h.timeout}s exceeds the ${limit}s prompt-path budget`).toBeLessThanOrEqual(limit);
         }
       }
     }
@@ -335,9 +376,20 @@ describe('registry hygiene', () => {
     }
   });
 
-  it('has exactly one hook registered on Stop', () => {
+  it('registers exactly the guarded continuation hook, the capture hook, and the grounding-turn gate on Stop', () => {
     const stopCmds = (reg.hooks.Stop ?? []).flatMap((m) => (m.hooks ?? []).map((h) => h.command));
-    expect(stopCmds.length).toBe(1);
+    // Stop carries THREE handlers now (grounding-turn-gate added 2026-09-12, the "answered without
+    // searching" pair's Stop half): the continuation gate reads the work ledger and may nudge; the
+    // capture hook writes the project snapshot that SessionStart restores; grounding-turn-gate forces
+    // continuation if a RuvNet-relevant turn ended without a recorded search_ruvnet call. Before the
+    // capture hook, SessionStart restored a journal nothing ever wrote.
+    expect(stopCmds).toHaveLength(3);
+    const [gate, capture, groundingGate] = stopCmds;
+    expect(gate).toContain('continuation-gate');
+    expect(capture).toContain('session-snapshot Stop');
+    expect(groundingGate).toContain('grounding-turn-gate');
+    // All advisory: a turn-end hook that can fail a turn is worse than a missed snapshot.
+    for (const command of stopCmds) expect(command).toContain('|| true');
   });
 
   /**
@@ -368,7 +420,7 @@ describe('registry hygiene', () => {
    * (anticipate + lesson-hooks) are spawned in candidate mode by `unprompted-runtime.mjs`, and the
    * ONLY thing hooks.json points at for them is `hook-shim.mjs unprompted-speech <CCEvent>`, a
    * mode:'blocking' entry in the shim's table. So the opted-in lesson refusal (exit 2) still
-   * propagates — but through the runtime, exactly like route-dispatch's wall, which is why
+   * propagates — but through the runtime, unlike route-dispatch's host-limited audit, which is why
    * unprompted-speech joins the other three here and `lesson-hooks.sh` leaves (leaving it on the list
    * would be a STALE exemption — it is no longer registered — and the assertion below now proves that).
    *
@@ -391,8 +443,22 @@ describe('registry hygiene', () => {
    * consent guard that switched itself off when the user switched the brain off would guard nothing
    * at the only moment it is needed.
    */
-  const BLOCKING = Object.freeze(['route-dispatch', 'design-wall', 'unprompted-speech', 'protect-state']);
-  const isBlocking = (cmd) => BLOCKING.some((b) => cmd.includes(b));
+  /**
+   * DERIVED FROM THE SHIM TABLE, not restated here (ADR-065/067).
+   *
+   * This was a hand-maintained list of four names — a second copy of a fact hook-shim.mjs already
+   * owns — and it rotted the moment ADR-067 consolidated the PreToolUse walls: `design-wall` and
+   * `protect-state` are still `mode:'blocking'` bodies, but they are now POLICIES consulted by
+   * decision-gate rather than hooks registered in their own right, and the new gate was classified
+   * advisory because nobody had added it to the copy. Reading the table makes both problems
+   * structurally impossible.
+   */
+  const SHIM_SRC = fs.readFileSync(path.join(ROOT, 'plugin', 'scripts', 'hook-shim.mjs'), 'utf8');
+  const BLOCKING = Object.freeze(
+    [...SHIM_SRC.matchAll(/'([a-z-]+)':\s*\{[^}]*mode:\s*'blocking'/g)].map((m) => m[1]),
+  );
+  const idOfCommand = (cmd) => (/hook-shim\.mjs"\s+([a-z-]+)/.exec(String(cmd || '')) || [])[1] || '';
+  const isBlocking = (cmd) => BLOCKING.includes(idOfCommand(cmd));
 
   it('gives every ADVISORY hook a `|| true` failsafe — a hook error must never reach the user', () => {
     const offenders = [];
@@ -421,10 +487,17 @@ describe('registry hygiene', () => {
       }
     }
     expect(disarmed, `blocking hook(s) disarmed by a failsafe:\n  ${disarmed.join('\n  ')}`).toEqual([]);
-    // And the exemption list must not rot into fiction: every name on it is really registered.
+    // ANTI-FICTION, restated as the property that actually matters. The old check demanded that every
+    // blocking BODY be registered as its own hook — which ADR-067 deliberately ended: four walls became
+    // one gate that consults them. What must still hold is the reverse and stronger claim: every
+    // registered hook names an id the shim actually knows, so a typo or a deleted body cannot sit in
+    // hooks.json looking armed.
     const all = Object.values(reg.hooks).flatMap((es) => es.flatMap((m) => (m.hooks ?? []).map((h) => h.command)));
-    for (const b of BLOCKING) {
-      expect(all.some((c) => c.includes(b)), `${b} is exempted but not registered — stale exemption`).toBe(true);
+    const known = new Set([...SHIM_SRC.matchAll(/'([a-z-]+)':\s*\{\s*file:/g)].map((m) => m[1]));
+    expect(known.size, 'sanity: the shim table must parse, or every check here is vacuous').toBeGreaterThan(5);
+    for (const cmd of all) {
+      const id = idOfCommand(cmd);
+      expect(known.has(id), `hooks.json registers "${id}", which hook-shim.mjs does not declare`).toBe(true);
     }
   });
 });

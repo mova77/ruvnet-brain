@@ -11,19 +11,95 @@
 // Design rules: dependency-free (Node built-ins + shelling to unzip/npm/claude only), idempotent
 // (safe to re-run), and never a silent half-state (every failure explains the next step).
 
-import https from 'node:https';
+import { downloadFileWithRetry, httpsJsonWithRetry } from '../kb/download-retry.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
+import { installCodexConsoleAlias } from '../plugin/scripts/codex-console-alias.mjs';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
+import { readAll as readAllReadiness, aggregate as aggregateReadiness } from '../plugin/scripts/mcp-readiness.mjs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import readline from 'node:readline';
 import crypto from 'node:crypto';
 import { applyBrainProfile, readBrainProfile } from '../kb/brain-profile.mjs';
+import { acquireRefreshLock, finishRefreshReceipt, openRefreshReceipt, physicalPath, recordRefreshAdvisory,
+  recordRefreshPhase, settleRefreshRun, UPDATE_REFRESH_PHASES } from '../kb/refresh-run.mjs';
+import { assessLifecycleEvidence, pruneLifecycleEvidence } from '../kb/lifecycle-evidence-retention.mjs';
+import { checkDiskSpace, recoverIncompleteStorageTransactions } from '../kb/update-storage-transaction.mjs';
+import { saveUpdateSource, stableNode } from '../plugin/scripts/automatic-update.mjs';
+import { acquireDeveloperLock } from '../plugin/scripts/developer-update-lock.mjs';
+import { footprintRoots, inventoryFootprint, sweepFootprint } from '../plugin/scripts/brain-footprint.mjs';
+import { kbCopyProof } from '../plugin/scripts/kb-copy-proof.mjs';
+import { assessMoveLeftovers, isVolumeMetadata, rescueOperationalFiles } from '../plugin/scripts/footprint-io.mjs';
+import { confirm, doctorVerdict, formatBytes, formatConfirmation, signatureEvidenceFromReceipts, signatureRecordValid, writeSignatureRecord } from '../plugin/scripts/brain-confirmation.mjs';
 import {
   requiredEmbedderModels,
   missingEmbedderModels,
 } from '../kb/model-requirements.mjs';
+import { applyManagedCatalogUpdate } from '../scripts/model-router-catalog.mjs';
+import { cmpVersion } from '../scripts/stack-sync.mjs';
+import {
+  inspectInstalledBrain, classifySmokeEvidence, classifySmokeFailure, classifyWarmupFailure, coldModels, DOCTOR_SMOKE_QUERY, doctorSmokeArgs,
+  MODEL_WARMUP_SCRIPT, MODEL_WARMUP_TIMEOUT_MS,
+} from '../scripts/installed-brain-health.mjs';
+import { validateCoverageDirectory } from '../plugin/scripts/coverage-integrity.mjs';
+import {
+  continuityContractIds,
+  continuityHookId,
+  continuityRegistrations,
+  isAllowedContinuityRegistration,
+} from '../plugin/scripts/continuity-hook-policy.mjs';
+import {
+  NIGHTLY_LABEL,
+  installNightlyRunner,
+  installScheduler,
+  nightlyArtifact,
+  nightlyModuleCurrency,
+  refreshNightlyModules,
+  removeScheduler,
+  readNightlyRegistration,
+  resolveNightlyProofBundle,
+  schedulerStatus,
+  verifyNightlyExecutionIdentity,
+} from '../plugin/scripts/nightly-scheduler.mjs';
+
+// ISSUE #123 — AN INSTALL THAT IS AHEAD OF THE PUBLISHED RELEASE IS NOT A BROKEN INSTALL.
+// Host convergence compared installed === PACKAGE_VERSION, so 4.0.29-dev against a published
+// 4.0.28 read EXACTLY like being behind: --update exited 1 with 'host synchronization is
+// incomplete' and --doctor printed '✗ FAILING' while every displayed check was green (121 repos
+// indexed, grounding proven, Codex MCP live, 17 hooks enabled). The prescribed repair —
+// reinstalling the plugin extras — was a no-op, because the extras were present and firing.
+// Telling someone their working install is broken, then handing them a fix that changes nothing,
+// is the worst kind of false alarm: it burns trust AND time.
+// Convergence means NOT BEHIND. Ordering comes from cmpVersion, which is prerelease-aware and is
+// documented as the only place ordering is decided in this system.
+const versionSatisfies = (installed, expected) => {
+  if (!expected) return true;
+  if (!installed) return false;
+  if (installed === expected) return true;
+  try { return cmpVersion(installed, expected) >= 0; } catch { return installed === expected; }
+};
+import {
+  CONSOLE_RUNTIME_SURFACE, CONSOLE_RUNTIME_IDENTITY_FILE, consoleRuntimeDigest,
+} from '../scripts/console-runtime-identity.mjs';
+import { shellDiff as pluginShellDiff } from '../plugin/scripts/host-shell-boundary.mjs';
+import { codexPluginContentChanged, codexTrustChanges, codexUsesContentTrust, CODEX_TRUST_ACTION } from '../scripts/codex-hook-trust.mjs';
+import { probeFreshCodexDeclarations } from '../scripts/codex-fresh-host-proof.mjs';
+import { refreshSharedCodexAppServer } from '../scripts/codex-hook-trust-reconcile.mjs';
+import { recordCodexOvernightNotice } from '../plugin/scripts/codex-overnight-notice.mjs';
+import { repairSecurityGuidance } from '../scripts/security-guidance-codex-compat.mjs';
+import { installNativeLaunchers, installRoutingRuntime, runtimeSnapshot } from '../scripts/model-routing-launchers.mjs';
+import { installTerminalLaunchers } from '../scripts/model-terminal-launchers.mjs';
+import { addGrokAgentsLine, grokPaths, grokStatus, grokStatusLine, GROK_AGENTS_LINE } from '../scripts/grok-host.mjs';
+import { readConsoleReceipts, replaceStaleConsoles } from '../scripts/console-instances.mjs';
+import { moveBrain, MoveRefused } from '../scripts/move-brain.mjs';
+import { brainLocation } from '../plugin/scripts/brain-location.mjs';
+import { resolveProjectStore } from '../plugin/scripts/project-store-resolver.mjs';
+import { runHostCli, waitForHostCli } from '../scripts/host-cli.mjs';
+import {
+  writeInstalledRuntimeIdentity, recordCorpusTransportIdentity, isCorpusReleaseTag, rejectedReleasePath,
+} from '../kb/corpus-release-identity.mjs';
+import { isDirectInvocation } from '../plugin/scripts/entrypoint.mjs';
 
 // SEC-0010 #6 — the Ed25519 PUBLIC key is EMBEDDED here (not a separate file) so the installer's
 // trust root travels with the installer code itself: an attacker who swaps the downloaded bundle
@@ -53,33 +129,25 @@ const PACKAGE_VERSION = (() => {
 const REPO = 'stuinfla/ruvnet-brain';
 const RELEASE_API = `https://api.github.com/repos/${REPO}/releases/latest`;
 const ASSET_NAME = 'ruvnet-brain.zip';
-// Known-good BUNDLE tag, used when we can't reach GitHub (offline / rate-limited / no releases),
-// and by --pin. Default behavior is "get the latest Release"; this is only the safety net.
-//
-// This MUST NOT be derived from this package's own version. The installer and the brain bundle are
-// two independent version streams (README: "Three independent things version separately here — by
-// design"). Reading it from package.json produced a tag that has never existed — installer 1.14.0-dev
-// asking for releases/download/v1.14.0-dev/ruvnet-brain.zip, which 404s, while the newest bundle
-// Release is v0.5.0-dev. Verified live: v1.14.0-dev → HTTP 404, v0.5.0-dev → HTTP 200. The safety net
-// was broken in exactly the situation it exists for. Bump this by hand when a new bundle ships.
-const RELEASE_VERSION = 'v2.9.0'; // sync-version-ignore: the BUNDLE Release tag, not this package's version
 const fallbackUrl = (tag) => `https://github.com/${REPO}/releases/download/${tag}/${ASSET_NAME}`;
-const APPROX_SIZE = '~736MB';
 
+export function optionArg(args, flag) {
+  const at = args.indexOf(flag);
+  if (at < 0) return undefined;
+  if (!args[at + 1] || args[at + 1].startsWith('-') || args.filter(value => value === flag).length !== 1) throw new Error(`${flag} requires one value`);
+  return args[at + 1];
+}
 const argv = process.argv.slice(2);
 const FLAG_LOCAL = argv.includes('--local');
 const FLAG_FORCE = argv.includes('--force');
 const FLAG_HELP = argv.includes('--help') || argv.includes('-h');
 const FLAG_DOCTOR = argv.includes('--doctor');
-// `--doctor --hooks`: the post-install hook battery (ADR-053 §2 / ADR-055 build item 2). Fires every
-// registration in the INSTALLED hooks.json through the real shim under four stdin regimes with an
-// external process-group watchdog. Separate flag because it spawns real hooks — the plain --doctor
-// stays a pure read.
+// Backward-compatible spelling for the retirement check. It never executes a hook: the only healthy
+// state is zero Brain-owned registrations in both shipped host manifests.
 const FLAG_HOOKS = argv.includes('--hooks');
 const FLAG_NO_VERIFY = argv.includes('--no-verify');
 // Escape hatch for the installer's closing self-check ONLY (it never disables --doctor's verdict).
 const FLAG_NO_SELFCHECK = argv.includes('--no-selfcheck');
-const FLAG_PIN = argv.includes('--pin'); // skip the latest-check, use the bundled default
 const FLAG_DEMO = argv.includes('--demo'); // guided, real (non-fabricated) walkthrough of the brain in action
 const FLAG_FEEDBACK = argv.includes('--feedback'); // prefill a GitHub Discussion (version + health, nothing private) and open it
 // ── freshness flags — invoke/schedule the SELF-UPDATER the bundle already ships (kb/forge-update.mjs) ──
@@ -96,6 +164,13 @@ const FLAG_DISABLE_SPEND_GUARD = argv.includes('--disable-spend-guard'); // the 
 const FLAG_UNINSTALL = argv.includes('--uninstall'); // reverse everything, in one command
 const FLAG_WHAT_CHANGED = argv.includes('--what-changed'); // show our footprint on this machine
 const FLAG_WHATS_NEW = argv.includes('--whats-new'); // show curated major-release highlights
+// --move-brain <dir> moves the whole Brain to another disk, leaving ~/.cache/ruvnet-brain as a link to it;
+// --move-brain --back brings it home (scripts/move-brain.mjs).
+const FLAG_MOVE_BRAIN = argv.includes('--move-brain');
+const MOVE_BRAIN_TO = (() => { const i = argv.indexOf('--move-brain'); const v = i === -1 ? null : argv[i + 1]; return v && !v.startsWith('-') ? v : null; })();
+const FLAG_CLEAN = argv.includes('--clean'); // enforce the footprint guarantee now (ADR-0098), then confirm
+const FLAG_JSON = argv.includes('--json'); // with --doctor / --clean: machine-readable confirmation only
+const FLAG_ARCHIVE = argv.includes('--archive'); // with --clean only (#335): archive files unique to old KB copies, then release them
 // ── onboarding-experience flags (all optional; every offer is safe to decline) ──
 const FLAG_YES = argv.includes('--yes') || argv.includes('-y'); // accept every optional offer non-interactively
 const FLAG_PLAN = argv.includes('--plan') || argv.includes('--dry-run'); // show the interactive checklist, then exit — install NOTHING
@@ -103,14 +178,38 @@ const FLAG_WITH_STACK = argv.includes('--with-stack'); // add missing Ruflo/RuVe
 const FLAG_NO_STACK = argv.includes('--no-stack'); // skip the toolkit offer entirely
 const FLAG_ENHANCE_CLAUDE_MD = argv.includes('--enhance-claude-md'); // add the CLAUDE.md section without prompting
 const FLAG_NO_ENHANCE = argv.includes('--no-enhance'); // skip the CLAUDE.md offer entirely
+const FLAG_GROK_AGENTS_MD = argv.includes('--grok-agents-md'); // opt in: add the search-first line to ~/.grok/AGENTS.md (#301)
 const FLAG_STATUSLINE = argv.includes('--statusline'); // opt in to the status-bar version segment, non-interactively
 const FLAG_NO_STATUSLINE = argv.includes('--no-statusline'); // decline the status-bar offer without prompting
-// --version <tag> forces a specific Release tag (e.g. --version v0.5.0-dev)
-const versionIdx = argv.indexOf('--version');
-const FORCED_VERSION =
-  versionIdx !== -1 && argv[versionIdx + 1] && !argv[versionIdx + 1].startsWith('-')
-    ? argv[versionIdx + 1]
-    : null;
+// --version <tag> forces a specific Release tag (e.g. --version v0.5.0-dev); --pin <tag> is the same.
+/**
+ * Which release the operator named, if any. Pure, for testing.
+ * --pin used to mean "install the bundled known-good v2.9.0" — a bundle that predates COVERAGE.json,
+ * so every --pin install failed validation two steps later. A pin now names its version, or stops.
+ * @returns {{ tag: string, source: 'pinned'|'forced' } | { error: string, hint: string } | null}
+ */
+export function namedReleaseFromArgs(args) {
+  const valueAfter = (flag) => {
+    const i = args.indexOf(flag);
+    if (i === -1) return undefined;
+    const next = args[i + 1];
+    return next && !next.startsWith('-') ? next : null;
+  };
+  const pin = valueAfter('--pin');
+  const version = valueAfter('--version');
+  if (version === null) {
+    return { error: '--version needs the release to install, e.g.  --version vX.Y.Z', hint: 'Use --help for installer options; read the package manifest to inspect the installed version.' };
+  }
+  if (pin === null) {
+    return { error: '--pin needs the release to install, e.g.  --pin vX.Y.Z', hint: `It no longer falls back to a built-in release (that bundle could not pass validation). Pick one from https://github.com/${REPO}/releases, or omit --pin to install the latest.` };
+  }
+  if (pin && version && pin !== version) return { error: `--pin ${pin} and --version ${version} disagree`, hint: 'Name one release.' };
+  if (pin) return { tag: pin, source: 'pinned' };
+  if (version) return { tag: version, source: 'forced' };
+  return null;
+}
+const NAMED_RELEASE = namedReleaseFromArgs(argv);
+const FORCED_VERSION = NAMED_RELEASE?.tag || null;
 
 // ── tiny narrating logger — every step says WHAT and WHY ─────────────────────────────────────────
 const c = {
@@ -141,11 +240,13 @@ function printBanner(subtitle) {
   console.log(`${c.cyan(line)}`);
 }
 
-function die(msg, hint) {
+function die(msg, hint, recoveryRequired = false) {
   console.error(`\n${c.red('✗ install stopped:')} ${msg}`);
   if (hint) console.error(`\n${hint}`);
   console.error(
-    `\nNothing is left half-installed — fix the above and re-run the same command (it's safe to re-run).`,
+    recoveryRequired
+      ? '\nRecovery requires inspection of the retained directories before retrying.'
+      : `\nNothing is left half-installed — fix the above and re-run the same command (it's safe to re-run).`,
   );
   process.exit(1);
 }
@@ -178,116 +279,79 @@ function tryRun(cmd, args, opts = {}) {
   const r = spawnSync(cmd, args, { stdio: 'inherit', shell: IS_WIN, ...opts });
   return !r.error && r.status === 0;
 }
-
-// ── download with redirect-following + progress ──────────────────────────────────────────────────
-function download(url, dest, redirects = 0) {
-  return new Promise((resolve, reject) => {
-    if (redirects > 10) return reject(new Error('too many redirects'));
-    const req = https.get(
-      url,
-      { headers: { 'User-Agent': 'ruvnet-brain-installer', Accept: 'application/octet-stream' } },
-      (res) => {
-        const { statusCode = 0, headers } = res;
-        if ([301, 302, 303, 307, 308].includes(statusCode) && headers.location) {
-          res.resume(); // drain so the socket frees up
-          const next = new URL(headers.location, url).toString();
-          return resolve(download(next, dest, redirects + 1));
-        }
-        if (statusCode !== 200) {
-          res.resume();
-          return reject(new Error(`server returned HTTP ${statusCode}`));
-        }
-        const total = Number(headers['content-length'] || 0);
-        let received = 0;
-        let lastShown = -1;
-        const out = fs.createWriteStream(dest);
-        res.on('data', (chunk) => {
-          received += chunk.length;
-          const mb = (received / 1e6).toFixed(0);
-          if (total) {
-            const pct = Math.floor((received / total) * 100);
-            if (pct !== lastShown && pct % 5 === 0) {
-              process.stdout.write(`\r    …${pct}% (${mb}MB / ${(total / 1e6).toFixed(0)}MB)`);
-              lastShown = pct;
-            }
-          } else if (mb % 20 === 0 && Number(mb) !== lastShown) {
-            process.stdout.write(`\r    …${mb}MB`);
-            lastShown = Number(mb);
-          }
-        });
-        res.pipe(out);
-        out.on('finish', () => out.close(() => {
-          process.stdout.write('\n');
-          resolve();
-        }));
-        out.on('error', (e) => reject(e));
-      },
-    );
-    req.on('error', (e) => reject(e));
-  });
+// The claude/codex CLIs update themselves and can be absent for seconds (scripts/host-cli.mjs):
+// retried with a bounded backoff, then ONE clear line instead of raw shell errors.
+function tryHostCli(cmd, args, opts = {}) {
+  const r = runHostCli(cmd, args, opts);
+  if (r.missingBinary) warn(r.message);
+  return !r.missingBinary && !r.error && r.status === 0;
 }
 
-// ── fetch a small JSON payload (redirect-following, dependency-free) ──────────────────────────────
-function fetchJson(url, redirects = 0) {
-  return new Promise((resolve, reject) => {
-    if (redirects > 10) return reject(new Error('too many redirects'));
-    const req = https.get(
-      url,
-      {
-        headers: {
-          // GitHub's API requires a User-Agent; the Accept header pins the v3 JSON schema.
-          'User-Agent': 'ruvnet-brain-installer',
-          Accept: 'application/vnd.github+json',
-        },
-        timeout: 15000,
-      },
-      (res) => {
-        const { statusCode = 0, headers } = res;
-        if ([301, 302, 303, 307, 308].includes(statusCode) && headers.location) {
-          res.resume();
-          const next = new URL(headers.location, url).toString();
-          return resolve(fetchJson(next, redirects + 1));
-        }
-        if (statusCode !== 200) {
-          res.resume();
-          return reject(new Error(`GitHub API returned HTTP ${statusCode}`));
-        }
-        let body = '';
-        res.setEncoding('utf8');
-        res.on('data', (chunk) => (body += chunk));
-        res.on('end', () => {
-          try {
-            resolve(JSON.parse(body));
-          } catch (e) {
-            reject(new Error(`GitHub API response was not valid JSON: ${e.message}`));
-          }
-        });
-      },
-    );
-    req.on('timeout', () => req.destroy(new Error('GitHub API request timed out')));
-    req.on('error', (e) => reject(e));
+// ── download with redirect-following + progress ──────────────────────────────────────────────────
+function download(url, dest) {
+  let lastShown = -1;
+  return downloadFileWithRetry(url, dest, {
+    headers: { 'User-Agent': 'ruvnet-brain-installer', Accept: 'application/octet-stream' },
+    // The retry continues the staged bytes (HTTP Range) when the server proves the same asset; otherwise it restarts.
+    onRetry: ({ attempt, error }) => warn(`download interrupted (${error.message}); retry ${attempt + 1}/3, resuming where it stopped when the server allows`),
+    onProgress: ({ received, total }) => {
+      const mb = Math.floor(received / 1e6);
+      const pct = total ? Math.floor(received / total * 100) : mb;
+      if (pct !== lastShown && pct % (total ? 5 : 20) === 0) {
+        process.stdout.write(`\r    …${total ? `${pct}% (${mb}MB / ${Math.floor(total / 1e6)}MB)` : `${mb}MB`}`);
+        lastShown = pct;
+      }
+    },
+  }).then(() => process.stdout.write('\n'));
+}
+
+function fetchJson(url) {
+  return httpsJsonWithRetry(url, {
+    headers: { 'User-Agent': 'ruvnet-brain-installer', Accept: 'application/vnd.github+json' },
   });
 }
 
 // ── step: resolve which Release to download (latest by default; safe fallback) ───────────────────
 // Default behavior: ask GitHub for the LATEST Release and use its ruvnet-brain.zip asset.
-// --version <tag> forces a tag; --pin skips the network check and uses the bundled known-good tag.
-// Any failure (offline / rate-limited / no releases) FALLS BACK to the pinned known-good Release,
-// narrated clearly so the user knows exactly what happened.
+// --version <tag> / --pin <tag> install exactly that tag; there is no built-in fallback release.
+// Any failure (offline / rate-limited / no releases) THROWS with the HTTP status or network error and
+// a retry hint; callers that must download stop on it, the staleness check reports "could not check".
+/**
+ * Which asset of a Release actually holds the brain bundle.
+ *
+ * THE UNAMBIGUOUS SINGLE ZIP — the lesson kb/forge-update.mjs's resolveBundleUrl() already learned
+ * (issue #35) and this installer had not. Matching ONLY the conventional `ruvnet-brain.zip` means a
+ * release whose bundle asset is named anything else falls through to `fallbackUrl(tag)`, a URL
+ * assembled from that same conventional name — so the "fallback" is a guaranteed 404, not a
+ * download. The path that reaches it is a FRESH install: the one case with no brain already on disk
+ * to keep working. ADR-086 step 16 makes this reachable in practice, because `releases/latest` can
+ * now be a corpus release.
+ *
+ * A release carrying exactly one .zip is not ambiguous about which zip is the bundle. Two or more
+ * and guessing would be worse than the honest warning, so it falls through as before.
+ *
+ * Pure and exported so the choice is testable without a network round-trip.
+ * @returns {{url: string, origin: 'exact-name'|'single-zip'|'conventional-url', assetName: string|null}}
+ */
+export function resolveReleaseAsset({ tag, assets, assetName = ASSET_NAME }) {
+  const list = Array.isArray(assets) ? assets : [];
+  const exact = list.find((a) => a && a.name === assetName && a.browser_download_url);
+  if (exact) return { url: exact.browser_download_url, origin: 'exact-name', assetName: exact.name };
+  const zips = list.filter((a) => a && typeof a.name === 'string' && a.name.endsWith('.zip') && a.browser_download_url);
+  if (zips.length === 1) return { url: zips[0].browser_download_url, origin: 'single-zip', assetName: zips[0].name };
+  return { url: fallbackUrl(tag), origin: 'conventional-url', assetName: null };
+}
+
 async function resolveRelease() {
   step(
     'Finding the latest brain to install',
     'so a stranger always gets the most current brain — not whatever was hardcoded when this script shipped',
   );
 
-  if (FLAG_PIN) {
-    info(`--pin set: skipping the latest-check and using the bundled known-good ${c.bold(RELEASE_VERSION)}`);
-    return { tag: RELEASE_VERSION, url: fallbackUrl(RELEASE_VERSION), source: 'pinned' };
-  }
-
-  if (FORCED_VERSION) {
-    info(`--version set: forcing Release ${c.bold(FORCED_VERSION)} (no latest-check)`);
-    return { tag: FORCED_VERSION, url: fallbackUrl(FORCED_VERSION), source: 'forced' };
+  if (NAMED_RELEASE?.error) throw Object.assign(new Error(NAMED_RELEASE.error), { hint: NAMED_RELEASE.hint });
+  if (NAMED_RELEASE) {
+    info(`${NAMED_RELEASE.source === 'pinned' ? '--pin' : '--version'} set: installing Release ${c.bold(NAMED_RELEASE.tag)} (no latest-check)`);
+    return { tag: NAMED_RELEASE.tag, url: fallbackUrl(NAMED_RELEASE.tag), source: NAMED_RELEASE.source };
   }
 
   // Deterministic integration seam: stale/current behavior must not depend on GitHub API quota.
@@ -303,18 +367,38 @@ async function resolveRelease() {
     const rel = await fetchJson(RELEASE_API);
     const tag = rel && rel.tag_name;
     if (!tag) throw new Error('latest Release has no tag_name');
-    const asset = Array.isArray(rel.assets) ? rel.assets.find((a) => a.name === ASSET_NAME) : null;
-    const url = asset && asset.browser_download_url ? asset.browser_download_url : fallbackUrl(tag);
-    if (!asset) {
+    const { url, origin, assetName } = resolveReleaseAsset({ tag, assets: rel.assets });
+    if (origin === 'single-zip') {
+      warn(`latest Release ${tag} has no ${ASSET_NAME} — using its only .zip asset, ${c.bold(assetName)}`);
+    } else if (origin === 'conventional-url') {
       warn(`latest Release ${tag} has no ${ASSET_NAME} asset listed — using the conventional download URL`);
     }
     ok(`latest Release is ${c.bold(tag)}`);
     return { tag, url, source: 'latest' };
   } catch (e) {
-    warn(`couldn't check for the latest version (${e.message})`);
-    info(`using the known-good ${c.bold(RELEASE_VERSION)} instead — the install is still safe and complete`);
-    return { tag: RELEASE_VERSION, url: fallbackUrl(RELEASE_VERSION), source: 'fallback' };
+    // FAIL LOUD. This used to return the hardcoded RELEASE_VERSION and promise "the install is still
+    // safe and complete" — but that bundle predates ReleaseCoverage, so two steps later it failed
+    // validation with "COVERAGE.json is missing", and the reason (a rate limit, a network blip) was
+    // gone from the screen. Measured 2026-09-30 on the owner's recovery rail. Only --pin and
+    // --version choose a tag the lookup did not return.
+    const failure = releaseLookupFailure(e);
+    throw Object.assign(new Error(failure.message), { hint: failure.hint });
   }
+}
+
+/** Why the latest-release lookup failed, and what to do about it. Pure, for testing. */
+export function releaseLookupFailure(error) {
+  const detail = (error && error.message) || String(error);
+  const limited = /HTTP (?:403|429)\b/.test(detail);
+  return {
+    message: `couldn't look up the latest RuvNet Brain release (${detail}).`,
+    hint: [
+      limited
+        ? 'GitHub allows a limited number of anonymous release checks per hour from one network address. Wait until the reset time above, then re-run the same command.'
+        : 'Check your connection, then re-run the same command in a minute.',
+      `Nothing was downloaded or installed. To install one specific release instead: add  --version <tag>  (tags: https://github.com/${REPO}/releases).`,
+    ].join('\n'),
+  };
 }
 
 // ── step: resolve the cache dir ──────────────────────────────────────────────────────────────────
@@ -327,12 +411,23 @@ function resolveCacheDir() {
   );
   info(`brain dir: ${c.bold(cacheDir)}`);
   if (custom) info(`(from your RUVNET_BRAIN_KB override)`);
-  fs.mkdirSync(cacheDir, { recursive: true });
+  // Activation creates the KB from a validated stage. A placeholder here becomes a false prior
+  // generation, which the cleanup proof correctly retains because it has no SOURCE.json.
+  fs.mkdirSync(path.dirname(cacheDir), { recursive: true });
   return { cacheDir, isCustom: Boolean(custom) };
 }
 
 // ── step: obtain the bundle (local or download) ──────────────────────────────────────────────────
 async function obtainBundle(release) {
+  const proofBundle = resolveNightlyProofBundle({
+    brainHome: process.env.RUVNET_BRAIN_HOME || path.join(os.homedir(), '.cache', 'ruvnet-brain'),
+    env: process.env,
+  });
+  if (proofBundle) {
+    step('Using the registered proof bundle', 'the native scheduler proof binds these exact bytes');
+    info(`source: ${proofBundle.spec}`);
+    return { zipPath: proofBundle.spec, downloaded: false };
+  }
   const localZip = path.join(REPO_ROOT, 'dist', 'ruvnet-brain.zip');
   const localDir = path.join(REPO_ROOT, 'dist', 'ruvnet-brain');
   const haveLocal = fs.existsSync(localZip);
@@ -357,12 +452,13 @@ async function obtainBundle(release) {
     return { zipPath: localZip, downloaded: false };
   }
 
-  const downloadUrl = (release && release.url) || fallbackUrl(RELEASE_VERSION);
+  if (!release || !release.url) die('no release was resolved to download.', 'Re-run to look up the latest release, or name one with  --version <tag>.');
+  const downloadUrl = release.url;
   step(
-    `Downloading the brain (${APPROX_SIZE})`,
+    'Downloading the brain',
     'the brain embeds source from dozens of RuvNet repos — too big for git, so it ships as a Release',
   );
-  info(`version: ${c.bold((release && release.tag) || RELEASE_VERSION)}`);
+  info(`version: ${c.bold(release.tag)}`);
   info(`from: ${downloadUrl}`);
   // Download into a PRIVATE, per-run temp DIR — never a predictable os.tmpdir()/ruvnet-brain-<pid>.zip
   // filename (CWE-377: a guessable path invites a pre-created or symlinked file at that location to be
@@ -374,7 +470,7 @@ async function obtainBundle(release) {
   process.on('exit', () => { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ } });
   const tmp = path.join(tmpDir, ASSET_NAME);
   try {
-    console.log(`    downloading the brain (${APPROX_SIZE})…`);
+    console.log('    downloading the brain…');
     await download(downloadUrl, tmp);
   } catch (e) {
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -432,21 +528,100 @@ export function copyLocalBundleInto(sourceDir, cacheDir) {
   return copied;
 }
 
-async function unzipInto(zipPath, cacheDir, sourceDir = null) {
+// ── the trusted coverage validator lives beside the updater, and only the INSTALLER puts it there ──
+// kb/forge-update.mjs (`loadTrustedCoverageValidator`) judges every downloaded bundle with
+// `KB_DIR/coverage-integrity.mjs` and dies — "installed coverage validator is missing; re-run the
+// current installer before self-update" — when it is absent. The bundle cannot be the source: the
+// validator vets the bundle, so it must come from the signed npm package. Measured 2026-09-12: no
+// production path had ever placed it (build-bundle's import walk cannot see the updater's dynamic
+// load; this installer imported the module for its own checks and never copied it), so every
+// 4.3.21 `--update` — the nightly included — died in the updater and fell back to a fresh install,
+// which a private-overlay brain refuses. Idempotent, byte-compared, atomic; a symlink is replaced by
+// a real file because a link is not a trusted regular file.
+const TRUSTED_VALIDATOR_SOURCE = path.join(REPO_ROOT, 'plugin', 'scripts', 'coverage-integrity.mjs');
+// Byte-compared, atomic, symlink-safe placement of one file the installer owns inside the KB.
+function placeFileAtomic(target, bytes) {
+  let existing = null;
+  try { existing = fs.lstatSync(target); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  const unchanged = !!(existing && existing.isFile() && !existing.isSymbolicLink() && fs.readFileSync(target).equals(bytes));
+  if (!unchanged) {
+    const staged = `${target}.${process.pid}.${Date.now()}.tmp`;
+    fs.writeFileSync(staged, bytes, { mode: 0o644 });
+    if (existing && existing.isSymbolicLink()) fs.unlinkSync(target); // never write through a link
+    fs.renameSync(staged, target);
+  }
+  return { existing, unchanged };
+}
+// The updater that runs on a customer is the forge-update.mjs inside their OWN installed KB, which only
+// changes when a bundle replaces it — so a fix to the updater never reached installs that already had
+// one. The signed npm package carries the updater and the sibling modules it imports; the `--update`
+// preflight places them (same trust as the validator) so a stale updater upgrades itself before it runs.
+const UPDATER_FILES = ['forge-update.mjs', 'zip-extract.mjs', 'brain-profile.mjs', 'refresh-run.mjs',
+  'update-storage-transaction.mjs', 'lifecycle-evidence-retention.mjs', 'corpus-release-identity.mjs', 'download-retry.mjs', 'forge-guard-injection.mjs'];
+export function placeUpdater(kbDir, { sourceDir = path.join(REPO_ROOT, 'kb') } = {}) {
+  const placed = {};
+  for (const name of UPDATER_FILES) {
+    let bytes;
+    try { bytes = fs.readFileSync(path.join(sourceDir, name)); }
+    catch (error) { throw new Error(`updater file ${name} is missing from this package (${sourceDir}): ${error.message}`); }
+    placed[name] = placeFileAtomic(path.join(kbDir, name), bytes).unchanged ? 'unchanged' : 'placed';
+  }
+  return placed;
+}
+export function placeTrustedCoverageValidator(kbDir, { source = TRUSTED_VALIDATOR_SOURCE,
+  brainVersion = PACKAGE_VERSION } = {}) {
+  let bytes;
+  try { bytes = fs.readFileSync(source); }
+  catch (error) { throw new Error(`trusted coverage validator is missing from this package (${source}): ${error.message}`); }
+  const target = path.join(kbDir, 'coverage-integrity.mjs');
+  const { existing, unchanged } = placeFileAtomic(target, bytes);
+  // STAMP THE APPROVED RUNTIME IN THE SAME BREATH AS PLACING ITS EXECUTABLES (ADR-086 step 16).
+  //
+  // This is the one moment where "which runtime is this brain running" is a measured fact rather
+  // than an assertion: the bytes were just written from THIS package, so the version and the hashes
+  // are recorded together and cannot drift. kb/forge-update.mjs re-hashes them before it will accept
+  // a corpus release — Dual: "Pinning survives only through enforced equality to the approved
+  // shipped runtime and its executable hashes. Copying current-main package.json or preserving a
+  // version string alone is insufficient." Re-stamped on every placement (install AND `--update`
+  // preflight), so an upgraded runtime immediately supersedes the previous pin.
+  const runtime = writeInstalledRuntimeIdentity(kbDir, { brainVersion });
+  return { action: unchanged ? 'unchanged' : (existing ? 'replaced' : 'placed'), path: target, runtimeIdentity: runtime };
+}
+/** `--update` preflight: place the validator only where an updater exists to consume it. */
+export function ensureUpdaterPrerequisites(kbDir) {
+  if (!fs.existsSync(path.join(kbDir, 'forge-update.mjs'))) return { updater: false, validator: null };
+  return { updater: true, files: placeUpdater(kbDir), validator: placeTrustedCoverageValidator(kbDir) };
+}
+
+export async function unzipInto(zipPath, cacheDir, sourceDir = null, { releaseTag = null, activate = true } = {}) {
   step(
     'Unpacking the brain into place',
     'so the plugin finds forge-mcp-all.mjs and the vector stores right where it looks',
   );
 
-  const localCopy = async () => `local directory copy — ${copyLocalBundleInto(sourceDir, cacheDir)} top-level entries`;
+  fs.mkdirSync(path.dirname(cacheDir), { recursive: true });
+  // DISK-SPACE PREFLIGHT before staging: the whole unpacked bundle lands beside the brain (the prior
+  // generation is renamed, never copied). Refuse cleanly with the exact shortfall rather than ENOSPC
+  // half-way through an extraction.
+  if (zipPath && !sourceDir) {
+    let space;
+    try {
+      const { zipDeclaredBytes } = await import(new URL('../kb/zip-extract.mjs', import.meta.url).href);
+      space = checkDiskSpace([{ dir: path.dirname(cacheDir), bytes: zipDeclaredBytes(zipPath), purpose: 'unpacked brain' }],
+        { what: 'install the brain' });
+    } catch { space = { ok: true }; } // unmeasurable: extraction's own limits still apply
+    if (!space.ok) die(space.message.split('\n')[0], 'Nothing was installed and nothing was changed.');
+  }
+  const stageDir = fs.mkdtempSync(path.join(path.dirname(cacheDir), `.${path.basename(cacheDir)}.install-stage-`));
+  const localCopy = async () => `local directory copy — ${copyLocalBundleInto(sourceDir, stageDir)} top-level entries`;
   const nodeExtract = async () => {
     const { extractZip } = await import(new URL('../kb/zip-extract.mjs', import.meta.url).href);
-    const r = await extractZip(zipPath, cacheDir);
+    const r = await extractZip(zipPath, stageDir);
     return `node:zlib — ${r.files} files, ${(r.bytes / 1e6).toFixed(1)}MB${r.crcChecked ? ', CRC verified' : ''}`;
   };
   const unzipExtract = async () => {
     if (!have('unzip')) throw new Error('`unzip` is not on PATH');
-    run('unzip', ['-q', '-o', zipPath, '-d', cacheDir]);
+    run('unzip', ['-q', '-o', zipPath, '-d', stageDir]);
     return 'unzip';
   };
   const psExtract = async () => {
@@ -461,7 +636,7 @@ async function unzipInto(zipPath, cacheDir, sourceDir = null) {
     if (!psExe) throw new Error('neither `pwsh` nor `powershell` is on PATH');
     run(psExe, [
       '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command',
-      `Expand-Archive -LiteralPath "${zipPath}" -DestinationPath "${cacheDir}" -Force`,
+      `Expand-Archive -LiteralPath "${zipPath}" -DestinationPath "${stageDir}" -Force`,
     ], { shell: false });
     return `${psExe} Expand-Archive`;
   };
@@ -481,6 +656,7 @@ async function unzipInto(zipPath, cacheDir, sourceDir = null) {
     catch (e) { failures.push(`  • ${label}: ${(e && e.message) || e}`); }
   }
   if (!extractedBy) {
+    fs.rmSync(stageDir, { recursive: true, force: true });
     die(
       `extraction failed — every available method was tried and each one is reported below.\n${failures.join('\n')}`,
       [
@@ -493,34 +669,436 @@ async function unzipInto(zipPath, cacheDir, sourceDir = null) {
   }
   if (failures.length) warn(`extracted via ${extractedBy} after ${failures.length} method(s) failed:\n${failures.join('\n')}`);
 
-  const nested = path.join(cacheDir, 'ruvnet-brain');
+  const nested = path.join(stageDir, 'ruvnet-brain');
   if (fs.existsSync(path.join(nested, 'forge-mcp-all.mjs'))) {
     for (const entry of fs.readdirSync(nested)) {
       const from = path.join(nested, entry);
-      const to = path.join(cacheDir, entry);
-      fs.rmSync(to, { recursive: true, force: true }); // idempotent overwrite
+      const to = path.join(stageDir, entry);
       fs.renameSync(from, to); // same filesystem → cheap rename
     }
     fs.rmdirSync(nested);
   }
 
-  // An update is a replacement, not an overlay. Before this prune existed, installing a public
-  // bundle over a KB that once contained private stores left every omitted `.rvf` and passages file
-  // behind. discoverRepos() then served those stale stores as if they were part of the new bundle.
-  // Only repo-artifact families are touched; reader deps, local logs, preferences, and unrelated
-  // files remain byte-for-byte.
-  const pruned = pruneUnlistedStores(cacheDir);
-  if (pruned.length) {
-    warn(`pruned ${pruned.length} stale repo artifact file(s) omitted by this bundle: ${[...new Set(pruned.map((p) => p.repo))].join(', ')}`);
-  }
-
-  if (!fs.existsSync(path.join(cacheDir, 'forge-mcp-all.mjs'))) {
+  if (!fs.existsSync(path.join(stageDir, 'forge-mcp-all.mjs'))) {
+    fs.rmSync(stageDir, { recursive: true, force: true });
     die(
-      `the brain unpacked but forge-mcp-all.mjs is missing from ${cacheDir}.`,
+      `the staged brain is missing forge-mcp-all.mjs.`,
       `The archive layout may have changed. Re-run, or report this at https://github.com/stuinfla/ruvnet-brain/issues`,
     );
   }
+  // A freshly installed brain must be able to self-update on its first night: the bundle never
+  // carries the trusted validator its own updater demands, so the installer lays it into the stage.
+  placeTrustedCoverageValidator(stageDir);
+  // THE TRANSPORT IDENTITY LANDS WITH THE BYTES. When `releases/latest` is a corpus release, the
+  // tag that authenticated these bytes (`corpus-sha256-<64 hex>`) is recorded in the STAGE, so the
+  // single rename below promotes the tree and its provenance together or promotes neither. Writing
+  // it after activation would leave a window where a crash yields an installed corpus this brain
+  // cannot name — and an unnamed corpus is a corpus the updater re-downloads every night.
+  // `brainVersion` / `releaseTag` are untouched: they are the runtime the bundle was built by, and
+  // a content address is not a version of that runtime (ADR-086 step 16, "keep runtime version
+  // distinct"). A non-corpus tag CLEARS any stale corpus tag — see recordCorpusTransportIdentity.
+  if (releaseTag) {
+    try { recordCorpusTransportIdentity(stageDir, { releaseTag }); }
+    catch (error) {
+      fs.rmSync(stageDir, { recursive: true, force: true });
+      die(`could not record the release identity into the staged brain (${error.message})`,
+        'The live brain was not touched. Re-run the installer.');
+    }
+  }
+  const stagedCoverage = validateCoverageDirectory(stageDir, { expectedVersion: PACKAGE_VERSION });
+  if (!stagedCoverage.valid) {
+    fs.rmSync(stageDir, { recursive: true, force: true });
+    die(`staged ReleaseCoverage failed integrity — ${stagedCoverage.failures.join('; ')}`,
+      'The live brain was not touched. Fetch a complete current release and retry.');
+  }
+
+  // Recovery (stageBundleForRecovery / kb/forge-update.mjs's applyVerifiedStagedRelease) consumes
+  // this authenticated, validated stage through runStorageTransaction instead — the SAME apply
+  // primitive main()'s normal --apply uses, which preserves a private overlay properly. Keep fresh
+  // activation below as the only owner of installer replacement and the private-overlay refusal:
+  // a caller that wants staged-only output must never fall through to it.
+  if (!activate) return { status: 'STAGED', stageDir, extractedBy, coverage: stagedCoverage };
+
+  // Activation is an exact directory generation swap. A malformed candidate never reaches this
+  // point, retired public files cannot survive as overlay debris, and a failed rename restores the
+  // prior generation. Existing private overlays are update-owned and must never be stripped by the
+  // fresh-install fallback.
+  if (fs.existsSync(path.join(cacheDir, 'SOURCE.json'))) {
+    try {
+      const current = JSON.parse(fs.readFileSync(path.join(cacheDir, 'SOURCE.json'), 'utf8'));
+      const stores = Array.isArray(current.stores) ? current.stores : Object.values(current.stores || {});
+      if (stores.some((store) => store?.updateManaged === false)) {
+        fs.rmSync(stageDir, { recursive: true, force: true });
+        die('fresh-install activation refused because this brain contains a private overlay',
+          `Run ${c.bold('npx ruvnet-brain --update')} so the bundle updater preserves those private stores.`);
+      }
+    } catch (error) {
+      fs.rmSync(stageDir, { recursive: true, force: true });
+      die(`existing SOURCE.json is unreadable — refusing an exact-tree replacement (${error.message})`);
+    }
+  }
+  const parent = path.dirname(cacheDir);
+  // THE ACTIVATION IS IN PROGRESS from here until the prior generation is proven and released (review S6).
+  // A plain install holds no refresh lock, so this marker (with our pid) is what tells the detached
+  // SessionStart sweep (plugin/scripts/brain-footprint.mjs) to touch NOTHING beside the KB meanwhile — it
+  // used to be able to delete kb.install-prior-* between the two renames below, stranding the rollback.
+  // A die() leaves it naming a dead pid, which the sweep treats as finished.
+  const activationMarker = path.join(parent, `.${path.basename(cacheDir)}.install-activation.lock`);
+  const clearActivationMarker = () => { try { fs.rmSync(activationMarker, { force: true }); } catch { /* a dead pid reads as finished */ } };
+  fs.writeFileSync(activationMarker, `${JSON.stringify({ pid: process.pid, at: Date.now() })}\n`, { mode: 0o600 });
+  process.once('exit', clearActivationMarker);
+  const priorPrefix = `${path.basename(cacheDir)}.install-prior-`;
+  const unresolved = fs.readdirSync(parent).filter((name) => name.startsWith(priorPrefix));
+  if (unresolved.length) {
+    fs.rmSync(stageDir, { recursive: true, force: true });
+    die(`unresolved installer rollback state exists: ${unresolved.join(', ')}`,
+      'Restore or remove that retained generation after inspection, then retry.');
+  }
+  const priorDir = `${cacheDir}.install-prior-${Date.now()}-${process.pid}`;
+  const preservedDir = `${cacheDir}.install-preserved-${path.basename(stageDir).split('.install-stage-').pop()}`;
+  const hadPrior = fs.existsSync(cacheDir);
+  const stageIdentity = fs.lstatSync(stageDir);
+  let priorMoved = false;
+  let activated = false;
+  try {
+    if (hadPrior) {
+      fs.renameSync(cacheDir, priorDir);
+      priorMoved = true;
+    }
+    fs.renameSync(stageDir, cacheDir);
+    activated = true;
+    const landedCoverage = validateCoverageDirectory(cacheDir, { expectedVersion: PACKAGE_VERSION });
+    if (!landedCoverage.valid) throw new Error(`landed ReleaseCoverage failed integrity: ${landedCoverage.failures.join('; ')}`);
+    if (hadPrior) {
+      // SOURCE only identifies declared stores; ReleaseCoverage does not establish ownership of
+      // every old code/custom file. Preserve the ENTIRE old tree, including symlinks without
+      // following them. This is unclassified user-data retention, NOT a managed cleanup backup.
+      if (fs.existsSync(preservedDir)) throw new Error(`preservation path already exists: ${preservedDir}`);
+      fs.renameSync(priorDir, preservedDir);
+    }
+  } catch (error) {
+    try {
+      // Never remove the live path merely because activation was attempted. In particular,
+      // a failed first rename leaves the ORIGINAL generation there. Retain a failed candidate
+      // for inspection, and refuse to move a replacement directory we did not activate.
+      if (activated) {
+        const landedIdentity = fs.lstatSync(cacheDir);
+        if (landedIdentity.dev !== stageIdentity.dev || landedIdentity.ino !== stageIdentity.ino ||
+            !landedIdentity.isDirectory() || fs.existsSync(stageDir)) {
+          throw new Error('activated directory identity changed; refusing rollback mutation');
+        }
+        fs.renameSync(cacheDir, stageDir);
+      }
+      if (priorMoved) {
+        if (fs.existsSync(cacheDir)) throw new Error('live path is occupied; refusing to replace it during rollback');
+        fs.renameSync(priorDir, cacheDir);
+      }
+    } catch (rollbackError) {
+      die(`activation failed (${error.message}); rollback also failed (${rollbackError.message})`,
+        `Recovery paths: prior=${priorDir}, candidate=${stageDir}, live=${cacheDir}.`, true);
+    }
+    die(`activation failed (${error.message}); ${priorMoved ? 'restored the prior brain generation' :
+      hadPrior ? 'the prior brain generation was not moved' : 'no prior brain generation existed'}`,
+    `Candidate retained for inspection at ${stageDir}.`);
+  }
+  // THE CREATOR NO LONGER LEAVES A SECOND KB BEHIND (ADR-0098). The new generation just passed landed
+  // coverage validation, so the prior one is released the moment kbCopyProof shows nothing in it is
+  // unique: every private-store file byte-identical in the live brain, every store the live brain lacks
+  // of public provenance. A copy holding anything else is KEPT and its files are named. Measured
+  // 2026-10-01: two install-preserved copies (~2.4 GB) had outlived every proof that could release them.
+  let priorGeneration = null;
+  if (hadPrior) {
+    const proof = kbCopyProof({ copyDir: preservedDir, liveDir: cacheDir });
+    if (proof.disposable) {
+      try {
+        // Its logs and ruflo scratch are copied out and verified first; a failed rescue keeps the copy. The
+        // rescue root is the sweep's (footprintRoots: links resolved, as after --move-brain), so the inventory
+        // finds and bounds kb-copy-rescued/ wherever the installer put it.
+        rescueOperationalFiles(preservedDir, proof.rescue, footprintRoots().brainHome);
+        fs.rmSync(preservedDir, { recursive: true, force: true });
+        ok(`released the prior generation (${proof.reason})`);
+        priorGeneration = { status: 'RELEASED', path: preservedDir, reason: proof.reason };
+      } catch (error) {
+        warn(`prior generation could not be removed (${error.message}); the next update or  npx ruvnet-brain --clean  retries`);
+        priorGeneration = { status: 'PRESERVED_UNCLASSIFIED', path: preservedDir, automaticCleanupEligible: true };
+      }
+    } else {
+      warn(`KEPT the prior generation at ${preservedDir}: ${proof.reason}`);
+      for (const { file, why } of proof.unique.slice(0, 10)) info(c.dim(`  ${file} — ${why}`));
+      priorGeneration = { status: 'PRESERVED_UNIQUE', path: preservedDir, unique: proof.unique, automaticCleanupEligible: false };
+    }
+  }
+  clearActivationMarker();
+  process.removeListener('exit', clearActivationMarker);
   ok(`brain unpacked to ${cacheDir}`);
+  return { status: 'ACTIVATED', priorGeneration };
+}
+
+/** Stage and validate a bundle for forge-update's private-overlay recovery rail
+ * (kb/forge-update.mjs's applyVerifiedStagedRelease) without touching the live generation. */
+export async function stageBundleForRecovery(zipPath, cacheDir, sourceDir = null, { releaseTag = null, signaturePath = `${zipPath}.sig` } = {}) {
+  const verified = verifyBundle(zipPath, signaturePath);
+  if (!verified.ok) throw new Error(`recovery bundle signature verification failed: ${verified.reason}`);
+  const bundleSha256 = crypto.createHash('sha256').update(fs.readFileSync(zipPath)).digest('hex');
+  const result = await unzipInto(zipPath, cacheDir, sourceDir, { releaseTag, activate: false });
+  fs.writeFileSync(`${result.stageDir}.staged-release.json`, JSON.stringify({
+    schemaVersion: 1, kind: 'ruvnet-brain-authenticated-stage', bundleSha256,
+    releaseTag, stagedAt: new Date().toISOString(),
+  }) + '\n', { mode: 0o600 });
+  return { ...result, bundleSha256 };
+}
+
+/**
+ * ISSUE #128 / #153 — STALE PLUGIN GENERATIONS MAY STILL BACK LIVE SESSIONS.
+ *
+ * `pruneUnlistedStores` below states the rule this repo already believes: "an update is a
+ * replacement, not an overlay." That rule was applied to KB stores and never to the plugin cache.
+ *
+ * Measured on the maintainer's machine 2026-08-10: the registry names ONE generation and the cache
+ * held TWENTY-EIGHT, 22 MB, each a complete generation with its own `skills/` and `hooks/`. Claude
+ * Code resolves skills by walking that directory rather than by honouring `installPath`, so old
+ * generations keep answering. One session announced three different versions, none of them the one
+ * executing, and the stale block's mandatory phrasing — "must say ONE version, never a second
+ * number" — made the assistant state the wrong version authoritatively in its first sentence.
+ *
+ * Worse than cosmetic: the three blocks CONTRADICT each other inside one session (one says do not
+ * restart, one says an update is landing, one mandates a third version), so whichever the model
+ * obeys, the user is misinformed by a source that sounds definitive.
+ *
+ * Registry reachability identifies candidates; it is not deletion proof. Claude freezes
+ * CLAUDE_PLUGIN_ROOT at session start, so an unregistered generation can remain live until that
+ * session exits. Modern roots expose `.in_use` PID-incarnation leases. Live or ambiguous leases
+ * retain the complete root; dead leases are collected. Legacy roots without the protocol are
+ * retained indefinitely because a frozen host session is not observable without a lease.
+ *
+ * WHAT MAKES DELETION SAFE HERE, since this removes directories from someone's machine:
+ *   • The registry is the ONLY authority. Unreadable, missing, or naming no ruvnet-brain install →
+ *     nothing is removed and a reason is returned. Never guess what to delete — the same discipline
+ *     as pruneUnlistedStores' catch, for a far larger blast radius.
+ *   • Only siblings of a registered installPath are considered, so the scan cannot wander.
+ *   • A candidate must LOOK like a generation (its own .claude-plugin/plugin.json). Anything else is
+ *     someone else's data and is left alone.
+ *   • Symlinks are never followed or removed: scripts/dev-plugin-link.sh links a dev checkout in
+ *     here, and deleting through that link would delete the working tree.
+ *   • EVERY registered installPath is protected, not just the first — the plugin may legitimately be
+ *     installed at both user and project scope, and treating one as stale would delete a live install.
+ *   • Registered generations are excluded by RESOLVED PATH, never by version string.
+ *   • The registry is re-read immediately before deletion; any byte change retains the candidate.
+ *   • Malformed, unreadable, symlinked, live, or unverifiable lease state fails closed.
+ *   • Report-only unless `apply` is set, and every removal is returned by name, so a silent sweep is
+ *     impossible.
+ */
+export function prunePluginGenerations({
+  registryPath = path.join(os.homedir(), '.claude', 'plugins', 'installed_plugins.json'),
+  apply = false,
+  now = () => Date.now(),
+  graceMs = 14 * 24 * 60 * 60 * 1000,
+  processIdentity = pluginProcessIdentity,
+} = {}) {
+  const nothing = (why) => ({ active: [], stale: [], marked: [], removed: [], bytes: 0, staleBytes: 0, cleanupBlocked: [], why });
+  let registryRaw;
+  let registry;
+  try {
+    registryRaw = fs.readFileSync(registryPath, 'utf8');
+    registry = JSON.parse(registryRaw);
+  } catch (e) {
+    return nothing(`plugin registry unreadable (${e.code || e.message}) — refusing to remove anything`);
+  }
+  const active = Object.entries(registry?.plugins || {})
+    .filter(([name]) => /^ruvnet-brain@/.test(name))
+    .flatMap(([, v]) => (Array.isArray(v) ? v : []))
+    .map((e) => e?.installPath)
+    .filter((p) => typeof p === 'string' && p);
+  if (!active.length) return nothing('no ruvnet-brain install is registered — refusing to remove anything');
+
+  const keep = new Set(active.map((p) => path.resolve(p)));
+  const stale = [];
+  for (const parent of new Set(active.map((p) => path.dirname(path.resolve(p))))) {
+    let names = [];
+    try { names = fs.readdirSync(parent); } catch { continue; }
+    for (const name of names) {
+      const full = path.resolve(parent, name);
+      if (keep.has(full)) continue;
+      let st;
+      try { st = fs.lstatSync(full); } catch { continue; }
+      if (st.isSymbolicLink() || !st.isDirectory()) continue;
+      if (!fs.existsSync(path.join(full, '.claude-plugin', 'plugin.json'))) continue;
+      stale.push({ path: full, version: name, bytes: dirBytes(full) });
+    }
+  }
+  const staleBytes = stale.reduce((n, s) => n + s.bytes, 0);
+  if (!apply) return { active, stale, marked: [], removed: [], bytes: 0, staleBytes, cleanupBlocked: [], why: null };
+
+  const marked = [];
+  const removed = [];
+  const cleanupBlocked = [];
+  let freed = 0;
+  for (const candidate of stale) {
+    const marker = path.join(candidate.path, '.orphaned_at');
+    if (!fs.existsSync(marker)) {
+      const temporary = `${marker}.tmp.${process.pid}.${crypto.randomBytes(4).toString('hex')}`;
+      try {
+        fs.writeFileSync(temporary, String(now()), { flag: 'wx', mode: 0o600 });
+        fs.renameSync(temporary, marker);
+        marked.push(candidate.version);
+      } catch {
+        try { fs.rmSync(temporary, { force: true }); } catch { /* retain on ambiguity */ }
+      }
+    }
+
+    let orphanedAt;
+    try {
+      const markerStat = fs.lstatSync(marker);
+      if (!markerStat.isFile() || markerStat.isSymbolicLink()) {
+        cleanupBlocked.push({ version: candidate.version, reason: '.orphaned_at is not a trusted file' });
+        continue;
+      }
+      orphanedAt = Number(fs.readFileSync(marker, 'utf8').trim());
+      if (!Number.isFinite(orphanedAt) || orphanedAt <= 0) {
+        cleanupBlocked.push({ version: candidate.version, reason: '.orphaned_at is malformed' });
+        continue;
+      }
+    } catch {
+      cleanupBlocked.push({ version: candidate.version, reason: '.orphaned_at could not be inspected' });
+      continue;
+    }
+
+    const leaseDir = path.join(candidate.path, '.in_use');
+    let leaseCapable = false;
+    let leaseNames = [];
+    try {
+      if (fs.existsSync(leaseDir)) {
+        const leaseDirStat = fs.lstatSync(leaseDir);
+        if (leaseDirStat.isSymbolicLink() || !leaseDirStat.isDirectory()) {
+          cleanupBlocked.push({ version: candidate.version, reason: '.in_use is not a trusted directory' });
+          continue;
+        }
+        leaseCapable = true;
+        leaseNames = fs.readdirSync(leaseDir);
+      }
+    } catch {
+      cleanupBlocked.push({ version: candidate.version, reason: '.in_use could not be inspected' });
+      continue;
+    }
+
+    if (!leaseCapable) {
+      if (now() - orphanedAt < graceMs) continue;
+      cleanupBlocked.push({ version: candidate.version, reason: 'legacy generation has no liveness lease; refusing destructive cleanup' });
+      continue;
+    }
+    let safeToReap = true;
+    for (const leaseName of leaseNames) {
+      const leasePath = path.join(leaseDir, leaseName);
+      let lease;
+      try {
+        const leaseStat = fs.lstatSync(leasePath);
+        if (!leaseStat.isFile() || leaseStat.isSymbolicLink()) throw new Error('not a trusted file');
+        lease = JSON.parse(fs.readFileSync(leasePath, 'utf8'));
+        if (!Number.isSafeInteger(lease?.pid) || lease.pid <= 0 || typeof lease?.procStart !== 'string' || !lease.procStart.trim()) {
+          throw new Error('malformed');
+        }
+      } catch {
+        cleanupBlocked.push({ version: candidate.version, reason: `lease ${leaseName} is malformed or unreadable` });
+        safeToReap = false;
+        break;
+      }
+      const state = processIdentity(lease);
+      if (state !== 'dead') {
+        cleanupBlocked.push({ version: candidate.version, reason: `lease ${leaseName} is ${state === 'live' ? 'live' : 'ambiguous'}` });
+        safeToReap = false;
+        break;
+      }
+      try { fs.rmSync(leasePath); } catch {
+        cleanupBlocked.push({ version: candidate.version, reason: `dead lease ${leaseName} could not be removed` });
+        safeToReap = false;
+        break;
+      }
+    }
+    if (!safeToReap) continue;
+
+    // The host registry can advance while the collector scans. Any byte change invalidates the
+    // original authority snapshot; retain every candidate rather than deleting on stale evidence.
+    let currentRaw;
+    try { currentRaw = fs.readFileSync(registryPath, 'utf8'); } catch { continue; }
+    if (currentRaw !== registryRaw) continue;
+    try {
+      fs.rmSync(candidate.path, { recursive: true });
+      removed.push(candidate.version);
+      freed += candidate.bytes;
+    } catch { /* retained for a later pass */ }
+  }
+  return {
+    active, stale, marked, removed, bytes: freed, staleBytes, cleanupBlocked,
+    why: stale.length
+      ? 'lease-proven orphan reconciliation; legacy generations receive a 14-day grace and live or ambiguous generations are retained'
+      : null,
+  };
+}
+
+/** Verify the exact PID incarnation recorded by a plugin generation lease. */
+function pluginProcessIdentity({ pid, procStart }) {
+  try { process.kill(pid, 0); } catch (error) {
+    return error?.code === 'ESRCH' ? 'dead' : 'unknown';
+  }
+  const result = process.platform === 'win32'
+    ? spawnSync('powershell.exe', [
+      '-NoProfile', '-NonInteractive', '-Command',
+      `$p=Get-Process -Id ${pid} -ErrorAction Stop; $p.StartTime.ToUniversalTime().ToString('ddd MMM dd HH:mm:ss yyyy',[Globalization.CultureInfo]::InvariantCulture)`,
+    ], { encoding: 'utf8' })
+    : spawnSync('ps', ['-p', String(pid), '-o', 'lstart='], {
+      encoding: 'utf8', env: { ...process.env, TZ: 'UTC', LC_ALL: 'C', LANG: 'C' },
+    });
+  if (result.status !== 0 || !String(result.stdout || '').trim()) return 'unknown';
+  return String(result.stdout).trim() === procStart.trim() ? 'live' : 'dead';
+}
+
+/** Size of a directory tree, best-effort — used only to report what was or would be freed. */
+function dirBytes(dir) {
+  let total = 0;
+  const walk = (d) => {
+    let items = [];
+    try { items = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const it of items) {
+      const p = path.join(d, it.name);
+      if (it.isSymbolicLink()) continue;
+      if (it.isDirectory()) { walk(p); continue; }
+      try { total += fs.statSync(p).size; } catch { /* vanished mid-walk */ }
+    }
+  };
+  walk(dir);
+  return total;
+}
+
+
+/**
+ * Every relative module `server.mjs` needs, transitively — read from the source, never restated.
+ *
+ * Bounded and cycle-safe. Returns `{ spec, from }` with the spec EXACTLY as written, because the
+ * copy target is resolved against the destination using that same spec: preserving the specifier is
+ * what makes `./sibling.mjs` and `../scripts/sibling.mjs` both land where the server will look.
+ */
+export function serverDependencies(source, seen = new Set()) {
+  const out = [];
+  const walk = (file, specPrefix) => {
+    if (seen.has(file)) return;
+    seen.add(file);
+    let src = '';
+    try { src = fs.readFileSync(file, 'utf8'); } catch { return; }
+    // Lazy [^'"]* (no \n exclusion) so a multi-line named import — `import {\n  a,\n} from './x.mjs';`
+    // — is still seen: the exclusion used to stop at the first newline, so this walker silently
+    // missed any dependency imported that way. Caught live 2026-09-27: a multi-line import in the
+    // lifecycle hook never reached the Codex MCP server package, reproducing the exact
+    // packaging-boundary failure this function's own header warns about.
+    for (const m of src.matchAll(/^\s*(?:import|export)[^'"]*?from\s*['"](\.[^'"]+)['"]/gm)) {
+      const spec = specPrefix ? path.join(specPrefix, m[1]) : m[1];
+      const from = path.resolve(path.dirname(file), m[1]);
+      if (out.some((d) => d.from === from)) continue;
+      out.push({ spec: spec.startsWith('.') ? spec : `./${spec}`, from });
+      walk(from, path.dirname(spec));
+    }
+  };
+  walk(source, '');
+  return out;
 }
 
 export function pruneUnlistedStores(cacheDir) {
@@ -604,7 +1182,7 @@ function installReader(cacheDir) {
 // though installation was green. Persist the exact runtime shipped by the installer underneath the
 // installed KB: Node then resolves optional reader dependencies from `<cacheDir>/node_modules`, and
 // both Claude Code and Codex get one stable path with no source clone or second package install.
-export function installConsoleRuntime(cacheDir, sourceRoot = REPO_ROOT) {
+export function beginConsoleRuntimeTransaction(cacheDir, sourceRoot = REPO_ROOT) {
   const runtime = path.join(cacheDir, '.console-runtime');
   const staged = `${runtime}.tmp-${process.pid}`;
   const prior = `${runtime}.prior-${process.pid}`;
@@ -612,35 +1190,149 @@ export function installConsoleRuntime(cacheDir, sourceRoot = REPO_ROOT) {
   fs.rmSync(prior, { recursive: true, force: true });
   fs.mkdirSync(staged, { recursive: true, mode: 0o700 });
 
-  const required = [
-    ['console', 'console'],
-    ['scripts', 'scripts'],
-    ['plugin/scripts', 'plugin/scripts'],
-    ['kb/brain-profile.mjs', 'kb/brain-profile.mjs'],
-    ['bin/install.mjs', 'bin/install.mjs'],
-    ['package.json', 'package.json'],
-  ];
-  for (const [from, to] of required) {
-    const source = path.join(sourceRoot, from);
+  // The copy list IS the generation's digest input (scripts/console-runtime-identity.mjs). Adding a
+  // file the runtime needs adds it to the runtime's identity in the same edit, so an asset can never
+  // again travel separately from the executable that reads it (#76) and a candidate can never again
+  // be indistinguishable from the one it replaces (#79).
+  for (const relative of CONSOLE_RUNTIME_SURFACE) {
+    const source = path.join(sourceRoot, relative);
     if (!fs.existsSync(source)) {
       fs.rmSync(staged, { recursive: true, force: true });
-      throw new Error(`console runtime is incomplete: missing ${from}`);
+      throw new Error(`console runtime is incomplete: missing ${relative}`);
     }
-    const target = path.join(staged, to);
+    const target = path.join(staged, relative);
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.cpSync(source, target, { recursive: true, force: true, preserveTimestamps: true });
   }
 
-  if (fs.existsSync(runtime)) fs.renameSync(runtime, prior);
+  let packageManifest;
   try {
-    fs.renameSync(staged, runtime);
-    fs.rmSync(prior, { recursive: true, force: true });
+    packageManifest = JSON.parse(fs.readFileSync(path.join(staged, 'package.json'), 'utf8'));
   } catch (error) {
-    if (fs.existsSync(prior) && !fs.existsSync(runtime)) fs.renameSync(prior, runtime);
     fs.rmSync(staged, { recursive: true, force: true });
+    throw new Error(`console runtime identity is invalid: ${error.message}`);
+  }
+  if (!packageManifest.version || packageManifest.version !== PACKAGE_VERSION) {
+    fs.rmSync(staged, { recursive: true, force: true });
+    throw new Error(`console runtime version ${packageManifest.version || '(missing)'} does not match candidate ${PACKAGE_VERSION}`);
+  }
+  try {
+    const providerCatalog = JSON.parse(fs.readFileSync(path.join(staged, 'data', 'model-catalog.json'), 'utf8'));
+    if (!providerCatalog.providers || typeof providerCatalog.providers !== 'object' || !Object.keys(providerCatalog.providers).length) {
+      throw new Error('providers object is missing or empty');
+    }
+  } catch (error) {
+    fs.rmSync(staged, { recursive: true, force: true });
+    throw new Error(`console runtime model-catalog is invalid: ${error.message}`);
+  }
+  const stagedEntry = path.join(staged, 'scripts', 'onboarding-console.mjs');
+  for (const syntaxTarget of [stagedEntry, path.join(staged, 'bin', 'install.mjs')]) {
+    const checked = spawnSync(process.execPath, ['--check', syntaxTarget], { encoding: 'utf8' });
+    if (checked.error || checked.status !== 0) {
+      fs.rmSync(staged, { recursive: true, force: true });
+      throw new Error(`console runtime failed syntax verification: ${path.relative(staged, syntaxTarget)}`);
+    }
+  }
+  // #76: prove the installed What's New boundary from the staged bytes, not from a file listing. The
+  // executable exits nonzero when its version manifest or curated notes are absent, so a runtime that
+  // would have to tell the user "the notes are unavailable" never activates in the first place.
+  const stagedWhatsNew = path.join(staged, 'plugin', 'scripts', 'whats-new.mjs');
+  const whatsNew = spawnSync(process.execPath, [stagedWhatsNew], { encoding: 'utf8' });
+  if (whatsNew.error || whatsNew.status !== 0) {
+    const detail = (whatsNew.stderr || whatsNew.error?.message || `exit ${whatsNew.status}`).trim();
+    fs.rmSync(staged, { recursive: true, force: true });
+    throw new Error(`console runtime cannot report its own release notes: ${detail}`);
+  }
+  const identity = {
+    product: 'ruvnet-brain-console-runtime',
+    schema: 1,
+    apiContract: 1,
+    runtimeVersion: packageManifest.version,
+    entrypoint: 'scripts/onboarding-console.mjs',
+    // The WHOLE runtime, not just its entrypoint (#79). The launcher compares this against a live
+    // server's self-reported identity, so it has to change whenever anything the server executes or
+    // serves changes — otherwise a stale process passes as current.
+    sourceSha256: consoleRuntimeDigest(staged),
+  };
+  fs.writeFileSync(path.join(staged, CONSOLE_RUNTIME_IDENTITY_FILE), `${JSON.stringify(identity, null, 2)}\n`, { mode: 0o600 });
+
+  let state = 'staged';
+  const entry = path.join(runtime, identity.entrypoint);
+  return {
+    identity,
+    entry,
+    activate() {
+      if (state !== 'staged') throw new Error(`console runtime transaction cannot activate from ${state}`);
+      if (fs.existsSync(runtime)) fs.renameSync(runtime, prior);
+      try {
+        fs.renameSync(staged, runtime);
+        state = 'active';
+        return entry;
+      } catch (error) {
+        if (fs.existsSync(prior) && !fs.existsSync(runtime)) fs.renameSync(prior, runtime);
+        fs.rmSync(staged, { recursive: true, force: true });
+        state = 'rolled-back';
+        throw error;
+      }
+    },
+    commit() {
+      if (state !== 'active') throw new Error(`console runtime transaction cannot commit from ${state}`);
+      fs.rmSync(prior, { recursive: true, force: true });
+      state = 'committed';
+      return entry;
+    },
+    rollback() {
+      if (state === 'staged') fs.rmSync(staged, { recursive: true, force: true });
+      if (state === 'active') {
+        fs.rmSync(runtime, { recursive: true, force: true });
+        if (fs.existsSync(prior)) fs.renameSync(prior, runtime);
+      }
+      fs.rmSync(staged, { recursive: true, force: true });
+      fs.rmSync(prior, { recursive: true, force: true });
+      state = 'rolled-back';
+    },
+  };
+}
+
+export function installConsoleRuntime(cacheDir, sourceRoot = REPO_ROOT) {
+  const transaction = beginConsoleRuntimeTransaction(cacheDir, sourceRoot);
+  try {
+    transaction.activate();
+    return transaction.commit();
+  } catch (error) {
+    transaction.rollback();
     throw error;
   }
-  return path.join(runtime, 'scripts', 'onboarding-console.mjs');
+}
+
+// Receipts of Consoles that died (pid gone, port silent) are pruned, not counted: the owner's Mac
+// reported pending-console-restart forever from two receipts left on 2026-09-16/17
+// (scripts/console-instances.mjs).
+/**
+ * --doctor's view of a recorded convergence receipt. Its Console state is a snapshot from the last sync;
+ * a recorded pending-console-restart is re-read against the LIVE receipts, so a Console that has since
+ * exited (or a receipt it left when it died) stops failing --doctor. Returns a new object.
+ */
+export function withLiveConsoleState(recorded, { receiptDir, alive, probe } = {}) {
+  if (recorded?.consoleRuntime?.state !== 'pending-console-restart' || !recorded.consoleRuntime.sourceSha256) return recorded;
+  const { replacementFailures, ...kept } = recorded.consoleRuntime;
+  const live = { ...kept, ...consoleRestartState(recorded.consoleRuntime, { receiptDir, alive, probe }) };
+  if (live.state !== 'ready' && replacementFailures) live.replacementFailures = replacementFailures;
+  return { ...recorded, consoleRuntime: live };
+}
+
+export function consoleRestartState(identity, {
+  receiptDir = path.join(process.env.RUVNET_BRAIN_HOME || path.join(os.homedir(), '.cache', 'ruvnet-brain'), 'console-instances'),
+  alive, probe,
+} = {}) {
+  const { live, pruned } = readConsoleReceipts(receiptDir, { ...(alive ? { alive } : {}), ...(probe ? { probe } : {}) });
+  const staleInstances = live.filter(({ receipt }) => receipt.sourceSha256 !== identity.sourceSha256).length;
+  return {
+    state: staleInstances > 0 ? 'pending-console-restart' : 'ready',
+    instanceReceipts: live.length,
+    staleInstances,
+    ...(pruned.length ? { prunedDeadReceipts: pruned.length } : {}),
+  };
 }
 
 // ── plugin presence: the ONLY reliable proof the slash commands will exist ───────────────────────
@@ -650,7 +1342,7 @@ export function installConsoleRuntime(cacheDir, sourceRoot = REPO_ROOT) {
 //
 // The brain ships as TWO independent artifacts and this is the one people lose:
 //   • KB + search_ruvnet  — installed by this script into ~/.cache/ruvnet-brain
-//   • the Claude Code plugin — slash commands, the Console, the grounding hook
+//   • the Claude Code plugin — slash commands, the Console, skills, and MCP declaration
 // Checking the commands directory on disk is what distinguishes them; a `claude plugin install`
 // exit code does not.
 /** @returns {string|null} the commands dir if the plugin is really installed, else null */
@@ -699,15 +1391,101 @@ export function claudePluginStatus({ home = os.homedir() } = {}) {
   }
 }
 
+// #420 item 4: Claude Code also records per-project installs (scope "local"/"project", keyed by projectPath), and --update
+// moves only the user row above, so a project row keeps running its old generation. `claude plugin update --scope local`
+// acts on the project in its cwd, i.e. on someone's repo: REPORTED with the exact command, never run for them. A row whose
+// projectPath is gone cannot be running anything; it is listed, never counted as behind and never given a `cd` that fails.
+export function claudeProjectInstalls({ home = os.homedir(), referenceVersion = null } = {}) {
+  let rows;
+  try { rows = JSON.parse(fs.readFileSync(path.join(home, '.claude', 'plugins', 'installed_plugins.json'), 'utf8'))?.plugins?.['ruvnet-brain@ruvnet-brain']; } catch { return []; }
+  if (!Array.isArray(rows)) return [];
+  return rows.filter((row) => (row?.scope === 'local' || row?.scope === 'project') && typeof row.projectPath === 'string' && row.projectPath).map((row) => {
+    let version = null;
+    try { version = JSON.parse(fs.readFileSync(path.join(row.installPath, '.claude-plugin', 'plugin.json'), 'utf8'))?.version || null; } catch { /* registry metadata below */ }
+    version ||= typeof row.version === 'string' ? row.version : null;
+    let exists = false;
+    try { exists = fs.statSync(row.projectPath).isDirectory(); } catch { /* gone */ }
+    return { scope: row.scope, projectPath: row.projectPath, version, exists,
+      behind: exists && Boolean(referenceVersion) && !versionSatisfies(version, referenceVersion),
+      command: exists ? `cd '${row.projectPath.replace(/'/g, `'\\''`)}' && claude plugin update ruvnet-brain@ruvnet-brain --scope ${row.scope}` : null };
+  });
+}
+
+/** The doctor's advisory line for claudeProjectInstalls(): '!' while any existing project lags, never a ✗ (it is the user's project). */
+export function projectInstallsCheck(projects, referenceVersion) {
+  if (!projects.length) return null;
+  const behind = projects.filter((p) => p.behind);
+  const gone = projects.filter((p) => !p.exists);
+  const named = (p) => `${p.projectPath} (${p.scope}, ${p.version || 'unknown'})`;
+  const detail = behind.length
+    ? `${behind.length} per-project Claude Code install(s) behind ${referenceVersion}: ${behind.map(named).join(', ')}`
+    : `${projects.length - gone.length} per-project Claude Code install(s) at ${referenceVersion} or newer`;
+  return { id: 'project-installs', label: 'Projects', state: behind.length ? 'warn' : 'ok',
+    detail: `${detail}${gone.length ? `; ${gone.length} registered for a folder that no longer exists: ${gone.map(named).join(', ')}` : ''}`,
+    fix: behind.length ? behind.map((p) => p.command).join(' ; ') : null };
+}
+
+// A plugin version can change without changing anything a running host freezes at boot. Compare
+// the actual installed payload with this candidate before updating it so body-only releases do not
+// manufacture a restart requirement. Unknown paths fail closed: if we cannot prove the boundary,
+// the caller must retain the restart notice rather than silently promise hot loading.
+function inspectPluginShellBoundary(installedRoot, candidateRoot = path.join(REPO_ROOT, 'plugin')) {
+  if (!installedRoot || !candidateRoot) {
+    return { known: false, changed: true, paths: [], restartRequired: true, reason: 'plugin boot surface could not be located' };
+  }
+  try {
+    const paths = pluginShellDiff(installedRoot, candidateRoot);
+    return {
+      known: true,
+      changed: paths.length > 0,
+      paths,
+      restartRequired: paths.length > 0,
+      reason: paths.length ? `boot-level declarations changed: ${paths.join(', ')}` : 'body-only plugin update',
+    };
+  } catch (error) {
+    return { known: false, changed: true, paths: [], restartRequired: true,
+      reason: `plugin boot surface comparison failed: ${error.message}` };
+  }
+}
+
+function codexInstalledPluginRoot({ codexHome = codexHomeDir(), status } = {}) {
+  const row = status?.row || {};
+  for (const value of [status?.installPath, status?.path, row.installPath, row.path]) {
+    if (typeof value === 'string' && value) {
+      try {
+        const real = fs.realpathSync(value);
+        if (fs.statSync(real).isDirectory()) return real;
+      } catch { /* try the cache scan below */ }
+    }
+  }
+  const cacheRoot = path.join(codexHome, 'plugins', 'cache', 'ruvnet-brain', 'ruvnet-brain');
+  let candidates = [];
+  try {
+    candidates = fs.readdirSync(cacheRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => path.join(cacheRoot, entry.name))
+      .filter((dir) => {
+        try {
+          const manifest = JSON.parse(fs.readFileSync(path.join(dir, '.codex-plugin', 'plugin.json'), 'utf8'));
+          return manifest?.name === 'ruvnet-brain' && (!status?.version || manifest.version === status.version);
+        } catch { return false; }
+      });
+  } catch { /* absent cache is handled as unknown below */ }
+  return candidates.sort().at(-1) || null;
+}
+
 function wirePlugin({ expectedVersion = PACKAGE_VERSION, requireManaged = false } = {}) {
   step(
     'Wiring the Claude Code plugin',
-    'this registers search_ruvnet + the grounding hook so Claude uses the brain automatically',
+    `this registers search_ruvnet, native skills, slash commands, and the allowlisted lifecycle hooks (${shippedHookHandlerCounts().claude ?? 'unknown number of'} handlers)`,
   );
-  const manualMarketplace = 'claude plugin marketplace add stuinfla/ruvnet-brain';
+  const marketplaceSource = process.env.RUVNET_CLAUDE_MARKETPLACE_SOURCE || 'stuinfla/ruvnet-brain';
+  const manualMarketplace = `claude plugin marketplace add ${marketplaceSource}`;
   const manualInstall = 'claude plugin install ruvnet-brain@ruvnet-brain --scope user';
 
-  if (!have('claude')) {
+  const claudeCli = waitForHostCli('claude');
+  if (!claudeCli.present) {
+    if (claudeCli.message) warn(claudeCli.message);
     warn(`I couldn't run the \`claude\` command from this shell.`);
     info(`That's normal if you use Claude Code as the ${c.bold('VS Code extension')} or ${c.bold('desktop app')} — the`);
     info(`command just isn't on your terminal's PATH. ${c.green('The brain itself is fully downloaded.')}`);
@@ -720,16 +1498,19 @@ function wirePlugin({ expectedVersion = PACKAGE_VERSION, requireManaged = false 
 
   const before = claudePluginStatus();
   if (requireManaged && !before.managed) return { host: false, wired: false, action: 'unmanaged' };
+  const shellBoundary = before.installed
+    ? inspectPluginShellBoundary(before.installPath)
+    : { known: true, changed: false, paths: [], restartRequired: false, reason: 'new host installation' };
   const addedMarket = before.managed
-    ? tryRun('claude', ['plugin', 'marketplace', 'update', 'ruvnet-brain'])
-    : tryRun('claude', ['plugin', 'marketplace', 'add', 'stuinfla/ruvnet-brain']);
+    ? tryHostCli('claude', ['plugin', 'marketplace', 'update', 'ruvnet-brain'])
+    : tryHostCli('claude', ['plugin', 'marketplace', 'add', marketplaceSource]);
   // Deliberately NOT reassuring here. This used to say "it may already be added — that's fine",
   // which is a GUESS about someone else's machine, and when it was wrong the user finished the
   // install with a working search_ruvnet, no slash commands, and a message telling them all was
   // well. The real state is checked below; nothing is declared fine until it has been looked at.
   if (!addedMarket) info(`marketplace add didn't report success — checking what actually landed…`);
 
-  tryRun('claude', before.installed
+  tryHostCli('claude', before.installed
     ? ['plugin', 'update', 'ruvnet-brain@ruvnet-brain', '--scope', 'user']
     : ['plugin', 'install', 'ruvnet-brain@ruvnet-brain', '--scope', 'user']);
 
@@ -737,27 +1518,51 @@ function wirePlugin({ expectedVersion = PACKAGE_VERSION, requireManaged = false 
   // code says the command ran, not that the plugin is usable; the commands either exist on disk or
   // they do not. This is the difference between `/rvbc` working and "Unknown command: /rvbc".
   const installed = claudePluginStatus();
-  if (installed.installed && (!expectedVersion || installed.version === expectedVersion)) {
+  const installedHookRetirement = claudeInstalledHookRetirementStatus({ plugin: installed });
+  if (installed.installed && versionSatisfies(installed.version, expectedVersion) && installedHookRetirement.ok) {
     ok(`plugin installed at user scope (global, alongside Ruflo / RuVector) — exact version ${installed.version}`);
-    info(`  commands available after a restart: ${c.bold('/rvbc')}, ${c.bold('/ruvnet-brain:configure')}`);
-    return { host: true, wired: true, version: installed.version, manualMarketplace, manualInstall };
+    if (shellBoundary.restartRequired && shellBoundary.known) {
+      info(`  boot-level plugin declarations changed (${shellBoundary.paths.join(', ')}): new Claude Code sessions load them; already-open windows keep the old hook definitions until they are reopened.`);
+    } else if (shellBoundary.restartRequired) {
+      warn(`could not verify the plugin's boot-level declarations (${shellBoundary.reason}); restart Claude Code once to be sure they are loaded.`);
+    } else if (before.installed && before.version !== installed.version) {
+      info('  body-only update: the Stable Spine is live on the next hook/MCP call; no restart is required.');
+    }
+    info(`  commands available${shellBoundary.restartRequired ? ' in new sessions' : ' immediately'}: ${c.bold('/rnbc')} (also /rnb, /rvbc), ${c.bold('/ruvnet-brain:configure')}`);
+    // #420 item 4: the user row moved; per-project rows did not. Name each lagging one with its own command (never run here).
+    const projectsBehind = claudeProjectInstalls({ referenceVersion: installed.version }).filter((p) => p.behind);
+    for (const p of projectsBehind) {
+      warn(`per-project install still on ${p.version || 'an unknown version'} (${p.scope} scope, ${p.projectPath}); --update moves only the user install. To update it: ${c.bold(p.command)}`);
+    }
+    return {
+      host: true, wired: true, version: installed.version, manualMarketplace, manualInstall,
+      shellChanged: shellBoundary.changed, shellChangedPaths: shellBoundary.paths,
+      restartRequired: shellBoundary.restartRequired,
+      // 'open-sessions': the new declarations are installed and PROVEN changed — only sessions already
+      // open booted the old ones. 'unproven': the boot surface could not be compared at all.
+      ...(shellBoundary.restartRequired ? { sessionSafety: 'restart-required', sessionSafetyReason: shellBoundary.reason,
+        restartScope: shellBoundary.known ? 'open-sessions' : 'unproven' } : {}),
+    };
   }
 
   // The honest failure. The brain still WORKS — this is the difference between a broken install and
   // a partial one, and the user is told exactly which they have instead of being congratulated.
-  const mismatch = installed.installed && expectedVersion && installed.version !== expectedVersion;
-  warn(mismatch
-    ? `Claude installed ${installed.version || 'an unknown version'}, not required ${expectedVersion}; refusing to call this host converged.`
-    : `the plugin did NOT land — so slash commands like ${c.bold('/rvbc')} will not exist yet.`);
+  const mismatch = installed.installed && !versionSatisfies(installed.version, expectedVersion);
+  const staleHooks = installed.installed && !installedHookRetirement.ok;
+  warn(staleHooks
+    ? `Claude installed the plugin with ${installedHookRetirement.registrations.length} retired lifecycle registration(s); refusing to call this host converged.`
+    : mismatch
+      ? `Claude installed ${installed.version || 'an unknown version'}, not required ${expectedVersion}; refusing to call this host converged.`
+      : `the plugin did NOT land — so slash commands like ${c.bold('/rnbc')} will not exist yet.`);
   info(`${c.green('Your brain still works')}: search_ruvnet is wired and Claude will ground answers with it.`);
-  info(`Only the plugin extras (slash commands, the Console, the grounding hook) are missing.`);
+  info(`Only the plugin extras (slash commands, the Console, skills, and MCP declaration) are missing.`);
   info(`Run these two yourself to finish:`);
   info(`  ${c.bold(manualMarketplace)}`);
   info(`  ${c.bold(manualInstall)}`);
   return {
     host: true,
     wired: false,
-    action: mismatch ? 'verification-failed' : 'install-failed',
+    action: staleHooks ? 'unexpected-runtime-hooks' : mismatch ? 'verification-failed' : 'install-failed',
     expectedVersion,
     version: installed.version,
     manualMarketplace,
@@ -798,6 +1603,8 @@ function codexManagedBlock(serverPath) {
     '[mcp_servers.ruvnet-brain]',
     'command = "node"',
     `args = [${JSON.stringify(serverPath)}]`,
+    'startup_timeout_sec = 30',
+    'env = { RUVNET_HOOK_HOST = "codex" }',
     CODEX_BLOCK_END,
   ].join('\n');
 }
@@ -855,7 +1662,11 @@ function removeCodexWiring() {
 // What the doctor asserts from disk — never from the fact that we once ran. "Wired" means our entry
 // is in the config AND the server.mjs it points at is really there, because a registration pointing
 // at a deleted file is worse than no registration: Codex fails at spawn time with nothing to read.
-export function codexStatus({ configPath = codexConfigPath(), codexDir = codexHomeDir() } = {}) {
+export function codexStatus({
+  configPath = codexConfigPath(),
+  codexDir = codexHomeDir(),
+  brainHome = path.join(path.dirname(codexDir), '.cache', 'ruvnet-brain'),
+} = {}) {
   let host = false;
   try { host = fs.existsSync(codexDir); } catch { /* unreadable — treat as absent */ }
   if (!host) return { host: false, wired: false, serverPath: null, serverExists: false };
@@ -866,7 +1677,79 @@ export function codexStatus({ configPath = codexConfigPath(), codexDir = codexHo
   try { serverPath = m ? JSON.parse(m[1]) : null; } catch { /* malformed entry — treat as absent */ }
   let serverExists = false;
   try { serverExists = serverPath ? fs.existsSync(serverPath) : false; } catch { /* unreadable */ }
-  return { host: true, wired: Boolean(serverPath) && serverExists, serverPath, serverExists };
+  const section = m ? text.slice(m.index).split(/\n[ \t]*\[/, 1)[0] : '';
+  const timeoutMatch = /(?:^|\n)[ \t]*startup_timeout_sec\s*=\s*(\d+)/.exec(section);
+  const startupTimeoutSec = timeoutMatch ? Number(timeoutMatch[1]) : null;
+  // ISSUE #133: read the DERIVED machine state, not one contested file. Every MCP shell used to
+  // overwrite `mcp-readiness.json`, so this read the state of whichever process wrote last and
+  // presented it as the state of the machine. Per-process records are aggregated (degraded wins over
+  // ready — a machine with one broken shell HAS a broken shell) with dead pids pruned on read. The
+  // legacy file is still the fallback, so a machine mid-update, whose server predates the split,
+  // reports something true rather than nothing.
+  const readinessReceipt = (() => {
+    try {
+      const live = readAllReadiness(brainHome);
+      if (live.length) {
+        const agg = aggregateReadiness(live);
+        // Carry the winning record forward so every downstream field (pid, workerPid, phase) still
+        // describes ONE real process rather than a blend of several.
+        const chosen = live.find((r) => r.state === agg.state) || live[0];
+        return { ...chosen, ...agg, shells: live.length };
+      }
+    } catch { /* fall through to the legacy single file */ }
+    try { return JSON.parse(fs.readFileSync(path.join(brainHome, 'mcp-readiness.json'), 'utf8')); }
+    catch { return null; }
+  })();
+  let live = false;
+  if (readinessReceipt?.state === 'ready'
+      && Number.isInteger(readinessReceipt.pid)
+      && Number.isInteger(readinessReceipt.workerPid)) {
+    try {
+      process.kill(readinessReceipt.pid, 0);
+      process.kill(readinessReceipt.workerPid, 0);
+      live = true;
+    } catch { /* stale process or worker receipt */ }
+  }
+  const readiness = live ? 'ready' : readinessReceipt?.state === 'degraded' ? 'degraded' : 'registered';
+  return {
+    host: true,
+    wired: Boolean(serverPath) && serverExists,
+    serverPath,
+    serverExists,
+    startupTimeoutSec,
+    readiness,
+    live,
+    readinessReceipt,
+  };
+}
+
+export function codexMcpGuidance(status) {
+  if (!status?.wired) {
+    return { healthy: false, blocking: true, summary: 'Codex MCP is not registered to a usable server.', detail: null };
+  }
+  if (status.live && status.readiness === 'ready') {
+    return {
+      healthy: true,
+      blocking: false,
+      summary: `Codex MCP ready and live; discovery uses a ${status.startupTimeoutSec ?? 'configured'}s startup deadline.`,
+      detail: 'A running MCP shell completed worker initialize and warmup.',
+    };
+  }
+  if (status.readiness === 'degraded') {
+    const receipt = status.readinessReceipt || {};
+    return {
+      healthy: false,
+      blocking: true,
+      summary: 'Codex MCP is registered but degraded.',
+      detail: `${receipt.phase || 'startup'}: ${receipt.error || 'worker readiness failed'}`,
+    };
+  }
+  return {
+    healthy: false,
+    blocking: false,
+    summary: `Codex MCP is registered with a ${status.startupTimeoutSec ?? 'missing'}s startup deadline; live readiness is not yet proven.`,
+    detail: 'The first real search establishes worker readiness without removing search_ruvnet from discovery.',
+  };
 }
 
 // Atomic file replacement: produce the new bytes BESIDE the target, then rename() over it. Against
@@ -895,13 +1778,117 @@ function atomicReplace(targetPath, writeTmp) {
   }
 }
 
+function legacyBrainWrapperOwnership(wrapperPath, home) {
+  const source = path.join(REPO_ROOT, 'plugin', 'scripts', 'codex-hook-wrapper.mjs');
+  try {
+    const canonicalHome = fs.realpathSync(home);
+    if (path.resolve(wrapperPath) !== path.resolve(home, '.cache', 'ruvnet-brain', 'codex-hook.mjs')) {
+      return { state: 'conflict', reason: 'bridge is outside the expected Brain namespace' };
+    }
+    for (const relative of ['.cache', path.join('.cache', 'ruvnet-brain')]) {
+      const ancestor = path.join(home, relative);
+      let parent;
+      try { parent = fs.lstatSync(ancestor); } catch (error) {
+        if (error.code === 'ENOENT') break;
+        throw error;
+      }
+      if (!parent.isDirectory() || parent.isSymbolicLink()
+        || fs.realpathSync(ancestor) !== path.join(canonicalHome, relative)
+        || (typeof process.getuid === 'function' && parent.uid !== process.getuid())) {
+        return { state: 'conflict', reason: 'bridge namespace is indirect or belongs to another owner' };
+      }
+    }
+  } catch { return { state: 'conflict', reason: 'bridge namespace could not be verified' }; }
+  let stat;
+  try { stat = fs.lstatSync(wrapperPath); } catch (error) {
+    if (error.code === 'ENOENT') return { state: 'absent' };
+    return { state: 'conflict', reason: 'existing bridge could not be inspected' };
+  }
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1
+    || (typeof process.getuid === 'function' && stat.uid !== process.getuid())) {
+    return { state: 'conflict', reason: 'existing bridge is not an unshared regular file' };
+  }
+  let installed;
+  try {
+    installed = fs.readFileSync(wrapperPath);
+    if (installed.equals(fs.readFileSync(source))) return { state: 'verified' };
+  } catch { /* Missing proof is not ownership. */ }
+  // An UPGRADE: the bridge is still byte-identical to a wrapper an earlier Brain generation shipped.
+  // Comparing only against the NEW source made every release that changed the wrapper bytes refuse
+  // its own previous install (4.6.4 -> 4.7.0, hook-wrapper-ownership-conflict). The proof is a
+  // generation the Stable Spine keeps under the already-verified namespace: versions/<v>/ (the
+  // active one named by active.json, its previous, and any retained one). Every directory on that
+  // path must be a real, owner-uid directory and the candidate a regular file; nothing is followed.
+  if (installed && shippedByRetainedGeneration(installed, path.join(home, '.cache', 'ruvnet-brain', 'versions'))) {
+    return { state: 'prior-generation' };
+  }
+  // A PRUNED generation's bridge (owner's machine, 2026-10-17): the bytes an EARLIER shipped release wrote,
+  // whose versions/<v>/ copy is gone (pruned, or written by a release that predates the Spine). The proof
+  // is the committed history of every wrapper each release tag carried, derived from git by
+  // scripts/codex-hook-wrapper-history.mjs and checked against git in the unit suite. Bytes only: the
+  // path, link, inode and uid checks above have already passed by the time this is consulted.
+  const past = installed && shippedByPastRelease(installed);
+  if (past) return { state: 'prior-release', release: past.tags[past.tags.length - 1] };
+  return { state: 'conflict', reason: 'existing bridge differs from the shipped Brain source' };
+}
+
+// Test seam only: RUVNET_WRAPPER_HISTORY_FILE points the proof at another history file, so the unit suite
+// can hand the installer a malformed or hostile history without touching the committed data file.
+const WRAPPER_HISTORY_FILE = path.join(REPO_ROOT, 'data', 'codex-hook-wrapper-history.json');
+function shippedByPastRelease(bytes, historyFile = process.env.RUVNET_WRAPPER_HISTORY_FILE || WRAPPER_HISTORY_FILE) {
+  let history;
+  try { history = JSON.parse(fs.readFileSync(historyFile, 'utf8')); } catch { return null; }
+  if (history?.schemaVersion !== 1 || history.kind !== 'ruvnet-brain-codex-hook-wrapper-history' || !Array.isArray(history.wrappers)) return null;
+  const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
+  const hit = history.wrappers.find((row) => row?.sha256 === sha256 && row.bytes === bytes.length
+    && Array.isArray(row.tags) && row.tags.length > 0 && row.tags.every((tag) => /^v\d+\.\d+\.\d+$/.test(tag)));
+  return hit || null;
+}
+
+function shippedByRetainedGeneration(bytes, versionsDir) {
+  const ownedDir = (dir) => {
+    try {
+      const st = fs.lstatSync(dir);
+      return st.isDirectory() && !st.isSymbolicLink()
+        && (typeof process.getuid !== 'function' || st.uid === process.getuid());
+    } catch { return false; }
+  };
+  if (!ownedDir(versionsDir)) return false;
+  let names;
+  try { names = fs.readdirSync(versionsDir); } catch { return false; }
+  return names.some((name) => {
+    // Staging remnants and hidden temporaries were never activated, so they prove nothing.
+    if (name.startsWith('.') || name.includes('.staging-')) return false;
+    const generation = path.join(versionsDir, name);
+    const scripts = path.join(generation, 'scripts');
+    const candidate = path.join(scripts, 'codex-hook-wrapper.mjs');
+    if (!ownedDir(generation) || !ownedDir(scripts)) return false;
+    try {
+      const st = fs.lstatSync(candidate);
+      if (!st.isFile() || st.isSymbolicLink() || st.size !== bytes.length) return false;
+      return fs.readFileSync(candidate).equals(bytes);
+    } catch { return false; }
+  });
+}
+
+// The bridge's previous bytes are kept beside it under ONE fixed name (the immediately prior
+// generation's wrapper), so a rollback is a rename and nothing accumulates release over release.
+// Written temp-then-rename: rename replaces a planted link at the backup name, never follows it.
+function backupPriorWrapper(wrapperPath) {
+  const backup = `${wrapperPath}.prior`;
+  const temporary = `${backup}.tmp-${process.pid}-${crypto.randomUUID()}`;
+  try {
+    fs.writeFileSync(temporary, fs.readFileSync(wrapperPath), { flag: 'wx', mode: fs.statSync(wrapperPath).mode & 0o777 });
+    fs.renameSync(temporary, backup);
+  } finally { fs.rmSync(temporary, { force: true }); }
+  return backup;
+}
+
 export function wireCodexHost({
   codexDir = codexHomeDir(),
   configPath = path.join(codexDir, 'config.toml'),
   serverDir = codexServerDir(),
   source = path.join(__dirname, '..', 'plugin', 'mcp', 'server.mjs'),
-  hookWrapperSource = path.join(__dirname, '..', 'plugin', 'scripts', 'codex-hook-wrapper.mjs'),
-  runtimePreferencesSource = path.join(__dirname, '..', 'plugin', 'scripts', 'runtime-preferences.mjs'),
   hookWrapperPath = codexHookWrapperPath(codexDir),
   announce = true,
 } = {}) {
@@ -910,6 +1897,14 @@ export function wireCodexHost({
   // No Codex on this machine is not a warning. Say nothing and change nothing.
   if (!host) return { host: false, action: 'no-host' };
 
+  // Check ownership before retiring registrations or changing any installed bytes.
+  const wrapperOwnership = legacyBrainWrapperOwnership(hookWrapperPath, path.dirname(codexDir));
+  if (wrapperOwnership.state === 'conflict') {
+    if (announce) warn(`Codex hook bridge preserved: ${wrapperOwnership.reason}`);
+    return { host: true, action: 'hook-wrapper-ownership-conflict', hookWrapperInstalled: false,
+      error: wrapperOwnership.reason };
+  }
+
   if (announce) {
     step('Wiring the Codex host', 'Codex reads MCP servers from ~/.codex/config.toml — the brain was never registered there');
   }
@@ -917,31 +1912,81 @@ export function wireCodexHost({
     if (announce) warn('MCP server missing from this bundle — Codex left untouched (non-fatal)');
     return { host: true, action: 'no-source' };
   }
-  const managedCliSource = path.join(path.dirname(source), 'managed-cli-interface.mjs');
-  if (!fs.existsSync(managedCliSource)) {
-    if (announce) warn('MCP structured-interface module missing from this bundle — Codex left untouched (non-fatal)');
-    return { host: true, action: 'no-source' };
-  }
-  if (!fs.existsSync(runtimePreferencesSource)) {
-    if (announce) warn('MCP runtime-preferences module missing from this bundle — Codex left untouched (non-fatal)');
+  // THE DEPENDENCY LIST IS DERIVED FROM server.mjs ITSELF, never hand-maintained.
+  //
+  // It used to name `managed-cli-interface.mjs` and `runtime-preferences.mjs` as literals — a second
+  // copy of the server's own import graph, and therefore a fact in two places with no producer. It
+  // failed exactly the way that always fails: ADR-067 added ONE import to server.mjs, this list did
+  // not know, and the Codex host shipped a server whose sibling was absent. The npm-tarball suite
+  // caught it as "no reply to initialize in 15s" — a dead server, on the packaging boundary, from a
+  // change that looked local.
+  //
+  // Relative specifiers are preserved verbatim on copy, so `./x.mjs` and `../scripts/y.mjs` both
+  // land where the server will look for them, and the walk is transitive because a dependency's own
+  // dependency is no less required.
+  const deps = serverDependencies(source);
+  // Progression capture reads its adapter version from this runtime resource, not an import.
+  // Keep it beside the copied plugin scripts, bound to the same source as the MCP shell.
+  deps.push({ spec: '../.claude-plugin/plugin.json',
+    from: path.resolve(path.dirname(source), '..', '.claude-plugin', 'plugin.json') });
+  const missing = deps.filter((d) => !fs.existsSync(d.from));
+  if (missing.length) {
+    if (announce) warn(`MCP server dependency missing from this bundle (${missing.map((d) => d.spec).join(', ')}) — Codex left untouched (non-fatal)`);
     return { host: true, action: 'no-source' };
   }
   const serverPath = path.join(serverDir, 'server.mjs');
-  const managedCliPath = path.join(serverDir, 'managed-cli-interface.mjs');
-  const runtimePreferencesPath = path.join(path.dirname(serverDir), 'scripts', 'runtime-preferences.mjs');
+  // Named for the return contract that callers and tests already depend on — RESOLVED from the
+  // derived list rather than re-stated, so they cannot drift from what is actually copied.
+  const depTarget = (suffix) => {
+    const hit = deps.find((d) => d.spec.endsWith(suffix));
+    return hit ? path.resolve(serverDir, hit.spec) : null;
+  };
+  const managedCliPath = depTarget('managed-cli-interface.mjs');
+  const runtimePreferencesPath = depTarget('runtime-preferences.mjs');
   fs.mkdirSync(serverDir, { recursive: true });
   // Write-beside-then-rename, both here and for the config below (issue #43): an interrupted plain
   // copy leaves a TORN server.mjs at the exact path a prior install's config already points at, so
   // Codex spawns half a file. rename() over the target is atomic; a failure leaves the old bytes.
   // Copy the dependency first. If the later server swap fails, the previously registered server
   // remains byte-intact and continues to import a backward-compatible module at the same path.
-  fs.mkdirSync(path.dirname(runtimePreferencesPath), { recursive: true });
-  atomicReplace(runtimePreferencesPath, (tmp) => fs.copyFileSync(runtimePreferencesSource, tmp));
-  atomicReplace(managedCliPath, (tmp) => fs.copyFileSync(managedCliSource, tmp));
+  // Dependencies FIRST, server last: if the server swap fails, the previously registered server
+  // remains byte-intact and continues to import backward-compatible modules at the same paths.
+  for (const dep of deps) {
+    const target = path.resolve(serverDir, dep.spec);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    atomicReplace(target, (tmp) => fs.copyFileSync(dep.from, tmp));
+  }
   atomicReplace(serverPath, (tmp) => fs.copyFileSync(source, tmp));
-  if (fs.existsSync(hookWrapperSource)) {
+  // The Codex manifest is a real shipped hook surface. Keep its bridge at a stable path outside
+  // the versioned cache so a plugin refresh cannot leave Codex pointing at a missing executable.
+  // The bridge resolves the active immutable generation on every fire and fails open on every
+  // non-contract error; only the two continuity registrations use it.
+  const hookWrapperSource = path.join(REPO_ROOT, 'plugin', 'scripts', 'codex-hook-wrapper.mjs');
+  if (!fs.existsSync(hookWrapperSource)) {
+    if (announce) warn(`Codex hook bridge source missing from this bundle: ${hookWrapperSource}`);
+    return { host: true, action: 'hook-wrapper-source-missing' };
+  }
+  let hookRetirement;
+  let hookWrapperBackup = null;
+  try {
     fs.mkdirSync(path.dirname(hookWrapperPath), { recursive: true });
+    const wrapperStat = (() => { try { return fs.lstatSync(hookWrapperPath); } catch (error) {
+      if (error?.code === 'ENOENT') return null; throw error;
+    }})();
+    if (wrapperStat?.isSymbolicLink()) {
+      throw new Error('installer-owned hook bridge path is a symlink; refusing to overwrite it');
+    }
+    const currentOwnership = legacyBrainWrapperOwnership(hookWrapperPath, path.dirname(codexDir));
+    if (currentOwnership.state === 'conflict') throw new Error(currentOwnership.reason);
+    hookRetirement = retireManagedHookRegistrations({ home: path.dirname(codexDir), codexDir, wrapperPath: hookWrapperPath });
+    if (currentOwnership.state === 'prior-generation' || currentOwnership.state === 'prior-release') hookWrapperBackup = backupPriorWrapper(hookWrapperPath);
     atomicReplace(hookWrapperPath, (tmp) => fs.copyFileSync(hookWrapperSource, tmp));
+  } catch (error) {
+    if (announce) warn(`could not install the Codex hook bridge at ${hookWrapperPath}: ${error.message}`);
+    return { host: true, action: 'hook-wrapper-install-failed', error: error.message };
+  }
+  if (announce && hookRetirement.conflicts.length) {
+    warn(`Preserved ${hookRetirement.conflicts.length} customized or unverified hook entries.`);
   }
 
   let before = '';
@@ -952,7 +1997,8 @@ export function wireCodexHost({
       ok('Codex already declares ruvnet-brain in your own config — left exactly as you wrote it');
       info(`  to hand it to us instead, delete that ${c.bold('[mcp_servers.ruvnet-brain]')} block and re-run this installer`);
     }
-    return { host: true, action, serverPath, managedCliPath, runtimePreferencesPath, hookWrapperPath };
+    return { host: true, action, serverPath, managedCliPath, runtimePreferencesPath,
+      hookWrapperPath, hookWrapperInstalled: true, hookWrapperBackup, hookOwnershipConflicts: hookRetirement.conflicts.length };
   }
   if (text !== before) {
     fs.mkdirSync(path.dirname(configPath), { recursive: true });
@@ -963,18 +2009,57 @@ export function wireCodexHost({
     info(`  server: ${serverPath} ${c.dim('(persistent copy — the npx dir vanishes)')}`);
     info(`  ${c.dim('only our marked block is written; every other section is byte-preserved')}`);
   }
-  return { host: true, action, serverPath, managedCliPath, runtimePreferencesPath, hookWrapperPath, changed: text !== before };
+  return { host: true, action, serverPath, managedCliPath, runtimePreferencesPath,
+    hookWrapperPath, hookWrapperInstalled: true, hookWrapperBackup, hookOwnershipConflicts: hookRetirement.conflicts.length,
+    changed: text !== before };
 }
 
 const CODEX_PLUGIN_ID = 'ruvnet-brain@ruvnet-brain';
 const CODEX_MARKETPLACE = 'ruvnet-brain';
 const CODEX_MARKETPLACE_SOURCE = 'stuinfla/ruvnet-brain';
 
-function prepareCodexMarketplace() {
-  const target = path.join(
+/**
+ * The Brain hooks Codex will hold back after replacing `installedRoot`'s plugin with `candidateRoot`'s:
+ * [{ key, status: 'modified'|'untrusted' }]. No installed root = a fresh install = every hook untrusted.
+ * An unreadable file is treated as absent (fail toward telling the user to review, never toward silence).
+ */
+export function codexHooksNeedingReview(installedRoot, candidateRoot, { contentTrust = false } = {}) {
+  const read = (root) => { try { return root ? JSON.parse(fs.readFileSync(path.join(root, 'hooks', 'codex-hooks.json'), 'utf8')) : {}; } catch { return {}; } };
+  // Codex 0.164+ (or a version we could not read) also holds back every hook whose plugin bytes changed (#492).
+  const contentChanged = contentTrust !== false && codexPluginContentChanged(installedRoot, candidateRoot);
+  return codexTrustChanges(read(installedRoot), read(candidateRoot), undefined, { contentChanged });
+}
+
+/** codex --version → whether it approves plugin hooks by content too (true/false), or null when unknown. */
+export function codexHostContentTrust({ codexBin = process.env.CODEX_BIN || 'codex', codexHome = codexHomeDir(), run = runHostCli } = {}) {
+  try {
+    const r = run(codexBin, ['--version'], { stdio: 'pipe', shell: false, encoding: 'utf8', timeout: 10_000,
+      env: { ...process.env, CODEX_HOME: codexHome } });
+    return r?.status === 0 ? codexUsesContentTrust(r.stdout) : null;
+  } catch { return null; }
+}
+
+function codexMarketplaceTarget() {
+  return path.join(
     process.env.RUVNET_BRAIN_HOME || path.join(os.homedir(), '.cache', 'ruvnet-brain'),
     'codex-marketplace',
   );
+}
+
+function codexMarketplaceReady(target = codexMarketplaceTarget()) {
+  try {
+    const manifest = JSON.parse(fs.readFileSync(path.join(target, '.claude-plugin', 'marketplace.json'), 'utf8'));
+    return manifest?.name === CODEX_MARKETPLACE
+      && Array.isArray(manifest.plugins)
+      && manifest.plugins.some((plugin) => plugin?.name === 'ruvnet-brain' && plugin?.source === './plugin')
+      && fs.existsSync(path.join(target, 'plugin', '.codex-plugin', 'plugin.json'));
+  } catch {
+    return false;
+  }
+}
+
+function prepareCodexMarketplace() {
+  const target = codexMarketplaceTarget();
   const staged = `${target}.tmp-${process.pid}`;
   fs.rmSync(staged, { recursive: true, force: true });
   fs.mkdirSync(path.join(staged, '.claude-plugin'), { recursive: true });
@@ -1004,22 +2089,53 @@ export function codexMarketplaceRows(value) {
   return Array.isArray(value) ? value : [];
 }
 
-function runCodexJson(args, {
+// Codex refuses EVERY plugin command while any configured marketplace snapshot fails to load, including one that is
+// not the Brain's. Measured 2026-10-23: a 7:21 p.m. ET update failed host convergence on "`claude-code-plugins` at
+// ~/.codex/.tmp/marketplaces/claude-code-plugins: marketplace root does not contain a supported manifest" while Codex
+// was refreshing that Git snapshot; the same step passed at 5 a.m. Reproduced with a snapshot missing its manifest:
+// `codex plugin list` exits 1, and `codex plugin marketplace upgrade <name>` repairs it (codex-cli 0.164.0).
+const CODEX_SNAPSHOT_FAILURE = /failed to load configured marketplace snapshot/i;
+export function codexBrokenMarketplaces(text) {
+  return [...String(text || '').matchAll(/^- `([^`]+)` at /gm)].map((m) => m[1]);
+}
+const sleepSync = (ms) => { if (ms > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
+
+export function runCodexJson(args, {
   codexBin = process.env.CODEX_BIN || 'codex',
   codexHome = codexHomeDir(),
   cwd = process.cwd(),
+  run = runHostCli,
+  waitMs = 5_000,
+  // Refreshing another tool's marketplace is a network write; only an install/update that is about to change the
+  // Brain's Codex plugin opts in. --doctor and listings report the broken snapshot and change nothing (review 2026-10-24).
+  repair = false,
 } = {}) {
-  const r = spawnSync(codexBin, args, {
-    cwd,
-    env: { ...process.env, CODEX_HOME: codexHome },
-    encoding: 'utf8',
-    timeout: 30_000,
-    maxBuffer: 20 * 1024 * 1024,
-  });
-  if (r.error || r.status !== 0) {
-    const detail = String(r.stderr || r.stdout || r.error?.message || `exit ${r.status}`).trim();
-    return { ok: false, error: detail };
+  const options = { stdio: 'pipe', shell: false, cwd, env: { ...process.env, CODEX_HOME: codexHome }, encoding: 'utf8',
+    timeout: 30_000, maxBuffer: 20 * 1024 * 1024 };
+  const snapshotFailure = (res) => !res.missingBinary && res.status !== 0 && CODEX_SNAPSHOT_FAILURE.test(String(res.stderr || res.stdout || ''));
+  let r = run(codexBin, args, options);
+  // One wait covers a refresh Codex is finishing; then refresh only the OTHER Git marketplaces it named (the Brain's
+  // own local snapshot is repaired by prepareCodexMarketplace), once, and ask again. Bounded: at most three asks.
+  const repaired = [];
+  if (snapshotFailure(r)) { sleepSync(waitMs); r = run(codexBin, args, options); }
+  if (repair && snapshotFailure(r)) {
+    for (const name of codexBrokenMarketplaces(r.stderr || r.stdout).filter((n) => n !== CODEX_MARKETPLACE)) {
+      const up = run(codexBin, ['plugin', 'marketplace', 'upgrade', name, '--json'], options);
+      repaired.push(`${name}: ${up.status === 0 ? 'refreshed' : `refresh failed (exit ${up.status})`}`);
+    }
+    if (repaired.length) r = run(codexBin, args, options);
   }
+  if (r.missingBinary) return { ok: false, error: r.message, missingBinary: true };
+  if (r.error || r.status !== 0) {
+    let detail = String(r.stderr || r.stdout || r.error?.message || `exit ${r.status}`).trim();
+    if (snapshotFailure(r)) {
+      const names = codexBrokenMarketplaces(r.stderr || r.stdout);
+      detail += ` — Codex cannot load its ${names.map((n) => `\`${n}\``).join(', ') || 'configured'} marketplace snapshot`
+        + `${repaired.length ? ` (tried: ${repaired.join('; ')})` : ''}; repair with: ${names.map((n) => `codex plugin marketplace upgrade ${n}`).join(' && ') || 'codex plugin marketplace upgrade'}`;
+    }
+    return { ok: false, error: detail, ...(repaired.length ? { repaired } : {}) };
+  }
+  if (repaired.length && !TEST_MODE) info(`  Codex marketplace snapshot repaired before the Brain step (${repaired.join('; ')})`);
   try { return { ok: true, value: JSON.parse(r.stdout || 'null') }; }
   catch { return { ok: false, error: `Codex returned non-JSON output for ${args.join(' ')}` }; }
 }
@@ -1027,7 +2143,8 @@ function runCodexJson(args, {
 export function codexPluginStatus(options = {}) {
   const { runJson = runCodexJson, ...commandOptions } = options;
   const listed = runJson(['plugin', 'list', '--json'], commandOptions);
-  if (!listed.ok) return { available: false, installed: false, enabled: false, error: listed.error };
+  if (!listed.ok) return { available: false, installed: false, enabled: false, error: listed.error,
+    ...(listed.missingBinary ? { missingBinary: true } : {}) };
   const rows = Array.isArray(listed.value?.installed) ? listed.value.installed : [];
   const row = rows.find((candidate) => candidate?.pluginId === CODEX_PLUGIN_ID);
   return {
@@ -1035,8 +2152,35 @@ export function codexPluginStatus(options = {}) {
     installed: Boolean(row?.installed),
     enabled: Boolean(row?.enabled),
     version: row?.version || null,
+    installPath: row?.installPath || row?.path || null,
     row: row || null,
   };
+}
+
+// User-scoped standing consent applies across projects, never implicitly to other installations.
+export function repairReleasedCodexHookTrust(status, { codexHome = codexHomeDir(), codexBin = process.env.CODEX_BIN || 'codex', cwd = process.cwd(), run = spawnSync } = {}) {
+  if (TEST_MODE || !status?.installed || !status?.enabled) return { state: 'not-applicable', changed: false };
+  let profile;
+  try { profile = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.claude', 'model-router', 'profile.json'), 'utf8')); } catch { return { state: 'not-authorized', changed: false }; }
+  if (profile.automaticHookTrustUpdates !== true) return { state: 'not-authorized', changed: false };
+  let compatibility;
+  try { compatibility = repairSecurityGuidance({ codexHome, apply: true }); }
+  catch (error) { compatibility = { status: 'blocked', reason: error.message }; }
+  const installedRoot = codexInstalledPluginRoot({ codexHome, status });
+  if (!installedRoot) return { state: 'blocked', changed: false, reason: 'Installed plugin root unavailable' };
+  const helper = path.join(REPO_ROOT, 'scripts', 'codex-hook-trust-reconcile.mjs');
+  const result = run(process.execPath, [helper, '--reconcile-installed'], {
+    input: JSON.stringify({ installedVersion: status.version, hooksPath: path.join(installedRoot, 'hooks', 'codex-hooks.json'),
+      configPath: path.join(codexHome, 'config.toml'), nativeBinary: codexBin, cwd }),
+    encoding: 'utf8', timeout: 30000, maxBuffer: 128 * 1024, env: process.env,
+  });
+  try {
+    const receipt = JSON.parse(result.stdout);
+    if (!result.error && ['registry-verified', 'unchanged', 'blocked', 'degraded'].includes(receipt.state)) return { ...receipt, compatibility };
+  } catch { /* a command exit alone never establishes hook trust */ }
+  return result.error?.code === 'ENOENT'
+    ? { state: 'blocked', changed: false, reason: 'Verified hook trust helper could not start' }
+    : { state: 'degraded', changed: 'unknown', reason: 'Hook trust helper acknowledgement unavailable; inspect native registry before retrying' };
 }
 
 export function wireCodexPlugin({
@@ -1048,9 +2192,24 @@ export function wireCodexPlugin({
   cwd = process.cwd(),
   announce = true,
   runJson = runCodexJson,
+  aliasHome,
+  // true/false/null (unknown): does this Codex pin plugin contents in hook approval (0.164+)? Probed for a real host.
+  contentTrust,
 } = {}) {
   if (!fs.existsSync(codexDir)) return { host: false, action: 'no-host' };
-  const options = { codexBin, codexHome, cwd };
+  const options = { codexBin, codexHome, cwd, repair: true };
+  // Codex loads every configured marketplace before it can report plugin state. Repair only an
+  // absent/malformed Brain-owned snapshot before that probe, or the probe can fail before its own
+  // repair path is reachable. A healthy current cache stays byte-untouched, and plugin enablement
+  // is still read and preserved below.
+  let localMarketplace = null;
+  if (runJson === runCodexJson && !codexMarketplaceReady()) {
+    try { localMarketplace = prepareCodexMarketplace(); }
+    catch (error) {
+      if (announce) warn(`Codex marketplace preparation failed — ${error.message}`);
+      return { host: true, action: 'marketplace-prepare-failed', error: error.message };
+    }
+  }
   const before = codexPluginStatus({ ...options, runJson });
   if (!before.available) {
     if (announce) warn(`Codex plugin lifecycle not installed — ${before.error}`);
@@ -1060,12 +2219,47 @@ export function wireCodexPlugin({
     if (announce) warn(`Codex Brain plugin is installed but disabled by user or policy — left disabled (${CODEX_PLUGIN_ID}).`);
     return { host: true, action: 'disabled', ...before };
   }
-  if (before.installed && before.enabled && (!expectedVersion || before.version === expectedVersion)) {
-    if (announce) ok(`Codex Brain plugin already installed and enabled (${before.version || 'version unknown'}) — no changes.`);
-    return { host: true, action: 'unchanged', ...before };
+  // Explicit alternate homes support isolated host qualification; metadata-only injected probes
+  // must not write the real user's skill directory.
+  if (aliasHome !== undefined || (runJson === runCodexJson && codexHome === codexHomeDir())) {
+    installCodexConsoleAlias({ home: aliasHome ?? os.homedir(), codexHome });
+  }
+  // An existing Codex session can keep the plugin generation it loaded at boot. Compare the
+  // installed bytes with the source candidate before mutating the marketplace so body-only updates
+  // remain live while a changed/unknown boot surface gets one explicit restart request.
+  const shellBoundary = before.installed
+    ? inspectPluginShellBoundary(
+      codexInstalledPluginRoot({ codexHome, status: before }),
+      path.join(REPO_ROOT, 'plugin'),
+    )
+    : { known: true, changed: false, paths: [], restartRequired: false, reason: 'new host installation' };
+  if (before.installed && before.enabled && versionSatisfies(before.version, expectedVersion)) {
+    const hookTrust = runJson === runCodexJson ? repairReleasedCodexHookTrust(before, options) : null;
+    if (announce) {
+      ok(`Codex Brain plugin already installed and enabled (${before.version || 'version unknown'}).`);
+      if (hookTrust && ['blocked', 'degraded'].includes(hookTrust.state)) warn(`Automatic Brain hook trust repair ${hookTrust.state}: ${hookTrust.reason}`);
+    }
+    return {
+      host: true, action: 'unchanged', ...before, ...(hookTrust ? { hookTrust } : {}),
+      shellChanged: shellBoundary.changed, shellChangedPaths: shellBoundary.paths,
+      restartRequired: false,
+    };
   }
 
-  const localMarketplace = runJson === runCodexJson ? prepareCodexMarketplace() : null;
+  // Which Brain hooks will Codex hold back after this update until the user re-reviews them? Codex keys
+  // trust to a hash of each hook's definition (scripts/codex-hook-trust.mjs), and codex-hooks.json is not
+  // a boot-surface path, so the shell boundary above cannot see it. Computed offline, before the install
+  // replaces the installed folder; on Codex 0.164+ a change to any plugin byte holds back every hook too (#492).
+  const hooksNeedingReview = codexHooksNeedingReview(before.installed
+    ? codexInstalledPluginRoot({ codexHome, status: before }) : null, path.join(REPO_ROOT, 'plugin'),
+    { contentTrust: contentTrust ?? (runJson === runCodexJson ? codexHostContentTrust({ codexBin, codexHome }) : false) });
+  if (runJson === runCodexJson && !localMarketplace) {
+    try { localMarketplace = prepareCodexMarketplace(); }
+    catch (error) {
+      if (announce) warn(`Codex marketplace preparation failed — ${error.message}`);
+      return { host: true, action: 'marketplace-prepare-failed', error: error.message };
+    }
+  }
   const markets = runJson(['plugin', 'marketplace', 'list', '--json'], options);
   if (!markets.ok) {
     if (announce) warn(`Codex marketplace check failed — ${markets.error}`);
@@ -1092,18 +2286,101 @@ export function wireCodexPlugin({
     return { host: true, action: 'plugin-failed', error: added.error };
   }
   const after = codexPluginStatus({ ...options, runJson });
-  if (!after.installed || !after.enabled || (expectedVersion && after.version !== expectedVersion)) {
+  if (!after.installed || !after.enabled || !versionSatisfies(after.version, expectedVersion)) {
     if (announce) warn('Codex accepted the install command but the Brain plugin is not installed and enabled.');
     return { host: true, action: 'verification-failed', expectedVersion, ...after };
   }
+  const hookTrust = runJson === runCodexJson ? repairReleasedCodexHookTrust(after, options) : null;
+  const trustVerified = hookTrust && ['registry-verified', 'unchanged'].includes(hookTrust.state);
   if (announce) {
     ok(`Codex Brain plugin installed and enabled (${after.version || 'version unknown'}).`);
+    if (hookTrust && ['blocked', 'degraded'].includes(hookTrust.state)) warn(`Automatic Brain hook trust repair ${hookTrust.state}: ${hookTrust.reason}`);
+    if (shellBoundary.restartRequired) {
+      warn(`boot-level plugin declarations changed; restart Codex, then review them in /hooks (${shellBoundary.paths.join(', ') || shellBoundary.reason}).`);
+    } else if (before.installed && before.version !== after.version) {
+      info('  body-only update: the Stable Spine is live on the next hook/MCP call; no restart is required.');
+    }
+    if (hooksNeedingReview.length && !trustVerified) {
+      warn(`Codex will NOT run ${hooksNeedingReview.length} Brain hook${hooksNeedingReview.length === 1 ? '' : 's'} until you review`
+        + ` ${hooksNeedingReview.length === 1 ? 'it' : 'them'} (${hooksNeedingReview.map((h) => `${h.key.split(':').slice(-3).join(':')} ${h.status}`).join(', ')}).`
+        + (hooksNeedingReview.some((h) => h.reason === 'plugin-content')
+          ? ' This update changed the plugin\'s files, and Codex 0.164+ approves those bytes as well as each hook\'s definition.' : ''));
+      info(`  ${CODEX_TRUST_ACTION}`);
+    }
   }
-  return { host: true, action: before.installed ? 'updated' : 'installed', ...after };
+  return {
+    host: true,
+    action: before.installed ? 'updated' : 'installed',
+    hooksNeedingReview: trustVerified ? [] : hooksNeedingReview,
+    ...(hookTrust ? { hookTrust } : {}),
+    ...after,
+    shellChanged: shellBoundary.changed,
+    shellChangedPaths: shellBoundary.paths,
+    restartRequired: shellBoundary.restartRequired,
+    ...(shellBoundary.restartRequired ? {
+      sessionSafety: 'restart-required',
+      sessionSafetyReason: shellBoundary.reason,
+      // Never 'open-sessions' for Codex: changed hook definitions show as PENDING until reviewed in
+      // /hooks (doctor fails closed on pending trust; the SessionStart notice says to trust them), and no
+      // measurement shows a fresh Codex session running them without that step. Unproven = restart.
+      restartScope: 'unproven',
+    } : {}),
+  };
+}
+
+/**
+ * After the Brain changed Codex's view of its plugin (new bytes, or hook trust written from another process), tell an
+ * already-running shared Codex app-server to reload, so its open sessions stop reporting the previous hooks (#492).
+ * Never starts, stops or restarts a server, and never grants an approval (scripts/codex-hook-trust-reconcile.mjs).
+ */
+export const codexHostViewChanged = (codexPlugin) => ['installed', 'updated'].includes(codexPlugin?.action)
+  || codexPlugin?.hookTrust?.changed === true || codexPlugin?.hookTrust?.changed === 'unknown';
+export async function refreshCodexSharedHost(codexPlugin, { codexHome = codexHomeDir(), refresh = refreshSharedCodexAppServer } = {}) {
+  if (!codexHostViewChanged(codexPlugin)) return { state: 'not-needed', changed: false };
+  return refresh({ codexHome });
+}
+
+/**
+ * What the owner is told after refreshCodexSharedHost. The reload reaches ALREADY-OPEN Codex sessions at once, and
+ * changed Brain hook definitions are pending until reviewed, so those sessions stop running Brain hooks until the
+ * owner re-reviews them in /hooks. Said plainly, so a pause in a session he had open is never a surprise (#492).
+ */
+export function codexHostRefreshMessage(hostRefresh, codexPlugin = null) {
+  if (hostRefresh?.state === 'refreshed') {
+    // Review r2 (4.7.21): the authorized trust reconciliation may already have re-trusted the released hooks
+    // (registry-verified, or nothing pending); then nothing pauses and saying so would be false.
+    const retrusted = ['registry-verified', 'unchanged'].includes(codexPlugin?.hookTrust?.state);
+    return { level: 'info', text: '  Running Codex app-server reloaded: Codex sessions that are already open pick up the change immediately; '
+      + (retrusted ? 'Brain hooks were already re-trusted, so they keep running there (nothing restarted).'
+        : 'Brain hooks pause in them until you re-review them in /hooks (no approval granted, nothing restarted).') };
+  }
+  if (hostRefresh?.state === 'failed') {
+    return { level: 'warn', text: `Running Codex app-server not reloaded (${hostRefresh.reason}); its open sessions may report the previous Brain hooks until Codex restarts.` };
+  }
+  return null;
+}
+
+export function codexSessionSafety(status) {
+  if (status?.restartRequired === true) return status;
+  return {
+    sessionSafety: 'unknown',
+    restartRequired: false,
+    sessionSafetyReason: 'No Codex plugin update occurred',
+  };
+}
+
+export function codexAdministrativeProbeBinary() {
+  if (process.env.CODEX_BIN) return process.env.CODEX_BIN;
+  try {
+    const brainHome = process.env.RUVNET_BRAIN_HOME || path.join(os.homedir(), '.cache', 'ruvnet-brain');
+    const configured = JSON.parse(fs.readFileSync(path.join(brainHome, 'model-routing', 'terminal-launcher-config.json'), 'utf8'));
+    if (typeof configured.realCodex === 'string' && path.isAbsolute(configured.realCodex)) return configured.realCodex;
+  } catch { /* absent or malformed configuration retains the ordinary bounded PATH probe */ }
+  return 'codex';
 }
 
 function codexHooksList({
-  codexBin = process.env.CODEX_BIN || 'codex',
+  codexBin = codexAdministrativeProbeBinary(),
   codexHome = codexHomeDir(),
   cwd = process.cwd(),
   timeoutMs = 8_000,
@@ -1162,15 +2439,34 @@ export function classifyCodexLifecycle(plugin, listed = null) {
   if (!plugin.enabled) return { state: 'disabled', plugin, hooks: [] };
   if (!listed.ok) return { state: 'probe-failed', plugin, hooks: [], error: listed.error };
   const groups = Array.isArray(listed.value?.data) ? listed.value.data : [];
-  const hooks = groups.flatMap((group) => Array.isArray(group?.hooks) ? group.hooks : [])
+  const hooks = groups.flatMap((group) => (Array.isArray(group?.hooks) ? group.hooks : [])
+    .map((hook) => ({ ...hook, event: hook?.event ?? group?.event ?? null })))
     .filter((hook) => hook?.pluginId === CODEX_PLUGIN_ID);
   const errors = groups.flatMap((group) => Array.isArray(group?.errors) ? group.errors : []);
-  if (errors.length || hooks.length === 0) {
+  if (errors.length) {
     return { state: 'missing-runtime-hooks', plugin, hooks, errors };
   }
-  if (hooks.some((hook) => hook.enabled === false)) return { state: 'disabled', plugin, hooks, errors };
-  if (hooks.every((hook) => hook.trustStatus === 'trusted')) return { state: 'active', plugin, hooks, errors };
-  return { state: 'pending-trust', plugin, hooks, errors };
+  // A REGISTERED CONTINUITY HOOK IS NOT A RETIRED ONE.
+  //
+  // This used to treat EVERY Brain-owned runtime registration as stale, because at the time the
+  // policy permitted none on Codex. The doctor therefore reported the SessionStart restore and the
+  // Stop continuation gate — the two handlers the policy itself requires — as "retired Brain
+  // lifecycle hooks", told the user to upgrade, and returned a failing exit code for a correctly
+  // wired machine. The authority on what belongs is the policy, so ask it instead of assuming zero.
+  const conforming = hooks.filter((hook) => continuityHookId(hook?.command, hook?.event));
+  const unexpected = hooks.filter((hook) => !continuityHookId(hook?.command, hook?.event));
+  if (unexpected.length) return { state: 'unexpected-runtime-hooks', plugin, hooks: unexpected, errors };
+  if (conforming.length === 0) return { state: 'inactive-by-design', plugin, hooks, errors };
+  // REGISTERED IS NOT RUNNING (4.5, review-4.3.39 #7). Codex runs a plugin hook only when its stored
+  // trusted_hash equals the hash of its CURRENT definition (scripts/codex-hook-trust.mjs cites the source);
+  // `untrusted` and `modified` hooks are listed but skipped. A release that edits a command's text leaves
+  // that hook `modified` on every machine that trusted the old one — measured on the owner's machine
+  // 2026-10-01: SessionEnd `modified` after 4.4.0, so it had silently stopped. A user-disabled hook is the
+  // user's choice and is not reported as pending.
+  const pending = conforming.filter((hook) => hook?.enabled !== false
+    && (hook?.trustStatus === 'untrusted' || hook?.trustStatus === 'modified'));
+  if (pending.length) return { state: 'pending-trust', plugin, hooks: conforming, pending, errors };
+  return { state: 'continuity-registered', plugin, hooks: conforming, errors };
 }
 
 export async function codexLifecycleStatus(options = {}) {
@@ -1184,37 +2480,59 @@ export async function codexLifecycleStatus(options = {}) {
 export function codexLifecycleGuidance(status) {
   const hookCount = Array.isArray(status?.hooks) ? status.hooks.length : 0;
   switch (status?.state) {
-    case 'active':
-      return {
-        healthy: true,
-        intentional: false,
-        summary: `Codex lifecycle active (${hookCount} Brain hook${hookCount === 1 ? '' : 's'} enabled and trusted).`,
-        detail: 'Proactive grounding, routing, learning capture, and session continuity are on.',
-        action: null,
-      };
-    case 'pending-trust':
+    case 'unexpected-runtime-hooks':
       return {
         healthy: false,
         intentional: false,
-        summary: `Codex installed the Brain, but ${hookCount || 'its'} lifecycle hook${hookCount === 1 ? '' : 's'} await review.`,
-        detail: 'Search works now; proactive interventions start after Codex records hook trust.',
-        action: `Start a fresh Codex session, run /hooks, and trust only ${CODEX_PLUGIN_ID}.`,
+        summary: `Codex still exposes ${hookCount} retired Brain lifecycle hook${hookCount === 1 ? '' : 's'}.`,
+        detail: 'Any Brain-owned runtime registration is stale and must not be trusted or executed.',
+        action: `Upgrade ${CODEX_PLUGIN_ID}, then start a fresh Codex session and re-run --doctor.`,
+      };
+    case 'continuity-registered':
+      return {
+        healthy: true,
+        intentional: true,
+        summary: `Codex carries ${hookCount} declared Brain continuity hook${hookCount === 1 ? '' : 's'}.`,
+        detail: 'Each one is named in plugin/hooks/hook-contracts.json. Codex capture is SessionEnd only:'
+          + ' a 2026-09-11 probe observed SessionStart, UserPromptSubmit and SessionEnd firing, and did not'
+          + ' observe Stop or PreCompact, so no capture handler was registered on those.',
+        action: null,
+      };
+    case 'pending-trust': {
+      const pending = Array.isArray(status?.pending) ? status.pending : [];
+      const named = pending.map((hook) => `${hook?.event ?? hook?.eventName ?? '?'} (${hook?.trustStatus})`).join(', ');
+      return {
+        healthy: false,
+        intentional: false,
+        summary: `Codex is NOT running ${pending.length} Brain hook${pending.length === 1 ? '' : 's'} until you review ${pending.length === 1 ? 'it' : 'them'}: ${named}.`,
+        detail: 'Codex runs a hook only while its definition matches the one you trusted; an update that changed'
+          + ' a hook leaves it "modified", a new hook "untrusted", and Codex skips both without an error.',
+        action: CODEX_TRUST_ACTION,
+      };
+    }
+    case 'inactive-by-design':
+      return {
+        healthy: true,
+        intentional: true,
+        summary: 'Codex Brain automatic lifecycle hooks are inactive by design.',
+        detail: 'MCP search, skills, slash commands, and explicit proof workflows remain available.',
+        action: null,
       };
     case 'disabled':
       return {
         healthy: false,
         intentional: true,
-        summary: 'Codex Brain lifecycle is disabled.',
-        detail: 'The installer preserved your explicit disabled state instead of silently overriding it.',
+        summary: 'Codex Brain plugin is disabled.',
+        detail: 'The installer preserved your explicit disabled state instead of silently overriding it; no Brain lifecycle hook can run.',
         action: null,
       };
     case 'not-installed':
       return {
         healthy: false,
         intentional: false,
-        summary: 'Codex can reach the Brain MCP, but the proactive lifecycle plugin is not installed.',
-        detail: 'Questions can still be grounded; automatic routing, learning, and session guidance are inactive.',
-        action: 'Run npx ruvnet-brain to install and verify the Codex lifecycle plugin.',
+        summary: 'Codex can reach the Brain MCP, but the Brain plugin is not installed.',
+        detail: 'MCP search remains available; skills and explicit plugin workflows are not installed.',
+        action: 'Run npx ruvnet-brain to install and verify the Codex plugin.',
       };
     case 'missing-runtime-hooks':
       return {
@@ -1237,6 +2555,323 @@ export function codexLifecycleGuidance(status) {
   }
 }
 
+// Remove only byte-verified Brain bridges with an exact shipped hook definition.
+// Foreign commands, mixed command strings, unknown shapes, and their surrounding settings survive.
+export function retireManagedHookRegistrations({ home = os.homedir(), codexDir = codexHomeDir(),
+  files = [path.join(home, '.claude', 'settings.json'), path.join(home, '.claude', 'settings.local.json'),
+    path.join(codexDir, 'hooks.json')], wrapperPath = codexHookWrapperPath(codexDir) } = {}) {
+  let removed = 0;
+  const changedFiles = [];
+  const conflicts = [];
+  // A bridge a retained Brain generation, or any earlier shipped release, wrote is as much the Brain's as the new source.
+  const verifiedWrapper = ['verified', 'prior-generation', 'prior-release']
+    .includes(legacyBrainWrapperOwnership(wrapperPath, path.dirname(codexDir)).state);
+  const tokensOf = (command) => (command.match(/"[^"]*"|'[^']*'|[^\s]+/g) || [])
+    .map((token) => token.replace(/^["']|["']$/g, ''));
+  const registry = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'plugin', 'hooks', 'codex-hooks.json'), 'utf8'));
+  const definitions = Object.entries(registry.hooks).flatMap(([event, groups]) => groups.flatMap(group =>
+    group.hooks.flatMap(hook => {
+      const values = typeof hook.command === 'string' ? tokensOf(hook.command) : [];
+      return values[0] === 'node' && values[1] === '-e' && /^\d+$/.test(values[3] || '')
+        ? [{ event, matcher: String(group.matcher ?? '*'), hook, args: values.slice(4) }] : [];
+    })));
+  const owns = (hook, event, group) => {
+    const command = hook?.command;
+    if (!verifiedWrapper || typeof command !== 'string' || hook.type !== 'command'
+      || (hook.pluginId != null && hook.pluginId !== 'ruvnet-brain@ruvnet-brain')
+      || Object.keys(group).some(key => !['matcher', 'hooks'].includes(key))) return false;
+    return definitions.some(definition => {
+      if (definition.event !== event || definition.matcher !== String(group.matcher ?? '*')) return false;
+      if (Object.keys(hook).some(key => !['command', 'pluginId', ...Object.keys(definition.hook)].includes(key))) return false;
+      if (Object.keys(definition.hook).some(key => key !== 'command' && hook[key] !== definition.hook[key])) return false;
+      if (Object.keys(hook).some(key => !['command', 'pluginId'].includes(key)
+        && hook[key] !== definition.hook[key])) return false;
+      if (command === definition.hook.command) return true;
+      if (/[;&|`$\n\r]/.test(command)) return false;
+      // Match literal installer forms, not a shell-like split: adjacent quoted tokens
+      // can execute a different script even when a permissive splitter looks identical.
+      if (/["']/.test(wrapperPath) || (process.platform !== 'win32' && wrapperPath.includes('\\'))
+        || (process.platform === 'win32' && /[%!^]/.test(command))
+        || definition.args.some(arg => !/^[\w-]+$/.test(arg))) return false;
+      const scripts = [`"${wrapperPath}"`];
+      if (process.platform !== 'win32') scripts.push(`'${wrapperPath}'`);
+      if (/^[\w/.:~-]+$/.test(wrapperPath)) scripts.push(wrapperPath);
+      const nodes = ['node', `"${process.execPath}"`];
+      if (process.platform !== 'win32') nodes.push(`'${process.execPath}'`);
+      if (/^[\w/.:~-]+$/.test(process.execPath)) nodes.push(process.execPath);
+      return nodes.some(node => scripts.some(script =>
+        command === `${node} ${script} ${definition.args.join(' ')}`));
+    });
+  };
+  for (const file of files) {
+    let stat;
+    try { stat = fs.lstatSync(file); } catch (error) {
+      if (error.code === 'ENOENT') continue;
+      throw error;
+    }
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
+      conflicts.push({ file, reason: 'shared or indirect settings preserved' });
+      continue;
+    }
+    let before;
+    try { before = fs.readFileSync(file, 'utf8'); } catch (error) {
+      if (error.code === 'ENOENT') continue;
+      throw error;
+    }
+    const document = JSON.parse(before);
+    if (!document.hooks || typeof document.hooks !== 'object' || Array.isArray(document.hooks)) continue;
+    let count = 0;
+    for (const [event, groups] of Object.entries(document.hooks)) {
+      if (!Array.isArray(groups)) continue;
+      document.hooks[event] = groups.flatMap((group) => {
+        if (!Array.isArray(group?.hooks)) return [group];
+        const hooks = group.hooks.filter((hook) => {
+          if (!owns(hook, event, group)) {
+            if (hook?.pluginId === 'ruvnet-brain@ruvnet-brain'
+              || (typeof hook?.command === 'string' && hook.command.includes(wrapperPath))) {
+              conflicts.push({ file, event, reason: 'unverified or customized hook preserved' });
+            }
+            return true;
+          }
+          count++; return false;
+        });
+        return hooks.length || group.hooks.length === 0 ? [{ ...group, hooks }] : [];
+      });
+      if (groups.length && document.hooks[event].length === 0) delete document.hooks[event];
+    }
+    if (!count) continue;
+    atomicReplace(file, (temp) => fs.writeFileSync(temp, JSON.stringify(document, null, 2) + '\n'));
+    removed += count;
+    changedFiles.push(file);
+  }
+  return { removed, changedFiles, conflicts };
+}
+
+/** Grok's state for --doctor and the install summary (#301): reported, never wired automatically. */
+function currentGrokStatus() {
+  return grokStatus({ pluginInstalled: Boolean(pluginCommandsDir()), hookCount: shippedHookHandlerCounts().grok });
+}
+function grokCheckLines(check) {
+  const status = currentGrokStatus();
+  const line = grokStatusLine(status);
+  if (!line) return [];
+  // Advisory only when the Brain cannot reach Grok at all; the AGENTS.md line is the user's choice.
+  return [check('grok', 'Grok', !status.pluginInstalled, line, 'npx ruvnet-brain', { advisory: true })];
+}
+
+/** Opt-in, never automatic: offer the search-first line when Grok is here and the line is not. */
+async function offerGrokAgentsMd() {
+  const status = currentGrokStatus();
+  if (!status.present || status.groundingLine || !status.pluginInstalled) return;
+  step('Optional — a search-first line for Grok', 'Grok drops prompt-time context, so this line is what makes it ground itself');
+  info(`Adds ${c.bold('one line')} (between ruvnet-brain markers) to the bottom of ${c.bold(status.agentsFile)}:`);
+  info(c.dim(`  ${GROK_AGENTS_LINE}`));
+  info('Backed up first; --uninstall removes it.');
+  const yes = FLAG_GROK_AGENTS_MD || (await ask('Add it?', false, { blanketYes: false }));
+  if (!yes) { info(`Skipped — add it any time with  ${c.bold('npx ruvnet-brain --grok-agents-md')}`); return; }
+  reportGrokAgentsLine(addGrokAgentsLine());
+}
+function reportGrokAgentsLine(result) {
+  if (result === 'added') ok(`added the search-first line to ${grokPaths().agents}`);
+  else if (result === 'present') ok('~/.grok/AGENTS.md already has a search_ruvnet line — left unchanged');
+  else if (result === 'no-grok') info('Grok CLI not detected (~/.grok/bin/grok) — nothing changed');
+  else warn('could not update ~/.grok/AGENTS.md — your file is untouched');
+}
+
+/**
+ * How many lifecycle handlers each SHIPPED host manifest registers, counted from the manifests
+ * themselves so help and progress text can never again claim "zero" while they carry handlers
+ * (#400). A missing or unreadable manifest is null ("unknown"), never 0.
+ */
+export function shippedHookHandlerCounts(root = REPO_ROOT) {
+  const count = (relative) => {
+    try {
+      const doc = JSON.parse(fs.readFileSync(path.join(root, relative), 'utf8'));
+      return Object.values(doc?.hooks || {}).flat().reduce((n, group) => n + (Array.isArray(group?.hooks) ? group.hooks.length : 0), 0);
+    } catch { return null; }
+  };
+  return {
+    claude: count('plugin/hooks/hooks.json'),
+    codex: count('plugin/hooks/codex-hooks.json'),
+    grok: count('plugin/hooks/grok-hooks.json'),
+  };
+}
+
+function hookCountPhrase({ claude, codex } = shippedHookHandlerCounts()) {
+  const n = (v) => (Number.isInteger(v) ? String(v) : 'an unknown number of');
+  return `${n(claude)} Claude Code, ${n(codex)} Codex handlers`;
+}
+
+export function automaticHookRetirementStatus(root = REPO_ROOT, { scope = 'source' } = {}) {
+  if (!['source', 'installed'].includes(scope)) throw new Error('invalid hook retirement scope');
+  const files = [
+    'plugin/hooks/hooks.json',
+    'plugin/hooks/codex-hooks.json',
+    ...(scope === 'source' ? ['.claude/settings.json', '.codex/hooks.json'] : []),
+  ];
+  const pointerContracts = [
+    ['plugin/.codex-plugin/plugin.json', 'hooks', './hooks/codex-hooks.json'],
+    ['plugin/host-adapters/codex.json', 'hooks', 'plugin/hooks/codex-hooks.json'],
+    ['plugin/host-adapters/claude.json', 'hooks', 'plugin/hooks/hooks.json'],
+  ];
+  const registrations = [];
+  const errors = [];
+  const checkedFiles = [...files];
+  for (const relative of files) {
+    try {
+      const doc = JSON.parse(fs.readFileSync(path.join(root, relative), 'utf8'));
+      if (!doc?.hooks || typeof doc.hooks !== 'object' || Array.isArray(doc.hooks)) {
+        errors.push(`${relative}: hooks must be an object`);
+        continue;
+      }
+      for (const [event, groups] of Object.entries(doc.hooks)) {
+        if (!Array.isArray(groups)) {
+          errors.push(`${relative}: ${event} must be an array`);
+          continue;
+        }
+        for (const [groupIndex, group] of groups.entries()) {
+          if (!group || typeof group !== 'object' || Array.isArray(group) || !Array.isArray(group.hooks)) {
+            errors.push(`${relative}: ${event}[${groupIndex}].hooks must be an array`);
+            continue;
+          }
+          for (const hook of group.hooks) {
+            const row = { file: relative, event, matcher: String(group.matcher ?? ''), command: String(hook?.command || '') };
+            // Project-local host settings must remain empty. The package registries may carry only
+            // the two continuity handlers; every former gate is still retired.
+            const packageRegistry = relative === 'plugin/hooks/hooks.json' || relative === 'plugin/hooks/codex-hooks.json';
+            const host = relative === 'plugin/hooks/codex-hooks.json' ? 'codex' : 'claude';
+            if (!packageRegistry || !isAllowedContinuityRegistration({ ...row, host })) registrations.push(row);
+          }
+        }
+      }
+      if (relative === 'plugin/hooks/hooks.json' || relative === 'plugin/hooks/codex-hooks.json') {
+        // PAIRS, NOT IDS. `session-snapshot` is legitimately registered at Stop, PreCompact and
+        // SessionEnd, so "exactly one registration per id" is the wrong invariant; "exactly one per
+        // (event, id), on the hosts that are proven to deliver that event" is the right one.
+        const host = relative === 'plugin/hooks/codex-hooks.json' ? 'codex' : 'claude';
+        const expected = continuityRegistrations(host);
+        for (const spec of expected) {
+          const groups = doc.hooks[spec.event] ?? [];
+          const count = groups.flatMap((group) => (group?.hooks ?? []).map((hook) => ({ group, hook })))
+            .filter(({ group, hook }) => String(group?.matcher ?? '') === spec.matcher
+              && isAllowedContinuityRegistration({ event: spec.event, matcher: group?.matcher, command: hook?.command, host })
+              && continuityHookId(hook?.command, spec.event)?.id === spec.id).length;
+          if (count !== 1) {
+            errors.push(`${relative}: continuity ${spec.event}:${spec.id} must have exactly one registration (found ${count})`);
+          }
+        }
+        for (const event of Object.keys(doc.hooks)) {
+          if (!expected.some((spec) => spec.event === event)) {
+            errors.push(`${relative}: legacy automatic event ${event} remains registered`);
+          }
+        }
+      }
+    } catch (error) {
+      errors.push(`${relative}: ${error.message}`);
+    }
+  }
+  try {
+    const contractsFile = 'plugin/hooks/hook-contracts.json';
+    const contracts = JSON.parse(fs.readFileSync(path.join(root, contractsFile), 'utf8'));
+    checkedFiles.push(contractsFile);
+    const pairs = Array.isArray(contracts.contracts) ? contracts.contracts.map((c) => `${c?.event}:${c?.id}`) : [];
+    const expectedPairs = continuityContractIds();
+    if (pairs.length !== expectedPairs.length || expectedPairs.some((pair) => !pairs.includes(pair))) {
+      errors.push(`${contractsFile}: contracts must list exactly the continuity handlers (${expectedPairs.join(', ')})`);
+    }
+    // Matchers belong to a host registry: one host's exception grants no authority to another.
+    const expectedMatchers = [['plugin', 'claude'], ['codex', 'codex']].flatMap(([layer, host]) =>
+      [...new Set(continuityRegistrations(host).map((spec) => `${layer}:${spec.event}:${spec.matcher}`))]);
+    const declaredMatchers = Array.isArray(contracts.matcherAllowlist)
+      ? contracts.matcherAllowlist.map((row) => `${row?.layer}:${row?.event}:${row?.matcher}`) : [];
+    if (declaredMatchers.length !== expectedMatchers.length
+      || expectedMatchers.some((entry) => !declaredMatchers.includes(entry))) {
+      errors.push(`${contractsFile}: matcherAllowlist must list exactly the continuity matchers (${expectedMatchers.join(', ')})`);
+    }
+  } catch (error) {
+    errors.push(`plugin/hooks/hook-contracts.json: ${error.message}`);
+  }
+  for (const [relative, field, expected] of pointerContracts) {
+    try {
+      const doc = JSON.parse(fs.readFileSync(path.join(root, relative), 'utf8'));
+      checkedFiles.push(relative);
+      if (doc?.[field] !== expected) errors.push(`${relative}: ${field} must equal ${expected}`);
+    } catch (error) {
+      errors.push(`${relative}: ${error.message}`);
+    }
+  }
+  return { ok: errors.length === 0 && registrations.length === 0, files: checkedFiles, registrations, errors };
+}
+
+export function claudeInstalledHookRetirementStatus({ home = os.homedir(), plugin: suppliedPlugin = null } = {}) {
+  const plugin = suppliedPlugin ?? claudePluginStatus({ home });
+  if (!plugin.managed && !plugin.installed) {
+    return { ok: true, state: 'not-installed', plugin, file: null, registrations: [], errors: [] };
+  }
+  if (!plugin.installed || !plugin.installPath) {
+    return {
+      ok: false,
+      state: 'installed-state-invalid',
+      plugin,
+      file: null,
+      registrations: [],
+      errors: [plugin.error || 'Claude Brain plugin registry record does not resolve to a managed install'],
+    };
+  }
+  const file = path.join(plugin.installPath, 'hooks', 'hooks.json');
+  const registrations = [];
+  const errors = [];
+  try {
+    const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (!doc?.hooks || typeof doc.hooks !== 'object' || Array.isArray(doc.hooks)) {
+      errors.push('installed Claude hooks must be an object');
+    } else {
+      for (const [event, groups] of Object.entries(doc.hooks)) {
+        if (!Array.isArray(groups)) {
+          errors.push(`installed Claude ${event} must be an array`);
+          continue;
+        }
+        for (const [groupIndex, group] of groups.entries()) {
+          if (!group || typeof group !== 'object' || Array.isArray(group) || !Array.isArray(group.hooks)) {
+            errors.push(`installed Claude ${event}[${groupIndex}].hooks must be an array`);
+            continue;
+          }
+          for (const hook of group.hooks) {
+            const row = { file, event, matcher: String(group.matcher ?? ''), command: String(hook?.command || '') };
+            if (!isAllowedContinuityRegistration(row)) registrations.push(row);
+          }
+        }
+      }
+      const expected = continuityRegistrations('claude');
+      for (const spec of expected) {
+        const count = (doc.hooks[spec.event] ?? [])
+          .flatMap((group) => (group?.hooks ?? []).map((hook) => ({ group, hook })))
+          .filter(({ group, hook }) => String(group?.matcher ?? '') === spec.matcher
+            && isAllowedContinuityRegistration({ event: spec.event, matcher: group?.matcher, command: hook?.command, host: 'claude' })
+            && continuityHookId(hook?.command, spec.event)?.id === spec.id).length;
+        if (count !== 1) {
+          errors.push(`installed Claude continuity ${spec.event}:${spec.id} must have exactly one registration (found ${count})`);
+        }
+      }
+      for (const event of Object.keys(doc.hooks)) {
+        if (!expected.some((spec) => spec.event === event)) {
+          errors.push(`installed Claude legacy automatic event ${event} remains registered`);
+        }
+      }
+    }
+  } catch (error) {
+    errors.push(`installed Claude hooks: ${error.message}`);
+  }
+  return {
+    ok: errors.length === 0 && registrations.length === 0,
+    state: errors.length === 0 && registrations.length === 0 ? 'inactive-by-design' : 'unexpected-runtime-hooks',
+    plugin,
+    file,
+    registrations,
+    errors,
+  };
+}
+
 function printCodexLifecycle(status) {
   const guidance = codexLifecycleGuidance(status);
   console.log(`  ${guidance.healthy ? c.green('✓') : guidance.intentional ? c.dim('○') : c.yellow('!')} ${guidance.summary}`);
@@ -1253,7 +2888,7 @@ function gatherInstallState(cacheDir) {
   try {
     repos = fs
       .readdirSync(cacheDir)
-      .filter((f) => f.endsWith('.rvf')).length;
+      .filter((f) => f.endsWith('.rvf') && !isVolumeMetadata(f)).length; // an exFAT `._x.rvf` shadow is not a store
   } catch {
     /* ignore */
   }
@@ -1314,11 +2949,13 @@ function ensureVerifier(cacheDir) {
   } catch { return 'unavailable'; }
 }
 
+/** The installed verifier: the module, or { broken } when the file is there but will not load (an install
+ * defect, ✗), or null when no verifier exists at all (neither installed nor shippable — "cannot settle"). */
 async function loadCitationVerifier(cacheDir) {
   ensureVerifier(cacheDir);
   const p = path.join(cacheDir, 'verify-citation.mjs');
   if (!fs.existsSync(p)) return null;
-  try { return await import(pathToFileURL(p).href); } catch { return null; }
+  try { return await import(pathToFileURL(p).href); } catch (error) { return { broken: String(error?.message || error).slice(0, 200) }; }
 }
 
 // Proving grounding means proving the answer's CITATION RESOLVES — that the file it points at is a
@@ -1333,14 +2970,53 @@ export function resolveRuntimeModelCache(env = process.env, home = os.homedir())
 
 async function smokeQuery(cacheDir) {
   const ask = path.join(cacheDir, 'forge-ask-all.mjs');
-  if (!fs.existsSync(ask)) return { ran: false };
+  // A missing reader is an INSTALL DEFECT, named as one (✗ with its fix), never a silent skip.
+  if (!fs.existsSync(ask)) {
+    warn('the reader forge-ask-all.mjs is not in the installed brain — the live question cannot be asked');
+    return { ran: false, grounded: false, reason: 'reader-missing: forge-ask-all.mjs is not in the installed brain' };
+  }
   step(
     'Asking the brain a real question',
-    'this warms the local model so your first real answer is instant — and proves grounding works end to end',
+    'this warms the local model and checks that retrieval returns usable, cited evidence',
   );
-  const Q = 'How should I store embeddings in this project without running a server?';
+  const Q = DOCTOR_SMOKE_QUERY;
+  const modelCache = resolveRuntimeModelCache();
+  // WARMING IS NOT ANSWERING. A cold cache means the first question also downloads and loads the
+  // models, so a timeout could not tell "still fetching" from "broken". Fetch them first, as their
+  // own step with their own bound and their own verdict; the question's limit then measures an
+  // answer. A warm cache (every later doctor run) skips this step entirely.
+  const cold = coldModels(cacheDir, modelCache);
+  if (cold.length) {
+    // The warm-up imports the reader's own modules. Missing ones are an incomplete install (✗, reinstall),
+    // not a "could not prepare the models" crash with an ERR_MODULE_NOT_FOUND stack.
+    const missing = ['forge-ask.mjs', 'forge-rerank.mjs'].filter((f) => !fs.existsSync(path.join(cacheDir, f)));
+    if (missing.length) {
+      warn(`the reader is incomplete — ${missing.join(', ')} missing from the installed brain`);
+      return { ran: true, grounded: false, reason: `reader-incomplete: ${missing.join(', ')} missing from the installed brain` };
+    }
+    info(c.dim(`warming ${cold.length} local model(s) once: ${cold.join(', ')}`));
+    const warmStarted = Date.now();
+    const w = spawnSync(process.execPath, ['--input-type=module', '-e', MODEL_WARMUP_SCRIPT], {
+      cwd: cacheDir, encoding: 'utf8', timeout: MODEL_WARMUP_TIMEOUT_MS,
+      env: { ...process.env, KB_MODEL_CACHE: modelCache },
+    });
+    const warmSecs = ((Date.now() - warmStarted) / 1000).toFixed(1);
+    if (w.status === 0) {
+      ok(`local models ready in ${warmSecs}s (downloaded and loaded once; later questions skip this)`);
+    } else if (w.status === 3) {
+      info(c.dim('this bundle predates the separate warm-up step — the question below includes it'));
+    } else {
+      // ONE classification (installed-brain-health.mjs classifyWarmupFailure): spawnSync's own timeout is
+      // advisory (a slow machine); a native crash (a signal with no ETIMEDOUT) is a broken runtime, ✗.
+      const v = classifyWarmupFailure({ error: w.error, signal: w.signal, status: w.status, secs: warmSecs, limitSecs: MODEL_WARMUP_TIMEOUT_MS / 1000 });
+      warn(`could not prepare the local models — the warm-up ${v.cause}`);
+      const err = `${w.stderr || ''}`.trim();
+      if (err) for (const line of err.split('\n').slice(0, 8)) info(c.dim(`    ${line.slice(0, 200)}`));
+      return { ran: true, grounded: false, reason: `model-warmup-${v.kind}: ${v.cause}`, stderr: err.slice(0, 4000),
+        ...(v.advisory ? { slow: true, warmupTimeout: true } : {}) };
+    }
+  }
   info(`Q: ${c.cyan(`"${Q}"`)}`);
-  info(c.dim('(first run downloads a small local model once — this can take a minute)'));
   const started = Date.now();
   let r;
   try {
@@ -1349,14 +3025,28 @@ async function smokeQuery(cacheDir) {
     // absolute path via spawnSync (no shell involved) that identity check silently fails on this
     // machine, so main() never runs — exit 0, zero stdout, zero stderr, no exception. Looks like a
     // clean success; is actually a total no-op. Verified: switching to a relative name + cwd fixes it.
-    r = spawnSync('node', ['forge-ask-all.mjs', '--dir', cacheDir, '--q', Q, '--k', '3'], {
+    r = spawnSync('node', doctorSmokeArgs(cacheDir), {
       cwd: cacheDir,
       encoding: 'utf8',
       timeout: 240000,
       // The stable MCP shell sets this exact default before spawning its worker. Passing the same
       // path here makes the install smoke warm the model cache the product will actually reopen,
       // instead of a second kb-local cache that can go green while the real door stays cold.
-      env: { ...process.env, KB_MODEL_CACHE: resolveRuntimeModelCache() },
+      //
+      // RUVNET_BRAIN_QUERY_DEADLINE_MS: 45s for this one probe, against the general 20s deadline
+      // (kb/query-deadline.mjs DEFAULT_QUERY_DEADLINE_MS) that protects every normal query. Still
+      // bounded — the module's core guarantee. The 27-29s once quoted here (public-verification runs
+      // 36324328134, 36325803503) were THREE doctors started at once on the 3-vCPU/7GB macOS runner,
+      // not one cold probe. Measured 2026-10-01 on that runner (ci-probe run 36882813925): model
+      // download+load 6-7s (now its own step above), this question alone 6.6-10.4s with a warm cache
+      // and 14-15s with the fetch inside it, three at once 24-34s; the real --doctor, alone, verified
+      // in 11.8s (4.4.1) and 15.4s (4.4.0). 45s is ~3x the measured single-doctor cost. Only applied
+      // if the caller hasn't already set an explicit override.
+      env: {
+        ...process.env,
+        KB_MODEL_CACHE: modelCache,
+        RUVNET_BRAIN_QUERY_DEADLINE_MS: process.env.RUVNET_BRAIN_QUERY_DEADLINE_MS ?? '45000',
+      },
     });
   } catch {
     warn("skipped the live test (couldn't launch the reader) — it'll warm on your first real question");
@@ -1365,7 +3055,18 @@ async function smokeQuery(cacheDir) {
   const secs = ((Date.now() - started) / 1000).toFixed(1);
   const out = `${r.stdout || ''}`;
   if (r.status !== 0 || !out.trim()) {
-    warn('no answer came back (first-run model download or offline) — the brain is installed; it\'ll warm on your first real question');
+    // NAME THE ACTUAL CAUSE, DO NOT GUESS A REASSURING ONE.
+    //
+    // This said "first-run model download or offline" unconditionally. It is one plausible cause
+    // among several, asserted as though it had been checked — and it is the reassuring one, so a
+    // crash, a timeout, and a missing module all read as "nothing is wrong, it will warm up".
+    // Observed on this machine: a smoke query that produced no answer in 240s was reported as a
+    // first-run download. spawnSync already tells us which it was; say that instead.
+    const limitMs = Number(process.env.RUVNET_BRAIN_QUERY_DEADLINE_MS ?? 45000);
+    const failure = classifySmokeFailure({ error: r.error, signal: r.signal, status: r.status,
+      stderr: r.stderr, secs, limitSecs: Number.isFinite(limitMs) ? limitMs / 1000 : 45 });
+    const { cause } = failure;
+    warn(`no answer came back — ${cause}`);
     // SHOW THE ACTUAL ERROR (issue #37 bug 2, Agentist-Elder, 2026-07-21).
     //
     // This captured stderr and then threw it away, so every hard failure — a crash, a missing
@@ -1385,17 +3086,36 @@ async function smokeQuery(cacheDir) {
       for (const line of lines.slice(0, 12)) info(c.dim(`    ${line.slice(0, 200)}`));
       if (lines.length > 12) info(c.dim(`    … ${lines.length - 12} more line(s)`));
     }
-    return { ran: true, grounded: false, reason: 'no-answer', stderr: err.slice(0, 4000) };
+    // The reason travels with the verdict so the doctor's "Grounding NOT proven (<reason>)" line
+    // names the real cause too, instead of the generic token.
+    return { ran: true, grounded: false, reason: `no-answer: ${cause}`, secs, stderr: err.slice(0, 4000),
+      slow: failure.kind === 'slow' };
   }
 
   const verifier = await loadCitationVerifier(cacheDir);
+  if (verifier?.broken) {
+    warn(`the installed citation verifier does not load (${verifier.broken}) — grounding cannot be proven until it is reinstalled`);
+    return { ran: true, grounded: false, reason: `reader-broken: verify-citation.mjs does not load (${verifier.broken})` };
+  }
   if (!verifier) {
     info(`the brain answered in ${secs}s, but this bundle predates the citation verifier —`);
     info(c.dim('  re-run `npx ruvnet-brain` to refresh it, and grounding will be PROVEN, not assumed'));
     return { ran: true, grounded: null, reason: 'verifier-missing' };
   }
 
-  const v = await verifier.verifyGrounding(out, cacheDir);
+  // A verifier that throws when CALLED is as broken as one that will not load: a named ✗, never a crash that
+  // leaves --doctor --json with nothing to parse (re-review a6 SF4).
+  let v;
+  try { v = await verifier.verifyGrounding(out, cacheDir); } catch (error) {
+    const why = String(error?.message || error).slice(0, 200);
+    warn(`the installed citation verifier failed while checking the answer (${why}) — reinstall to repair it`);
+    return { ran: true, grounded: false, reason: `reader-broken: verify-citation.mjs threw (${why})` };
+  }
+  const evidence = classifySmokeEvidence(v, out);
+  if (v.grounded && !evidence.usable) {
+    warn(`the citation resolves, but the question was not answered with sufficient evidence (${evidence.reason})`);
+    return { ran: true, grounded: false, citationResolved: true, reason: evidence.reason, secs };
+  }
   if (v.grounded) {
     ok(`grounded in rUv's real source — verified in ${secs}s, not guessed ✦`);
     console.log(`      ${c.dim('cited:')}    ${c.bold(v.receipt.path)}`);
@@ -1521,7 +3241,7 @@ async function runDemo() {
   } catch { /* informational only */ }
 
   console.log(`\n  Now try it for real: open Claude Code in any project and ask it something about`);
-  console.log(`  RuVector, Ruflo, AgentDB, or SPARC — it'll ground the same way, automatically.`);
+  console.log(`  RuVector, Ruflo, AgentDB, or SPARC — use ${c.bold('search_ruvnet')} when you need source grounding.`);
   console.log(`  Run this demo again any time:  ${c.bold('npx ruvnet-brain --demo')}`);
   console.log(`  Full health check:              ${c.bold('npx ruvnet-brain --doctor')}\n`);
 }
@@ -1570,22 +3290,110 @@ function meterSummaryLine() {
 // Honest prose that no machine can read is not a check. It could not gate a CI job, a nightly probe,
 // or a `&&` in someone's shell. It now RETURNS a verdict and main() exits with it, so "needs
 // attention" and "success" can never again be the same thing to a script.
-async function doctor() {
+// `--doctor --json` runs THIS SAME doctor (review S5: it used to print only the confirmation object, so the
+// text doctor and the JSON could give one machine two verdicts). The narration goes to stderr; stdout carries
+// only the ONE verdict object (brain-confirmation.mjs doctorVerdict), and the exit code is its exitCode.
+async function doctor({ json = false } = {}) {
+  if (!json) return doctorRun({ json });
+  const log = console.log;
+  console.log = (...args) => console.error(...args);
+  try { return await doctorRun({ json }); } finally { console.log = log; }
+}
+async function doctorRun({ json }) {
   printBanner('doctor');
   console.log(c.dim('Checking every part of the install and reporting green/red.\n'));
   const cacheDir = process.env.RUVNET_BRAIN_KB || path.join(os.homedir(), '.cache', 'ruvnet-brain', 'kb');
   info(`brain dir: ${c.bold(cacheDir)}`);
+  {
+    const where = brainLocation();
+    if (where.state === 'linked') ok(`the Brain lives on another disk: ${where.real} (${where.path} links to it; that disk is mounted)`);
+  }
   const present = fs.existsSync(path.join(cacheDir, 'forge-mcp-all.mjs'));
   if (!present) {
-    warn('brain not found here — run the installer first:  npx ruvnet-brain');
-    return 1; // "not installed" is a FAILING doctor, not a neutral one
+    // "not installed" is a FAILING doctor, not a neutral one — and the same verdict in both outputs. An
+    // interrupted --move-brain may have left the ONLY copy at <home>.old-<pid>: its Move line names the `mv`
+    // back (a fresh install over it would build a second, public-only Brain).
+    let moveLines = [];
+    try { // names only (measure:false): no tree walk on a machine that has no Brain here
+      moveLines = confirm({ footprint: inventoryFootprint({ now: footprintNow(), measure: false }), installedVersion: PACKAGE_VERSION, now: footprintNow() })
+        .lines.filter((l) => l.id === 'move-leftover');
+    } catch { /* the install line stands */ }
+    // A Brain an interrupted move set aside is RESTORED, never reinstalled over (re-review a6 SHOULD-FIX 1).
+    const restore = moveLines.find((l) => l.state === 'fail');
+    if (restore) warn(`the Brain is not at its path, but an interrupted move left it here — restore it, do NOT reinstall:  ${restore.fix}`);
+    else warn('brain not found here — run the installer first:  npx ruvnet-brain');
+    const verdict = doctorVerdict({ schemaVersion: 1, kind: 'ruvnet-brain-confirmation', lines: moveLines },
+      [{ id: 'install', label: 'Install', state: 'fail', detail: `brain not found at ${cacheDir}`,
+        fix: moveLines.find((l) => l.state === 'fail')?.fix || 'npx ruvnet-brain' }]);
+    if (json) process.stdout.write(`${JSON.stringify(verdict, null, 2)}\n`);
+    else {
+      if (moveLines.length) console.log(`\n${formatConfirmation(verdict, { color: c, summary: false })}`);
+      console.log(`\n  ${c.red('✗ FAILING')} — ${verdict.failing.join(', ')}: run the fix named ${moveLines.length ? 'on each ✗ line' : 'above'}.`);
+    }
+    return verdict.exitCode;
   }
+  const convergencePath = path.join(process.env.RUVNET_BRAIN_HOME || path.join(os.homedir(), '.cache', 'ruvnet-brain'), 'host-convergence.json');
+  let hostConvergence = { healthy: true, state: 'not-recorded' };
+  if (fs.existsSync(convergencePath)) {
+    try {
+      const recorded = withLiveConsoleState(JSON.parse(fs.readFileSync(convergencePath, 'utf8')),
+        { receiptDir: path.join(path.dirname(convergencePath), 'console-instances') });
+      hostConvergence = classifyHostConvergence(recorded);
+      const codex = recorded.hosts?.codex;
+      if (codex?.state === 'ready' && codex.restartRequired === true && codex.restartScope === 'unproven') {
+        const binary = codexAdministrativeProbeBinary();
+        const fresh = await probeFreshCodexDeclarations({ binary, codexHome: codexHomeDir(), cwd: process.cwd(),
+          releasedPluginRoot: path.join(REPO_ROOT, 'plugin'), expectedVersion: PACKAGE_VERSION });
+        hostConvergence = reconcileFreshCodexDeclarations(recorded, fresh);
+        if (fresh.ok) info('Codex fresh-declarations-ready: current trusted hook declarations only; hook bodies and MCP execution were not tested. Existing open windows remain unproven.');
+        else warn(`Codex fresh declarations remain unproven: ${fresh.reason}`);
+      }
+      if (hostConvergence.healthy) {
+        ok(`host convergence receipt: ${hostConvergence.state}`);
+        if (hostConvergence.notice) info(hostConvergence.notice);
+      }
+      else {
+        warn(`host convergence incomplete: ${hostConvergence.state}`);
+        info(`Retry the same generation: ${c.bold('npx ruvnet-brain --update')}${hostConvergence.action ? `; ${hostConvergence.action}` : ''}`);
+      }
+    } catch (error) {
+      hostConvergence = { healthy: false, state: 'invalid-receipt', error: error.message };
+      warn(`host convergence receipt is invalid: ${error.message}`);
+    }
+  }
+  const brainHome = process.env.RUVNET_BRAIN_HOME || path.dirname(cacheDir);
+  const nightlyHealth = schedulerStatus({ platform: process.platform, env: process.env,
+    brainHome, kbDir: cacheDir });
+  // Does the scheduled job run the code installed now? Its module snapshot is refreshed by --update, its runner only
+  // by --enable-nightly (measured stale 2026-10-22). Read-only; `unregistered` is already covered by the state lines.
+  let nightlyCode = { state: 'unregistered' };
+  try { nightlyCode = nightlyModuleCurrency({ brainHome, runnerSource: path.join(REPO_ROOT, 'bin', 'nightly-refresh.mjs') }); } catch (error) { nightlyCode = { state: 'unknown', why: error.message }; }
+  if (nightlyHealth.state === 'on') {
+    ok(`nightly scheduler: ${nightlyHealth.evidence}`);
+    if (nightlyCode.state === 'current') ok('nightly runs current code: the registered update modules are the installed set');
+    else if (nightlyCode.fix) warn(`nightly runs ${nightlyCode.state === 'runner-changed' ? 'an older runner' : 'stale update modules'} — fix:  ${c.bold(nightlyCode.fix)}`);
+    if (nightlyHealth.runHealth?.state === 'ok' || nightlyHealth.runHealth?.state === 'running') {
+      ok(`nightly execution: ${nightlyHealth.runHealth.evidence}`);
+    } else if (nightlyHealth.runHealth?.state === 'failed') {
+      warn(`nightly refresh FAILED — the brain is not updating: ${nightlyHealth.runHealth.evidence}`);
+    } else warn(`nightly execution unproven: ${nightlyHealth.runHealth?.evidence || 'no run receipt'}`);
+  }
+  else if (nightlyHealth.state === 'degraded') warn(`nightly scheduler degraded: ${nightlyHealth.evidence}`);
+  else if (nightlyHealth.state === 'off') warn('nightly scheduler is OFF — knowledge updates only when a session starts (SessionStart retries at most every 6h); for nightly updates run  npx ruvnet-brain --enable-nightly  (skip if agentic-kit manages this machine)');
+  else info(`nightly scheduler status unavailable: ${nightlyHealth.evidence}`);
   have('node') ? ok('node present') : warn('node missing');
   have('npm') ? ok('npm present') : warn('npm missing');
   have('claude') ? ok('claude CLI present') : warn('claude CLI missing (plugin wiring needs it)');
   // Two independent version streams (KB bundle vs plugin wrapper) — see checkVersionDrift()'s
   // header comment for the full story. Silent unless they've genuinely diverged.
   reportVersionDrift(cacheDir);
+  const installedIdentity = inspectInstalledBrain(cacheDir, PACKAGE_VERSION);
+  info(`installed identities: package ${installedIdentity.packageVersion || 'unknown'}; search engine ${installedIdentity.searchVersion || 'unknown'}; validator ${installedIdentity.validatorVersion || 'unknown'}`);
+  if (installedIdentity.corpusTag) info(`corpus generation: ${installedIdentity.corpusTag}`);
+  if (!installedIdentity.healthy) {
+    for (const issue of installedIdentity.issues) warn(`installed identity: ${issue}`);
+    info(`Repair the installed generation: ${c.bold('npx ruvnet-brain@latest --update')}`);
+  }
   // Extraction no longer needs an external binary at all — kb/zip-extract.mjs does it with node:zlib
   // (see unzipInto()). So this reports the file's PRESENCE, not a PATH lookup: if it is missing from
   // the install, extraction on Windows silently loses its primary method, which is exactly the class
@@ -1603,9 +3411,17 @@ async function doctor() {
   cleanupStrayRuvectorDb(); // issue #39: sweep a leftover empty scaffold from before this fix, if one's here
   const env = detectEnvironment();
   let rufloOperational = null;
-  if (env.ruflo) {
-    rufloOperational = probeRufloOperationalHealth();
-    if (rufloOperational.healthy) {
+  const rufloAt = locateRuflo();
+  if (env.ruflo && !rufloAt.cli) {
+    // Wired into ~/.claude/settings.json (npx) but no CLI to ask: the probe used to spawn a missing `ruflo`,
+    // read the empty output as "operational", and print a ✓ it had not measured.
+    rufloOperational = { configuredOnly: true };
+    info('Ruflo is configured in ~/.claude/settings.json but no ruflo CLI is on PATH — not probed');
+  } else if (env.ruflo) {
+    rufloOperational = probeRufloOperationalHealth({ cli: rufloAt.cli });
+    if (rufloOperational.notInitialized) {
+      info('Ruflo CLI present; this directory has not run `ruflo init`, so there is no project learning to judge here (not a failure)');
+    } else if (rufloOperational.healthy) {
       ok(rufloOperational.directMode
         ? 'Ruflo direct mode ready — daemon/swarm is stopped by design; AgentDB remains CLI-backed'
         : 'Ruflo operational — runtime, memory, and learning signals agree');
@@ -1656,11 +3472,16 @@ async function doctor() {
   const v = verifyInstall(cacheDir);
   const smoke = await smokeQuery(cacheDir);
   const allGreen = v.repos > 0 && v.reader && v.mcp;
-  console.log(
-    `\n  ${allGreen ? c.green('✓ Healthy.') : c.yellow('! Needs attention.')} ${
-      allGreen ? 'The brain is installed and reachable.' : 'Re-run the installer to fix the warnings above.'
-    }`,
-  );
+  // ONE VERDICT, AND IT COMES AFTER ITS EVIDENCE.
+  //
+  // This line used to print "✓ Healthy." here, from `allGreen` — which reads only repos/reader/mcp —
+  // and then a SECOND verdict, "✗ FAILING", printed ~120 lines later from the much wider `failed`.
+  // A --doctor run genuinely emitted both, and exited 0. Two verdicts is not a cosmetic problem: a
+  // reader stops at the first one, so the tool told people they were healthy while its own exit-code
+  // logic had already decided otherwise. The single verdict is now emitted at the end, where every
+  // input to `failed` exists; this position keeps only the installed-and-reachable READING.
+  console.log(`\n  ${allGreen ? c.green('Install: present and reachable.')
+    : c.yellow('Install: incomplete — see the warnings above.')}`);
   // Installed-and-reachable and actually-grounded are different claims. Keep them separate, so a
   // healthy install can never be mistaken for proven grounding.
   if (smoke.grounded === true) {
@@ -1668,7 +3489,12 @@ async function doctor() {
     console.log(`    really exists in your local KB. Checked in ${smoke.secs}s, no cloud, no API key.`);
   } else if (smoke.grounded === false) {
     console.log(`  ${c.yellow('! Grounding NOT proven')} (${smoke.reason}). The install is present but the brain did not`);
-    console.log('    answer from a verifiable source. Re-run  npx ruvnet-brain  to repair the KB.');
+    // A timeout mid-answer is not a damaged KB, and reinstalling a working brain does not make the
+    // machine faster — so that case gets its own, true advice. Still NOT proven, still failing.
+    console.log(smoke.slow
+      ? '    answer inside the limit. The reader was working, not broken — a reinstall will not help. Run\n'
+        + '    npx ruvnet-brain --doctor  again when the machine is less busy.'
+      : '    answer from a verifiable source. Re-run  npx ruvnet-brain  to repair the KB.');
   } else if (smoke.grounded === null) {
     console.log(`  ${c.yellow('! Grounding not verifiable')} on this bundle — it predates the citation verifier.`);
     console.log('    Re-run  npx ruvnet-brain  to refresh, then --doctor will prove it.');
@@ -1678,11 +3504,14 @@ async function doctor() {
   // from disk (our entry present AND the server.mjs it names really there), never asserted from the
   // fact that an install once ran.
   const cx = codexStatus();
+  let codexMcp = null;
   let codexLifecycle = null;
   if (!cx.host) {
     console.log(`  ${c.dim('Codex: no host detected (no ~/.codex) — nothing to wire.')}`);
   } else if (cx.wired) {
-    console.log(`  ${c.green('✓ Codex: wired.')} search_ruvnet is registered in ~/.codex/config.toml and its server exists.`);
+    codexMcp = codexMcpGuidance(cx);
+    console.log(`  ${codexMcp.healthy ? c.green('✓') : codexMcp.blocking ? c.yellow('!') : c.dim('○')} ${codexMcp.summary}`);
+    if (codexMcp.detail) console.log(`    ${codexMcp.detail}`);
     codexLifecycle = await codexLifecycleStatus();
     printCodexLifecycle(codexLifecycle);
   } else {
@@ -1705,36 +3534,58 @@ async function doctor() {
       console.log(`      window and it's there. ${c.bold('No reinstall per project. No second download.')} One brain, shared.`);
     }
     console.log(`    • ${c.bold('Nothing to git-ignore')} in your projects — it drops zero files into your working repos.`);
-    console.log(`    • ${c.bold('To use it:')} just ask Claude about rUv's stack (RuVector, Ruflo, AgentDB, SPARC…) — it`);
-    console.log(`      grounds the answer automatically and takes the lead on builds. You don't invoke anything.`);
-    console.log(`    • ${c.bold("To know it's on:")} a fresh session greets you with "🧠 RuvNet Brain active". Or run this`);
-    console.log(`      ${c.bold('--doctor')} command any time.`);
+    console.log(`    • ${c.bold('To use it:')} invoke ${c.bold('search_ruvnet')} or a Brain skill when source-grounded`);
+    console.log('      RuvNet context is needed. Nothing is injected into an ordinary turn automatically.');
+    console.log(`    • ${c.bold("To know it's available:")} run this ${c.bold('--doctor')} command any time; no Brain lifecycle`);
+    console.log(`      hook should fire automatically.`);
   }
   console.log(
     c.dim('\n  Heads-up: a window that was ALREADY open when you installed needs a restart to pick it up;\n  newly-opened windows are fine.\n'),
   );
 
+  // AgentDB recording is proven per write: a refused or unverified ruflo write is a hook-failures row,
+  // summarized at SessionStart. There is no local outbox to inspect here any more.
+  const agentdbLine = null;
+
+  const { turnRecordingStatus } = await import('../plugin/scripts/turn-outcome-capture.mjs');
+  const turnStatus = turnRecordingStatus({ projectDir: process.cwd() });
+  const turnLine = { id: 'turn-recording', label: 'Turn recording', state: turnStatus.state, detail: turnStatus.line, fix: null };
+
   // ── THE MECHANICAL VERDICT ────────────────────────────────────────────────────────────────────
-  // `--hooks` additionally fires every registration in the INSTALLED hooks.json through the real
-  // shim under the four stdin regimes. Opt-in because it spawns real hooks; plain --doctor stays a
-  // pure read that anyone can run without side effects.
+  // `--hooks` is a read-only proof that every registration in the shipped manifests is on the
+  // continuity allowlist (#400: it is not, and never was, a zero-registration proof). It must never
+  // execute hook bodies.
   let hookResult = null;
   if (FLAG_HOOKS) {
-    console.log(`  ${c.dim('── hook battery (installed hooks.json, four stdin regimes, external watchdog) ──')}`);
-    hookResult = await runSelfCheck({ installState: { repos: v.repos, reader: v.reader, mcp: v.mcp } });
+    const retirement = automaticHookRetirementStatus(REPO_ROOT, { scope: 'installed' });
+    const installedClaude = claudeInstalledHookRetirementStatus();
+    const hookOk = retirement.ok && installedClaude.ok;
+    hookResult = { exitCode: hookOk ? 0 : 1 };
+    console.log(`  ${hookOk ? c.green('✓') : c.red('✗')} automatic Brain hook continuity policy: ${retirement.registrations.length + installedClaude.registrations.length} legacy/invalid registration(s), ${retirement.errors.length + installedClaude.errors.length} manifest error(s)`);
+    for (const error of retirement.errors) console.log(`    ${error}`);
+    for (const error of installedClaude.errors) console.log(`    ${error}`);
+    for (const registration of retirement.registrations) {
+      console.log(`    ${registration.file} ${registration.event}: ${registration.command || '(empty command)'}`);
+    }
+    for (const registration of installedClaude.registrations) {
+      console.log(`    ${registration.file} ${registration.event}: ${registration.command || '(empty command)'}`);
+    }
   }
 
-  // ── THE PERSISTED GROUNDING VERDICT (ADR-058 §D8) — read-only, never re-derived here ────────────
-  // bin/install.mjs's own install run is the ONLY writer (right after its real smoke query), so a
-  // failed smoke stays non-fatal there. `--doctor` is different: it is the command someone runs
-  // SPECIFICALLY TO ASK whether the install is healthy, so this is the one place an unresolved
-  // "unproven" verdict DOES gate the exit code — without doctor() re-running a second live query
-  // (the live smoke result printed above already updates the SAME file the next real install or
-  // search_ruvnet touches; this just reads back whatever the most recent real attempt recorded).
+  // ── THE PERSISTED GROUNDING VERDICT (ADR-058 §D8) — synchronize stronger live proof first ───────
+  // A failed install smoke stays non-fatal there. `--doctor` is different: it is the command someone
+  // runs SPECIFICALLY TO ASK whether the install is healthy, so this is the one place an unresolved
+  // "unproven" verdict DOES gate the exit code. Its successful live citation proof above must clear
+  // an older failure before this read; otherwise one invocation can print both PROVEN and UNPROVEN.
   let groundingUnprovenPersisted = false;
+  let persistedGrounding = null;
   try {
     const mod = await import(new URL('../scripts/selfcheck.mjs', import.meta.url).href);
-    groundingUnprovenPersisted = mod.groundingUnproven(mod.readInstallState());
+    if (smoke.grounded === true) {
+      mod.writeInstallState({ grounding: 'proven', reason: null, clearedBy: 'doctor-live-proof', coverageSha256: liveCoverageSha256(cacheDir) });
+    }
+    persistedGrounding = mod.readInstallState();
+    groundingUnprovenPersisted = mod.groundingUnproven(persistedGrounding);
     if (groundingUnprovenPersisted) {
       console.log(`  ${c.yellow('! Grounding UNPROVEN')} (recorded at ${c.bold(mod.installStatePath())}).`);
       console.log(`    This is what makes ${c.bold('--doctor')} fail here even though nothing above crashed — re-run`);
@@ -1750,16 +3601,60 @@ async function doctor() {
     && !codexLifecycleGuidance(codexLifecycle).healthy
     && !codexLifecycleGuidance(codexLifecycle).intentional,
   );
+  // A staged release verifier can execute the packaged hooks under Codex's explicit automation
+  // trust bypass. That proves the real hook commands without pretending a fresh interactive user
+  // has already reviewed them; normal end-user doctor runs remain fail-closed on pending trust.
+  const codexTrustBypassed = process.env.RUVNET_CODEX_HOOK_TRUST_MODE === 'bypass';
   const codexWiringFailed = Boolean(cx.host && !cx.wired);
-  const failed = (hookResult ? hookResult.exitCode !== 0 : !allGreen)
-    || groundingUnprovenPersisted
-    || codexLifecycleFailed
-    || codexWiringFailed
-    || Boolean(rufloOperational && !rufloOperational.healthy);
-  if (failed && !hookResult && !groundingUnprovenPersisted) {
-    console.log(`  ${c.red('✗ FAILING')} — the warnings above are real. Re-run  ${c.bold('npx ruvnet-brain')}  to repair.`);
+  const codexReadinessFailed = Boolean(codexMcp?.blocking);
+  // ADR-0098 positive confirmation (read-only here; `--clean` enforces) PLUS every doctor check, as lines of
+  // ONE block, judged by ONE function (doctorVerdict): ✗ anywhere fails; ! (currency: KB age, a host plugin
+  // behind, npm newer) advises and never fails, so a correctly installed older build still verifies.
+  const confirmation = await printConfirmation({ print: false });
+  const check = (id, label, failedNow, detail, fix, { advisory = false } = {}) => ({ id, label,
+    state: failedNow ? (advisory ? 'warn' : 'fail') : 'ok', detail, fix: failedNow ? fix : null });
+  const nightlyFailed = nightlyHealth.state === 'degraded'
+    || (nightlyHealth.state === 'on' && !['ok', 'running'].includes(nightlyHealth.runHealth?.state));
+  const codexFailed = codexWiringFailed || codexReadinessFailed || (codexLifecycleFailed && !codexTrustBypassed);
+  // #420 item 4: per-project Claude installs lag silently behind the user one; advisory, with each project's own command.
+  const projectReference = claudePluginStatus().version || PACKAGE_VERSION;
+  const projectLine = projectInstallsCheck(claudeProjectInstalls({ referenceVersion: projectReference }), projectReference);
+  const checks = [
+    // With --hooks the install reading was never part of the verdict (release install verification); keep that.
+    check('install', 'Install', !allGreen, `${v.repos} store(s), reader ${v.reader ? 'present' : 'MISSING'}, search server ${v.mcp ? 'present' : 'MISSING'}`,
+      'npx ruvnet-brain', { advisory: Boolean(hookResult) }),
+    ...(hookResult ? [check('hooks', 'Hooks', hookResult.exitCode !== 0, 'automatic Brain hook continuity policy', 'npx ruvnet-brain')] : []),
+    check('identity', 'Identity', !installedIdentity.healthy, installedIdentity.healthy ? 'search engine, validator and archive manifest agree'
+      : installedIdentity.issues.join('; '), 'npx ruvnet-brain@latest --update'),
+    groundingCheckLine({ smoke, persisted: persistedGrounding, coverageSha256: liveCoverageSha256(cacheDir) }),
+    ...(cx.host ? [check('codex', 'Codex', codexFailed, codexFailed ? (codexWiringFailed ? 'host detected but NOT wired'
+      : codexReadinessFailed ? 'MCP readiness blocked' : 'lifecycle hooks unhealthy') : 'wired', 'npx ruvnet-brain')] : []),
+    check('nightly', 'Nightly', nightlyFailed, `${nightlyHealth.state}${nightlyHealth.runHealth?.state ? `, last run ${nightlyHealth.runHealth.state}` : ''}`,
+      nightlyFix(nightlyHealth)),
+    // Scheduler ON but running yesterday's code: an advisory naming the exact fix, never a failing verdict.
+    ...(nightlyHealth.state === 'on' && nightlyCode.state !== 'unregistered' ? [check('nightly-code', 'Nightly code', nightlyCode.state !== 'current',
+      nightlyCode.state === 'current' ? 'registered update modules match the installed set' : `${nightlyCode.state}: registered ${String(nightlyCode.registered || '?').slice(0, 12)}, installed ${String(nightlyCode.current || '?').slice(0, 12)}`,
+      nightlyCode.fix || 'npx ruvnet-brain@latest --update', { advisory: true })] : []),
+    check('host-convergence', 'Hosts sync', !hostConvergence.healthy, hostConvergence.state, 'npx ruvnet-brain --update'),
+    ...grokCheckLines(check),
+    ...(rufloOperational ? [rufloCheckLine(rufloOperational)] : []),
+    ...(projectLine ? [projectLine] : []),
+    ...(agentdbLine ? [agentdbLine] : []),
+    turnLine,
+  ];
+  // THE ONE VERDICT. Text, --json and the exit code are all read from this object; nothing else decides.
+  const verdict = doctorVerdict(confirmation, checks);
+  if (json) {
+    process.stdout.write(`${JSON.stringify(verdict, null, 2)}\n`);
+  } else {
+    console.log(`\n${formatConfirmation(verdict, { color: c, summary: false })}`);
+    if (!verdict.ok) {
+      console.log(`\n  ${c.red('✗ FAILING')} — ${verdict.failing.join(', ')}: run the fix named on each ✗ line.`);
+    } else {
+      console.log(`\n  ${c.green('✓ Healthy.')} The brain is installed, reachable, and its checks pass${verdict.advisories.length ? ` (${verdict.advisories.length} advisory ! line(s): ${verdict.advisories.join(', ')})` : ''}.`);
+    }
   }
-  return failed ? 1 : 0;
+  return verdict.exitCode;
 }
 
 // ── the post-install self-check, wired for both --doctor --hooks and the installer's last step ────
@@ -1784,7 +3679,7 @@ async function runSelfCheck({ installState = null, quiet = false } = {}) {
     mod = await import(new URL('../scripts/selfcheck.mjs', import.meta.url).href);
   } catch (e) {
     warn(`self-check could not run (${e && e.message}) — this install has NOT been verified end to end`);
-    return { exitCode: 0, violations: [], lines: [], unavailable: true };
+    return { exitCode: FLAG_HOOKS ? 1 : 0, violations: [], lines: [], unavailable: true };
   }
   const result = await mod.selfCheck({ installState, security: true });
   if (!quiet || result.violations.length) console.log(mod.formatVerdict(result, { color: c }));
@@ -1823,6 +3718,20 @@ function cmpTag(a, b) {
   if (!A.pre) return 1;   // 3.5.0 is newer than 3.5.0-dev
   if (!B.pre) return -1;
   return A.pre > B.pre ? 1 : -1;
+}
+
+/**
+ * The CORPUS transport tag this brain last received, or null.
+ *
+ * Deliberately separate from installedBrainVersion(): that one answers "which runtime built the KB
+ * on disk" (a semver), this one answers "which published corpus archive is on disk" (a content
+ * address). Conflating them is the defect ADR-086 step 16 exists to fix.
+ */
+function installedCorpusTag(cacheDir) {
+  try {
+    const tag = JSON.parse(fs.readFileSync(path.join(cacheDir, 'SOURCE.json'), 'utf8')).corpusReleaseTag;
+    return isCorpusReleaseTag(tag) ? tag : null;
+  } catch { return null; }
 }
 
 function installedBrainVersion(cacheDir) {
@@ -1904,8 +3813,8 @@ function reportVersionDrift(cacheDir) {
   const state = checkVersionDrift(cacheDir);
   if (!state.drift) return state;
   warn(`the brain (${c.bold(state.kb)}) and the Claude Code plugin (${c.bold(state.wrapper)}) have drifted apart —`);
-  info(`that's normal (they update on separate schedules) and neither one is broken. To bring the`);
-  info(`plugin up to date:  ${c.bold('claude plugin marketplace update ruvnet-brain')}  ${c.dim('(then restart Claude Code)')}`);
+  info(`they update on separate schedules; this comparison does not prove either is healthy. To bring the`);
+  info(`plugin up to date:  ${c.bold('claude plugin marketplace update ruvnet-brain')}  ${c.dim('(body updates go live without a restart; boot-surface changes are called out)')}`);
   return state;
 }
 
@@ -1927,9 +3836,13 @@ function feedbackHealthLines(cacheDir) {
   const env = detectEnvironment();
   const allGreen = s.repos > 0 && s.reader && s.mcp;
   return [
-    `${s.repos} repo stores on disk · reader ${s.reader ? 'ok' : 'MISSING'} · search_ruvnet ${s.mcp ? 'ok' : 'MISSING'} · plugin ${s.plugin ? 'ok' : 'NOT INSTALLED (no /rvbc)'}`,
+    `${s.repos} repo stores on disk · reader ${s.reader ? 'ok' : 'MISSING'} · search_ruvnet ${s.mcp ? 'ok' : 'MISSING'} · plugin ${s.plugin ? 'ok' : 'NOT INSTALLED (no /rnbc)'}`,
     `toolkit: Ruflo ${env.ruflo ? 'present' : 'not found'} · RuVector ${env.ruvector ? 'present' : 'not found'} · claude CLI ${env.claude ? 'present' : 'not found'}`,
-    allGreen ? 'verdict: Healthy — installed and reachable' : 'verdict: Needs attention — re-run npx ruvnet-brain',
+    // NOT called a "verdict": this reads only repos/reader/mcp, while --doctor's verdict also weighs
+    // grounding, Codex wiring, nightly health, host convergence and the hook policy. Two lines both
+    // labelled "verdict" that answer different questions can disagree in public, which is the exact
+    // Healthy-and-FAILING confusion the doctor's single verdict was collapsed to remove.
+    allGreen ? 'install reading: present and reachable' : 'install reading: incomplete — re-run npx ruvnet-brain',
   ];
 }
 
@@ -1989,11 +3902,8 @@ function runFeedback() {
 // canonical Release bundle, backs the current copy up, extracts, and re-verifies with forge-guard —
 // failing loud with no partial clobber. These flags never reimplement any of that; they only INVOKE
 // it once (--update) or SCHEDULE it per-user (--enable-nightly). Nothing here ever publishes.
-const NIGHTLY_LABEL = 'com.ruvnet.brain-update';
 const resolvedKbDir = () =>
   process.env.RUVNET_BRAIN_KB || path.join(os.homedir(), '.cache', 'ruvnet-brain', 'kb');
-const nightlyPlistPath = () =>
-  path.join(os.homedir(), 'Library', 'LaunchAgents', `${NIGHTLY_LABEL}.plist`);
 // RUVNET_BRAIN_TEST=1 → write/remove the plist but NEVER call launchctl. Tests point HOME at a temp
 // dir; bootstrapping a temp-dir plist into the user's real gui domain would mutate exactly the
 // system state the tests promise not to touch.
@@ -2004,12 +3914,70 @@ const TEST_MODE = process.env.RUVNET_BRAIN_TEST === '1';
 // (see smokeQuery's launch note) — and a silently-skipped installer main is the worst possible
 // failure mode for a stranger's first contact. With the variable unset, behavior is unchanged.
 const IMPORT_ONLY = process.env.RUVNET_BRAIN_IMPORT_ONLY === '1';
-const xmlEscape = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-// The same nightly command, cron-flavored — the pattern forge-update.mjs documents in its header.
-// 03:47 on purpose: an off-hour minute, so it never piles onto the :00 cron rush.
-const cronExample = (kbDir) =>
-  `47 3 * * *  cd ${kbDir} && ${process.execPath} forge-update.mjs --apply >> ${kbDir}/update.log 2>&1`;
+/**
+ * The doctor's fix for the Nightly line. Re-enabling repairs a job that cannot fire (not loaded, command drift);
+ * a job that is loaded, verified, FIRED and exited non-zero (`lastExitCode`) is a failed update run, and
+ * re-enabling it changes nothing — the update itself is the fix (4.7.21).
+ */
+export function nightlyFix(nightlyHealth) {
+  const fired = Number.isInteger(nightlyHealth?.lastExitCode) && nightlyHealth.lastExitCode !== 0;
+  if (fired) return 'npx ruvnet-brain@latest --update';
+  return nightlyHealth?.state === 'degraded' ? 'npx ruvnet-brain --enable-nightly' : 'npx ruvnet-brain --update';
+}
+
+export function classifyUpdaterExit(status, { fallbackAllowed = true, result = null, requireResult = false } = {}) {
+  if (status === 12 && result?.terminalVerdict === 'cleanup-pending') {
+    return { verdict: 'cleanup-pending', fallback: false, exitCode: 12 };
+  }
+  if (status === 0) {
+    if (result?.terminalVerdict === 'applied') return { verdict: 'applied', fallback: false, exitCode: 0 };
+    if (result?.terminalVerdict === 'noop') return { verdict: 'noop', fallback: false, exitCode: 0 };
+    // S2 (ONE CURRENCY VERDICT): rollback protection — the offered candidate's corpus generation
+    // predates the installed one. A clean, intentional no-op, not a failure: the live tree is exactly
+    // as it was, on purpose, and reporting it as 'invalid-result'/failed would turn the updater's own
+    // correct refusal into a reported --update failure (the exact issue #106 shape, one gate later).
+    if (result?.terminalVerdict === 'refused') return { verdict: 'refused', fallback: false, exitCode: 0 };
+    if (!requireResult) return { verdict: 'legacy-success', fallback: false, exitCode: 0 };
+    return { verdict: 'invalid-result', fallback: false, exitCode: 1 };
+  }
+  // The updater refused BECAUSE full-KB copies already sit beside the brain ("refusing to create another
+  // full-KB copy"). A fresh install is exactly another full copy (it preserves the prior generation), so
+  // the fallback would turn the refusal into +1 copy per run (measured: 2 -> 3, +1.3 GB). Report instead.
+  if (/^unresolved rollback state exists/.test(String(result?.reason || ''))) {
+    return { verdict: 'refused-retained-copies', fallback: false, exitCode: status || 1 };
+  }
+  // Exit 6 / "not enough free disk space": the updater measured before unpacking and touched nothing. A
+  // fresh-install fallback needs at least as much room, so it would only fail later and messier.
+  if (status === 6 || /^not enough free disk space/.test(String(result?.reason || ''))) {
+    return { verdict: 'refused-disk-space', fallback: false, exitCode: status || 6 };
+  }
+  // Exit 2 is "manifest unreachable, nothing touched". The fallback exists for a DEAD manifest URL (an old
+  // bundle polling a path that 404s); a rate limit, a 5xx or no network is transient, and a full fresh
+  // reinstall over it re-downloads the brain and preserves another full copy each time. Retry later instead.
+  // Exit 3 is the same transport failure one request later: the bundle downloaded, then its 64-byte .sig hit a
+  // 5xx or a timeout. Nothing was touched, and a fallback would re-download the whole ~745 MB bundle. A 404 on
+  // the .sig (a release published without one) is not transient and keeps the fallback.
+  if ((status === 2 || status === 3) && /returned HTTP (?:403|408|429|5\d\d)\b|network failure/.test(String(result?.reason || ''))) {
+    return { verdict: 'transient-network', fallback: false, exitCode: status };
+  }
+  // Neither of these is a broken updater, so a fresh reinstall cannot fix them; it only re-downloads ~745 MB
+  // into the same wall, every night (4.7.21, audit C: a `.prune-*` left by a killed run made retention
+  // `unsafe`, which forge-update reported as recovery-required, and the fallback reinstall hit it again).
+  // - recovery-required: the updater stopped on evidence it must not discard; it names the recovery.
+  // - exit 5: the offered corpus is incompatible with (or was already refused by) the runtime this run has
+  //   just re-stamped (ensureUpdaterPrerequisites), and a reinstall of the same package stamps the same one.
+  if (result?.terminalVerdict === 'recovery-required') {
+    return { verdict: 'recovery-required', fallback: false, exitCode: status || 1 };
+  }
+  if (status === 5) return { verdict: 'refused-incompatible', fallback: false, exitCode: 5 };
+  // The updater was stopped by a signal (its own TTL, a logout, Ctrl-C) and settled itself as `interrupted`.
+  // Nothing is broken, so a fresh reinstall would only re-download ~745 MB into the same interruption.
+  if (result?.terminalVerdict === 'interrupted' || status === 143 || status === 130) {
+    return { verdict: 'interrupted', fallback: false, exitCode: status || 143 };
+  }
+  return { verdict: 'failed', fallback: fallbackAllowed, exitCode: status || 1 };
+}
 
 function missingUpdaterHelp(kbDir) {
   console.error(`\n${c.red('✗ can\'t update:')} ${c.bold('forge-update.mjs')} is missing from ${kbDir}.`);
@@ -2018,53 +3986,543 @@ function missingUpdaterHelp(kbDir) {
   console.error(`  — the current bundle ships forge-update.mjs; then this command will work.`);
 }
 
-function syncHostsAfterUpdate() {
+export function acquireHostConvergenceLock(lockPath, {
+  staleMs = 5 * 60 * 1000,
+  now = () => Date.now(),
+  processAlive = (pid, owner) => {
+    if (owner?.host && owner.host !== os.hostname()) return true;
+    try { process.kill(pid, 0); return true; }
+    catch (error) { return error?.code !== 'ESRCH'; }
+  },
+} = {}) {
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+  const token = crypto.randomBytes(16).toString('hex');
+  const owner = {
+    pid: process.pid,
+    host: os.hostname(),
+    token,
+    startedAt: new Date(now()).toISOString(),
+  };
+  const publish = () => {
+    try {
+      // mkdir is the exclusive operation. The owner write follows it, but an incomplete
+      // directory is treated as busy until the stale threshold; no contender may reclaim it in
+      // that publication window. This avoids rename-over-empty-directory replacement on macOS.
+      fs.mkdirSync(lockPath, { recursive: false });
+      fs.writeFileSync(path.join(lockPath, 'owner.json'), JSON.stringify(owner), { flag: 'wx', mode: 0o600 });
+      return true;
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+      return false;
+    }
+  };
+  const release = () => {
+    const quarantine = `${lockPath}.release-${process.pid}-${token}`;
+    try {
+      const current = JSON.parse(fs.readFileSync(path.join(lockPath, 'owner.json'), 'utf8'));
+      if (current?.token !== token) return false;
+      fs.renameSync(lockPath, quarantine);
+      const moved = JSON.parse(fs.readFileSync(path.join(quarantine, 'owner.json'), 'utf8'));
+      if (moved?.token !== token) {
+        try { fs.renameSync(quarantine, lockPath); } catch { /* preserve evidence if another writer won */ }
+        return false;
+      }
+      fs.rmSync(quarantine, { recursive: true, force: true });
+      return true;
+    } catch { return false; }
+  };
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      if (publish()) return { acquired: true, release };
+    } catch (error) {
+      return { acquired: false, error: error.message };
+    }
+
+    let existing;
+    let lockAge = 0;
+    try {
+      const stat = fs.statSync(lockPath);
+      lockAge = Math.max(0, now() - stat.mtimeMs);
+      existing = JSON.parse(fs.readFileSync(path.join(lockPath, 'owner.json'), 'utf8'));
+    } catch { /* an incomplete lock is handled below, with a grace period */ }
+    if (existing && Number.isInteger(existing.pid) && processAlive(existing.pid, existing)) {
+      return { acquired: false, error: `another host synchronization is running (pid ${existing.pid})` };
+    }
+    if (!existing && lockAge < staleMs) {
+      return { acquired: false, error: 'another host synchronization is publishing its lock' };
+    }
+    const quarantine = `${lockPath}.reclaim-${process.pid}-${token}-${attempt}`;
+    try {
+      fs.renameSync(lockPath, quarantine);
+      fs.rmSync(quarantine, { recursive: true, force: true });
+    } catch (error) {
+      if (error?.code === 'ENOENT') continue;
+      return { acquired: false, error: `host synchronization lock changed concurrently: ${error.message}` };
+    }
+  }
+  return { acquired: false, error: 'host synchronization lock changed concurrently' };
+}
+
+export function syncHostsAfterUpdate(cacheDir = resolvedKbDir(), {
+  sourceRoot = REPO_ROOT,
+  brainHome = process.env.RUVNET_BRAIN_HOME || path.join(os.homedir(), '.cache', 'ruvnet-brain'),
+  consoleReceiptDir = path.join(brainHome, 'console-instances'),
+  wireClaude = wirePlugin,
+  wireCodexHost: detectCodexHost = wireCodexHost,
+  wireCodexPlugin: installCodexPlugin = wireCodexPlugin,
+  hostLockPath = path.join(brainHome, 'host-convergence.lock'),
+  replaceConsoles = null, // test seam; production runs replaceStaleConsoles
+  runStableSpine = (apply) => spawnSync(
+    process.execPath,
+    [apply, '--auto', '--expected-version', PACKAGE_VERSION],
+    { stdio: 'inherit', env: process.env },
+  ),
+} = {}) {
   const results = {};
-  results.claude = wirePlugin({ expectedVersion: PACKAGE_VERSION, requireManaged: true });
-  if (results.claude.host && !results.claude.wired) return { ok: false, results };
+  const hostLock = acquireHostConvergenceLock(hostLockPath);
+  if (!hostLock.acquired) return { ok: false, results, error: `host synchronization lock unavailable: ${hostLock.error}` };
+  let runtimeTransaction;
   try {
-    results.codexHost = wireCodexHost();
+    runtimeTransaction = beginConsoleRuntimeTransaction(cacheDir, sourceRoot);
+  } catch (error) {
+    hostLock.release();
+    return { ok: false, results, error: `Console runtime staging failed: ${error.message}` };
+  }
+  const fail = (detail = {}) => {
+    runtimeTransaction.rollback();
+    hostLock.release();
+    // Three paths below returned no error at all, so the refresh receipt recorded `state: null, error: null` and the
+    // failure could not be diagnosed afterwards (2026-10-23 7:21 p.m. ET). Every failure now carries its reason.
+    return { ok: false, results, ...detail, error: detail.error || hostFailureReason(results) };
+  };
+
+  try {
+    if (wireClaude === wirePlugin) results.hookRetirement = retireManagedHookRegistrations();
+    results.claude = wireClaude === wirePlugin
+      ? wirePlugin({ expectedVersion: PACKAGE_VERSION, requireManaged: true })
+      : wireClaude({ expectedVersion: PACKAGE_VERSION, requireManaged: true });
+    if (results.claude.host && !results.claude.wired) return fail();
+    results.codexHost = detectCodexHost();
     if (results.codexHost.host) {
-      results.codex = wireCodexPlugin({ expectedVersion: PACKAGE_VERSION });
-      if (!['unchanged', 'installed', 'updated', 'disabled'].includes(results.codex.action)) {
-        return { ok: false, results };
+      if (!['added', 'rewritten', 'unchanged', 'user-owned'].includes(results.codexHost.action)) {
+        return fail({ error: `Codex host convergence failed: ${results.codexHost.action || 'unknown action'}` });
+      }
+      results.codex = installCodexPlugin({ expectedVersion: PACKAGE_VERSION });
+      // ~/.codex exists but no `codex` binary is on PATH (an uninstalled CLI, or a desktop-only setup whose shell
+      // cannot see it): there is no Codex host to converge here, which is absence, not a failed update (4.7.21,
+      // audit C-opus #6). Any other unavailability (the binary ran and failed) still fails.
+      if (results.codex.action === 'codex-unavailable' && results.codex.missingBinary === true) {
+        results.codexAbsent = true;
+      } else if (!['unchanged', 'installed', 'updated', 'disabled'].includes(results.codex.action)) {
+        return fail();
       }
     }
   } catch (error) {
     results.codex = { action: 'failed', error: error?.message || String(error) };
-    return { ok: false, results };
+    return fail();
   }
 
-  const apply = path.join(__dirname, '..', 'plugin', 'scripts', 'update-apply.mjs');
-  if (!fs.existsSync(apply)) return { ok: false, results, error: 'Stable Spine updater missing from package' };
-  const applied = spawnSync(process.execPath, [apply, '--auto', '--expected-version', PACKAGE_VERSION], { stdio: 'inherit', env: process.env });
+  const apply = path.join(sourceRoot, 'plugin', 'scripts', 'update-apply.mjs');
+  if (!fs.existsSync(apply)) return fail({ error: 'Stable Spine updater missing from package' });
+  const applied = runStableSpine(apply);
   const okApplied = !applied.error && applied.status === 0;
+  const codexReceipt = {
+    state: results.codex?.action === 'disabled' ? 'disabled' : (results.codexHost?.host && !results.codexAbsent ? 'ready' : 'absent'),
+    version: results.codex?.version || null,
+  };
+  if (results.codex?.restartRequired === true) {
+    codexReceipt.restartRequired = true;
+    codexReceipt.sessionSafety = results.codex.sessionSafety || null;
+    codexReceipt.sessionSafetyReason = results.codex.sessionSafetyReason || null;
+    codexReceipt.restartScope = results.codex.restartScope || 'unproven';
+  }
+  const claudeReceipt = {
+    state: results.claude.host ? 'ready' : 'absent',
+    version: results.claude.version || null,
+  };
+  if (results.claude?.restartRequired === true) {
+    claudeReceipt.restartRequired = true;
+    claudeReceipt.sessionSafety = results.claude.sessionSafety || null;
+    claudeReceipt.sessionSafetyReason = results.claude.sessionSafetyReason || null;
+    claudeReceipt.restartScope = results.claude.restartScope || 'unproven';
+  }
   if (okApplied) {
-    const home = process.env.RUVNET_BRAIN_HOME || path.join(os.homedir(), '.cache', 'ruvnet-brain');
-    const receiptPath = path.join(home, 'host-convergence.json');
+    // ISSUE #153 — a running host may freeze an old plugin root. Reclaim only generations whose
+    // modern leases prove no live consumer; legacy roots without that proof stay on disk.
     try {
-      fs.mkdirSync(home, { recursive: true });
+      const gens = prunePluginGenerations({ apply: true });
+      if (gens.retired?.length) {
+        ok(`retired ${gens.retired.length} stale plugin generation(s) to compatibility shells: ${gens.retired.join(', ')}`);
+      }
+      if (gens.removed.length) {
+        ok(`pruned ${gens.removed.length} stale plugin generation(s), freed ${(gens.bytes / 1048576).toFixed(1)} MB: ${gens.removed.join(', ')}`);
+      }
+      if (gens.cleanupBlocked?.length) {
+        warn(`plugin cleanup blocked for ${gens.cleanupBlocked.length} generation(s): ${gens.cleanupBlocked.map((item) => `${item.version} (${item.reason})`).join(', ')}`);
+      } else if (!gens.removed.length && !gens.retired?.length && gens.why) {
+        info(`plugin generation reconciliation: ${gens.why}`);
+      }
+    } catch (e) {
+      warn(`stale plugin generations were not pruned (${e.message}); nothing was removed`);
+    }
+    const receiptPath = path.join(brainHome, 'host-convergence.json');
+    const writeConvergenceReceipt = () => {
+      fs.mkdirSync(brainHome, { recursive: true });
       const tmp = `${receiptPath}.tmp-${process.pid}`;
       fs.writeFileSync(tmp, JSON.stringify({
         desiredVersion: PACKAGE_VERSION,
         verifiedAt: new Date().toISOString(),
         hosts: {
-          claude: { state: results.claude.host ? 'ready' : 'absent', version: results.claude.version || null },
-          codex: { state: results.codex?.action === 'disabled' ? 'disabled' : (results.codexHost?.host ? 'ready' : 'absent'), version: results.codex?.version || null },
+          claude: claudeReceipt,
+          codex: codexReceipt,
         },
+        consoleRuntime: results.consoleRuntime,
       }, null, 2));
       fs.renameSync(tmp, receiptPath);
+    };
+    try {
+      runtimeTransaction.activate();
+      results.consoleRuntime = {
+        ...runtimeTransaction.identity,
+        ...consoleRestartState(runtimeTransaction.identity, { receiptDir: consoleReceiptDir }),
+      };
+      writeConvergenceReceipt();
+      runtimeTransaction.commit();
     } catch (error) {
-      return { ok: false, results, applyStatus: applied.status, error: `host convergence receipt failed: ${error.message}` };
+      return fail({ applyStatus: applied.status, error: `Console runtime convergence failed: ${error.message}` });
+    }
+    // A Console still serving the previous runtime is replaced here, by the activated runtime's own
+    // launcher (the 'stale-running' path of scripts/onboarding-console.mjs, without --open), so an
+    // update never ends with "restart Console". Anything it could not replace is recorded with why.
+    if (results.consoleRuntime.state === 'pending-console-restart') {
+      try {
+        const replaceArgs = { entry: runtimeTransaction.entry, identity: runtimeTransaction.identity, receiptDir: consoleReceiptDir };
+        results.consoleReplacement = replaceConsoles ? replaceConsoles(replaceArgs) : replaceStaleConsoles(replaceArgs);
+        const failures = results.consoleReplacement.filter((item) => !item.replaced);
+        for (const item of results.consoleReplacement) {
+          if (item.replaced) ok(`Console on port ${item.port} replaced with the current runtime (pid ${item.newPid})`);
+        }
+        results.consoleRuntime = {
+          ...runtimeTransaction.identity,
+          ...consoleRestartState(runtimeTransaction.identity, { receiptDir: consoleReceiptDir }),
+          ...(failures.length ? { replacementFailures: failures.map((item) => `port ${item.port ?? '?'}: ${item.reason}`) } : {}),
+        };
+        writeConvergenceReceipt();
+      } catch (error) {
+        warn(`could not replace the running Console automatically (${error.message})`);
+      }
     }
   }
-  return { ok: okApplied, results, applyStatus: applied.status };
+  // update-apply exits 75 when another live run holds the spine lock: nothing was applied, so it is not success.
+  if (!okApplied) return fail({ applyStatus: applied.status, error: applied.error?.message || (applied.status === 75
+    ? 'Stable Spine is busy (another update holds its lock); nothing was applied — re-run when it finishes'
+    : 'Stable Spine activation failed') });
+  const convergedReceipt = {
+    desiredVersion: PACKAGE_VERSION,
+    hosts: {
+      claude: claudeReceipt,
+      codex: codexReceipt,
+    },
+    consoleRuntime: results.consoleRuntime,
+  };
+  const convergence = classifyHostConvergence(convergedReceipt);
+  hostLock.release();
+  return { ok: convergence.healthy === true, convergence, results, applyStatus: applied.status,
+    ...(convergence.healthy !== true && hostRestartIsOnlyGap(convergedReceipt) ? { restartOnly: true } : {}),
+    error: convergence.healthy === true ? null : `host convergence is ${convergence.state}: ${convergence.action}` };
 }
 
-function runUpdate() {
+/**
+ * The ONE host-convergence entry for `--update` and `--host-sync-only`: syncHostsAfterUpdate, then the #492 reload of a
+ * running shared Codex app-server when the Codex plugin or its hook trust changed (fresh installs reload it in the
+ * main flow; before this, every existing user's `--update` skipped it — cross-vendor review E). The reload never
+ * grants an approval and never starts, stops or restarts a server (refreshSharedCodexAppServer).
+ */
+export async function convergeHostsAfterUpdate(cacheDir = resolvedKbDir(), { refreshHost = refreshCodexSharedHost,
+  unattended = process.env.RUVNET_NIGHTLY === '1', recordNotice = recordCodexOvernightNotice,
+  noticeHome = () => footprintRoots().brainHome, ...options } = {}) {
+  const convergence = syncHostsAfterUpdate(cacheDir, options);
+  if (!convergence.results?.codex) return convergence;
+  // Owner decision (4.7.21 review r2): the unattended nightly never reloads the shared Codex app-server; a reload
+  // pauses Brain hooks in sessions already open until someone re-reviews them in /hooks. It leaves a notice the next
+  // SessionStart shows once instead. An interactive --update still reloads.
+  if (unattended) {
+    if (!codexHostViewChanged(convergence.results.codex)) return { ...convergence, hostRefresh: { state: 'not-needed', changed: false } };
+    const recorded = recordNotice(noticeHome());
+    return { ...convergence, hostRefresh: { state: 'deferred-unattended', changed: false, noticeRecorded: recorded } };
+  }
+  let hostRefresh;
+  try { hostRefresh = await refreshHost(convergence.results.codex); }
+  catch (error) { hostRefresh = { state: 'failed', changed: false, reason: error?.message || String(error) }; }
+  const note = codexHostRefreshMessage(hostRefresh, convergence.results.codex);
+  if (note) (note.level === 'warn' ? warn : info)(note.text);
+  return { ...convergence, hostRefresh };
+}
+
+/**
+ * True when a host restart is the ONLY gap in a convergence receipt: every restart-flagged host is ready at the
+ * expected version, and with those hosts read as "already-open windows only" everything else (other hosts, the
+ * Console) is converged. `--update` records that as an advisory and keeps the knowledge update's success; any
+ * other gap behind the restart keeps the failure (4.7.21, audit C: Codex's restartScope is always 'unproven').
+ */
+export function hostRestartIsOnlyGap(receipt, expectedVersion = PACKAGE_VERSION) {
+  const flagged = Object.values(receipt?.hosts || {}).filter((host) => host?.restartRequired === true);
+  if (!flagged.length || flagged.some((host) => host.state !== 'ready' || !versionSatisfies(host.version, expectedVersion))) return false;
+  const hosts = Object.fromEntries(Object.entries(receipt.hosts).map(([name, host]) => [name,
+    host?.restartRequired === true ? { ...host, restartScope: 'open-sessions' } : host]));
+  return classifyHostConvergence({ ...receipt, hosts }, expectedVersion).healthy === true;
+}
+
+export function classifyHostConvergence(receipt, expectedVersion = PACKAGE_VERSION) {
+  // Same 'ahead is not behind' rule as host convergence above (#123). A receipt written by a
+  // NEWER generation than the installer currently running is not a version mismatch — it is a
+  // machine that is further along. Only a receipt for an OLDER generation is stale.
+  if (!receipt || !versionSatisfies(receipt.desiredVersion, expectedVersion)) {
+    return { healthy: false, state: 'version-mismatch', action: `required version ${expectedVersion}` };
+  }
+  const hostStates = Object.values(receipt.hosts || {});
+  // A host that is ready at the expected version and whose ONLY gap is PROVEN changed boot-level
+  // declarations is converged: new sessions load the new hooks; only windows already open booted the
+  // old ones (owner's Mac, 4.3.40 -> 4.4.0: a fresh `claude -p` loaded 4.4.0 and ran its hooks). That is
+  // reported, not failed. An UNPROVEN boot surface (it could not be compared) still requires a restart.
+  const openSessionsOnly = (host) => host?.state === 'ready' && versionSatisfies(host.version, expectedVersion)
+    && host.restartRequired === true && host.restartScope === 'open-sessions';
+  const openSessions = Object.entries(receipt.hosts || {}).filter(([, host]) => openSessionsOnly(host)).map(([name]) => name);
+  const badHost = hostStates.find((host) => !openSessionsOnly(host) && (!['ready', 'disabled', 'absent'].includes(host?.state)
+    || (host.state === 'ready' && !versionSatisfies(host.version, expectedVersion))
+    || (host.state === 'ready' && host.restartRequired === true)));
+  if (badHost?.restartRequired === true) {
+    return { healthy: false, state: 'host-restart-required', action: badHost.sessionSafetyReason || 'restart the host, then re-run --doctor' };
+  }
+  if (badHost) return { healthy: false, state: 'host-pending', action: 're-run host synchronization' };
+  if (receipt.consoleRuntime?.state !== 'ready') {
+    const why = Array.isArray(receipt.consoleRuntime?.replacementFailures) && receipt.consoleRuntime.replacementFailures.length
+      ? `the installer could not replace the running Console (${receipt.consoleRuntime.replacementFailures.join('; ')}); ` : '';
+    return { healthy: false, state: receipt.consoleRuntime?.state || 'console-unproven', action: `${why}restart Console, then re-run --doctor` };
+  }
+  if (openSessions.length) return { healthy: true, state: 'channels-converged', openSessions, notice: openSessionsNotice(openSessions, receipt.desiredVersion) };
+  return { healthy: true, state: 'channels-converged' };
+}
+
+/** Activation and host readiness are independent; never claim a rollback from a host refusal. */
+/** Why host synchronization stopped, from the per-host results it had gathered; null when nothing says. */
+export function hostFailureReason(results = {}) {
+  const firstLines = (text) => String(text || '').trim().split('\n').slice(0, 3).join(' ');
+  if (results.claude?.host && !results.claude.wired) {
+    return `Claude Code plugin ${results.claude.action || 'wiring failed'}${results.claude.version ? ` (installed ${results.claude.version}, required ${results.claude.expectedVersion || PACKAGE_VERSION})` : ''}`;
+  }
+  if (results.codex && !['unchanged', 'installed', 'updated', 'disabled'].includes(results.codex.action)) {
+    return `Codex plugin ${results.codex.action || 'failed'}${results.codex.error ? `: ${firstLines(results.codex.error)}` : ''}`;
+  }
+  return null;
+}
+
+export function hostSynchronizationFailureMessage(convergence, active, expectedVersion = PACKAGE_VERSION) {
+  const verified = active?.version === expectedVersion && Number.isSafeInteger(active.generation) && active.generation > 0
+    && active.codeRoot === `versions/${expectedVersion}`;
+  const state = verified ? `runtime ${expectedVersion} generation ${active.generation} is active`
+    : 'the active runtime generation could not be verified';
+  return `host synchronization is incomplete — ${state}${convergence?.error ? ` (${convergence.error})` : ''}`;
+}
+
+/** Doctor projection only. Fresh hook metadata cannot clear an executable or MCP boot gap. */
+export function reconcileFreshCodexDeclarations(recorded, proof, expectedVersion = PACKAGE_VERSION) {
+  const original = classifyHostConvergence(recorded, expectedVersion);
+  const codex = recorded?.hosts?.codex;
+  if (!proof?.ok || proof.state !== 'fresh-declarations-ready' || proof.expectedVersion !== expectedVersion
+    || recorded?.desiredVersion !== expectedVersion || codex?.version !== expectedVersion
+    || codex.state !== 'ready' || codex.restartRequired !== true || codex.restartScope !== 'unproven') return original;
+  // Older receipts carry the paths only in this machine-generated reason. An unknown reason,
+  // body file, skill/command surface, or MCP declaration retains the historical restart refusal.
+  const prefix = 'boot-level declarations changed: ';
+  const reason = codex.sessionSafetyReason;
+  const changed = typeof reason === 'string' && reason.startsWith(prefix) ? reason.slice(prefix.length).split(', ') : [];
+  if (!changed.length || changed.some((file) => !['hooks/codex-hooks.json', 'hooks/hooks.json'].includes(file))) {
+    return { ...original, freshDeclarations: proof, notice: 'Fresh Codex hook declarations are ready; executable/MCP boot readiness and existing open windows remain unproven.' };
+  }
+  const projected = classifyHostConvergence({ ...recorded, hosts: { ...recorded.hosts,
+    codex: { ...codex, restartScope: 'open-sessions' } } }, expectedVersion);
+  return { ...projected, ...(projected.healthy ? { state: 'fresh-declarations-ready' } : {}), freshDeclarations: proof,
+    notice: 'Fresh Codex hook declarations are ready; hook bodies and MCP execution were not tested. Existing open windows remain unproven.' };
+}
+
+const HOST_LABELS = { claude: 'Claude Code', codex: 'Codex' };
+/** The one accurate line for converged hosts whose already-open windows booted the old declarations. */
+export function openSessionsNotice(hosts, version) {
+  const names = hosts.map((host) => HOST_LABELS[host] || host).join('/');
+  return `new ${names} sessions use ${version}; already-open windows keep the old hook definitions until they are reopened`;
+}
+
+/** A moved brain whose disk is unplugged (plugin/scripts/brain-location.mjs state 'unmounted') is never
+ * reinstalled, updated or cleaned beside the dead link (ADR-098): stop with that module's one line. */
+function refuseUnmountedBrain() {
+  const roots = footprintRoots();
+  if (!roots.dangling) return;
+  die(roots.location.message, 'Nothing was installed, updated or removed.');
+}
+
+// An interrupted --move-brain left the ONLY Brain at <home>.old-<pid> while the home path is missing or was
+// recreated without a Brain by a hook (4.5.2): an install or update there would build a second, public-only
+// Brain beside it. Refuse with the restore command instead. Names only: no tree walk.
+function refuseOverSetAsideBrain() {
+  let lo = null;
+  try { const roots = footprintRoots(); lo = assessMoveLeftovers({ brainHome: roots.location?.path || roots.brainHome, location: roots.location }).find((l) => l.onlyCopy); }
+  catch { return false; }
+  if (!lo) return false;
+  warn(`the Brain is not at its path, but an interrupted move left the ONLY copy at ${lo.path} — restore it, do NOT reinstall:  ${lo.fix}`);
+  info(`then check:  ${c.bold('npx ruvnet-brain --doctor')}`);
+  process.exitCode = 1;
+  return true;
+}
+
+/**
+ * A SOURCE CHECKOUT older than the runtime already installed cannot apply the current release: it downloads ~736 MB
+ * and then refuses on "staged ReleaseCoverage failed integrity — release version 4.7.17 differs from 4.5.2" (measured
+ * 2026-10-23: `npx ruvnet-brain --update` run inside a stale checkout resolves that checkout's own bin). Say so
+ * before the download, with the command that works. Only a checkout: a published installer can legitimately be
+ * older than active.json (a plugin seeded from main during a release window, a release candidate installed from a
+ * checkout), and the nightly and self-heal `@latest` updates must keep working then (review, 2026-10-24).
+ */
+export function olderInstallerRefusal({ brainHome, packageVersion = PACKAGE_VERSION, repoRoot = REPO_ROOT } = {}) {
+  let installed;
+  try { installed = JSON.parse(fs.readFileSync(path.join(brainHome, 'active.json'), 'utf8'))?.version; } catch { return null; }
+  if (!/^\d+\.\d+\.\d+$/.test(String(installed || ''))) return null;
+  try { if (cmpVersion(installed, packageVersion) <= 0) return null; } catch { return null; }
+  if (!fs.existsSync(path.join(repoRoot, '.git'))) return null;
+  return `this is ruvnet-brain ${packageVersion}, a source checkout at ${repoRoot}, older than the ${installed} already `
+    + 'installed here, and an older checkout cannot apply the current release. '
+    + 'Run  npx ruvnet-brain@latest --update  from any other folder, or bring this checkout up to date first (git pull).';
+}
+
+async function runUpdate() {
   printBanner('update');
+  refuseUnmountedBrain();
   const kbDir = resolvedKbDir();
+  const brainHome = process.env.RUVNET_BRAIN_HOME || path.dirname(kbDir);
+  const olderInstaller = olderInstallerRefusal({ brainHome });
+  if (olderInstaller) {
+    console.error(`\n${c.red('✗ update stopped before downloading:')} ${olderInstaller}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  if (FLAG_HOST_SYNC_ONLY) {
+    info(c.dim('repairing host shells and managed model catalog without mutating KB bytes…\n'));
+    const convergence = await convergeHostsAfterUpdate(kbDir);
+    if (!convergence.ok) {
+      warn(`host synchronization is incomplete${convergence.error ? ` (${convergence.error})` : ''}`);
+      process.exitCode = 1;
+      return;
+    }
+    if (convergence.convergence?.notice) info(convergence.convergence.notice);
+    try {
+      const managed = applyManagedCatalogUpdate({
+        routerDir: path.join(os.homedir(), '.claude', 'model-router'),
+        packageRoot: REPO_ROOT,
+      });
+      if (managed.action === 'merged' && managed.added.length) {
+        ok(`model router: added ${managed.added.length} managed model(s) — ${managed.added.join(', ')} (your catalog edits were preserved)`);
+      }
+    } catch (error) {
+      warn(`managed model additions were not merged (${error.message}); your catalog was left unchanged`);
+    }
+    refreshManagedRouterDefault();
+    process.exitCode = 0;
+    return;
+  }
+  let refreshLock;
+  let refreshReceipt;
+  let refreshSettled = false;
+  const nightlyExecution = process.env.RUVNET_NIGHTLY === '1'
+    ? verifyNightlyExecutionIdentity({ brainHome, env: process.env })
+    : null;
+  if (nightlyExecution && !nightlyExecution.ok) {
+    console.error(`\n${c.red('✗ nightly refresh identity is invalid:')} ${nightlyExecution.why}`);
+    process.exitCode = 1;
+    return;
+  }
+  try {
+    const refreshAction = process.env.RUVNET_NIGHTLY === '1' ? 'nightly' : 'update';
+    const refreshExecutableIdentity = nightlyExecution?.identity
+      || { path: fileURLToPath(import.meta.url), version: PACKAGE_VERSION };
+    refreshLock = acquireRefreshLock({ kbDir, brainHome, action: refreshAction, desiredVersion: PACKAGE_VERSION,
+      schedulerIdentity: nightlyExecution?.identity.schedulerIdentity || null,
+      executableIdentity: refreshExecutableIdentity });
+    refreshReceipt = openRefreshReceipt({ brainHome, lock: refreshLock,
+      action: refreshAction, desiredVersion: PACKAGE_VERSION,
+      schedulerIdentity: nightlyExecution?.identity.schedulerIdentity || null,
+      executableIdentity: refreshExecutableIdentity });
+  } catch (error) {
+    console.error(`\n${c.red('✗ refresh transaction could not start:')} ${error.message}`);
+    process.exitCode = 1;
+    return;
+  }
+  const refreshEnv = { ...process.env, RUVNET_REFRESH_RUN_TOKEN: refreshLock.token,
+    RUVNET_REFRESH_RECEIPT: refreshReceipt.file };
+  const settleRefresh = (code, detail) => {
+    if (!refreshSettled) {
+      try {
+        settleRefreshRun({ handle: refreshReceipt, lock: refreshLock,
+          status: code === 0 ? 'SUCCEEDED' : 'FAILED', detail });
+      } catch (error) {
+        code = 1;
+      }
+      refreshSettled = true;
+    }
+    process.exitCode = code;
+  };
+  const exitGuard = () => {
+    if (refreshSettled) return;
+    try { settleRefreshRun({ handle: refreshReceipt, lock: refreshLock, status: 'FAILED',
+      detail: { reason: 'process exited before terminal settlement' } }); } catch { /* retained lock and receipt are recovery evidence */ }
+  };
+  process.once('exit', exitGuard);
+  // SIGTERM/SIGINT (4.7.21): the SessionStart self-heal kills this process group at its TTL (detach.mjs), and the
+  // default disposition ends Node without an 'exit' event, so the refresh receipt stayed RUNNING and its lock
+  // stayed held until a later run proved the owner dead. Settle FAILED with the signal, release the lock, exit
+  // 128+n. While a child runs under spawnSync the handler cannot run, so the same settlement is applied as soon
+  // as a child is seen to have died of one of these signals (a group kill reaches both).
+  const signalGuard = (signal) => {
+    if (!refreshSettled) {
+      try {
+        settleRefreshRun({ handle: refreshReceipt, lock: refreshLock, status: 'FAILED',
+          detail: { reason: 'signal', signal, phase: 'interrupted', terminalVerdict: 'failed' } });
+        refreshSettled = true;
+      } catch { /* retained lock and receipt are recovery evidence */ }
+    }
+    console.error(`\n${c.red('✗ update interrupted by')} ${signal} — the refresh run was recorded FAILED; nothing is left locked.`);
+    process.exit(128 + (os.constants.signals[signal] || 15));
+  };
+  process.once('SIGTERM', signalGuard);
+  process.once('SIGINT', signalGuard);
+  // The updater now settles its own SIGTERM/SIGINT (kb/forge-update.mjs exits 143/130 with an `interrupted`
+  // result) instead of dying of the signal, so a group kill shows up here as that exit status too.
+  const settleIfSignalled = (child) => {
+    if (['SIGTERM', 'SIGINT'].includes(child?.signal)) signalGuard(child.signal);
+    else if (child?.status === 143) signalGuard('SIGTERM');
+    else if (child?.status === 130) signalGuard('SIGINT');
+  };
+  const detachGuards = () => {
+    process.removeListener('exit', exitGuard);
+    process.removeListener('SIGTERM', signalGuard);
+    process.removeListener('SIGINT', signalGuard);
+  };
   info(`brain dir: ${c.bold(kbDir)}`);
+  // RECOVER AN INTERRUPTED UPDATE FIRST, before anything below writes into the brain. Two measured
+  // reasons: (1) a kill between the two directory renames leaves no usable kb/ — the brain sits in a
+  // receipted kb.rollback-<id>, and the recovery that renames it back lives inside the updater that is
+  // now missing; (2) the preflight below re-stamps RUNTIME-IDENTITY.json into kb/, after which recovery
+  // can never prove kb/ still equals the identity sealed at LOCKED, so any pre-activation kill wedged
+  // every later update at RECOVERY_REQUIRED. Same function the updater runs, under this refresh lock.
+  // Receipts hold the REAL paths the updater knew, so recovery is addressed by the physical path.
+  if (fs.existsSync(path.join(path.dirname(kbDir), `.${path.basename(kbDir)}.update-transactions`))) {
+    try {
+      const recovered = recoverIncompleteStorageTransactions(physicalPath(kbDir));
+      if (recovered.length) ok(`restored the brain from an interrupted update (${recovered.map((r) => `${r.transactionId}: ${r.from}`).join(', ')})`);
+    } catch (error) {
+      warn(`an interrupted update could not be recovered automatically: ${error.message}`);
+    }
+  }
   let updateStatus = 1;
   // NO updater at all = no brain installed here (or a pre-self-updater bundle). That is a USER
   // message, not a fallback trigger: fail LOUD with the re-run-installer help and exit — never
@@ -2075,169 +4533,413 @@ function runUpdate() {
   // private KB stores a surprise fresh PUBLIC install is exactly the store-stripping hazard the
   // project docs warn about. The fallback's own comment scopes it to an updater that EXISTS but
   // is broken — this branch enforces that scope.)
-  if (!fs.existsSync(path.join(kbDir, 'forge-update.mjs')) && !FLAG_HOST_SYNC_ONLY) {
+  if (!fs.existsSync(path.join(kbDir, 'forge-update.mjs'))) {
     missingUpdaterHelp(kbDir);
-    process.exit(1);
+    recordRefreshPhase(refreshReceipt, 'source-enumeration', 'FAIL', { reason: 'forge-update.mjs is missing' });
+    settleRefresh(1, { phase: 'source-enumeration' });
+    return;
   }
-  if (FLAG_HOST_SYNC_ONLY && !fs.existsSync(path.join(kbDir, 'forge-update.mjs'))) {
-    warn('KB updater is absent — continuing with host-shell repair only; the knowledge bundle remains unchanged.');
-    updateStatus = 0;
-  } else {
+  // The updater exists; make sure the trusted validator it will load exists too (package copy,
+  // byte-compared). A failure here is reported, not fatal — the updater states the same absence
+  // in its own words and the run then takes the documented fallback.
+  try {
+    const prerequisites = ensureUpdaterPrerequisites(kbDir);
+    if (prerequisites.validator?.action !== 'unchanged') {
+      info(c.dim(`trusted coverage validator ${prerequisites.validator.action} beside the updater`));
+    }
+  } catch (error) {
+    warn(`could not place the trusted coverage validator (${error.message}); the updater will report what it finds`);
+  }
+  // ADR-0098: release every KB copy that is PROVEN disposable before the updater looks. Its preflight
+  // refuses ("unresolved rollback state exists") while a full copy it cannot account for sits beside the
+  // live KB, and its own redundancy proof can never account for an older generation — measured
+  // 2026-10-01: three copies (3.6 GB) kept every later update from running at all. This runs under the
+  // refresh lock this process already holds; private-unique copies stay and are named.
+  enforceFootprint({ holdingRefreshLock: true, quiet: true });
   info(c.dim("running the bundle's own self-updater (backs up first, re-verifies, never half-applies)…\n"));
   // Relative filename + matching cwd — same launch convention as smokeQuery(); stdio:'inherit'
   // streams the updater's narration live and unedited.
-  const r = spawnSync(process.execPath, ['forge-update.mjs', '--apply'], { cwd: kbDir, stdio: 'inherit' });
+  const updaterSource = fs.readFileSync(path.join(kbDir, 'forge-update.mjs'), 'utf8');
+  const supportsResultReceipt = updaterSource.includes("'--result-file'");
+  const updaterResultDir = supportsResultReceipt ? fs.mkdtempSync(path.join(os.tmpdir(), 'ruvnet-update-result-')) : null;
+  const updaterResultFile = updaterResultDir ? path.join(updaterResultDir, 'result.json') : null;
+  const updaterArgs = ['forge-update.mjs', '--apply', ...(updaterResultFile ? ['--result-file', updaterResultFile] : [])];
+  const r = spawnSync(process.execPath, updaterArgs, {
+    cwd: kbDir, stdio: 'inherit', env: refreshEnv,
+  });
   updateStatus = r.error ? 1 : (r.status === null ? 1 : r.status);
+  const updaterExit = updateStatus;
+  let updaterResult = null;
+  try { if (updaterResultFile && fs.existsSync(updaterResultFile)) updaterResult = JSON.parse(fs.readFileSync(updaterResultFile, 'utf8')); }
+  catch { updaterResult = null; }
+  // Before settleIfSignalled, which exits: an interrupted run used to leak one ruvnet-update-result-* temp dir.
+  if (updaterResultDir) fs.rmSync(updaterResultDir, { recursive: true, force: true });
+  settleIfSignalled(r);
   // FALLBACK (2026-07-17), scoped 2026-07-18 to exists-but-FAILED only. An OLDER bundle whose
   // canonicalManifestUrl points at the dead main/kb/.last-built.json path and 404s (the exact break a
   // real user, Jan Lafko, hit). NEVER leave the user stranded at a 404: re-run THIS installer as a
   // fresh install, which pulls the latest Release DIRECTLY (releases/latest) and never touches the
   // manifest — so --update always succeeds and self-heals the stale SOURCE.json in one shot.
-  if (updateStatus !== 0 && !process.env.RUVNET_BRAIN_NO_UPDATE_FALLBACK) {
-    warn("\nthe bundle's own updater couldn't complete — falling back to a fresh install of the latest Release (this always works)…\n");
-    const self = fileURLToPath(import.meta.url);
-    const fr = spawnSync(process.execPath, [self, '--force'], { stdio: 'inherit',
-      env: { ...process.env, RUVNET_BRAIN_NO_UPDATE_FALLBACK: '1' } });
-    updateStatus = fr.error ? 1 : (fr.status === null ? 1 : fr.status);
+  //
+  // Scoped again 2026-08-04 (issue #106): "nothing landed" is excluded, because for THAT verdict the
+  // fallback re-installed identical bytes and its exit 0 became the command's exit code, turning the
+  // updater's own correct refusal into a reported success.
+  const outcome = classifyUpdaterExit(updateStatus, {
+    fallbackAllowed: !process.env.RUVNET_BRAIN_NO_UPDATE_FALLBACK,
+    result: updaterResult,
+    requireResult: supportsResultReceipt,
+  });
+  if (outcome.verdict === 'refused-retained-copies') {
+    warn('nothing was changed: full copies of earlier brain generations already sit beside this one (listed above).');
+    info('Run  npx ruvnet-brain --clean --archive  (keeps only the files they alone hold, in kb.archive/), then re-run  npx ruvnet-brain --update');
   }
-  }
-  if (updateStatus === 0) {
-    info(c.dim('\nsynchronizing every detected host to this exact published version…\n'));
-    const convergence = syncHostsAfterUpdate();
-    if (!convergence.ok) {
-      warn(`host synchronization is incomplete — runtime stays on the prior verified generation${convergence.error ? ` (${convergence.error})` : ''}`);
-      updateStatus = 1;
+  if (outcome.fallback && FLAG_HOST_SYNC_ONLY) {
+    // Host synchronization has a narrower contract than a full update: it must converge the
+    // executable plugin/spine to the published package even when an optional large KB asset is
+    // missing. The old path fell through to a fresh install here, which required the same missing
+    // zip and stranded every host on its previous generation. Keep the KB failure visible, but
+    // continue to the host-sync transaction; the published-surface/release gates still fail the
+    // release until the signed KB asset exists.
+    warn("the knowledge bundle could not refresh; continuing with executable host synchronization only");
+    updateStatus = 0;
+  } else if (outcome.fallback) {
+    // A blind fresh --force reinstall REFUSES to activate on top of a private overlay (unzipInto's
+    // own "fresh-install activation refused" guard, above) — so for a private-overlay install this
+    // branch used to die() in a loop every time the bundle's own updater failed: same refusal, same
+    // non-zero exit, forever, with no path that ever actually recovers the KB. The authenticated
+    // staged recovery rail (kb/forge-update.mjs's applyVerifiedStagedRelease) exists for exactly
+    // this case: it stages and independently re-verifies the signed bundle, then activates through
+    // runStorageTransaction — the SAME apply primitive main()'s normal --apply uses — which DOES
+    // preserve the private overlay, instead of a second, less careful mechanism that cannot.
+    let hasPrivateOverlay = false;
+    try {
+      const installedSource = JSON.parse(fs.readFileSync(path.join(kbDir, 'SOURCE.json'), 'utf8'));
+      const installedStores = Array.isArray(installedSource.stores) ? installedSource.stores : Object.values(installedSource.stores || {});
+      hasPrivateOverlay = installedStores.some((store) => store?.updateManaged === false);
+    } catch { /* updater already supplied the authoritative failure */ }
+    let fr;
+    if (hasPrivateOverlay) {
+      warn("\nthe installed updater failed; using authenticated staged recovery to preserve private stores…\n");
+      const release = await resolveRelease().catch((error) => die(error.message, error.hint));
+      const bundle = await obtainBundle(release);
+      if (!bundle.zipPath) throw new Error('private-overlay recovery requires a downloadable signed bundle');
+      const sigPath = `${bundle.zipPath}.sig`;
+      const stagedRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ruvnet-recovery-stage-'));
+      const staged = await stageBundleForRecovery(bundle.zipPath, stagedRoot, null, { signaturePath: sigPath,
+        releaseTag: release?.source === 'latest' ? (release.tag || null) : null });
+      const descriptor = path.join(stagedRoot, 'recovery-input.json');
+      let expectedRuntimeVersion = PACKAGE_VERSION;
+      try { expectedRuntimeVersion = JSON.parse(fs.readFileSync(path.join(kbDir, 'RUNTIME-IDENTITY.json'), 'utf8')).brainVersion || expectedRuntimeVersion; } catch { /* validator reports missing identity */ }
+      fs.writeFileSync(descriptor, JSON.stringify({ stagedDir: staged.stageDir, liveDir: kbDir,
+        bundlePath: bundle.zipPath, signaturePath: sigPath, bundleSha256: staged.bundleSha256,
+        expectedRuntimeVersion, releaseTag: release?.source === 'latest' ? (release.tag || null) : null,
+      }) + '\n', { mode: 0o600 });
+      fr = spawnSync(process.execPath, [path.join(REPO_ROOT, 'kb', 'forge-update.mjs'), '--staged-release', descriptor], {
+        stdio: 'inherit', cwd: path.dirname(kbDir), env: { ...refreshEnv, RUVNET_BRAIN_NO_UPDATE_FALLBACK: '1' },
+      });
+    } else {
+      warn("\nthe bundle's own updater couldn't complete — falling back to a fresh install of the latest Release (this always works)…\n");
+      const self = fileURLToPath(import.meta.url);
+      fr = spawnSync(process.execPath, [self, '--force'], { stdio: 'inherit',
+        env: { ...refreshEnv, RUVNET_BRAIN_NO_UPDATE_FALLBACK: '1' } });
     }
+    settleIfSignalled(fr);
+    updateStatus = fr.error ? 1 : (fr.status === null ? 1 : fr.status);
+  } else {
+    updateStatus = outcome.exitCode;
   }
-  // `--update --auto` = update now AND enroll in Evergreen, so this is the LAST time it's ever run by
-  // hand. Only enroll if the update itself succeeded — never promise "you're set forever" on a failed
-  // update. enableNightly() prints its own real verification (plist path + launchctl result).
-  if (updateStatus === 0 && FLAG_AUTO) {
+  const cleanupPending = outcome.verdict === 'cleanup-pending';
+  if (updateStatus !== 0 && !cleanupPending) {
+    recordRefreshPhase(refreshReceipt, 'source-enumeration', 'FAIL', {
+      updaterExit, finalExit: updateStatus, fallback: outcome.fallback, verdict: outcome.verdict,
+      updateResult: updaterResult,
+    });
+    settleRefresh(updateStatus, { phase: 'source-enumeration',
+      terminalVerdict: outcome.verdict === 'recovery-required' ? 'recovery-required' : 'failed' });
+    detachGuards();
+    return;
+  }
+  if (cleanupPending) updateStatus = 0;
+  // The updater refuses unsigned or mis-signed bundles (exit 3/4), so an applied result names bytes whose
+  // signature verified. Record it bound to the live COVERAGE.json (ADR-0098 positive confirmation).
+  if (updaterResult?.terminalVerdict === 'applied' && updaterResult.bundleSha256) {
+    try {
+      const corpusTag = JSON.parse(fs.readFileSync(path.join(kbDir, 'SOURCE.json'), 'utf8')).corpusReleaseTag || null;
+      writeSignatureRecord({ brainHome: footprintRoots().brainHome, kbDir, bundleSha256: updaterResult.bundleSha256,
+        releaseTag: corpusTag, source: 'update', now: footprintNow() });
+    } catch (error) { warn(`signature verification could not be recorded (${error.message})`); }
+  } else if (updateStatus === 0) {
+    // Nothing was applied (already current). The doctor names `--update` as the fix for a missing record, so
+    // this run must be able to write it — but only from proof: this machine's own receipt of an update that
+    // APPLIED a signature-verified bundle whose coverage digest equals the live COVERAGE.json (review S5).
+    const roots = footprintRoots();
+    try {
+      if (!signatureRecordValid({ brainHome: roots.brainHome, kbDir })) {
+        const evidence = signatureEvidenceFromReceipts({ brainHome: roots.brainHome, kbDir });
+        if (evidence) {
+          writeSignatureRecord({ brainHome: roots.brainHome, kbDir, bundleSha256: evidence.bundleSha256,
+            source: `update-receipt:${evidence.runId}`, now: footprintNow() });
+          ok('signature verification recorded for the live knowledge (from this machine\'s verified update receipt)');
+        } else {
+          warn('no signature verification is on record for the live knowledge, and no verified update of these exact bytes is either;');
+          info(`it is recorded by the next update that applies a signed release, or now by a verified reinstall:  ${c.bold('npx ruvnet-brain@latest --force')}`);
+        }
+      }
+    } catch (error) { warn(`signature verification could not be recorded (${error.message})`); }
+  }
+  let phaseEvidence = updaterResult?.phaseEvidence || null;
+  if (!phaseEvidence) {
+    const installed = validateCoverageDirectory(kbDir, { expectedVersion: PACKAGE_VERSION });
+    if (!installed.valid) {
+      recordRefreshPhase(refreshReceipt, 'source-enumeration', 'FAIL', { failures: installed.failures,
+        reason: 'legacy updater returned success without a valid installed ReleaseCoverage projection' });
+      settleRefresh(1, { phase: 'source-enumeration', terminalVerdict: 'failed' });
+      detachGuards();
+      return;
+    }
+    phaseEvidence = Object.fromEntries(UPDATE_REFRESH_PHASES.map((phase) => [phase, {
+      compatibility: 'validated-legacy-updater', coverageSha256: installed.coverageSha256,
+      releaseCoverageGeneration: installed.coverage.releaseCoverageGeneration,
+      execution: { kind: 'validated-legacy', sourceSnapshot: installed.coverage.releaseIdentity?.sourceSnapshot || null,
+        upstreamFreshness: 'UNKNOWN' },
+    }]));
+  }
+  for (const phase of UPDATE_REFRESH_PHASES) {
+    if (!phaseEvidence[phase]) {
+      recordRefreshPhase(refreshReceipt, phase, 'FAIL', { reason: `updater omitted ${phase} evidence` });
+      settleRefresh(1, { phase, terminalVerdict: 'failed' });
+      detachGuards();
+      return;
+    }
+    recordRefreshPhase(refreshReceipt, phase, 'PASS', phaseEvidence[phase]);
+  }
+  const finished = await finishUpdate({ kbDir, brainHome, refreshReceipt, outcome, updaterResult, cleanupPending,
+    settle: settleRefresh, converge: async () => await convergeHostsAfterUpdate(kbDir) });
+  detachGuards();
+  await printConfirmation({ footprint: finished.footprint?.after || null });
+}
+
+/**
+ * What host convergence means for an `--update` whose knowledge phases all PASSED (the shared 4.7.21 exit
+ * contract). Converged: PASS. A host restart as the ONLY gap (Codex reports restartScope 'unproven' on every
+ * boot-level change): the knowledge update stands, exit 0, and the phase is recorded required:false with
+ * restartPending, so the nightly no longer reports a good update as FAILED and still reconciles its modules
+ * (audit C, real receipt on the owner's Mac, Oct 24). Anything else: a required FAIL, exit 1.
+ */
+export function hostConvergenceUpdateVerdict(convergence) {
+  if (convergence?.ok && convergence.convergence?.healthy === true) return { status: 'PASS', required: true, exitCode: 0 };
+  if (convergence?.restartOnly === true && convergence.convergence?.state === 'host-restart-required') {
+    return { status: 'PASS', required: false, restartPending: true, exitCode: 0 };
+  }
+  return { status: 'FAIL', required: true, exitCode: 1 };
+}
+
+/**
+ * The part of `--update` after every knowledge phase has PASSED: host convergence, managed router additions,
+ * nightly module reconciliation, lifecycle retention, footprint, terminal settlement. Exported with its effects
+ * injectable so the exit contract is testable without a network or a real host:
+ *   0 knowledge updated (a host restart as the only gap is an advisory); 12 cleanup pending; 1 a real failure.
+ * Lifecycle-evidence retention is an ADVISORY here, never the terminal verdict: it used to turn every good
+ * update into recovery-required exit 1 and a ~745 MB reinstall, nightly (audit C). The updater's own
+ * `retentionAdvisory` (forge-update, 4.7.21) is recorded beside the installer's measurement.
+ */
+export async function finishUpdate({ kbDir, brainHome, refreshReceipt, outcome, updaterResult = null, cleanupPending = false,
+  settle,
+  converge = convergeHostsAfterUpdate,
+  reconcile = reconcileNightlyModules,
+  routerDefault = refreshManagedRouterDefault,
+  managedCatalog = () => applyManagedCatalogUpdate({ routerDir: path.join(os.homedir(), '.claude', 'model-router'), packageRoot: REPO_ROOT }),
+  prune = pruneLifecycleEvidence,
+  enforce = enforceFootprint,
+  enroll = () => {
+    // `--update --auto` = update now AND enroll in Evergreen, so this is the LAST time it's ever run by
+    // hand. enableNightly() prints its own real verification (plist path + launchctl result).
+    if (!FLAG_AUTO) return;
     info(c.dim("\n--auto set: enrolling in Evergreen auto-update so you never run this again…\n"));
     enableNightly(); // exits on its own with verified output; if it returns, fall through to the update verdict
+  },
+} = {}) {
+  let updateStatus = 0;
+  info(c.dim('\nsynchronizing every detected host to this exact published version…\n'));
+  const convergence = await converge(kbDir);
+  const host = hostConvergenceUpdateVerdict(convergence);
+  if (host.exitCode !== 0) {
+    let active;
+    try { active = JSON.parse(fs.readFileSync(path.join(footprintRoots().brainHome, 'active.json'), 'utf8')); } catch { /* report unknown activation */ }
+    warn(hostSynchronizationFailureMessage(convergence, active));
+    updateStatus = 1;
+  } else if (host.restartPending) {
+    warn(`the knowledge update succeeded; a host restart is still pending — ${convergence.convergence.action}`);
+  } else if (convergence.convergence?.notice) info(convergence.convergence.notice);
+  recordRefreshPhase(refreshReceipt, 'host-convergence', host.status, {
+    state: convergence?.convergence?.state || null, error: convergence?.error || null,
+    ...(host.restartPending ? { restartPending: true, advisory: 'host restart pending; knowledge update succeeded' } : {}),
+    ...(convergence?.convergence?.openSessions ? { openSessions: convergence.convergence.openSessions } : {}),
+    execution: { kind: 'executed', runId: refreshReceipt.runId },
+    required: host.required,
+  });
+  // Issue #87: a normal lifecycle update must also carry MANAGED MODEL additions to an existing
+  // user. This call used to live only in offerRouterProfile() — the fresh-install path — so someone
+  // who already had ~/.claude/model-router/catalog.json (i.e. every existing user, the only ones who
+  // can be behind) never received a newly shipped managed candidate no matter how often they
+  // updated. Additive and non-interactive; their overrides win, metered rows are never auto-enabled,
+  // and a failure here is reported but never fails an otherwise-good update.
+  if (updateStatus === 0) {
+    const defaultReceipt = routerDefault();
+    recordRefreshAdvisory(refreshReceipt, 'managed-router-default', defaultReceipt.action === 'failed' ? 'SKIP' : 'PASS', defaultReceipt);
+    try {
+      const managed = managedCatalog();
+      if (managed.action === 'merged' && managed.added.length) {
+        ok(`model router: added ${managed.added.length} managed model(s) — ${managed.added.join(', ')} (your catalog edits were preserved)`);
+      }
+      recordRefreshAdvisory(refreshReceipt, 'managed-catalog', 'PASS', { action: managed.action, added: managed.added || [] });
+    } catch (e) {
+      warn(`managed model additions were not merged (${e.message}); your catalog was left unchanged`);
+      recordRefreshAdvisory(refreshReceipt, 'managed-catalog', 'SKIP', { reason: e.message });
+    }
   }
-  process.exit(updateStatus); // exit with the updater's own verdict
+  // Only enroll if the update itself succeeded — never promise "you're set forever" on a failed update.
+  if (updateStatus === 0) enroll();
+  // The knowledge phases passed, so the nightly must run the installed modules even when a host did not
+  // converge; otherwise a host problem froze the 03:30 job on yesterday's coordinator (audit C).
+  reconcile({ brainHome, refreshReceipt });
+  let retention;
+  try {
+    retention = prune({ brainHome, kbDir, preserveRefreshRunIds: [refreshReceipt.runId],
+      preserveTransactionPaths: updaterResult?.transactionReceipts ? [updaterResult.transactionReceipts] : [] });
+  } catch (error) {
+    retention = { schemaVersion: 1, kind: 'ruvnet-brain-lifecycle-evidence-retention',
+      withinBudget: false, unsafe: [{ path: brainHome, reason: error.message }] };
+  }
+  const retentionFailed = retention?.withinBudget !== true;
+  const updaterRetention = updaterResult?.retentionAdvisory || null;
+  recordRefreshPhase(refreshReceipt, 'cleanup', cleanupPending ? 'FAIL' : (updateStatus === 0 ? 'PASS' : 'SKIP'), {
+    reason: cleanupPending ? 'verified live generation has redundant rollback cleanup pending'
+      : (updateStatus === 0 ? 'transaction settled' : 'upstream required phase failed'),
+    storageDelta: updaterResult?.storageDelta || null,
+    lifecycleRetention: retention,
+    execution: { kind: 'executed', runId: refreshReceipt.runId },
+    required: cleanupPending || updateStatus === 0,
+  });
+  if (retentionFailed || updaterRetention) {
+    const unsafe = (retentionFailed ? retention?.unsafe || [] : []).map((entry) => entry?.path).filter(Boolean);
+    warn(`lifecycle evidence could not be fully pruned (advisory; the update itself stands)${unsafe.length ? `: ${unsafe.slice(0, 3).join(', ')}` : ''}`);
+    try {
+      recordRefreshAdvisory(refreshReceipt, 'lifecycle-retention', 'FAIL', {
+        installer: retentionFailed ? retention : null, updater: updaterRetention });
+    } catch { /* the advisory never blocks settlement */ }
+  }
+  // ADR-0098: after the swap, enforce the footprint (the updater just released its own rollback; this
+  // releases everything else that must not exist) and record the result on the receipt as an advisory —
+  // a footprint problem is reported, it never fails an otherwise-good update.
+  const footprint = enforce({ holdingRefreshLock: true });
+  try {
+    const after = footprint?.after;
+    recordRefreshAdvisory(refreshReceipt, 'footprint', after && after.kbCopies === 1 && !after.cruft.length && after.withinBudget ? 'PASS' : 'FAIL', {
+      kbCopies: after?.kbCopies ?? null, cruft: after?.cruft.length ?? null, totalBytes: after?.totalBytes ?? null,
+      budgetBytes: after?.budgetBytes ?? null, removed: footprint?.removed.length ?? 0, freedBytes: footprint?.freedBytes ?? 0,
+    });
+  } catch { /* the advisory never blocks settlement */ }
+  // A genuine failure (a required host convergence) outranks cleanup-pending: 12 tells the coordinator and
+  // host-update the knowledge applied and only redundant cleanup is owed, so it must not mask an exit 1.
+  const failed = updateStatus !== 0;
+  const exitCode = failed ? updateStatus : (cleanupPending ? 12 : 0);
+  settle(exitCode, {
+    phase: failed ? 'failed' : (cleanupPending ? 'cleanup' : 'complete'),
+    terminalVerdict: failed ? 'failed' : cleanupPending ? 'cleanup-pending' : (outcome?.verdict === 'noop' ? 'noop' : 'applied'),
+    storageDelta: updaterResult?.storageDelta || null, lifecycleRetention: retention });
+  return { exitCode, footprint, hostConvergence: host };
+}
+
+/**
+ * After a successful --update: the nightly runs a content-addressed SNAPSHOT of the update modules (installNightlyRunner),
+ * which until now only --enable-nightly refreshed, so a fix shipped by --update stayed invisible to the 03:30 job
+ * (measured 2026-10-22: the 4.7.15 developer-update fix). A stale registration is re-pointed at the installed modules;
+ * a changed RUNNER would change the LaunchAgent command, which only explicit enablement may do, so that case is an
+ * advisory naming the fix. Advisory and fail-open: it never fails an otherwise good update.
+ */
+export function reconcileNightlyModules({ brainHome, refreshReceipt = null, runnerSource = path.join(REPO_ROOT, 'bin', 'nightly-refresh.mjs') } = {}) {
+  const advise = (status, detail) => { // the advisory write itself must never escape this step
+    try { if (refreshReceipt) recordRefreshAdvisory(refreshReceipt, 'nightly-modules', status, detail); } catch { /* the receipt is evidence, not the gate */ }
+    return { status, ...detail };
+  };
+  try {
+    const nightly = refreshNightlyModules({ brainHome, runnerSource });
+    if (nightly.state === 'refreshed') ok(`nightly scheduler now runs the installed update modules (${nightly.registered.slice(0, 16)}…)`);
+    else if (nightly.state === 'runner-changed') warn(`nightly scheduler runs an older runner; the LaunchAgent changes only on explicit enablement — run  ${c.bold(nightly.fix)}`);
+    else if (nightly.state === 'refused') warn(`nightly module snapshot was not refreshed: ${nightly.reason} — run  ${c.bold(nightly.fix)}`);
+    return advise(['runner-changed', 'refused'].includes(nightly.state) ? 'SKIP' : 'PASS',
+      { state: nightly.state, registered: nightly.registered ?? null, current: nightly.current ?? null, ...(nightly.reason ? { reason: nightly.reason } : {}), ...(nightly.fix ? { fix: nightly.fix } : {}) });
+  } catch (error) {
+    warn(`nightly module snapshot was not refreshed (${error.message}); the scheduler registration was left as it was`);
+    return advise('FAIL', { state: 'error', reason: error.message });
+  }
 }
 
 function enableNightly() {
   printBanner('enable nightly updates');
   const kbDir = resolvedKbDir();
-
-  if (process.platform !== 'darwin') {
-    info('The LaunchAgent scheduler is macOS-only (for now).');
-    info("On this platform, schedule the bundle's self-updater with cron — the pattern");
-    info('forge-update.mjs itself documents:');
-    console.log(`\n    ${c.bold(cronExample(kbDir))}\n`);
-    info(`(${c.bold('crontab -e')}, paste the line, save. Remove the line to disable.)`);
-    return; // exit 0 — the user got the working recipe
-  }
-
   info(`brain dir: ${c.bold(kbDir)}`);
   if (!fs.existsSync(path.join(kbDir, 'forge-update.mjs'))) {
-    // Refuse to schedule a job that is guaranteed to fail every night — fail loud NOW instead.
     missingUpdaterHelp(kbDir);
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
-
-  // Template the plist to THIS user's kb dir + node binary.
-  //
-  // No `/bin/sh -c` (ADR-038): a LaunchAgent whose ProgramArguments invoke a shell is the standard
-  // macOS persistence pattern, and EDR persistence monitors score it well above a plist that execs a
-  // binary directly. launchd provides everything the shell was doing here natively —
-  // WorkingDirectory replaces `cd`, StandardOutPath/StandardErrorPath replace `>>` and `2>&1` — so
-  // dropping the shell costs nothing and removes both a shell parse of interpolated paths and the
-  // signature. Same schedule, same command, same log.
-  const logPath = path.join(kbDir, 'update.log');
-  const plist = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>${NIGHTLY_LABEL}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>${xmlEscape(process.execPath)}</string>
-    <string>forge-update.mjs</string>
-    <string>--apply</string>
-  </array>
-  <key>WorkingDirectory</key>
-  <string>${xmlEscape(kbDir)}</string>
-  <key>StandardOutPath</key>
-  <string>${xmlEscape(logPath)}</string>
-  <key>StandardErrorPath</key>
-  <string>${xmlEscape(logPath)}</string>
-  <key>StartCalendarInterval</key>
-  <dict>
-    <key>Hour</key>
-    <integer>3</integer>
-    <key>Minute</key>
-    <integer>47</integer>
-  </dict>
-  <key>RunAtLoad</key>
-  <false/>
-</dict>
-</plist>
-`;
-  const plistPath = nightlyPlistPath();
   try {
-    fs.mkdirSync(path.dirname(plistPath), { recursive: true });
-    fs.writeFileSync(plistPath, plist);
-  } catch (e) {
-    console.error(`\n${c.red('✗ couldn\'t write the LaunchAgent:')} ${e.message}`);
-    process.exit(1);
-  }
-  ok(`wrote ${c.bold(plistPath)}`);
-  info(c.dim('runs nightly at 03:47 — an off-hour minute, so it never lands on the :00 rush'));
-
-  if (TEST_MODE) {
-    warn('RUVNET_BRAIN_TEST=1 — skipping launchctl bootout/bootstrap (plist written only)');
-  } else {
-    const uid = process.getuid();
-    // bootout first so re-running replaces the loaded job cleanly; failure just means "wasn't loaded".
-    spawnSync('launchctl', ['bootout', `gui/${uid}/${NIGHTLY_LABEL}`], { stdio: 'ignore' });
-    const boot = spawnSync('launchctl', ['bootstrap', `gui/${uid}`, plistPath], { encoding: 'utf8' });
-    if (boot.status === 0) ok('LaunchAgent loaded — your brain now updates while you sleep');
-    else {
-      warn(`launchctl bootstrap failed (${(boot.stderr || '').trim() || `exit ${boot.status}`}) — the plist is in place;`);
-      info(`load it yourself:  ${c.bold(`launchctl bootstrap gui/${uid} ${plistPath}`)}`);
+    const brainHome = process.env.RUVNET_BRAIN_HOME || path.dirname(kbDir);
+    const registration = installNightlyRunner({ brainHome, env: { ...process.env, RUVNET_BRAIN_HOME: brainHome, RUVNET_BRAIN_KB: kbDir },
+      source: path.join(REPO_ROOT, 'bin', 'nightly-refresh.mjs'),
+      nodePath: stableNode({ explicit: optionArg(argv, '--nightly-node') }) });
+    const installed = installScheduler(registration, {
+      platform: process.platform, env: process.env, kbDir, testMode: TEST_MODE,
+      pathValue: [...new Set([path.dirname(process.execPath), ...(process.env.PATH || '').split(path.delimiter)])].filter(Boolean).join(path.delimiter),
+    });
+    if (!installed.ok) throw new Error(installed.why);
+    const status = schedulerStatus({ platform: process.platform, env: process.env, brainHome, kbDir,
+      testMode: TEST_MODE });
+    if (status.state !== 'on') throw new Error(status.evidence);
+    ok(`nightly updates enabled — ${status.evidence}`);
+    info(c.dim(`identity ${NIGHTLY_LABEL}; immutable runner ${registration.runnerSha256.slice(0, 16)}…; 03:30 local`));
+    if (TEST_MODE) warn('RUVNET_BRAIN_TEST=1 — scheduler registration was written but OS activation was safely simulated');
+  } catch (error) {
+    console.error(`\n${c.red('✗ nightly updates were NOT enabled:')} ${error.message}`);
+    process.exitCode = 1;
+    return;
     }
-  }
-
-  console.log(`\n  ${c.bold('Verify it:')}   launchctl list | grep ${NIGHTLY_LABEL}`);
-  console.log(`  ${c.bold('Watch it:')}    tail ${logPath}   ${c.dim('(appears after the first nightly run)')}`);
   console.log(`  ${c.bold('Disable it:')}  npx ruvnet-brain --disable-nightly`);
-  console.log(`\n  ${c.dim('It only ever PULLS the published Release bundle (backup + re-verify built in) — it never publishes,')}`);
-  console.log(`  ${c.dim('and a night with no new Release is a clean no-op.')}\n`);
 }
 
 function disableNightly() {
   printBanner('disable nightly updates');
-  if (process.platform !== 'darwin') {
-    info('The LaunchAgent nightly is macOS-only, so nothing was scheduled here by this tool.');
-    info(`If you added the cron line yourself, remove it with:  ${c.bold('crontab -e')}`);
-    return;
+  const kbDir = resolvedKbDir();
+  const brainHome = process.env.RUVNET_BRAIN_HOME || path.dirname(kbDir);
+  const registration = readNightlyRegistration({ brainHome });
+  const removed = removeScheduler({ platform: process.platform, env: process.env, testMode: TEST_MODE });
+  if (!removed.ok) {
+    console.error(`\n${c.red('✗ nightly updates were NOT disabled:')} ${removed.why}`);
+    process.exitCode = 1;
+    return false;
   }
-  const plistPath = nightlyPlistPath();
-  const existed = fs.existsSync(plistPath);
-  if (TEST_MODE) {
-    warn('RUVNET_BRAIN_TEST=1 — skipping launchctl bootout (plist removal only)');
-  } else {
-    // Ignore failure: "not loaded" is exactly the state we want anyway.
-    spawnSync('launchctl', ['bootout', `gui/${process.getuid()}/${NIGHTLY_LABEL}`], { stdio: 'ignore' });
+  const status = schedulerStatus({ platform: process.platform, env: process.env, brainHome, kbDir,
+    testMode: TEST_MODE });
+  if (!['off', 'unsupported'].includes(status.state)) {
+    console.error(`\n${c.red('✗ nightly disable could not be verified:')} ${status.evidence}`);
+    process.exitCode = 1;
+    return false;
   }
-  if (existed) {
-    try {
-      fs.rmSync(plistPath);
-    } catch (e) {
-      console.error(`\n${c.red('✗ couldn\'t remove the LaunchAgent:')} ${e.message}`);
-      console.error(`  Remove it yourself:  rm ${plistPath}`);
-      process.exit(1);
+  if (registration.ok) {
+    fs.rmSync(registration.record.recordPath, { force: true });
+    const dir = path.dirname(registration.record.recordPath);
+    const otherRegistrations = fs.readdirSync(dir).filter(name => /^registration.*\.json$/.test(name));
+    // A proof registration may share the immutable runner; retain it if any registration remains.
+    if (!otherRegistrations.length && path.dirname(registration.record.runnerPath) === dir
+      && path.basename(registration.record.runnerPath) === `nightly-refresh-${registration.record.runnerSha256}.mjs`) {
+      fs.rmSync(registration.record.runnerPath, { force: true });
     }
-    ok(`nightly updates disabled — removed ${plistPath}`);
-  } else {
-    ok('nightly updates were already off — nothing to remove (safe to run any time)');
   }
+  ok(removed.already ? 'nightly updates were already off — nothing to remove' : 'nightly updates disabled and absence verified');
   info(`re-enable any time:  ${c.bold('npx ruvnet-brain --enable-nightly')}`);
+  return true;
 }
 
 // ── spend guard: the alarm that catches a runaway agentic fleet BEFORE it drains a card ───────────
@@ -2251,15 +4953,56 @@ const SPEND_GUARD_LABEL = 'com.ruvnet.spend-watchdog';
 const spendGuardScriptPath = () => path.join(os.homedir(), '.claude', 'scripts', 'api-spend-watchdog.mjs');
 const spendGuardPlistPath = () => path.join(os.homedir(), 'Library', 'LaunchAgents', `${SPEND_GUARD_LABEL}.plist`);
 
-function enableSpendGuard() {
+/**
+ * Every LaunchAgent that already runs an api-spend-watchdog.mjs, under ANY label (the owner's runs as
+ * com.stuartkerr.api-spend-watchdog). Matched on ProgramArguments, so a second hourly job is never added beside
+ * an existing one. Read-only; a binary plist is converted with plutil, an unreadable one is skipped.
+ */
+export function spendGuardAgents({ agentsDir = path.join(os.homedir(), 'Library', 'LaunchAgents') } = {}) {
+  let names = [];
+  try { names = fs.readdirSync(agentsDir).filter((name) => name.endsWith('.plist')); } catch { return []; }
+  const found = [];
+  for (const name of names) {
+    const file = path.join(agentsDir, name);
+    let text;
+    try {
+      const bytes = fs.readFileSync(file);
+      text = bytes.subarray(0, 6).toString('latin1') === 'bplist'
+        ? spawnSync('plutil', ['-convert', 'xml1', '-o', '-', file], { encoding: 'utf8' }).stdout || ''
+        : bytes.toString('utf8');
+    } catch { continue; }
+    const args = /<key>\s*ProgramArguments\s*<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(text)?.[1] || '';
+    if (!/api-spend-watchdog\.mjs/.test(args)) continue;
+    const label = /<key>\s*Label\s*<\/key>\s*<string>([^<]*)<\/string>/.exec(text)?.[1]?.trim() || name.replace(/\.plist$/, '');
+    found.push({ label, plist: file });
+  }
+  return found;
+}
+
+export function enableSpendGuard() {
+  // A spend watchdog already scheduled under another label (the owner's own job, or an earlier hand install)
+  // is the same safety net: say where it is and add nothing. Two hourly jobs mean two alerts per event.
+  const foreign = spendGuardAgents().filter((agent) => agent.label !== SPEND_GUARD_LABEL);
+  if (foreign.length) {
+    ok(`spend watchdog already installed as ${c.bold(foreign[0].label)} (${foreign[0].plist}) — not adding a second hourly job`);
+    return 'already-on';
+  }
   // The npx checkout is ephemeral, so copy the bundled watchdog to a persistent home the launchd
-  // job can point at for good.
+  // job can point at for good — but NEVER over a different file already there: it may be the user's own
+  // fixed copy (the owner's 2026-10-25 flood fix was one interactive install away from being reverted).
   const src = path.join(__dirname, 'api-spend-watchdog.mjs');
   const dst = spendGuardScriptPath();
   if (!fs.existsSync(src)) { warn('spend-watchdog source missing from this bundle — skipping (non-fatal)'); return 'no-source'; }
   fs.mkdirSync(path.dirname(dst), { recursive: true });
-  fs.copyFileSync(src, dst);
-  ok(`installed the spend watchdog → ${c.bold(dst)}`);
+  let existing = null;
+  try { existing = fs.readFileSync(dst); } catch { /* absent */ }
+  if (existing && !existing.equals(fs.readFileSync(src))) {
+    warn(`kept your existing ${c.bold(dst)} — it differs from the bundled watchdog, so it was not overwritten`);
+    info(`to use the bundled one instead:  ${c.bold(`rm ${dst}`)}  then  ${c.bold('npx ruvnet-brain --enable-spend-guard')}`);
+  } else if (!existing) {
+    fs.copyFileSync(src, dst);
+    ok(`installed the spend watchdog → ${c.bold(dst)}`);
+  } else ok(`spend watchdog script already current → ${c.bold(dst)}`);
 
   const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -2312,6 +5055,8 @@ function disableSpendGuard() {
   const plistPath = spendGuardPlistPath();
   const scriptPath = spendGuardScriptPath();
   const existed = fs.existsSync(plistPath);
+  // The script stays when another LaunchAgent runs it: that job is not ours to break.
+  const sharedWith = spendGuardAgents().filter((agent) => agent.label !== SPEND_GUARD_LABEL);
   if (TEST_MODE) {
     warn('RUVNET_BRAIN_TEST=1 — skipping launchctl bootout (plist removal only)');
   } else {
@@ -2319,7 +5064,8 @@ function disableSpendGuard() {
     spawnSync('launchctl', ['bootout', `gui/${process.getuid()}/${SPEND_GUARD_LABEL}`], { stdio: 'ignore' });
   }
   let failed = false;
-  for (const p of [plistPath, scriptPath]) {
+  if (sharedWith.length && fs.existsSync(scriptPath)) info(`kept ${scriptPath} — ${sharedWith[0].label} runs it`);
+  for (const p of sharedWith.length ? [plistPath] : [plistPath, scriptPath]) {
     if (!fs.existsSync(p)) continue;
     try { fs.rmSync(p); } catch (e) {
       failed = true;
@@ -2350,6 +5096,65 @@ const upgradeNoticeStatePath = () =>
 const brainOffSentinelPath = () =>
   path.join(process.env.RUVNET_BRAIN_STATE_DIR || path.join(os.homedir(), '.config', 'ruvnet-brain'), 'brain-off');
 
+// ── ADR-0098: THE FOOTPRINT GUARANTEE — one KB, current, in use, nothing building up ─────────────
+// The classifier and sweep live in plugin/scripts/brain-footprint.mjs (shared with SessionStart's
+// detached sweep); this file supplies the two collectors only it may run: the lease-aware plugin
+// generation collector and the lifecycle-evidence pruner. Test seams (RUVNET_BRAIN_TEST=1 only):
+// RUVNET_BRAIN_TEST_NPM_LATEST pins the registry answer, RUVNET_BRAIN_TEST_NOW the clock.
+const footprintNow = () => (process.env.RUVNET_BRAIN_TEST === '1' && Date.parse(process.env.RUVNET_BRAIN_TEST_NOW || ''))
+  || Date.now();
+async function npmLatestVersion() {
+  if (process.env.RUVNET_BRAIN_TEST === '1' && process.env.RUVNET_BRAIN_TEST_NPM_LATEST) {
+    return { version: process.env.RUVNET_BRAIN_TEST_NPM_LATEST, checkedAt: footprintNow(), source: 'test registry seam' };
+  }
+  try {
+    const response = await fetch('https://registry.npmjs.org/ruvnet-brain/latest', { signal: AbortSignal.timeout(3_000) });
+    const metadata = response.ok ? await response.json() : null;
+    return typeof metadata?.version === 'string' ? { version: metadata.version, checkedAt: Date.now(), source: 'npm registry, live' } : null;
+  } catch { return null; }
+}
+function footprintEvidence() {
+  const { brainHome, kbDir } = footprintRoots();
+  try { return assessLifecycleEvidence({ brainHome, kbDir }); } catch { return null; }
+}
+
+/** Enforce the footprint now: remove what must not exist (proof-gated), rotate over-cap logs, collect
+ * lease-free plugin generations. Narrates every removal and every refusal; never throws. */
+export function enforceFootprint({ holdingRefreshLock = false, pruneEvidence = false, quiet = false, archive = false } = {}) {
+  let result;
+  try {
+    result = sweepFootprint({ apply: true, archive, holdingRefreshLock, now: footprintNow(), evidence: footprintEvidence(),
+      collectPluginGenerations: ({ registryPath, apply }) => prunePluginGenerations({ registryPath, apply }),
+      pruneEvidence: pruneEvidence ? (args) => pruneLifecycleEvidence(args) : null });
+  } catch (error) {
+    warn(`footprint sweep could not run (${error.message}); nothing was removed`);
+    return null;
+  }
+  if (result.removed.length) ok(`footprint: removed ${result.removed.length} item(s) that must not exist, freed ${formatBytes(result.freedBytes)}`);
+  for (const r of quiet ? [] : result.removed) info(c.dim(`  removed ${r.path.replace(os.homedir(), '~')} — ${r.reason}`));
+  if (result.rotated.length) ok(`footprint: rotated ${result.rotated.length} log(s) past their size cap`);
+  if (result.plugins?.removed?.length) ok(`footprint: collected plugin generation(s) ${result.plugins.removed.join(', ')}`);
+  for (const k of result.kept.filter((item) => /^KEPT/.test(item.reason) || item.unique)) {
+    warn(`footprint: ${k.path.replace(os.homedir(), '~')} ${k.reason}`);
+    for (const { file, why } of (k.unique || []).slice(0, 5)) info(c.dim(`  ${file} — ${why}`));
+  }
+  return result;
+}
+
+/** Print (or emit as JSON) the positive-confirmation block for the machine as it is right now. */
+async function printConfirmation({ footprint = null, json = false, print = true } = {}) {
+  const now = footprintNow();
+  // Read-only: the inventory only — no copy is proven (no GB-sized hashing) and nothing is written (re-review S4).
+  const fp = footprint || inventoryFootprint({ now, evidence: footprintEvidence() });
+  // The doctor also checks the directory's bytes against the release projection (bounded: ~0.3 s on 1.4 GB).
+  const result = confirm({ footprint: fp, npmLatest: await npmLatestVersion(), installedVersion: PACKAGE_VERSION, now,
+    coverageIntegrity: FLAG_DOCTOR ? (dir) => validateCoverageDirectory(dir) : null });
+  if (!print) return result;
+  if (json) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  else console.log(`\n${formatConfirmation(result, { color: c })}`);
+  return result;
+}
+
 /**
  * Everything this installer can leave on a machine, DERIVED from disk — never asserted.
  *
@@ -2364,10 +5169,23 @@ export function machineFootprint() {
   const add = (label, p, undo) => { try { if (p && fs.existsSync(p)) items.push({ label, path: p, undo }); } catch { /* unreadable → not ours to claim */ } };
 
   add('Brain bundle (knowledge base)', resolvedKbDir(), 'npx ruvnet-brain --uninstall');
+  {
+    const artifact = nightlyArtifact({ platform: process.platform, env: process.env });
+    if (artifact.kind === 'launchd') add('Nightly updater (LaunchAgent)', artifact.path, 'npx ruvnet-brain --disable-nightly');
+    add('Nightly scheduler registration', path.join(process.env.RUVNET_BRAIN_HOME || path.dirname(resolvedKbDir()), 'scheduler', 'registration.json'), 'npx ruvnet-brain --disable-nightly');
+    // Only ever present after the updater refused an incompatible corpus release (ADR-086 step 16).
+    // It lives BESIDE the KB rather than inside it so an exact-tree update cannot erase the memory of
+    // the refusal — which is what keeps a refusal from being rediscovered, and re-downloaded, nightly.
+    // Declared here because a file we write is a file we own and must be able to take back.
+    add('Rejected-release memo (only after an incompatible corpus release)',
+      rejectedReleasePath(resolvedKbDir()), 'npx ruvnet-brain --uninstall');
+  }
   if (process.platform === 'darwin') {
-    add('Nightly updater (LaunchAgent)', nightlyPlistPath(), 'npx ruvnet-brain --disable-nightly');
     add('Spend watchdog (LaunchAgent)', spendGuardPlistPath(), 'npx ruvnet-brain --disable-spend-guard');
-    add('Spend watchdog script', spendGuardScriptPath(), 'npx ruvnet-brain --disable-spend-guard');
+    // A script another LaunchAgent runs is not ours to list for removal (disableSpendGuard keeps it).
+    if (!spendGuardAgents().some((agent) => agent.label !== SPEND_GUARD_LABEL)) {
+      add('Spend watchdog script', spendGuardScriptPath(), 'npx ruvnet-brain --disable-spend-guard');
+    }
   }
   const cmds = pluginCommandsDir();
   if (cmds) items.push({
@@ -2386,6 +5204,12 @@ export function machineFootprint() {
   try {
     if (fs.existsSync(cmdPath) && fs.readFileSync(cmdPath, 'utf8').includes(CLAUDE_MD_START)) {
       items.push({ label: 'CLAUDE.md block (6 lines, between markers)', path: cmdPath, undo: 'npx ruvnet-brain --uninstall' });
+    }
+  } catch { /* unreadable */ }
+  try {
+    const grokAgents = grokPaths().agents;
+    if (fs.existsSync(grokAgents) && fs.readFileSync(grokAgents, 'utf8').includes(CLAUDE_MD_START)) {
+      items.push({ label: 'Grok AGENTS.md search-first line (between markers)', path: grokAgents, undo: 'npx ruvnet-brain --uninstall' });
     }
   } catch { /* unreadable */ }
   add('Usage-counts preference', telemetryConsentPath(), 'delete this file');
@@ -2434,8 +5258,8 @@ export function machineFootprint() {
         undo: 'npx ruvnet-brain --uninstall (removes only the managed block)',
       });
     }
-    add('Codex lifecycle hook wrapper', codexHookWrapperPath(),
-      'npx ruvnet-brain --uninstall');
+    add('Legacy Codex lifecycle hook wrapper', codexHookWrapperPath(),
+      're-run npx ruvnet-brain to retire it, or use --uninstall');
     add('Codex MCP server files', codexServerDir(), 'npx ruvnet-brain --uninstall');
     const codexPlugin = codexPluginStatus();
     if (codexPlugin.installed) {
@@ -2477,15 +5301,14 @@ function printFootprint({ heading = 'What this put on your machine' } = {}) {
 }
 
 function showWhatsNew() {
-  const notes = path.join(REPO_ROOT, 'docs', 'RELEASE-NOTES-4.0.md');
-  if (!fs.existsSync(notes)) {
-    console.error('RuvNet Brain release notes are missing from this artifact.');
+  const executable = path.join(REPO_ROOT, 'plugin', 'scripts', 'whats-new.mjs');
+  const result = spawnSync(process.execPath, [executable], { stdio: 'inherit' });
+  if (result.error) {
+    console.error(`RuvNet Brain What's New failed: ${result.error.message}`);
     process.exitCode = 1;
     return;
   }
-  const text = fs.readFileSync(notes, 'utf8');
-  process.stdout.write(text);
-  if (!text.endsWith('\n')) process.stdout.write('\n');
+  process.exitCode = result.status === 0 ? 0 : 1;
 }
 
 /**
@@ -2493,8 +5316,7 @@ function showWhatsNew() {
  * Backed up and written atomically, same as when it was added — taking something away is at least
  * as sensitive as putting it there.
  */
-function removeClaudeMdBlock() {
-  const p = path.join(os.homedir(), '.claude', 'CLAUDE.md');
+function removeClaudeMdBlock(p = path.join(os.homedir(), '.claude', 'CLAUDE.md')) {
   let src = '';
   try { src = fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : ''; } catch { return 'unreadable'; }
   // PAIR THE MARKERS PROPERLY. The first version took the FIRST start and the FIRST end, unpaired.
@@ -2544,13 +5366,14 @@ function uninstallAll() {
   // Ours-by-construction directories and files are removed; things that live INSIDE a file the user
   // owns (settings.json entries, the MCP registration) and the Claude Code plugin itself are not
   // ours to delete, so they are handed over as commands.
-  const AUTO = new Set(['Brain bundle (knowledge base)', 'Nightly updater (LaunchAgent)',
+  const AUTO = new Set(['Brain bundle (knowledge base)', 'Nightly updater (LaunchAgent)', 'Nightly scheduler registration',
+    'Rejected-release memo (only after an incompatible corpus release)',
     'Spend watchdog (LaunchAgent)', 'Spend watchdog script', 'CLAUDE.md block (6 lines, between markers)',
     'Model-router files', 'Status-bar version script', 'Status-bar preference', 'Usage-counts preference',
     // Two gaps closed here: the statusLine KEY is now removable in place (we know exactly what we
     // wrote — see removeSettingsStatusLine()), and the upgrade-notice tracker is a file we fully own.
     'The statusLine entry in settings.json', 'Upgrade-notice state (release-notice tracking)',
-    'The Codex search_ruvnet MCP registration', 'Codex lifecycle hook wrapper',
+    'The Codex search_ruvnet MCP registration', 'Legacy Codex lifecycle hook wrapper',
     'Codex MCP server files']);
   const willRemove = before.filter((it) => AUTO.has(it.label));
   const manual = before.filter((it) => !AUTO.has(it.label));
@@ -2565,10 +5388,14 @@ function uninstallAll() {
   console.log(`\n  ${c.dim('Your own CLAUDE.md content is preserved — only our marked block is taken out,')}`);
   console.log(`  ${c.dim('and the file is backed up first.')}\n`);
 
-  if (process.platform === 'darwin') { disableNightly(); disableSpendGuard(); }
+  if (nightlyArtifact({ platform: process.platform, env: process.env }).supported) {
+    if (disableNightly() === false) return;
+  }
+  if (process.platform === 'darwin') disableSpendGuard();
 
   const claudeMd = removeClaudeMdBlock();
   if (claudeMd === 'removed') ok('removed our block from ~/.claude/CLAUDE.md (your content untouched, backup saved)');
+  if (removeClaudeMdBlock(grokPaths().agents) === 'removed') ok('removed our line from ~/.grok/AGENTS.md (your content untouched, backup saved)');
 
   // GAP FIX: this used to be permanently "manual" — machineFootprint() treated ANY settings.json edit
   // as something only the user could safely touch. That blanket rule was right for edits we cannot
@@ -2617,7 +5444,8 @@ function uninstallAll() {
     ['upgrade-notice state', upgradeNoticeStatePath()],
     // ADR-054 §5: a reinstall must never inherit an invisible OFF. See brainOffSentinelPath().
     ['brain on/off switch', brainOffSentinelPath()],
-    ['Codex lifecycle hook wrapper', codexHookWrapperPath()],
+    ['legacy Codex lifecycle hook wrapper', codexHookWrapperPath()],
+    ['prior Codex hook wrapper backup', `${codexHookWrapperPath()}.prior`],
     ['Codex MCP server files', codexServerDir()],
   ]) {
     if (!fs.existsSync(target)) continue;
@@ -2638,9 +5466,16 @@ function uninstallAll() {
 // Exported (testable under RUVNET_BRAIN_IMPORT_ONLY=1, like offerNightly). Never throws — the caller
 // also guards, because a finished install must never be broken by an optional safety offer.
 export async function offerSpendGuard() {
+  // Read-only detection first, so an existing guard under ANY label is reported as on (and never offered twice).
+  if (process.platform === 'darwin') {
+    const existing = spendGuardAgents();
+    if (existing.length || fs.existsSync(spendGuardPlistPath())) {
+      ok(`spend watchdog already installed${existing.length ? ` as ${existing[0].label}` : ''} — runaway API spend will alert you`);
+      return 'already-on';
+    }
+  }
   if (FLAG_NO_NIGHTLY_PROMPT || TEST_MODE) return 'suppressed';
   if (process.platform !== 'darwin') return 'unsupported';
-  if (fs.existsSync(spendGuardPlistPath())) { ok('spend watchdog already installed — runaway API spend will alert you'); return 'already-on'; }
 
   step(
     'One more safety net — a spend watchdog',
@@ -2685,42 +5520,141 @@ export function parseNightlyAnswer(answer) {
 // suppression flags) is testable in-process under RUVNET_BRAIN_IMPORT_ONLY=1 without a real install.
 // Returns a status string; never throws (the caller also guards — a finished install must never
 // be broken by an optional offer).
+// The default classifier is managed executable source; overrides belong in policy.mjs.
+// Preserve every prior default by its content digest before replacing it atomically.
+export function syncManagedRouterDefault({ routerDir = path.join(os.homedir(), '.claude', 'model-router'), packageRoot = REPO_ROOT } = {}) {
+  const source = fs.readFileSync(path.join(packageRoot, 'config', 'model-router', 'policy.default.mjs'));
+  const destination = path.join(routerDir, 'policy.default.mjs');
+  fs.mkdirSync(routerDir, { recursive: true });
+  const prior = fs.existsSync(destination) ? fs.readFileSync(destination) : null;
+  if (prior?.equals(source)) return { action: 'unchanged' };
+  let backup = null;
+  if (prior) {
+    backup = `${destination}.pre-managed-upgrade-${crypto.createHash('sha256').update(prior).digest('hex').slice(0, 16)}`;
+    try { fs.writeFileSync(backup, prior, { flag: 'wx', mode: 0o600 }); }
+    catch (error) {
+      if (error.code !== 'EEXIST' || !fs.readFileSync(backup).equals(prior)) throw error;
+    }
+  }
+  const temporary = `${destination}.tmp-${process.pid}-${crypto.randomUUID()}`;
+  try {
+    fs.writeFileSync(temporary, source, { flag: 'wx', mode: prior ? fs.statSync(destination).mode & 0o777 : 0o600 });
+    fs.renameSync(temporary, destination);
+  } finally { fs.rmSync(temporary, { force: true }); }
+  return { action: prior ? 'upgraded' : 'created', backup };
+}
+
+export function refreshInstalledModelLaunchers({ sourceRoot = REPO_ROOT, home = os.homedir() } = {}) {
+  const terminalFile = path.join(home, '.cache', 'ruvnet-brain', 'model-routing', 'terminal-launcher-config.json');
+  let terminal = { action: 'not-installed' };
+  if (fs.existsSync(terminalFile)) {
+    const previous = JSON.parse(fs.readFileSync(terminalFile, 'utf8'));
+    const runtime = installRoutingRuntime({ sourceRoot, home, apply: true });
+    const receipt = installTerminalLaunchers({ home, ...runtime, nodeBinary: previous.nodeBinary,
+      realCodex: previous.realCodex, realClaude: previous.realClaude, apply: true });
+    terminal = { action: previous.runtimeDigest === runtime.runtimeDigest ? 'unchanged' : 'updated',
+      runtimeDigest: runtime.runtimeDigest, shellConflicts: receipt.shellConflicts };
+  }
+  const file = path.join(home, '.cache', 'ruvnet-brain', 'model-routing', 'launcher-config.json');
+  if (!fs.existsSync(file)) return { action: 'not-installed', terminal };
+  const previous = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const receipt = installNativeLaunchers({ sourceRoot, home, extensionsRoot: previous.extensionsRoot, nodeBinary: previous.nodeBinary, apply: true });
+  return { action: receipt.config.runtimeDigest === previous.runtimeDigest ? 'unchanged' : 'updated', runtimeDigest: receipt.config.runtimeDigest, terminal };
+}
+
+export function syncManagedRouterTools({ routerDir = path.join(os.homedir(), '.claude', 'model-router'), packageRoot = REPO_ROOT } = {}) {
+  const destination = path.join(routerDir, 'bin');
+  fs.mkdirSync(destination, { recursive: true });
+  let copied = 0;
+  for (const name of ['model-router-engine.mjs', 'model-router-setup.mjs', 'model-router-status.mjs', 'model-router-outcome.mjs', 'subscription-hosts.mjs', 'review-model-defaults.mjs', 'dual-host-deliberation.mjs', 'dual-host-suggest.mjs', 'route-cheap.mjs', 'dispatch-receipt.mjs', 'metaharness-receipts.mjs', 'metaharness-router.mjs', 'model-router-dispatch.mjs', 'model-currency.mjs', 'model-currency-evidence.mjs', 'user-model-prompt-hook.mjs', 'model-router-agent-hook.mjs', 'model-weekly-assessment.mjs', 'model-weekly-analyst.mjs', 'model-weekly-cycle.mjs', 'model-weekly-qualification.mjs', 'model-native-qualification.mjs', 'model-routing-launchers.mjs', 'model-terminal-gateway.mjs', 'model-terminal-launchers.mjs', 'claude-terminal-mod.mjs', 'claude-controlled-terminal.mjs', 'model-managed-prompt.mjs', 'model-managed-workflow-service.mjs', 'model-routing-controller.mjs', 'model-routing-execution-adapters.mjs', 'codex-managed-terminal.mjs', 'grok-subscription-host.mjs', 'model-native-catalog.mjs', 'model-analyst-sandbox.mjs', 'model-routing-policy-promotion.mjs', 'model-routing-gateway.mjs', 'native-subscription-usage.mjs', 'codex-routed.sh', 'goldie-weekly.sh']) {
+    const source = path.join(packageRoot, 'scripts', name);
+    if (!fs.existsSync(source)) throw new Error(`Packaged router tool missing: ${name}`);
+    const target = path.join(destination, name);
+    const bytes = fs.readFileSync(source);
+    if (fs.existsSync(target) && fs.readFileSync(target).equals(bytes)) continue;
+    const temporary = `${target}.${crypto.randomUUID()}.tmp`;
+    try { fs.writeFileSync(temporary, bytes, { mode: name.endsWith('.sh') ? 0o755 : 0o600 }); fs.renameSync(temporary, target); }
+    finally { fs.rmSync(temporary, { force: true }); }
+    copied++;
+  }
+  // Copy the same transitive dependencies used by immutable terminal runtimes.
+  // Repository scripts live in bin here, preserving their relative sibling imports.
+  for (const [relative, runtimeBytes] of runtimeSnapshot(packageRoot).files) {
+    const mapped = relative.startsWith('scripts/') ? `bin/${relative.slice(8)}` : relative;
+    const runtimeTarget = path.join(routerDir, mapped);
+    if (fs.existsSync(runtimeTarget) && fs.readFileSync(runtimeTarget).equals(runtimeBytes)) continue;
+    fs.mkdirSync(path.dirname(runtimeTarget), { recursive: true });
+    const temporary = `${runtimeTarget}.${crypto.randomUUID()}.tmp`;
+    try { fs.writeFileSync(temporary, runtimeBytes, { mode: 0o600 }); fs.renameSync(temporary, runtimeTarget); }
+    finally { fs.rmSync(temporary, { force: true }); }
+    copied++;
+  }
+  const qualificationSource = path.join(packageRoot, 'config', 'model-router', 'qualification-contract.json');
+  const qualificationTarget = path.join(routerDir, 'qualification-contract.json');
+  const qualificationBytes = fs.readFileSync(qualificationSource);
+  if (!fs.existsSync(qualificationTarget) || !fs.readFileSync(qualificationTarget).equals(qualificationBytes)) {
+    const temporary = `${qualificationTarget}.${crypto.randomUUID()}.tmp`;
+    try { fs.writeFileSync(temporary, qualificationBytes, { mode: 0o600 }); fs.renameSync(temporary, qualificationTarget); }
+    finally { fs.rmSync(temporary, { force: true }); }
+    copied++;
+  }
+  const launchers = routerDir === path.join(os.homedir(), '.claude', 'model-router')
+    ? refreshInstalledModelLaunchers({ sourceRoot: packageRoot }) : { action: 'custom-router-directory' };
+  return { action: copied ? 'updated' : 'unchanged', copied, launchers };
+}
+
+function refreshManagedRouterDefault() {
+  try {
+    const receipt = syncManagedRouterDefault();
+    syncManagedRouterTools();
+    if (receipt.action === 'created') ok('installed managed model-router default (custom overrides belong in policy.mjs)');
+    if (receipt.action === 'upgraded') ok(`upgraded managed model-router default; prior source preserved at ${receipt.backup}`);
+    return receipt;
+  } catch (error) {
+    warn(`managed model-router default was not refreshed (${error.message}); native dispatch remains fail-closed`);
+    return { action: 'failed' };
+  }
+}
+
 // ── MetaHarness router: config materialization + THIS user's subscription profile (2026-07-12) ──
 // Stuart's mandate: subscription-awareness must be per-user. Detect what the machine can PROVE
 // (Codex auth mode from ~/.codex/auth.json's SHAPE — never its secrets), ASK what it can't (Claude
 // plan tiers aren't probeable from disk), and RECORD both with their basis, so the router's
 // $0-floor never assumes a plan this user doesn't have (billing them) or misses one they do
 // (wasting it). Config templates ship in the npm package's config/; router tools are copied to
-// ~/.claude/model-router/bin/ because the npx run dir vanishes after install. Never overwrites
-// user-edited files. Non-fatal like every offer.
+// ~/.claude/model-router/bin/ because the npx run dir vanishes after install. Managed defaults
+// upgrade with a backup; custom policy.mjs, profiles and reviewed allocation overrides remain user-owned. Non-fatal like every offer.
 export async function offerRouterProfile() {
   if (TEST_MODE) return 'suppressed';
   const routerDir = path.join(os.homedir(), '.claude', 'model-router');
   const pkgRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
   step(
-    'MetaHarness model router — the right model for each task, cheapest first',
-    "your subscription models are $0 marginal; the router just needs to know which ones YOU have",
+    'Model router — appropriate intelligence for each task',
+    "native subscription routes preserve your overrides; weekly analysis checks the evidence",
   );
 
   fs.mkdirSync(path.join(routerDir, 'bin'), { recursive: true });
-  for (const [src, dst] of [['catalog.template.json', 'catalog.json'], ['policy.default.mjs', 'policy.default.mjs']]) {
-    const s = path.join(pkgRoot, 'config', 'model-router', src);
-    const d = path.join(routerDir, dst);
-    if (fs.existsSync(s) && !fs.existsSync(d)) { fs.copyFileSync(s, d); ok(`installed ${dst} (edit freely — goldie keeps prices fresh where scheduled)`); }
+  refreshManagedRouterDefault();
+  // ONE implementation of the managed-catalog step, shared with runUpdate() (issue #87). It used to
+  // live here only, which is exactly why existing users never received managed additions.
+  try {
+    const managed = applyManagedCatalogUpdate({ routerDir, packageRoot: pkgRoot });
+    if (managed.action === 'created') ok('installed catalog.json (edit freely — goldie keeps prices fresh where scheduled)');
+    if (managed.action === 'merged') ok(`merged ${managed.added.length} managed subscription model(s); your catalog overrides were preserved`);
+  } catch (error) {
+    warn(`managed model additions were not merged (${error.message}); your existing catalog was left unchanged`);
   }
-  let copied = 0;
-  // dispatch-receipt + metaharness-receipts added 2026-07-13: without the LOGGER, subagent routing is
-  // invisible; without the VIEWER, the user has no scoreboard to hold it to. Shipping one without the
-  // other is how a router ends up "working" with three test pings in its log and nobody the wiser.
-  // (dispatch-receipt.mjs relative-imports route-cheap.mjs — they land in the same bin/ dir, so it resolves.)
-  for (const t of ['model-router-engine.mjs', 'model-router-setup.mjs', 'model-router-status.mjs', 'model-router-outcome.mjs', 'subscription-hosts.mjs', 'dual-host-deliberation.mjs', 'dual-host-suggest.mjs', 'route-cheap.mjs', 'dispatch-receipt.mjs', 'metaharness-receipts.mjs', 'codex-routed.sh']) {
-    const s = path.join(pkgRoot, 'scripts', t);
-    if (fs.existsSync(s)) { fs.copyFileSync(s, path.join(routerDir, 'bin', t)); copied++; }
-  }
-  if (copied) {
-    try { fs.chmodSync(path.join(routerDir, 'bin', 'codex-routed.sh'), 0o755); } catch { /* not fatal */ }
-    ok(`${copied} router tools at ~/.claude/model-router/bin/ (stable path — the npx dir vanishes)`);
-  }
+  const toolsReceipt = syncManagedRouterTools({ routerDir, packageRoot: pkgRoot });
+  if (toolsReceipt.copied) ok(`updated ${toolsReceipt.copied} managed routing tools`);
+
+  // Allocation is user-owned. A shipped seed retains its real review date; installation never
+  // certifies it fresh or overwrites a reviewed user policy.
+  const selectionSrc = path.join(pkgRoot, 'config', 'model-router', 'routing-policy.template.json');
+  const selectionDst = path.join(routerDir, 'routing-policy.json');
+  if (fs.existsSync(selectionSrc) && !fs.existsSync(selectionDst)) fs.copyFileSync(selectionSrc, selectionDst);
+  const instructionSrc = path.join(pkgRoot, 'config', 'model-router', 'weekly-analyst-instruction.md');
+  const instructionDst = path.join(routerDir, 'weekly-analyst-instruction.md');
+  if (fs.existsSync(instructionSrc) && !fs.existsSync(instructionDst)) fs.copyFileSync(instructionSrc, instructionDst);
 
   const profilePath = path.join(routerDir, 'profile.json');
   if (fs.existsSync(profilePath)) { ok('subscription profile already exists — routing already uses it'); return 'already'; }
@@ -2789,14 +5723,15 @@ export async function offerNightly() {
     'rUv ships constantly; a brain that updates itself stays current with zero effort from you',
   );
 
-  if (process.platform !== 'darwin') {
-    info('The LaunchAgent scheduler is macOS-only (for now).');
-    info(`Update manually any time with:  ${c.bold('npx ruvnet-brain --update')}`);
-    info(`(or schedule it yourself with the cron line documented in the brain's own forge-update.mjs)`);
+  const artifact = nightlyArtifact({ platform: process.platform, env: process.env });
+  if (!artifact.supported) {
+    info(`No reversible scheduler adapter is available for ${process.platform}.`);
     return 'unsupported';
   }
 
-  if (fs.existsSync(nightlyPlistPath())) {
+  const brainHome = process.env.RUVNET_BRAIN_HOME || path.dirname(kbDir);
+  if (schedulerStatus({ platform: process.platform, env: process.env, brainHome, kbDir,
+    testMode: process.env.RUVNET_BRAIN_SCHEDULER_TEST === '1' }).state === 'on') {
     ok('nightly auto-updates are already on — new repos and gists arrive while you sleep');
     return 'already-on';
   }
@@ -2808,7 +5743,7 @@ export async function offerNightly() {
   // nudged past a decision they'd have made differently. Both failures cost trust; only one is loud.
   info(`${c.green('Recommended')} — rUv ships constantly, and this is how fixes reach you without you`);
   info(`thinking about it. ${c.bold('Entirely your call, though')}, and easy to undo.`);
-  info(`${c.dim('What it sets up:')} a small background job (a macOS LaunchAgent) that checks each night`);
+  info(`${c.dim('What it sets up:')} a small background job (${artifact.kind}) that checks each night`);
   info(`${c.dim('                 ')} and downloads a fresher brain — signature-verified before anything is applied.`);
   info(`${c.dim('If you skip:')}     nothing changes; update whenever you like with  ${c.bold('npx ruvnet-brain --update')}`);
   info(`${c.dim('Turn it off:')}     ${c.bold('npx ruvnet-brain --disable-nightly')}  ${c.dim('(any time, no reinstall)')}`);
@@ -3115,18 +6050,29 @@ function detectEnvironment() {
     platform: process.platform,
     arch: process.arch,
     claude: have('claude'),
-    ruflo: have('ruflo') || have('claude-flow'),
+    ruflo: (() => { const r = locateRuflo(); return Boolean(r.cli || r.configured); })(),
     ruvector: have('ruvector') || hasUserScopeMcpServer('ruvector'),
   };
-  // Also honor a toolkit that's wired into the Claude config even if the CLI isn't on PATH (npx users).
-  try {
-    const settings = path.join(os.homedir(), '.claude', 'settings.json');
-    if (fs.existsSync(settings)) {
-      const s = fs.readFileSync(settings, 'utf8');
-      if (/claude-flow|\bruflo\b/i.test(s)) env.ruflo = true;
-    }
-  } catch { /* ignore — detection is best-effort */ }
   return env;
+}
+
+/**
+ * THE Ruflo locator — the only way the installer and --doctor decide whether Ruflo is here. Every route it
+ * uses is a parameter, so a caller (or a test) controls all of them: the CLI is `ruflo` (or the legacy
+ * `claude-flow`) found by the shell on `env.PATH`, and `configured` means `~/.claude/settings.json`
+ * mentions it (npx users with no CLI on PATH). Nothing else is consulted — not node's own directory, not the
+ * npm prefix — unless it is on that PATH. (CI run 36919727923: `npm i -g ruflo` puts ruflo beside node, so a
+ * test PATH that kept node's directory still "had" ruflo.)
+ */
+export function locateRuflo({ env = process.env, home = os.homedir() } = {}) {
+  const which = (cmd) => {
+    const r = IS_WIN ? spawnSync('where', [cmd], { env, encoding: 'utf8' })
+      : spawnSync('sh', ['-c', `command -v -- ${cmd}`], { env, encoding: 'utf8' });
+    return !r.error && r.status === 0 ? (String(r.stdout || '').trim().split(/\r?\n/)[0] || null) : null;
+  };
+  let configured = false;
+  try { configured = /claude-flow|\bruflo\b/i.test(fs.readFileSync(path.join(home, '.claude', 'settings.json'), 'utf8')); } catch { /* none */ }
+  return { cli: which('ruflo') || which('claude-flow'), configured };
 }
 
 export function classifyRufloOperationalHealth({ status = '', memory = '', metrics = '' } = {}) {
@@ -3153,16 +6099,92 @@ export function classifyRufloOperationalHealth({ status = '', memory = '', metri
   };
 }
 
-function probeRufloOperationalHealth() {
-  const run = (args) => {
-    const result = spawnSync('ruflo', args, { cwd: process.cwd(), encoding: 'utf8', timeout: 10_000 });
-    return `${result.stdout || ''}\n${result.stderr || ''}`;
-  };
+const RUFLO_NOT_INITIALIZED = /not initialized in this directory/i;
+const rufloProbeRun = (args, cli = 'ruflo', timeoutMs = 10_000) => {
+  // Every `ruflo` invocation auto-starts a project background daemon unless this is set
+  // (verified live: ~/.npm-global/lib/node_modules/ruflo/node_modules/@claude-flow/cli/dist/src/
+  // services/daemon-autostart.js:85) — a read-only health probe must not leave one running.
+  const result = spawnSync(cli, args, { cwd: process.cwd(), encoding: 'utf8', timeout: timeoutMs, shell: IS_WIN && /\.(?:cmd|bat)$/i.test(cli),
+    env: { ...process.env, RUFLO_DAEMON_AUTOSTART: '0', CLAUDE_FLOW_AUTO_UPDATE: 'false' } });
+  // A spawn failure or a timeout is marked, so it can never pass for an (empty, "healthy") answer.
+  return `${result.stdout || ''}\n${result.stderr || ''}${result.error ? `\n[ruflo-probe-error] ${result.error.code || result.error.message}` : ''}`;
+};
+
+/**
+ * The Ruflo probe, READ-ONLY and therefore the same on every run. Measured on ruflo 3.49.0: in a directory
+ * that has not run `ruflo init`, `ruflo status` only reports "not initialized", but `ruflo status memory`
+ * WRITES .swarm/, .claude-flow/ and ruvector.db into it and `hooks metrics` writes .claude-flow/. So the old
+ * probe initialized the user's directory itself: the first --doctor read "not initialized" as degraded
+ * learning (✗), every later one saw "[STOPPED]" (direct mode, ✓) — text and --json disagreed on CI Linux,
+ * run 36915686695. An uninitialized directory is now "not applicable" and the writing commands never run.
+ */
+export function probeRufloOperationalHealth({ cli = 'ruflo', timeoutMs = 10_000, run = (args) => rufloProbeRun(args, cli, timeoutMs) } = {}) {
+  const status = run(['status']);
+  // No answer (could not start, timed out, printed nothing) is NOT health, and nothing more is asked (re-review NIT).
+  if (/\[ruflo-probe-error\]/.test(status) || !status.trim()) {
+    return { healthy: false, unanswered: true, directMode: false, stopped: false, zeroLearning: false, memoryContradiction: false, memoryEntries: 0 };
+  }
+  if (RUFLO_NOT_INITIALIZED.test(status)) {
+    return { healthy: true, notInitialized: true, directMode: false, stopped: false, zeroLearning: false, memoryContradiction: false, memoryEntries: 0 };
+  }
   return classifyRufloOperationalHealth({
-    status: run(['status']),
+    status,
     memory: run(['status', 'memory']),
     metrics: run(['hooks', 'metrics', '--v3-dashboard']),
   });
+}
+
+/** sha256 of the live COVERAGE.json: the identity a persisted grounding verdict is bound to. */
+export function liveCoverageSha256(kbDir) {
+  try { return crypto.createHash('sha256').update(fs.readFileSync(path.join(kbDir, 'COVERAGE.json'))).digest('hex'); } catch { return null; }
+}
+
+/**
+ * THE Grounding line of the doctor's one verdict (ADR-058 §D8), from the live question and the persisted
+ * verdict only (owner ruling: a WARM-UP timeout is advisory; the timed QUESTION timing out is ✗):
+ *   live proven                              ✓ (and the persisted verdict was just rewritten, bound to these bytes)
+ *   persisted UNPROVEN, live not proven      ✗ — the persisted verdict gates
+ *   reader missing / incomplete / broken     ✗ — an install defect, fix: reinstall (a verifier that throws on
+ *                                              import is "broken", not "cannot settle")
+ *   warm-up crashed, answer wrong or late    ✗
+ *   model warm-up ran out of time            ! — a slow machine, advisory, fix: run it again
+ *   NO verifier at all (none installed, none shippable): the live question cannot settle it, so a persisted
+ *     'proven' verdict FOR THESE BYTES (coverage digest) passes, named as not re-proven live; anything else ✗.
+ *     Only this narrow case can pass without a live proof.
+ */
+export function groundingCheckLine({ smoke = {}, persisted = null, coverageSha256 = null } = {}) {
+  const line = (state, detail, fix = null) => ({ id: 'grounding', label: 'Grounding', state, detail, fix: state === 'ok' ? null : fix });
+  // Coarse by design (tests/unit/install-state.test.mjs): any recorded state that is not literally 'proven' is unproven.
+  const recorded = persisted && typeof persisted === 'object' ? persisted : null;
+  if (smoke.grounded === true) return line('ok', `proven (${smoke.receipt?.path || 'cited passage'})`);
+  if (recorded && recorded.grounding !== 'proven') return line('fail', `recorded UNPROVEN${recorded.reason ? ` (${recorded.reason})` : ''}`, 'npx ruvnet-brain');
+  if (smoke.grounded === null) {
+    const forTheseBytes = recorded?.grounding === 'proven' && Boolean(coverageSha256) && recorded.coverageSha256 === coverageSha256;
+    return forTheseBytes
+      ? line('ok', `not re-proven live (${smoke.reason || 'no verifier'}); last proven for these bytes${recorded.clearedBy ? ` by ${recorded.clearedBy}` : ''}`)
+      : line('fail', `not verifiable live (${smoke.reason || 'no verifier'}) and never proven for these bytes`, 'npx ruvnet-brain');
+  }
+  if (smoke.warmupTimeout) return line('warn', `not proven in time (${smoke.reason || 'slow'})`, 'npx ruvnet-brain --doctor (again, when the machine is less busy)');
+  // The reader's own deadline ("slow on this machine, not broken") is ✗, but its fix is to run it again: a
+  // reinstall does not make a machine faster (and the narration says so).
+  return line('fail', `not proven (${smoke.reason || (smoke.ran === false ? 'the live question did not run' : 'unknown')})`,
+    smoke.slow ? 'npx ruvnet-brain --doctor (again, when the machine is less busy)' : 'npx ruvnet-brain');
+}
+
+/** THE Ruflo line of the doctor's one verdict: derived only from the probe result, for text and --json alike. */
+export function rufloCheckLine(health) {
+  if (health.unanswered) {
+    return { id: 'ruflo', label: 'Ruflo', state: 'fail', detail: '`ruflo status` did not answer (could not start or timed out)', fix: 'ruflo doctor --fix' };
+  }
+  if (health.configuredOnly) {
+    return { id: 'ruflo', label: 'Ruflo', state: 'unknown', detail: 'configured in ~/.claude/settings.json; no ruflo CLI on PATH (not probed)', fix: null };
+  }
+  if (health.notInitialized) {
+    return { id: 'ruflo', label: 'Ruflo', state: 'unknown', detail: 'CLI present; not initialized in this directory (no project learning to judge)', fix: null };
+  }
+  return health.healthy
+    ? { id: 'ruflo', label: 'Ruflo', state: 'ok', detail: health.directMode ? 'direct mode (daemon stopped by design)' : 'operational', fix: null }
+    : { id: 'ruflo', label: 'Ruflo', state: 'fail', detail: 'operational learning DEGRADED', fix: 'ruflo doctor --fix' };
 }
 
 // ── issue #39: the ruvector MCP server's own native VectorDb defaults ITS storage to
@@ -3295,7 +6317,7 @@ async function offerStack(env) {
   for (const m of missing) {
     if (m.shell) {
       info(`installing ${m.what} … ${c.dim(m.say)}`);
-      const ran = tryRun(m.shell[0], m.shell[1]);
+      const ran = ['claude', 'codex'].includes(m.shell[0]) ? tryHostCli(m.shell[0], m.shell[1]) : tryRun(m.shell[0], m.shell[1]);
       // Don't trust the exit code alone — e.g. `claude mcp add` exits non-zero on "already exists",
       // which is functionally success. Re-check the real state (m.verify) before warning.
       if (ran || (m.verify && m.verify())) ok(`${m.what} added`);
@@ -3619,7 +6641,7 @@ function success({ cacheDir, isCustom, plugin, codexHost, codexPlugin, env, nigh
   console.log(`    • the brain (embedded source of ${installedRepoCount(cacheDir)} RuvNet repos) at:`);
   console.log(`        ${c.bold(cacheDir)}`);
   console.log(
-    `    • the Claude Code plugin ${plugin.wired ? c.green('wired at user scope') : c.yellow('(finish the 2 commands above)')} — search_ruvnet + grounding hook`,
+    `    • the Claude Code plugin ${plugin.wired ? c.green('wired at user scope') : c.yellow('(finish the 2 commands above)')} — search_ruvnet + skills + commands`,
   );
   if (codexHost?.host) {
     const hostReady = ['added', 'rewritten', 'user-owned'].includes(codexHost.action);
@@ -3628,6 +6650,8 @@ function success({ cacheDir, isCustom, plugin, codexHost, codexPlugin, env, nigh
       `    • the Codex host ${hostReady && pluginReady ? c.green('wired at user scope') : c.yellow('needs attention')} — search_ruvnet + native Brain skills`,
     );
   }
+  const grokLine = grokStatusLine(currentGrokStatus());
+  if (grokLine) console.log(`    • ${grokLine}`);
   if (env) {
     const t = (okv) => (okv ? c.green('✓ present') : c.yellow('not added (optional)'));
     console.log(`    • rUv build toolkit — Ruflo: ${t(env.ruflo)} · RuVector: ${t(env.ruvector)}  ${c.dim('answers work without them')}`);
@@ -3642,14 +6666,13 @@ function success({ cacheDir, isCustom, plugin, codexHost, codexPlugin, env, nigh
   console.log(`\n  ${c.bold('Where it runs:')} ${c.bold(`everywhere you use ${hostLabel}`)} — CLI and supported editor/desktop surfaces.`);
   console.log(`    It's ${c.bold('user-level (global)')}: open ANY repo or folder and it's already there. Nothing per project,`);
   console.log(`    nothing to copy in, nothing to git-ignore. ${c.dim('(Runs locally — it is not active in the claude.ai web app.)')}`);
-  console.log(`\n  ${c.bold('How it runs:')} ${c.bold('automatically')} — you never call or configure anything. Ask normally; on rUv-stack work it`);
-  console.log(`    grounds in real source and cites it, and if you drift to a classical default it steps in with the rUv option.`);
+  console.log(`\n  ${c.bold('How it runs:')} search_ruvnet, Brain skills and proof commands when you ask, plus the allowlisted`);
+  console.log(`    lifecycle hooks (${hookCountPhrase()}): grounding reminders, a write gate, and continuity snapshots.`);
   console.log(`\n  ${c.bold('Keep it fresh:')} re-run ${c.bold('npx ruvnet-brain')} any time — the brain itself always pulls the latest`);
   console.log(`  Release regardless (that part isn't cached). For the bleeding-edge installer too, use ${c.bold('npx github:stuinfla/ruvnet-brain')}.`);
 
-  // ── one important expectation: the hook activates on the NEXT session ──
-  console.log(`\n  ${c.yellow(c.bold('One thing to know:'))} lifecycle hooks turn on in your ${c.bold('next')} host session.`);
-  console.log(`  ${c.dim(`If ${hostLabel} is open right now, quit and reopen it so the new plugin snapshot loads.`)}`);
+  console.log(`\n  ${c.bold('Updates take effect:')} body-only releases go live on the next hook/MCP call without a restart.`);
+  console.log(`  ${c.dim('If boot-level declarations change, the installer names the affected host and requests one restart.')}`);
 
   // ── what to do now ──
   console.log(`\n  ${c.bold('What to do now:')}`);
@@ -3659,19 +6682,19 @@ function success({ cacheDir, isCustom, plugin, codexHost, codexPlugin, env, nigh
 
   // ── how you'll KNOW it's working ──
   console.log(`\n  ${c.bold('How you\'ll know it\'s working:')}`);
-  console.log(`    ${c.green('✓')} Claude reaches for ${c.bold('RuVector / RVF, Ruflo, AgentDB')} instead of Pinecone / pgvector / LangChain.`);
-  console.log(`    ${c.green('✓')} It ${c.bold('cites real source paths')} (it calls ${c.bold('search_ruvnet')}) instead of guessing.`);
-  console.log(`    ${c.green('✓')} If you start to drift to a generic default, the brain ${c.bold('steps in')} and points you back.`);
+  console.log(`    ${c.green('✓')} ${c.bold('search_ruvnet')} returns cited source paths when invoked.`);
+  console.log(`    ${c.green('✓')} Brain skills and slash commands remain available.`);
+  console.log(`    ${c.green('✓')} Writing rUv-product code the Brain has not looked up is refused until search_ruvnet grounds it.`);
 
   // ── honest expectations ──
   console.log(`\n  ${c.bold('What to expect (honestly):')}`);
-  console.log(`    • On rUv-stack work (vectors, swarms, agent memory, SPARC) it grounds ${c.bold('every time')}.`);
-  console.log(`    • On unrelated work, it stays quiet — Claude behaves normally. It only speaks up when it should.`);
+  console.log(`    • Grounding reminders are added only to prompts that touch the rUv stack.`);
+  console.log(`    • Other work proceeds normally; the write gate is the only hook that refuses by default.`);
   console.log(`    • Not sure it's on?  Run  ${c.bold('npx ruvnet-brain --doctor')}  any time for a health check.
     • Want to see it answer, live, right now?  ${c.bold('npx ruvnet-brain --demo')}  — 2 real questions, real cited answers.`);
 
-  console.log(`\n  ${c.bold('Set it up your way:')} this default is ${c.bold('global')} — live in every VS Code project automatically,`);
-  console.log(`    which is what most people want. Want it different (project-only, moved, with the build stack`);
+  console.log(`\n  ${c.bold('Set it up your way:')} this default is ${c.bold('global')} — MCP, skills, and commands are available in every project,`);
+  console.log(`    but they run only when invoked. Want it different (project-only, moved, with the build stack`);
   console.log(`    added)? ${c.bold('Just tell Claude')} once it's on. You never have to learn its internals.`);
 
   if (nightly === 'enabled' || nightly === 'already-on') {
@@ -3692,7 +6715,7 @@ function success({ cacheDir, isCustom, plugin, codexHost, codexPlugin, env, nigh
   console.log(`\n  ${c.bold('If it earns it:')} a GitHub star helps other people find the brain —`);
   console.log(`    ${c.bold('https://github.com/stuinfla/ruvnet-brain')}   ${c.dim('· feedback in one command: npx ruvnet-brain --feedback')}`);
 
-  console.log(`\n  ${c.dim('You can\'t break anything — the plugin is disable-able and only acts on RuvNet-shaped work.')}`);
+  console.log(`\n  ${c.dim(`The plugin is disable-able. It registers lifecycle hooks (${hookCountPhrase()}), only the allowlisted set in continuity-hook-policy.mjs; Codex runs its set once trusted in /hooks.`)}`);
   console.log('');
 }
 
@@ -3700,22 +6723,27 @@ function showHelp() {
   console.log(`
 RuvNet Brain installer
 
-By default this installs the LATEST published Release (it asks GitHub which one that is),
-and falls back to a known-good version if GitHub can't be reached.
+By default this installs the LATEST published Release (it asks GitHub which one that is).
+If GitHub can't be reached or rate-limits the check, it STOPS with the reason and downloads
+nothing; re-run later, or pick a release yourself with  --version <tag>.
 
 Usage:
   npx ruvnet-brain                         Install the brain + Claude Code plugin (recommended, npm)
   npx github:stuinfla/ruvnet-brain         Same, but from the bleeding-edge GitHub commit
-  npx ruvnet-brain --doctor   Health-check an existing install (green/red per part).
+  npx ruvnet-brain --doctor   Health-check an existing install (green/red per part), ending with the
+                              positive confirmation: latest software, ONE current signed KB in use,
+                              footprint within budget, no cruft. --doctor --json prints only that, as JSON.
+  npx ruvnet-brain --clean    Remove everything that must not exist (old KB copies — never one holding
+                              private files the live brain lacks — old installers, over-cap logs), then confirm.
+  npx ruvnet-brain --clean --archive
+                              Same, and for a kept copy: copy only the files it alone holds into
+                              kb.archive/<stamp>/ (verified byte-for-byte), then release that copy.
                               EXITS NON-ZERO when the install is genuinely broken, so it can gate a
                               script:  npx ruvnet-brain --doctor && ./deploy.sh
   npx ruvnet-brain --doctor --hooks
-                              …and additionally fire every hook this plugin registered on THIS
-                              machine through the real shim under four stdin regimes (valid event
-                              JSON, empty EOF, 1MB garbage, and stdin held open past budget), with an
-                              external process-group watchdog. Asserts each hook's declared exit
-                              codes, a 4KB stdout cap, its declared timeout with margin, and zero
-                              surviving descendants. Your own hooks are listed, never executed.
+                              Read-only proof that the shipped hook manifests register only the
+                              allowlisted continuity handlers (${hookCountPhrase()}).
+                              Executes no hook body.
   npx ruvnet-brain --demo     Guided walkthrough — 2 real questions, real cited answers
   npx ruvnet-brain --feedback Tell us how it went — prefills a GitHub Discussion with your brain
                               version, platform, and a 3-line health summary (you see exactly
@@ -3723,7 +6751,7 @@ Usage:
   npx ruvnet-brain --update   One-shot: pull the latest Release bundle into your installed brain
                               (runs the bundle's own forge-update.mjs --apply: backup + re-verify)
   npx ruvnet-brain --enable-nightly    Schedule that update nightly at 03:47 — macOS LaunchAgent;
-                              other platforms get the documented cron line. OFF by default.
+                              Linux uses cron; Windows uses Task Scheduler. OFF by default.
   npx ruvnet-brain --disable-nightly   Remove the nightly schedule (safe to run any time)
   npx ruvnet-brain --what-changed     Show exactly what RuvNet Brain has put on this machine,
                               with the undo command for each piece
@@ -3732,16 +6760,23 @@ Usage:
                               block only — your own CLAUDE.md content is preserved and backed up)
   npx ruvnet-brain --enable-spend-guard   Install the hourly runaway-agent spend alarm (alert-only)
   npx ruvnet-brain --disable-spend-guard  Remove it (safe to run any time)
+  npx ruvnet-brain --grok-agents-md       Grok CLI only, opt-in: add one search-first line to ~/.grok/AGENTS.md
+                              (only if no search_ruvnet line is there; backed up; --uninstall removes it)
   npx ruvnet-brain --enhance-claude-md    Add the 6-line RuvNet-Brain block to ~/.claude/CLAUDE.md
                               (appended at the bottom between markers; your file is backed up first)
                               (a default install RECOMMENDS nightly and asks, defaulting to yes)
+  node bin/install.mjs --update-source installed  Keep compatible signed corpus updates; never unattended npx
+  node bin/install.mjs --update-source latest     Restore the default latest-package update coordinator
+  node bin/install.mjs --enable-nightly --nightly-node /absolute/stable/node  Use a supported stable Node alias
   node bin/install.mjs --no-nightly-prompt Don't offer nightly auto-updates at the end of the install
   node bin/install.mjs --no-telemetry      Decline anonymous usage counts without being asked
                               (counts of installs/searches ONLY — never queries, code, or paths;
                               opt-in prompt appears once at install; answer lives in a plain file:
                               ~/.cache/ruvnet-brain/.telemetry-consent)
   node bin/install.mjs --version <tag>     Install a specific Release tag (e.g. --version v0.5.0-dev)
-  node bin/install.mjs --pin               Skip the latest-check; use the bundled known-good version
+  node bin/install.mjs --pin <tag>         Same as --version <tag>: install exactly that release
+  node bin/install.mjs --move-brain <dir>  Move the whole Brain to <dir> (e.g. an external disk); ~/.cache/ruvnet-brain links to it
+  node bin/install.mjs --move-brain --back Bring the Brain back to ~/.cache/ruvnet-brain
   node bin/install.mjs --local             Install from a repo clone's assembled dist/ruvnet-brain/
   node bin/install.mjs --force             Re-fetch and reinstall even if already present
   node bin/install.mjs --no-verify         Skip the post-install verify + warm-up smoke test
@@ -3761,7 +6796,8 @@ Env:
                         download or an air-gapped machine is not a broken install). Only ever set
                         this for a locked-down environment where you want to know immediately.
 
-It is safe to re-run at any time. After installing, restart Claude Code so the grounding hook loads.
+It is safe to re-run at any time. Body updates go live on the next hook/MCP call. Restart only when
+the installer reports that boot-level declarations changed.
 `);
 }
 
@@ -3772,20 +6808,70 @@ It is safe to re-run at any time. After installing, restart Claude Code so the g
   // in a unit test ran a real install against the maintainer's HOME. Direct argv identity is the
   // authority boundary. The old IMPORT_ONLY flag may still be present in a long-lived test worker;
   // it must never suppress a genuinely direct CLI execution.
-  const canonical = (value) => {
-    try { return fs.realpathSync(value); } catch { return path.resolve(value); }
-  };
-  const invokedDirectly = Boolean(process.argv[1])
-    && canonical(process.argv[1]) === canonical(fileURLToPath(import.meta.url));
+  const invokedDirectly = isDirectInvocation(import.meta.url);
   if (!invokedDirectly) return;
   if (FLAG_HELP) return showHelp();
+  if (NAMED_RELEASE?.error) {
+    console.error(NAMED_RELEASE.error);
+    console.error(NAMED_RELEASE.hint);
+    process.exitCode = 1;
+    return;
+  }
+  if (argv.includes('--update-source')) {
+    try { saveUpdateSource(optionArg(argv, '--update-source')); }
+    catch (error) { console.error(error.message); process.exitCode = 1; return; }
+    if (!FLAG_UPDATE && !FLAG_ENABLE_NIGHTLY) { info('automatic update source saved; other owner settings preserved'); return; }
+  }
+  // The Brain moved to another disk (a symlink at ~/.cache/ruvnet-brain) and that disk is not here:
+  // say so in one line and stop. Never re-create a fresh brain in ~/.cache over the dangling link, and
+  // never update one that is not there. --doctor reports it as its verdict.
+  {
+    const where = brainLocation();
+    if (where.state === 'unmounted' && !FLAG_MOVE_BRAIN) {
+      if (FLAG_DOCTOR) { printBanner('doctor'); warn(where.message); console.log(`\n  ${c.red('✗ BRAIN DISK NOT MOUNTED')} — nothing was checked or changed; this is not a health verdict.`); process.exitCode = 1; return; }
+      die(where.message, 'Plug the disk in (or mount it), then run the same command again.');
+    }
+  }
+  if (FLAG_MOVE_BRAIN) {
+    printBanner('move the brain');
+    try {
+      const moved = moveBrain({ to: MOVE_BRAIN_TO, back: argv.includes('--back'), log: info });
+      ok(`the Brain is at ${moved.to}${moved.to === moved.link ? '' : ` (${moved.link} links to it)`} — ${(moved.bytes / 1024 ** 3).toFixed(2)} GB moved, verified byte for byte`);
+    } catch (error) {
+      if (error instanceof MoveRefused) die(error.message);
+      throw error;
+    }
+    return;
+  }
   // `process.exitCode`, not `return` — doctor()'s verdict is the whole point of running it in a
   // script. A bare `return await doctor()` discarded the number, which is how "! Needs attention"
   // and `echo $?` → 0 coexisted for so long.
-  if (FLAG_DOCTOR) { process.exitCode = await doctor(); return; }
+  // `--doctor --json`: the positive-confirmation object ONLY (no narration), exit 0 iff every line that
+  // can be proven here is green — for scripts, CI, and agents (ADR-0098).
+  if (FLAG_DOCTOR) { process.exitCode = await doctor({ json: FLAG_JSON }); return; }
+  // `--clean`: enforce the footprint guarantee now, then confirm. Exit 0 only when exactly one KB copy
+  // remains and nothing that must not exist is left (a private-unique copy kept for safety is a 1).
+  if (FLAG_CLEAN) {
+    if (!FLAG_JSON) printBanner('clean');
+    const swept = enforceFootprint({ pruneEvidence: true, quiet: FLAG_JSON, archive: FLAG_ARCHIVE });
+    const result = await printConfirmation({ footprint: swept?.after || null, json: FLAG_JSON });
+    process.exitCode = swept && result.footprint.kbCopies === 1 && result.footprint.cruft.length === 0 ? 0 : 1;
+    return;
+  }
   if (FLAG_DEMO) return runDemo();
   if (FLAG_FEEDBACK) return runFeedback();
-  if (FLAG_UPDATE) return runUpdate();
+  if (FLAG_UPDATE) {
+    if (refuseOverSetAsideBrain()) return;
+    const developerLock = acquireDeveloperLock({ brainHome: process.env.RUVNET_BRAIN_HOME || path.dirname(resolvedKbDir()) });
+    const previousToken = process.env.RUVNET_DEVELOPER_UPDATE_TOKEN;
+    process.env.RUVNET_DEVELOPER_UPDATE_TOKEN = developerLock.token;
+    try { return await runUpdate(); }
+    finally {
+      if (previousToken === undefined) delete process.env.RUVNET_DEVELOPER_UPDATE_TOKEN;
+      else process.env.RUVNET_DEVELOPER_UPDATE_TOKEN = previousToken;
+      developerLock.release();
+    }
+  }
   if (FLAG_ENABLE_NIGHTLY) return enableNightly();
   if (FLAG_DISABLE_NIGHTLY) return disableNightly();
   // Standalone, like the nightly pair above. Without these, the flags existed only as a way to
@@ -3795,9 +6881,11 @@ It is safe to re-run at any time. After installing, restart Claude Code so the g
   if (FLAG_ENABLE_SPEND_GUARD) { enableSpendGuard(); return; }
   if (FLAG_DISABLE_SPEND_GUARD) { disableSpendGuard(); return; }
   if (FLAG_UNINSTALL) { uninstallAll(); return; }
+  if (FLAG_GROK_AGENTS_MD) { reportGrokAgentsLine(addGrokAgentsLine()); return; }
   if (FLAG_WHAT_CHANGED) { printBanner('what RuvNet Brain put on this machine'); printFootprint(); return; }
   if (FLAG_WHATS_NEW) { showWhatsNew(); return; }
 
+  if (refuseOverSetAsideBrain()) return;
   printBanner('installer');
   console.log(c.dim("I'll set up the brain for Claude Code and Codex, explaining each step as I go.\n"));
 
@@ -3820,6 +6908,7 @@ It is safe to re-run at any time. After installing, restart Claude Code so the g
   }
 
   await printPlanAndConfirm();
+  refuseUnmountedBrain();
 
   const { cacheDir, isCustom } = resolveCacheDir();
 
@@ -3846,9 +6935,9 @@ It is safe to re-run at any time. After installing, restart Claude Code so the g
     installedTag = installedBrainVersion(cacheDir); // 'unknown' when SOURCE.json has no releaseTag
     try {
       resolvedRelease = await resolveRelease();
-      // ONLY a genuine `latest` lookup counts as "what current means". resolveRelease() does NOT
-      // throw when the GitHub API fails — it returns the hardcoded known-good pin with
-      // source:'fallback'. Treating that as latest inverts this whole fix: a rate-limited lookup
+      // ONLY a genuine `latest` lookup counts as "what current means". A failed lookup now THROWS
+      // (caught below: "could not check"); it used to return the hardcoded known-good pin with
+      // source:'fallback'. Treating that as latest inverted this whole fix: a rate-limited lookup
       // would report installed v3.4.21-dev "→ latest v2.9.0" and DOWNGRADE a perfectly current
       // machine. (Caught by exercising the failure path against a 404 repo — the first version of
       // this fix did exactly that.) A pinned/forced resolution is likewise the operator's explicit
@@ -3857,21 +6946,33 @@ It is safe to re-run at any time. After installing, restart Claude Code so the g
         ? (resolvedRelease.tag_name || resolvedRelease.tag || null)
         : null;
     } catch { latestTag = null; }
-    const norm = (v) => (v == null || v === 'unknown' ? null : String(v).replace(/^v/, ''));
-    const a = norm(installedTag), b = norm(latestTag);
-    // BEHIND => download. SAME => skip. AHEAD => skip, and say so honestly.
-    //
-    // This was a bare `a !== b`, which treats "newer than the latest release" as staleness. Anyone
-    // running a pre-release or dev build — or who simply updated in the window before a release was
-    // cut — was told "Brain is out of date" and pushed through a 2 GB download that would DOWNGRADE
-    // them. Found 2026-07-22 the moment this repo's own version moved to 3.5.0-dev ahead of the
-    // 3.4.22-dev release: the installer immediately declared its own newest brain stale.
-    //
-    // stack-sync.mjs has modelled AHEAD as legal from the start ("AHEAD is legal and produces NO
-    // recommendation — that modelling choice is what makes the alpha-vs-latest downgrade war
-    // structurally impossible"). The installer never learned the same lesson. It has now.
-    ahead = Boolean(a && b && cmpTag(a, b) > 0);
-    staleSkip = Boolean(b && (a === null || (a !== b && !ahead)));
+    // A CORPUS RELEASE IS NOT ORDERABLE AGAINST A SEMVER (ADR-086 step 16). `corpus-sha256-<64 hex>`
+    // is a content address; cmpTag() parses its leading segment with parseInt, gets NaN, floors it
+    // to 0, and concludes any installed version is NEWER — so a corpus release would be reported as
+    // "installed is NEWER than the latest release" and silently skipped, forever. Compare the
+    // installed corpus tag against the offered corpus tag instead: equal = current, different =
+    // behind, never "ahead", because content addresses have no order.
+    if (isCorpusReleaseTag(latestTag)) {
+      const installedCorpus = installedCorpusTag(cacheDir);
+      ahead = false;
+      staleSkip = installedCorpus !== latestTag;
+    } else {
+      const norm = (v) => (v == null || v === 'unknown' ? null : String(v).replace(/^v/, ''));
+      const a = norm(installedTag), b = norm(latestTag);
+      // BEHIND => download. SAME => skip. AHEAD => skip, and say so honestly.
+      //
+      // This was a bare `a !== b`, which treats "newer than the latest release" as staleness. Anyone
+      // running a pre-release or dev build — or who simply updated in the window before a release was
+      // cut — was told "Brain is out of date" and pushed through a 2 GB download that would DOWNGRADE
+      // them. Found 2026-07-22 the moment this repo's own version moved to 3.5.0-dev ahead of the
+      // 3.4.22-dev release: the installer immediately declared its own newest brain stale.
+      //
+      // stack-sync.mjs has modelled AHEAD as legal from the start ("AHEAD is legal and produces NO
+      // recommendation — that modelling choice is what makes the alpha-vs-latest downgrade war
+      // structurally impossible"). The installer never learned the same lesson. It has now.
+      ahead = Boolean(a && b && cmpTag(a, b) > 0);
+      staleSkip = Boolean(b && (a === null || (a !== b && !ahead)));
+    }
   }
 
   if (alreadyInstalled && !FLAG_FORCE && !staleSkip) {
@@ -3899,20 +7000,25 @@ It is safe to re-run at any time. After installing, restart Claude Code so the g
     const localZipPresent =
       FLAG_LOCAL || fs.existsSync(path.join(REPO_ROOT, 'dist', 'ruvnet-brain.zip'));
     // Reuse the staleness check's resolution when it already ran — one network round-trip, not two.
-    const release = localZipPresent ? null : (resolvedRelease || await resolveRelease());
+    const release = localZipPresent ? null
+      : (resolvedRelease || await resolveRelease().catch((error) => die(error.message, error.hint)));
     const { zipPath, sourceDir, tmpDir, downloaded, sigError } = await obtainBundle(release);
     // Verify the Ed25519 signature BEFORE extracting a downloaded bundle into the user's config
     // (SEC-0010 #6 — trust root = the pubkey EMBEDDED in this file, so an attacker who swaps the
     // bundle cannot also swap the key it is checked against).
     //
     // SIGNING_REQUIRED was `false` transitionally, for releases that predated signing. That is over:
-    // every release from v2.0.0 on is signed, including the pinned offline fallback (RELEASE_VERSION).
+    // every release from v2.0.0 on is signed.
     // Leaving it false left a real downgrade path — strip or 404 the small .sig file and the missing-
     // signature branch printed a warning and extracted 800MB+ of executable .mjs anyway. No alarm
     // fired, because no signature was ever obtained. Now a missing signature fails closed like an
     // invalid one, and --no-verify remains the single explicit, user-chosen override.
     const SIGNING_REQUIRED = true;
-    if (downloaded && !FLAG_NO_VERIFY) {
+    let signedBundleSha256 = null; // set only when THIS run verified the bundle's Ed25519 signature
+    // A local bundle that carries its signature beside it is verified (and recorded) too; without one it
+    // installs as before, unverified and recorded as such (the doctor says "signature NOT verified").
+    const localSigned = !downloaded && Boolean(zipPath) && fs.existsSync(`${zipPath}.sig`);
+    if ((downloaded || localSigned) && !FLAG_NO_VERIFY) {
       const sigPath = `${zipPath}.sig`;
       const hasSig = fs.existsSync(sigPath);
       if (!hasSig) {
@@ -3928,9 +7034,21 @@ It is safe to re-run at any time. After installing, restart Claude Code so the g
               `Refusing to extract an unverified bundle. Re-run to fetch a fresh copy; if it persists, the\nrelease may be tampered — report it. (Override at your own risk with ${c.bold('--no-verify')}.)`);
         }
         ok(reason);
+        signedBundleSha256 = crypto.createHash('sha256').update(fs.readFileSync(zipPath)).digest('hex');
       }
     }
-    await unzipInto(zipPath, cacheDir, sourceDir);
+    // The tag is only carried when it came from a genuine `latest` resolution — a pinned/offline
+    // fallback is not evidence of which release these bytes are, and recording a guess would be
+    // worse than recording nothing.
+    await unzipInto(zipPath, cacheDir, sourceDir, {
+      releaseTag: release && release.source === 'latest' ? (release.tag_name || release.tag || null) : null,
+    });
+    if (signedBundleSha256) {
+      try {
+        writeSignatureRecord({ brainHome: footprintRoots().brainHome, kbDir: cacheDir, bundleSha256: signedBundleSha256,
+          releaseTag: release?.tag_name || release?.tag || null, source: 'install', now: footprintNow() });
+      } catch (error) { warn(`signature verification could not be recorded (${error.message})`); }
+    }
     const brainProfile = readBrainProfile();
     if (brainProfile !== 'complete') {
       const scoped = applyBrainProfile(cacheDir, brainProfile);
@@ -3948,9 +7066,10 @@ It is safe to re-run at any time. After installing, restart Claude Code so the g
   } catch (error) {
     die(
       `the Brain Console runtime could not be installed (${error.message})`,
-      `The knowledge base is present, but /rvbc would be broken. Re-run the installer from a complete package.`,
+      `The knowledge base is present, but /rnbc would be broken. Re-run the installer from a complete package.`,
     );
   }
+  retireManagedHookRegistrations();
   const plugin = wirePlugin();
   // Codex hosts got nothing before this (issue #42): shipped, never registered. Non-fatal like every
   // other wiring step — a second host we cannot reach must never break the one we can.
@@ -3960,6 +7079,9 @@ It is safe to re-run at any time. After installing, restart Claude Code so the g
     codexHost = wireCodexHost();
     if (codexHost.host) {
       codexPlugin = wireCodexPlugin();
+      const hostRefresh = await refreshCodexSharedHost(codexPlugin);
+      const refreshNote = codexHostRefreshMessage(hostRefresh, codexPlugin);
+      if (refreshNote) (refreshNote.level === 'warn' ? warn : info)(refreshNote.text);
       if (codexPlugin.available) printCodexLifecycle(await codexLifecycleStatus());
     }
   } catch (e) {
@@ -3985,6 +7107,7 @@ It is safe to re-run at any time. After installing, restart Claude Code so the g
   const env = detectEnvironment();
   try { await offerStack(env); } catch (e) { warn(`(toolkit check skipped: ${e && e.message})`); }
   try { await offerClaudeMd(); } catch { /* non-fatal — never let an offer break the install */ }
+  try { await offerGrokAgentsMd(); } catch { /* non-fatal — never let an offer break the install */ }
   // Stuart's requirement: a default install must end by clearly recommending nightly auto-updates
   // and asking, DEFAULTING TO YES (TTY + macOS + not already on). Non-fatal like every other offer.
   let nightly = 'skipped';
@@ -4010,6 +7133,11 @@ It is safe to re-run at any time. After installing, restart Claude Code so the g
   // out what we did — which is precisely the position the 2026-07-20 corporate-machine reporter was
   // left in. Derived from disk, so it can only ever describe what is actually there.
   try { printFootprint(); } catch { /* a summary must never break a finished install */ }
+  // ADR-0098: enforce the footprint the install just produced, then prove it in one block.
+  try {
+    const swept = enforceFootprint({ pruneEvidence: true, quiet: true });
+    await printConfirmation({ footprint: swept?.after || null });
+  } catch (error) { warn(`positive confirmation could not run (${error.message})`); }
 
   // ── SCOPE + UPGRADE, on the path a real user actually takes ─────────────────────────────────
   //
@@ -4057,16 +7185,14 @@ It is safe to re-run at any time. After installing, restart Claude Code so the g
   //
   //    "Never block a healthy install" is honoured literally: a healthy install still exits 0 and
   //    nothing above this point is undone. What changes is that a genuinely broken install can no
-  //    longer masquerade as a successful one to a script. The user's OWN hooks and third-party
-  //    plugins are enumerated and reported but NEVER charged against them — only registrations this
-  //    package ships can make this fail.
+  //    longer masquerade as a successful one to a script. No Brain automatic hook is executed.
   if (!FLAG_NO_SELFCHECK) {
     const selfcheck = await runSelfCheck({
       installState: verified ? { repos: verified.repos, reader: verified.reader, mcp: verified.mcp } : null,
       quiet: true,
     });
     if (selfcheck.exitCode !== 0) {
-      console.log(`\n  ${c.dim(`Re-run  ${c.bold('npx ruvnet-brain --doctor --hooks')}  after fixing, to re-check.`)}`);
+      console.log(`\n  ${c.dim(`Re-run  ${c.bold('npx ruvnet-brain --doctor')}  after fixing, to re-check.`)}`);
       process.exitCode = selfcheck.exitCode;
     }
   }
@@ -4091,6 +7217,8 @@ It is safe to re-run at any time. After installing, restart Claude Code so the g
     mod.writeInstallState({
       grounding,
       reason: !smoke ? 'verify-skipped' : (smoke.grounded === true ? null : (smoke.reason || (smoke.ran ? 'not-grounded' : 'no-answer'))),
+      // The verdict is about THESE bytes: a later corpus no longer inherits it (re-review S1).
+      coverageSha256: liveCoverageSha256(cacheDir),
     });
     if (grounding !== 'proven' && process.env.RUVNET_STRICT_INSTALL === '1') {
       die(

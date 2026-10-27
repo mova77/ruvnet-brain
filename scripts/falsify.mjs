@@ -28,6 +28,8 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { resolveRuflo, RUFLO_MISSING } from '../plugin/scripts/ruflo-bin.mjs';
+import { isDirectInvocation } from '../plugin/scripts/entrypoint.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const sh = (cmd, args) => spawnSync(cmd, args, { cwd: ROOT, encoding: 'utf8' });
@@ -169,9 +171,18 @@ export const CHECKS = [
       const end = Number(q("SELECT COUNT(*) FROM memory_entries WHERE key LIKE 'session-sessionend%';"));
 
       // 3. Does it RECALL? A real semantic round-trip through the REAL CLI — not a DB peek.
-      const r = spawnSync('npx', ['ruflo@latest', 'memory', 'search', '-q', 'nightly job supervision heartbeat receipts'], {
-        cwd: ROOT, encoding: 'utf8', timeout: 120_000,
-      });
+      // `npx ruflo@latest` was here before (Rule 21 violation: it resolves ITS OWN cached copy,
+      // masking drift from the global install — see ~/.claude/CLAUDE.md Rule 21) and, separately,
+      // ran with no RUFLO_DAEMON_AUTOSTART guard — every `ruflo` invocation auto-starts a project
+      // background daemon unless that is set (verified live: ~/.npm-global/lib/node_modules/ruflo/
+      // node_modules/@claude-flow/cli/dist/src/services/daemon-autostart.js:85). This falsifier
+      // must not itself leave a daemon running as a side effect of checking whether memory works.
+      const rufloBin = resolveRuflo();
+      const r = rufloBin
+        ? spawnSync(rufloBin, ['memory', 'search', '-q', 'nightly job supervision heartbeat receipts'], {
+          cwd: ROOT, encoding: 'utf8', timeout: 120_000, env: { ...process.env, RUFLO_DAEMON_AUTOSTART: '0', CLAUDE_FLOW_AUTO_UPDATE: 'false' },
+        })
+        : { error: new Error(RUFLO_MISSING), stdout: '' };
       const recalled = /Found\s+\d+\s+results/.test(r.stdout || '') && !/Found\s+0\s+results/.test(r.stdout || '');
 
       const problems = [];
@@ -228,4 +239,4 @@ function main() {
   process.exit(0);
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) main();
+if (isDirectInvocation(import.meta.url)) main();
