@@ -190,6 +190,12 @@ read, the network and a home write, a restricted tool-less `claude -p` served by
 subscription judging a planted payload not CLEAN, and a delivered page. It writes a receipt beside the
 nightly ones and changes nothing in the repository or on GitHub.
 
+**Rehearsal.** `node scripts/issue-fix.mjs --mode autofix --rehearse [--base <sha>] [--only n,m]` runs the real
+night — real model stages, gate and sandbox on real open issues — with every write that would reach GitHub refused
+by the exec layer (push, comment, label, close, PR, workflow, dispatch, variable), its own state file and no pages;
+the comments it would post are in its receipt. `--base` cuts the worktrees from an older commit, to replay issues a
+person has since fixed and compare.
+
 **Arming.** The code ships disarmed. The integration owner arms it only after the simulations
 (`tests/integration/issue-autofix-simulate.test.mjs`, `tests/integration/issue-autofix-simulate-night.test.mjs`)
 pass and, from launchd under a test label, both the self-test and a live `--dry-run` pass. Arming is:
