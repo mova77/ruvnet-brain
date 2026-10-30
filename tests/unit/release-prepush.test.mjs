@@ -24,7 +24,7 @@ const surface = (chunks, stores) => `RuvNet Brain: ${chunks.toLocaleString('en-U
 /** A scripted world: git answers from `repo`, gh from `gh`, node/vitest from `node`. Every call is recorded. */
 function world(over = {}) {
   const repo = {
-    branch: 'release/4.7.23', version: '4.7.23', dirty: '', added: [], changed: [], sizes: {}, rootAtMain: ['README.md', 'package.json'],
+    branch: 'release/9.8.7', version: '9.8.7', dirty: '', added: [], changed: [], sizes: {}, rootAtMain: ['README.md', 'package.json'],
     tracked: ['README.md', 'package.json', 'tests/unit/a.test.mjs', 'tests/mesh/coexistence.test.mjs', 'tests/mutation/m.test.mjs', 'bin/install.mjs'],
     surfaces: Object.fromEntries(claims.CHUNK_SURFACES.map((file) => [file, surface(171583, 206)])),
     files: { 'tests/mesh/coexistence.test.mjs': "const INSTALLER = path.join(REPO_ROOT, 'bin/install.mjs');", 'tests/mutation/m.test.mjs': 'nothing' },
@@ -100,7 +100,7 @@ it('collects EVERY failure rather than stopping at the first', async () => {
   const result = byName(await run(w));
   expect(Object.values(result).filter((c) => !c.ok).map((c) => c.name).sort())
     .toEqual(['architecture-review-lock', 'branch-identity', 'census', 'convergence-check', 'qualification-inventory', 'stray-artifacts']);
-  expect(result['branch-identity'].detail).toMatch(/4\.7\.22 but package\.json says 4\.7\.23.*tracked change/);
+  expect(result['branch-identity'].detail).toMatch(/4\.7\.22 but package\.json says 9\.8\.7.*tracked change/);
   expect(result['stray-artifacts'].detail).toMatch(/agentdb\.rvf\.idmap\.json: new root-level file/);
   expect(result['qualification-inventory'].detail).toMatch(/tests\/unit\/a\.test\.mjs is not tracked/);
 });
@@ -158,7 +158,7 @@ it('stray patterns are anchored: real offenders hit, legitimate lookalikes do no
 });
 
 it('pre-dispatch: the sealed generation must still be the newest, read from the release-qe log, else from the surfaces', async () => {
-  const preflight = [{ databaseId: 11, conclusion: 'success', status: 'completed', event: 'push', headBranch: 'release/4.7.23', createdAt: '2026-10-30T04:00:00Z' }];
+  const preflight = [{ databaseId: 11, conclusion: 'success', status: 'completed', event: 'push', headBranch: 'release/9.8.7', createdAt: '2026-10-30T04:00:00Z' }];
   const jobs = [{ databaseId: 99, name: 'ci / release-qe' }];
   const log = `ci / release-qe\tUNKNOWN STEP\t2026-10-30T04:56:15Z [corpus-next-seed] published-generation ${E93.tag} (judged 1)`;
   const same = await run(world({ gh: { preflight, jobs, log }, newest: E93 }), { preDispatch: true, sha: SHA });
