@@ -37,7 +37,7 @@ export async function fixOne(rt, issue, { governed }) {
   const wt = path.join(rt.paths.worktrees, `issue-${n}-${stamp}`);
   rt.resolveWorkPath(wt);
   fs.mkdirSync(rt.paths.worktrees, { recursive: true });
-  await mustGit(rt.ctx, 'S2', 'agent-failed', rt.paths.clone, ['worktree', 'add', '-b', `autofix/issue-${n}-${stamp}`, wt, 'origin/main']);
+  await mustGit(rt.ctx, 'S2', 'agent-failed', rt.paths.clone, ['worktree', 'add', '-b', `autofix/issue-${n}-${stamp}`, wt, rt.base || 'origin/main']);
   out.wt = wt; rt.current.wt = wt;
   linkModules(rt.nodeModules, wt);
   rt.end(true);

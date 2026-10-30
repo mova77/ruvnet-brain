@@ -113,10 +113,10 @@ export function makeWorld({ issues = [humanIssue()], script = {}, gh = {}, nowMs
     primaryFingerprint: () => ['rev-parse HEAD', 'status --porcelain', 'worktree list', 'for-each-ref'].map((a) => git(primary, ...a.split(' ')).stdout).join('|')
       + fs.readFileSync(path.join(primary, '.git/index')).toString('hex'),
     receipts: () => fs.existsSync(paths.receipts) ? fs.readdirSync(paths.receipts).filter((f) => f.endsWith('.json')).sort().map((f) => world.read(path.join(paths.receipts, f))) : [],
-    async run({ now = nowMs, dryRun = true, simulate = true, deps = {}, env: extra = {} } = {}) {
+    async run({ now = nowMs, dryRun = true, simulate = true, rehearse = null, deps = {}, env: extra = {} } = {}) {
       const before = commands.length;
       world.setGh({ clockOffsetMs: now - Date.now() }); // the fake gh stamps runs and comments on the same clock as this run
-      const receipt = await runAutofix({ now, dryRun, simulate, env: { ...env, ...extra }, deps: { paths, gates, governed0103: [],
+      const receipt = await runAutofix({ now, dryRun, simulate, rehearse, env: { ...env, ...extra }, deps: { paths, gates, governed0103: [],
         ...(process.platform === 'darwin' ? {} : { runSandboxed: passThrough }),
         nodeModules: path.join(ROOT, 'node_modules'), sleep: async () => {}, onCommand: (l) => commands.push(l),
         notify: (title, body, priority) => { pages.push({ title, body, priority }); return 0; },

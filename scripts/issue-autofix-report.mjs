@@ -80,7 +80,7 @@ export async function notifyPeople(rt, items, { checkpoint }) {
         patchIssue(rt.paths.state, n, { outcomes: [...(readNs(rt.paths.state)[n]?.outcomes || []), { kind: it.kind, version: it.version ?? null, postedAt: new Date(rt.now()).toISOString() }],
           ...(it.kind === 'findings' ? { findingsPostedAt: new Date(rt.now()).toISOString() } : {}) });
       }
-      results.push({ number: n, kind: it.kind, commented: r.commented, closed: r.closed, thanksIncluded: !!(r.commented && thanks), error: r.error });
+      results.push({ number: n, kind: it.kind, commented: r.commented, closed: r.closed, thanksIncluded: !!(r.commented && thanks), error: r.error, body });
     }
   }
   return results;

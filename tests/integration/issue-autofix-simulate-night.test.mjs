@@ -266,3 +266,21 @@ describe('stand-down, daily cap, dry run', () => {
     expect(fs.existsSync(w.paths.receipts)).toBe(false);
   }, T);
 });
+
+describe('--rehearse: the real night with every GitHub write refused', () => {
+  it('fixes for real in its own clone, pushes nothing, comments nothing, keeps its own state, and shows what it would post', async () => {
+    setup({ gh: { variable: null } }); // disarmed: a rehearsal needs no switch, it cannot write to GitHub
+    const { receipt, commands } = await w.run({ rehearse: {} });
+    expect(receipt).toMatchObject({ status: 'rehearsed', exitCode: 0 });
+    expect(receipt.ready).toEqual([expect.objectContaining({ number: 7 })]);
+    expect(w.claudeCalls().map((c) => c.stage)).toEqual(['plan', 'build', 'redteam', 'verify', 'note']);
+    expect(commands.filter((c) => /^\[dry-run, not executed\] .*issue comment/.test(c))).toHaveLength(1);
+    expect(w.ghWrites()).toHaveLength(0);
+    expect(comments()).toHaveLength(0);
+    expect(w.originRef('refs/heads/main')).toBe(mainBefore);
+    expect(w.originRef('refs/heads/release/9.9.10')).toBe('');
+    expect(fs.existsSync(w.paths.state)).toBe(false); // the real state file is never written
+    expect(receipt.comments[0].body).toMatch(new RegExp(`^${BOT_MARKER} fix report — RuvNet Brain\\n\\nHi @alice — You gave`));
+  }, T);
+});
+

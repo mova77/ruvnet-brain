@@ -66,11 +66,20 @@ export function isWriteCommand(cmd, args, { ghBin } = {}) {
   return false;
 }
 
+/** True for a command that reaches GitHub with a write (push, comment, label, close, PR, workflow, dispatch, variable). */
+export function isRemoteWrite(cmd, args, { ghBin } = {}) {
+  const a = (args || []).map(String);
+  const bin = path.basename(String(cmd));
+  if (bin === 'git') return gitSub(a).sub === 'push';
+  return (String(cmd) === ghBin || bin === 'gh') && isWriteCommand(cmd, a, { ghBin });
+}
+
 /**
  * exec(cmd, args, {cwd, env, timeoutMs, input}) -> {status, stdout, stderr, signal, timedOut}. Never throws on a
- * non-zero exit; throws AutofixAbort for a forbidden argv or a primary-checkout cwd.
+ * non-zero exit; throws AutofixAbort for a forbidden argv or a primary-checkout cwd. dryRun skips every write;
+ * rehearse skips only writes that reach GitHub (local worktrees and commits in the job's own clone still happen).
  */
-export function makeExec({ dryRun = false, log = () => {}, primary = null, ghBin = 'gh', env = process.env } = {}) {
+export function makeExec({ dryRun = false, rehearse = false, log = () => {}, primary = null, ghBin = 'gh', env = process.env } = {}) {
   let stage = 'S0';
   const exec = (cmd, args = [], opts = {}) => {
     const argv = args.map(String);
@@ -81,7 +90,7 @@ export function makeExec({ dryRun = false, log = () => {}, primary = null, ghBin
       if (path.basename(String(cmd)) === 'git' && c !== -1 && argv[c + 1]) resolveWorkPath(argv[c + 1], { primary });
     }
     const line = [cmd, ...argv.map((t) => (t.length > 160 ? `${t.slice(0, 160)}…` : t))].join(' ');
-    if (dryRun && isWriteCommand(cmd, argv, { ghBin })) {
+    if ((dryRun && isWriteCommand(cmd, argv, { ghBin })) || (rehearse && isRemoteWrite(cmd, argv, { ghBin }))) {
       log(`[dry-run, not executed] ${line}`);
       return { status: 0, stdout: '', stderr: '', signal: null, timedOut: false, skipped: true };
     }

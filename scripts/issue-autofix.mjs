@@ -55,13 +55,17 @@ export function replyCandidates(issues, { state, now }) {
     && !(i.comments || []).some((c) => String(c.author?.login).toLowerCase() === 'stuinfla' && !String(c.body || '').trimStart().startsWith(BOT_MARKER)));
 }
 
-export async function runAutofix({ now = Date.now(), dryRun = false, simulate = false, env = process.env, deps = {} } = {}) {
+// rehearse: { base?: sha, only?: number[] } — the real model stages, gate and sandbox on real issues, with every write
+// that would reach GitHub refused by the exec layer, a separate state file, no pages and no release. It proves the
+// night end to end before the job is armed (ADR-107); the would-be comments are in the receipt.
+export async function runAutofix({ now = Date.now(), dryRun = false, simulate = false, rehearse = null, env = process.env, deps = {} } = {}) {
   const home = env.HOME || os.homedir();
   const ghBin = deps.ghBin || env.GH_BIN || 'gh';
   const claudeBin = deps.claudeBin || env.CLAUDE_BIN || 'claude';
   const originUrl = simulate ? env.AUTOFIX_SIMULATE_ORIGIN : ORIGIN_URL;
   if (simulate) assertSimulateAllowed({ dryRun, ghBin, claudeBin, origin: originUrl });
-  const paths = deps.paths || PATHS(home);
+  const basePaths = deps.paths || PATHS(home);
+  const paths = rehearse ? { ...basePaths, state: path.join(basePaths.receipts, 'rehearsal-state.json'), runner: null } : basePaths;
   const live = !dryRun || simulate; // a plain --dry-run executes no write and persists nothing
   const t0 = Date.now();
   const nowFn = () => now + (Date.now() - t0);
@@ -82,8 +86,8 @@ export async function runAutofix({ now = Date.now(), dryRun = false, simulate = 
     return rcp;
   };
 
-  const exec = deps.exec || makeExec({ dryRun: !live, log: note, primary: paths.primary, ghBin, env });
-  const notifyFn = deps.notify || defaultNotify(ROOT);
+  const exec = deps.exec || makeExec({ dryRun: !live, rehearse: !!rehearse, log: note, primary: paths.primary, ghBin, env });
+  const notifyFn = rehearse ? () => 2 : deps.notify || defaultNotify(ROOT);
   const page = (title, body = '', priority = 'default') => { const exit = live ? notifyFn(title, body, priority) : null; rcp.pages.push({ title, exit }); return exit; };
   const ns = () => readNs(paths.state);
   const bump = (n, patch) => { if (live && n) patchIssue(paths.state, n, patch); };
@@ -100,6 +104,7 @@ export async function runAutofix({ now = Date.now(), dryRun = false, simulate = 
   };
   const guard = (stage, { allowHalted = false } = {}) => {
     exec.setStage?.(stage);
+    if (rehearse) return; // a rehearsal cannot reach GitHub with a write (makeExec rehearse); there is nothing to stop
     const ks = killState();
     rcp.killSwitch = { armed: ks.armed, reason: ks.reason };
     if (ks.armed || (allowHalted && ks.reason === 'halted' && ks.variableOn)) return;
@@ -224,6 +229,27 @@ export async function runAutofix({ now = Date.now(), dryRun = false, simulate = 
     return res;
   }
 
+  async function rehearseNight() {
+    await ensureClone();
+    rt.base = rehearse.base ? exec('git', ['-C', paths.clone, 'rev-parse', '--verify', `${rehearse.base}^{commit}`]).stdout.trim() : null;
+    if (rehearse.base && !rt.base) throw new AutofixAbort('S0', 'transient', `unknown base ${rehearse.base}`);
+    const listed = listIssues();
+    if (listed.error) throw new AutofixAbort('S1', 'transient', listed.error);
+    const sel = select(listed.issues);
+    const picked = sel.candidates.filter((c) => !rehearse.only?.length || rehearse.only.includes(c.number));
+    rcp.candidates = picked.map((c) => ({ number: c.number, reason: 'eligible' }));
+    rcp.skipped = sel.skipped;
+    rt.mainVersion = JSON.parse(exec('git', ['-C', paths.clone, 'show', 'origin/main:plugin/.claude-plugin/plugin.json']).stdout).version;
+    const candidates = await screen(picked);
+    const { ready, items } = candidates.length ? await fixAll(rt, candidates, { governed: await governedSet(paths.clone) }) : { ready: [], items: [] };
+    const version = rt.mainVersion.replace(/\d+$/, (z) => String(Number(z) + 1));
+    rcp.ready = ready.map((r) => ({ number: r.number, fixSha: r.fixSha, wt: r.wt, diff: r.diff, testValidity: r.testValidity, verify: r.verify }));
+    await tell([...ready.map((r) => ({ issue: r.issue, kind: 'fixed', version, sha: r.fixSha, testPath: r.testPath, platformCaveat: r.platformCaveat,
+      facts: { verified: [...r.facts.verified, 'install-verified on Linux, macOS and Windows (would be, after the release)'], notVerified: r.facts.notVerified },
+      fallback: { whatWasWrong: String(r.plan?.rootCause?.explanation || r.summary), whatChanged: String(r.plan?.summary || '').slice(0, 400) } })), ...items]);
+    return ['rehearsed'];
+  }
+
   let lockOwned = false;
   try {
     if (live) fs.mkdirSync(runDir, { recursive: true });
@@ -233,7 +259,7 @@ export async function runAutofix({ now = Date.now(), dryRun = false, simulate = 
     const halted = ks0.reason === 'halted' && ks0.variableOn;
     // A plain --dry-run executes no write and spawns no model, so it still evaluates the window and the selection while
     // disarmed: that is how the job is checked before it is armed. Everything else stops at the switch.
-    const readOnly = dryRun && !simulate;
+    const readOnly = (dryRun && !simulate) || !!rehearse;
     if (!ks0.armed && !halted && !readOnly) return settle(ks0.reason === 'halted' ? 'halted' : 'disabled', 0);
     if (live) {
       const lk = acquireLock(paths.lock, { now: nowFn(), mode: 'autofix' });
@@ -241,6 +267,7 @@ export async function runAutofix({ now = Date.now(), dryRun = false, simulate = 
       if (!lk.acquired && lk.holder?.pid !== process.pid) { rcp.abort = { stage: 'S0', code: 'lock-held', detail: `held by pid ${lk.holder?.pid}`, halt: false }; return settle('stood-down', 75); }
     }
     const cloneReady = live || fs.existsSync(path.join(paths.clone, '.git'));
+    if (cloneReady && live && rehearse) return settle(...await rehearseNight(), 0);
     if (cloneReady && live) {
       guard('S0', { allowHalted: true }); await ensureClone();
       rcp.followUp = await recheckAwaiting(rt, ctx, { checkpoint: async () => guard('S13b', { allowHalted: true }) });
@@ -327,6 +354,15 @@ export async function runAutofix({ now = Date.now(), dryRun = false, simulate = 
 }
 
 export async function main(argv = process.argv.slice(2)) {
+  if (argv.includes('--rehearse')) {
+    keepAwake();
+    const at = (f) => (argv.includes(f) ? argv[argv.indexOf(f) + 1] : undefined);
+    const only = (at('--only') || '').split(',').filter(Boolean).map(Number);
+    const r = await runAutofix({ rehearse: { base: at('--base'), only }, env: process.env, deps: { onCommand: (l) => console.log(l) } });
+    console.log(`issue-autofix: ${r.status}${r.abort ? ` (${r.abort.stage}:${r.abort.code})` : ''} [rehearsal: nothing reached GitHub]`);
+    for (const c of r.comments || []) console.log(`\n===== would post on #${c.number} (${c.kind}) =====\n${c.body || '(none)'}`);
+    return r.exitCode;
+  }
   if (argv.includes('--self-test')) {
     const { selfTest } = await import('./issue-autofix-selftest.mjs');
     return selfTest({ env: process.env, notify: defaultNotify(ROOT) });
