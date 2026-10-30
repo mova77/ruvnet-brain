@@ -55,7 +55,10 @@ describe('one issue, S0 -> S13', () => {
     const primaryBefore = w.primaryFingerprint();
     const { receipt, commands } = await w.run();
     expect(receipt).toMatchObject({ status: 'shipped', exitCode: 0, abort: null, schemaVersion: 2, job: 'com.ruvnet.issue-autofix' });
-    expect(labelsOf(commands)).toEqual(['clone', 'wt-fix', 'vitest', 'vitest', 'vitest', 'vitest', 'commit-fix', 'wt-release', 'version-set',
+    // On macOS the four sandboxed vitest runs go through the exec layer and appear in the transcript; elsewhere the
+    // harness's stand-in runner executes them without the sandbox (no sandbox-exec) and they are not logged.
+    const tests = process.platform === 'darwin' ? ['vitest', 'vitest', 'vitest', 'vitest'] : [];
+    expect(labelsOf(commands)).toEqual(['clone', 'wt-fix', ...tests, 'commit-fix', 'wt-release', 'version-set',
       'cherry-pick', 'pack', 'pack', 'audit', 'audit', 'push-release', 'pr-create', 'pr-checks', 'push-main', 'dispatch', 'release-watch', 'comment', 'close']);
     expect(commands[0]).toMatch(/variable get ISSUE_AUTOFIX/);
     expect(w.claudeCalls().map((c) => c.stage)).toEqual(['plan', 'build', 'redteam', 'verify', 'redteam', 'note']);
