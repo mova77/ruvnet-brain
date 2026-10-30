@@ -58,7 +58,11 @@ export function runVitest(runSandboxed, cwd, files) {
   const failedTests = [];
   for (const tr of json?.testResults || []) {
     const file = files.find((f) => String(tr.name).endsWith(`/${f}`) || tr.name === f) || tr.name;
-    for (const a of tr.assertionResults || []) if (a.status === 'failed') failedTests.push(`${file} > ${a.fullName || a.title}`);
+    const failed = (tr.assertionResults || []).filter((a) => a.status === 'failed');
+    for (const a of failed) failedTests.push(`${file} > ${a.fullName || a.title}`);
+    // A new test that imports what the fix adds cannot even load against the old code: the FILE failed. That is the
+    // new test failing on unfixed code, attributed to that file (judgeTestValidity still requires it to be a new test).
+    if (tr.status === 'failed' && failed.length === 0) failedTests.push(`${file} > (the test file failed to load)`);
   }
   return { exitCode: r.timedOut ? 124 : r.status, failedTests, output: out.slice(-6000) };
 }

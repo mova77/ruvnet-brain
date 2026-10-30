@@ -240,6 +240,17 @@ describe('the security gate: a hostile fix never ships; its reporter is answered
   }, T);
 });
 
+describe('a new test that imports what the fix adds', () => {
+  it('cannot load against the old code: that counts as failing before the fix, and the fix ships', async () => {
+    const plan = { ...CANNED.plan, files: ['scripts/slugify-strict.mjs'], testPlan: { newTests: ['tests/unit/slugify-strict.test.mjs'], failsBeforeFix: true } };
+    const verify = { ...CANNED.verify, evidence: CANNED.verify.evidence.map((e, i) => (i === 0 ? { ...e, file: 'tests/unit/slugify-strict.test.mjs', command: 'npx vitest run tests/unit/slugify-strict.test.mjs' } : e)) };
+    setup({ script: { plan, verify, buildPatch: path.join(FIX, 'fix-newexport.patch') } });
+    const { receipt } = await w.run();
+    expect(receipt.dropped).toEqual([]);
+    expect(receipt.status).toBe('shipped');
+  }, T);
+});
+
 describe('the exec wrapper and the primary checkout', () => {
   beforeEach(() => setup());
   it('refuses a cwd or git -C inside the developer checkout', () => {
