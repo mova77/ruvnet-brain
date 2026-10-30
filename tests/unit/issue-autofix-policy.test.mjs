@@ -416,13 +416,13 @@ describe('release window: stale release branches and PRs below main do not close
   const judge = (f) => P.judgeReleaseWindow({ ...base, ...f }, { now });
   it('an old deferred PR from release/4.5.15 does not block; one from release/4.7.23 does; no head names blocks all', () => {
     expect(judge({ openReleasePrs: [413], openReleasePrHeads: { 413: 'release/4.5.15' } })).toEqual({ open: true, reasons: [] });
-    expect(judge({ openReleasePrs: [9], openReleasePrHeads: { 9: 'release/4.7.23' } }).reasons).toEqual(['open-release-pr:9']);
+    expect(judge({ openReleasePrs: [9], openReleasePrHeads: { 9: 'release/4.8.1' } }).reasons).toEqual(['open-release-pr:9']);
     expect(judge({ openReleasePrs: [9], openReleasePrHeads: { 9: 'release/next' } }).reasons).toEqual(['open-release-pr:9']);
     expect(judge({ openReleasePrs: [413] }).reasons).toEqual(['open-release-pr:413']);
   });
   it('a suffixed branch is judged by its leading version (gatherWindowFacts parses it); an unversioned one still blocks', () => {
     expect(judge({ remoteReleaseBranches: [{ name: 'release/4.5.15-stop', version: '4.5.15' }] }).open).toBe(true);
-    expect(judge({ remoteReleaseBranches: [{ name: 'release/4.7.23-x', version: '4.7.23' }] }).reasons).toEqual(['release-branch-ahead:release/4.7.23-x']);
+    expect(judge({ remoteReleaseBranches: [{ name: 'release/4.8.1-x', version: '4.8.1' }] }).reasons).toEqual(['release-branch-ahead:release/4.8.1-x']);
     expect(judge({ remoteReleaseBranches: [{ name: 'release/next', version: '' }] }).reasons).toEqual(['release-branch-ahead:release/next']);
   });
 });
