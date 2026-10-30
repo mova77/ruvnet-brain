@@ -1,16 +1,16 @@
 {
   "schemaVersion": 1,
   "kind": "ruvnet-brain-convergence-manifest",
-  "version": "4.7.22",
-  "sourceIdentity": "7db81cc60b5eb25534a1836f33b71368fe28c85223ea4f867896a3df3af07e49",
+  "version": "4.7.23",
+  "sourceIdentity": "3092df0262783e48863f027ef7aa84e94b8eebb111af9b3e2c59516178ebbd1e",
   "versionSurfaces": {
-    "package.json": "4.7.22",
-    "plugin/.claude-plugin/plugin.json": "4.7.22",
-    "plugin/.codex-plugin/plugin.json": "4.7.22",
-    "data/manifest.json": "4.7.22",
-    "kb/RVF-GENERATIONS.json": "4.7.22",
-    "explainer/index.html": "4.7.22",
-    "primer/ruvnet-primer.md": "4.7.22"
+    "package.json": "4.7.23",
+    "plugin/.claude-plugin/plugin.json": "4.7.23",
+    "plugin/.codex-plugin/plugin.json": "4.7.23",
+    "data/manifest.json": "4.7.23",
+    "kb/RVF-GENERATIONS.json": "4.7.23",
+    "explainer/index.html": "4.7.23",
+    "primer/ruvnet-primer.md": "4.7.23"
   },
   "adrInventory": [
     "0001-verified-bundle-not-single-file.md",
@@ -116,7 +116,7 @@
     "README.md"
   ],
   "trackedFileCount": 2046,
-  "trackedFilesSha256": "b56366aa88ea4738e91c95fbe8d4a6e7220ddc49c75dd38eec215b58d684114a",
+  "trackedFilesSha256": "67303c778c14ba4144b8ac46171c463ce25b53903d8b53ff27dd3a66cc70c81d",
   "ownershipChecks": [
     "version:check",
     "doc:currency",
