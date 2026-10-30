@@ -67,8 +67,21 @@ export function runVitest(runSandboxed, cwd, files) {
   return { exitCode: r.timedOut ? 124 : r.status, failedTests, output: out.slice(-6000) };
 }
 
+/**
+ * The worktree gets its OWN node_modules directory whose entries link to the shared install (measured 2026-10-30:
+ * vitest compiles vitest.config.mjs into node_modules/.vite-temp, and with node_modules itself a link into the shared
+ * install the sandbox refused that write, so no real test could start). Packages still resolve to the shared, read-only
+ * install; vitest's scratch files land inside the worktree, where the sandbox allows writes.
+ */
 const linkModules = (from, to) => {
-  if (from && fs.existsSync(from) && !fs.existsSync(path.join(to, 'node_modules'))) fs.symlinkSync(from, path.join(to, 'node_modules'));
+  const dest = path.join(to, 'node_modules');
+  if (!from || !fs.existsSync(from) || fs.existsSync(dest)) return;
+  const src = fs.realpathSync(from);
+  fs.mkdirSync(dest);
+  for (const e of fs.readdirSync(src)) {
+    if (e === '.vite' || e === '.vite-temp' || e === '.cache') continue; // tool scratch stays per worktree
+    fs.symlinkSync(path.join(src, e), path.join(dest, e));
+  }
 };
 export { linkModules };
 
