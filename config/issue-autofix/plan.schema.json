@@ -47,7 +47,9 @@
     "files": {
       "type": "array",
       "items": {
-        "type": "string"
+        "type": "string",
+        "pattern": "^\\S{1,200}$",
+        "maxLength": 200
       },
       "maxItems": 12
     },
@@ -62,7 +64,9 @@
         "newTests": {
           "type": "array",
           "items": {
-            "type": "string"
+            "type": "string",
+            "pattern": "^tests/[A-Za-z0-9_./-]+\\.(test|spec)\\.m?[jt]s$",
+            "maxLength": 200
           },
           "minItems": 1
         },

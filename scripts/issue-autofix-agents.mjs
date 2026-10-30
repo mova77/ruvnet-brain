@@ -86,7 +86,10 @@ function check(schema, v, at, errs) {
   const t = schema.type;
   const actual = Array.isArray(v) ? 'array' : v === null ? 'null' : Number.isInteger(v) ? 'integer' : typeof v;
   if (t && !(t === actual || (t === 'number' && actual === 'integer'))) { errs.push(`${at}: expected ${t}, got ${actual}`); return; }
-  if (t === 'string') { if (schema.maxLength != null && v.length > schema.maxLength) errs.push(`${at}: longer than ${schema.maxLength}`); }
+  if (t === 'string') {
+    if (schema.maxLength != null && v.length > schema.maxLength) errs.push(`${at}: longer than ${schema.maxLength}`);
+    if (schema.pattern && !new RegExp(schema.pattern).test(v)) errs.push(`${at}: does not match ${schema.pattern}`);
+  }
   if (t === 'integer' && schema.minimum != null && v < schema.minimum) errs.push(`${at}: below ${schema.minimum}`);
   if (t === 'array') {
     if (schema.minItems != null && v.length < schema.minItems) errs.push(`${at}: fewer than ${schema.minItems} items`);

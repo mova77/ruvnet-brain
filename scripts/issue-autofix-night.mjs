@@ -15,7 +15,7 @@ const STOP_RUN = new Set(['kill-switch-off', 'halted', 'deadline', 'sandbox-unav
 // Not the issue's fault (infrastructure, quota, a model we did not ask for): retried next night, nothing said publicly.
 // The job's own guards (primary-checkout, forbidden-command) tripping is the job's problem, never the reporter's.
 const INFRA = new Set(['agent-failed', 'agent-timeout', 'model-downgrade', 'window-closed', 'transient', 'lock-held',
-  'primary-checkout', 'forbidden-command', 'injection-scan-failed']);
+  'primary-checkout', 'forbidden-command', 'injection-scan-failed', 'plan-malformed']);
 // The fix itself looked hostile: held for the owner (URGENT page, never retried until a person labels it autofix:go).
 // The reporter is still answered honestly (owner, 2026-10-30) but in words that reveal nothing about what was detected,
 // and the hold, not the breaker, keeps it out of later nights.

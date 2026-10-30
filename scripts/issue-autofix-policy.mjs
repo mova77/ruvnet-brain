@@ -19,7 +19,7 @@ export const ABORT_CODES = Object.freeze([
   'branch-exists', 'push-failed', 'preflight-failed', 'preflight-timeout', 'checks-failed', 'not-ancestor',
   'main-moved', 'dispatch-not-found', 'release-failed', 'terminal-unverified', 'comment-failed', 'deadline',
   'not-editable', 'security-finding', 'redteam-flagged', 'sandbox-unavailable', 'injection-scan-failed', 'modules-tampered',
-  'batch-security', 'prepush-failed', 'transient']);
+  'batch-security', 'prepush-failed', 'transient', 'plan-malformed']);
 // A red at or after S10 means main has (or may have) moved: the caller halts the whole job.
 export const HALT_STAGES = new Set(['S10', 'S11', 'S12', 'S13']);
 
@@ -228,7 +228,11 @@ export function judgePlan(plan, { governed0103 = new Set() } = {}) {
   const substance = hasSubstance(plan);
   if (plan.classification !== 'fixable') return stop('plan-not-fixable', substance);
   if (plan.risk === 'high' || !['low', 'medium'].includes(plan.risk)) return stop('plan-high-risk', substance);
-  if (!Array.isArray(plan.files) || plan.files.some((f) => isProtectedPath(f, governed0103) || !isEditablePath(f).ok)) return stop('protected-path', substance);
+  // A plan whose file lists are not paths at all is the planner's format slip, not a verdict on the issue: retried, never
+  // reported as "needs a maintainer" (measured 2026-10-30: prose test descriptions in newTests).
+  const notPath = (f) => typeof f !== 'string' || !f || f.length > 200 || /\s/.test(f);
+  if (!Array.isArray(plan.files) || plan.files.some(notPath) || (plan.testPlan?.newTests || []).some(notPath)) return stop('plan-malformed', false);
+  if (plan.files.some((f) => isProtectedPath(f, governed0103) || !isEditablePath(f).ok)) return stop('protected-path', substance);
   const tests = plan.testPlan?.newTests;
   if (!Array.isArray(tests) || !tests.length || tests.some((f) => !isEditablePath(f).ok || !isTestFile(f))) return stop('protected-path', substance);
   return { proceed: true, code: null, publicFindings: false };

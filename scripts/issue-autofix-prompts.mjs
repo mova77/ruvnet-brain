@@ -28,7 +28,7 @@ ${EDIT_SCOPE}
 
 1. Verify the claim against the ACTUAL code in this worktree: read the referenced files and find the real root cause (file and line). Do not assume the report is accurate.
 2. Classify: fixable (small, mechanical, testable here with vitest and no network), needs-owner (design or product judgement, or it needs a non-editable file), needs-info, invalid, duplicate, or already-fixed.
-3. For a fixable issue list every file you would change (at most 12) and the new test file(s) under tests/unit/ or tests/regression/ that must FAIL on today's code and pass after the fix. Mark risk high if the change touches security, release, install, update or data-loss behaviour.
+3. For a fixable issue list every file you would change (at most 12) and the new test file(s) under tests/unit/ or tests/regression/ that must FAIL on today's code and pass after the fix. "files" and "testPlan.newTests" hold repo-relative FILE PATHS ONLY (for example tests/unit/fleet-dedupe.test.mjs) — describe what each test checks in "summary", never in those lists. Mark risk high if the change touches security, release, install, update or data-loss behaviour.
 4. For anything not fixable, still give the root cause with a real file:line if you found one (line 0 only if unknown) and say in whatItNeeds what a person must decide.
 Answer ONLY with the JSON object required by the schema.`,
 

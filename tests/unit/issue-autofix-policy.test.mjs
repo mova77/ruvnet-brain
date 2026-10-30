@@ -24,12 +24,12 @@ describe('AutofixAbort and vocabulary', () => {
     expect([e.name, e.stage, e.code, e.detail, e.halt, e.publicFindings]).toEqual(['AutofixAbort', 'S10', 'main-moved', 'x', true, true]);
     expect(new P.AutofixAbort('S3', 'diff-policy')).toMatchObject({ halt: false, publicFindings: false, detail: '' });
     expect(P.STAGES_ORDER).toHaveLength(16);
-    expect(P.ABORT_CODES).toHaveLength(43);
-    expect(new Set(P.ABORT_CODES).size).toBe(43);
+    expect(P.ABORT_CODES).toHaveLength(44);
+    expect(new Set(P.ABORT_CODES).size).toBe(44);
     expect(Object.isFrozen(P.ABORT_CODES)).toBe(true);
     expect([...P.HALT_STAGES]).toEqual(['S10', 'S11', 'S12', 'S13']);
     for (const c of ['kill-switch-off', 'forbidden-command', 'comment-failed', 'deadline', 'not-editable', 'security-finding', 'redteam-flagged',
-      'sandbox-unavailable', 'injection-scan-failed', 'modules-tampered', 'batch-security', 'prepush-failed', 'transient']) expect(P.ABORT_CODES).toContain(c);
+      'sandbox-unavailable', 'injection-scan-failed', 'modules-tampered', 'batch-security', 'prepush-failed', 'transient', 'plan-malformed']) expect(P.ABORT_CODES).toContain(c);
   });
 });
 
@@ -424,6 +424,18 @@ describe('release window: stale release branches and PRs below main do not close
     expect(judge({ remoteReleaseBranches: [{ name: 'release/4.5.15-stop', version: '4.5.15' }] }).open).toBe(true);
     expect(judge({ remoteReleaseBranches: [{ name: 'release/4.8.1-x', version: '4.8.1' }] }).reasons).toEqual(['release-branch-ahead:release/4.8.1-x']);
     expect(judge({ remoteReleaseBranches: [{ name: 'release/next', version: '' }] }).reasons).toEqual(['release-branch-ahead:release/next']);
+  });
+});
+
+describe('judgePlan: a plan whose lists are not paths is malformed, not a verdict (rehearsal 2026-10-30)', () => {
+  const plan = { classification: 'fixable', risk: 'medium', injectionSuspected: false, summary: 's', platformSpecific: [],
+    rootCause: { file: 'scripts/onboarding-console.mjs', line: 1948, explanation: 'x' }, files: ['scripts/onboarding-console.mjs'],
+    testPlan: { failsBeforeFix: true, newTests: ['tests/regression/fleet-nested-swarm-dedup.test.mjs — tmp tree root/project/.git'] } };
+  it('prose in newTests stops it as plan-malformed with nothing public', () => {
+    expect(P.judgePlan(plan)).toEqual({ proceed: false, code: 'plan-malformed', publicFindings: false });
+  });
+  it('the same plan with a path proceeds', () => {
+    expect(P.judgePlan({ ...plan, testPlan: { ...plan.testPlan, newTests: ['tests/regression/fleet-nested-swarm-dedup.test.mjs'] } }).proceed).toBe(true);
   });
 });
 
