@@ -1,4 +1,4 @@
-Updated: 2026-10-29 12:00:00 EDT | Version 1.6.0
+Updated: 2026-10-30 10:20:00 EDT | Version 1.7.0
 Created: 2026-07-07 09:22:01 EDT
 
 # Contributing to RuvNet Brain — the one rulebook
@@ -43,8 +43,10 @@ npm run version:set -- X.Y.Z && npm run convergence:write      # commit these fi
 npm run release:qualify -- --suite source --report /tmp/source-qualification-UNIQUE.json
 npm run release:qualify -- --suite integration --report /tmp/integration-qualification-UNIQUE.json
 npm test && npm run single-source:check                    # distinct grounding and rule checks
-# before the FIRST push, run what preflight runs first (the ADR-0103 review row is the usual first-push red):
-node --check scripts/release.mjs && npm run version:check && npm run release:authority && node scripts/architecture-review-lock.mjs
+# before the FIRST push: every cheap check preflight would fail on, all failures at once, ~1 minute
+# (branch/version, preflight's first gates incl. the ADR-0103 review row, qualification inventory, stray files,
+# census surfaces vs the NEWEST corpus generation, text-anchored mesh/mutation/regression tests):
+npm run release:prepush -- --receipt /tmp/release-prepush-UNIQUE.json
 git push origin release/X.Y.Z                                # triggers release-candidate-preflight
 ```
 
@@ -53,7 +55,10 @@ git push origin release/X.Y.Z                                # triggers release-
    Rebase** — each creates a new SHA the publisher will refuse. An agent never calls `gh pr merge` or the merge API; the PR exists only to put the required `canonical-qa` check on the exact SHA, and step 3's fast-forward push lands it.
 3. Promote with a normal fast-forward: confirm `origin/main` is an ancestor, then
    `git push origin "$SHA:refs/heads/main"` and confirm the remote ref equals `$SHA`. Never force.
-4. Dispatch: `gh workflow run protected-release.yml -f mode=code -f candidate_sha=$SHA -f version=X.Y.Z`.
+4. Dispatch. First `npm run release:prepush -- --pre-dispatch --sha "${SHA}"`: it fails if the corpus generation
+   the preflight sealed for `$SHA` is no longer the newest (the nightly publishes ~06:00-07:30 UTC); restamp and
+   re-run preflight instead of dispatching a release that `release.mjs` will refuse. Then
+   `gh workflow run protected-release.yml -f mode=code -f candidate_sha=$SHA -f version=X.Y.Z`.
 5. There is no approval step. The `Production – ruvnet-brain` environment has no reviewer; it is a scoping
    boundary (it alone holds `NPM_TOKEN`, deployable from protected branches only, admins cannot bypass). The
    `publish` job starts by itself once the machine gates below pass, and the dispatching agent watches the run
