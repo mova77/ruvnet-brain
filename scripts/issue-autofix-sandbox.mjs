@@ -80,8 +80,21 @@ export function makeSandboxRunner({ exec, tmpRoot = os.tmpdir(), platform = proc
     const tmp = fs.mkdtempSync(path.join(tmpRoot, 'autofix-sbx-'));
     const profile = path.join(tmp, 'profile.sb');
     // node_modules is usually a link out of the worktree; its target must stay readable even under a denied tree.
+    // node_modules is a directory of links into the shared install (issue-autofix-diff.mjs linkModules) or, in older
+    // layouts, a single link: either way the install it points into must stay READABLE even inside a denied tree such as
+    // ~/.cache/ruvnet-brain (measured 2026-10-30: without this, vitest itself could not be read and no test started).
     const nm = path.join(cwd, 'node_modules');
-    const extra = [cwd, ...readable, ...(exists(nm) ? [real(nm)] : [])];
+    const targets = new Set();
+    if (exists(nm)) {
+      targets.add(real(nm));
+      try {
+        for (const e of fs.readdirSync(nm)) {
+          const p = path.join(nm, e);
+          if (fs.lstatSync(p).isSymbolicLink()) targets.add(path.dirname(real(p)));
+        }
+      } catch { /* an unreadable node_modules just gets no extra grants */ }
+    }
+    const extra = [cwd, ...readable, ...targets];
     fs.writeFileSync(profile, sandboxProfile({ home, writable: [cwd, tmp], readable: extra }));
     const tmpHome = path.join(tmp, 'home');
     fs.mkdirSync(tmpHome);

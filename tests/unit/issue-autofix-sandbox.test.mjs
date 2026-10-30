@@ -147,3 +147,22 @@ console.log(JSON.stringify(out));
     }
   }, 60_000);
 });
+
+describe('the shared install stays readable from inside a denied tree (measured 2026-10-30)', () => {
+  it.runIf(process.platform === 'darwin' && fs.existsSync(SANDBOX_BIN))('a worktree whose node_modules entries link into ~/.cache/ruvnet-brain can load its packages', async () => {
+    const { makeExec } = await import('../../scripts/issue-autofix-exec.mjs');
+    const home = tmp('autofix-sbx-home-');
+    const shared = path.join(home, '.cache', 'ruvnet-brain', 'autofix-repo', 'node_modules'); // denied by READ_DENY_HOME
+    fs.mkdirSync(path.join(shared, 'leftpad'), { recursive: true });
+    fs.writeFileSync(path.join(shared, 'leftpad', 'package.json'), '{"name":"leftpad","type":"module","main":"index.js"}');
+    fs.writeFileSync(path.join(shared, 'leftpad', 'index.js'), 'export default (s) => `  ${s}`;');
+    const wt = path.join(home, '.cache', 'ruvnet-brain', 'issue-fix-worktrees', 'issue-1'); // also inside the denied tree
+    fs.mkdirSync(path.join(wt, 'node_modules'), { recursive: true });
+    fs.symlinkSync(path.join(shared, 'leftpad'), path.join(wt, 'node_modules', 'leftpad'));
+    fs.writeFileSync(path.join(wt, 'probe.mjs'), "import pad from 'leftpad'; console.log(JSON.stringify(pad('x')));");
+    const run = makeSandboxRunner({ exec: makeExec({}), tmpRoot: tmp(), home });
+    const r = run(process.execPath, ['probe.mjs'], { cwd: wt, timeoutMs: 60_000 });
+    expect(r.stderr).toBe('');
+    expect(r.stdout.trim()).toBe('"  x"');
+  });
+});

@@ -170,15 +170,27 @@ const SECRET_RE = [/\bgh[pos]_[A-Za-z0-9]{20,}/, /\bgithub_pat_[A-Za-z0-9_]{20,}
   /\bsk-ant-[A-Za-z0-9_-]{10,}/, /\bsk-[A-Za-z0-9_-]{20,}/, /\bAKIA[0-9A-Z]{16}\b/, /-----BEGIN [A-Z ]*-----/];
 const MODEL_RE = /\b(claude|opus|sonnet|haiku|anthropic|gpt|openai|llms?|language models?|system prompts?|prompts?|prompted|as an ai|automated pipeline|autofix|the bot|token budget)\b/i;
 const CLAIM_RE = /\b(fixed|shipped|released|published|resolved|is live|are live|now live)\b/gi;
-const HEDGE_RE = /\b(not|never|no|until|once|when|if|after|yet|unless|before|will|would|should|could|may|might|to be)\b|n't\b/i;
+const HEDGE_RE = /\b(not|never|no|nothing|none|neither|nor|without|until|once|when|if|after|yet|unless|before|will|would|should|could|may|might|to be)\b|n't\b/i;
 const VERIFY_RE = /\b(verified|verify|install-verified|tested|tests? pass(?:ed|es)?|passes|passed|confirmed|checked|reproduced|ran|runs|works|working)\b/i;
 const NEG_RE = /\b(not|never|no|unverified|untested|without)\b|n't\b/i;
 const PLATFORM_RE = /\b(windows|macos|mac|linux|codex|grok)\b/gi;
 const platformKey = (p) => (p === 'mac' ? 'macos' : p);
 const platformsIn = (s) => new Set([...lower(s).matchAll(PLATFORM_RE)].map((m) => platformKey(m[1])));
 
-function claimsDone(text) {
-  for (const m of str(text).matchAll(CLAIM_RE)) {
+// Code the note quotes is not a claim: `resolved.projectRoot`, { db: resolved } and backticked spans are removed first
+// (measured 2026-10-30: a true cause quoting resolveProjectStore's `resolved` read as "resolved").
+const proseOnly = (t) => str(t).replace(/`[^`]*`/g, ' ').replace(/\{[^{}]*\}/g, ' ').replace(/[\w$]+(?:\.[\w$]+)+/g, ' ').replace(/\b\w+\(/g, ' ');
+function claimsDone(raw) {
+  const text = proseOnly(raw);
+  for (const m of text.matchAll(CLAIM_RE)) {
+    const after = text.slice(m.index + m[0].length, m.index + m[0].length + 24);
+    if (/^\s+yet\b/i.test(after)) continue; // "shipped yet"
+    // Only an ASSERTED state is a claim: "is fixed", "it shipped", "now live", "fixed in v4.7.23". The adjective in
+    // "carry the resolved project root" is not (measured 2026-10-30 on a real note).
+    const lead = text.slice(Math.max(0, m.index - 30), m.index).toLowerCase().split(/\s+/).filter(Boolean).slice(-3);
+    const asserted = lead.some((w) => /^(is|are|was|were|be|been|being|has|have|had|it|this|that|now|got|gets|it's|that's|its)$/.test(w.replace(/[^\w']/g, '')))
+      || /^\s+(in|as of)\s+(v?\d|the latest|version)/i.test(after) || /^(is|are|now)\s+live$/i.test(m[0]);
+    if (!asserted) continue;
     let before = text.slice(Math.max(0, m.index - 40), m.index);
     const cut = Math.max(...[',', ';', ':', '.', '!', '?'].map((c) => before.lastIndexOf(c)));
     if (cut >= 0) before = before.slice(cut + 1);

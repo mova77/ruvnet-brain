@@ -65,7 +65,8 @@ export async function runAutofix({ now = Date.now(), dryRun = false, simulate = 
   const originUrl = simulate ? env.AUTOFIX_SIMULATE_ORIGIN : ORIGIN_URL;
   if (simulate) assertSimulateAllowed({ dryRun, ghBin, claudeBin, origin: originUrl });
   const basePaths = deps.paths || PATHS(home);
-  const paths = rehearse ? { ...basePaths, state: path.join(basePaths.receipts, 'rehearsal-state.json'), runner: null } : basePaths;
+  // Each rehearsal starts from a clean state of its own: an earlier rehearsal's attempts never feed this one's breaker.
+  const paths = rehearse ? { ...basePaths, state: path.join(basePaths.receipts, `rehearsal-state-${now}.json`), runner: null } : basePaths;
   const live = !dryRun || simulate; // a plain --dry-run executes no write and persists nothing
   const t0 = Date.now();
   const nowFn = () => now + (Date.now() - t0);

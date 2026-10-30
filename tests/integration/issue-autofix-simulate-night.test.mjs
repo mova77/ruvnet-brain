@@ -280,6 +280,8 @@ describe('--rehearse: the real night with every GitHub write refused', () => {
     expect(w.originRef('refs/heads/main')).toBe(mainBefore);
     expect(w.originRef('refs/heads/release/9.9.10')).toBe('');
     expect(fs.existsSync(w.paths.state)).toBe(false); // the real state file is never written
+    const again = await w.run({ rehearse: {}, now: NOW + 60_000 }); // a fresh state each time: the breaker does not carry over
+    expect(again.receipt.ready).toEqual([expect.objectContaining({ number: 7 })]);
     expect(receipt.comments[0].body).toMatch(new RegExp(`^${BOT_MARKER} fix report — RuvNet Brain\\n\\nHi @alice — You gave`));
   }, T);
 });

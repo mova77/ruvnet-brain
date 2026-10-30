@@ -1,6 +1,6 @@
 // issue-autofix-notes.test.mjs — guards + regenerate loop for the personal thank-you notes (ADR-107).
 // Owner's standing order: never a form letter. Every guard here is proven by a red case and a green twin.
-import { describe, it, expect, vi } from 'vitest';
+import { beforeAll, describe, it, expect, vi } from 'vitest';
 import {
   MAX_REGENERATIONS, WAIT_APOLOGY_DAYS, BOILERPLATE, groupByPerson, reporterWords, waitedDays, noteText,
   checkNote, generatePersonNote,
@@ -220,3 +220,21 @@ describe('generatePersonNote', () => {
     expect(gen.mock.calls[1][0].feedback.length).toBeGreaterThan(0);
   });
 });
+
+describe('truthful notes are not rejected as overclaims (real drafts, rehearsal 2026-10-30)', () => {
+  const issue = { number: 500, title: 'Fleet scan counts nested metadata directory as another project', author: { login: 'Obi' }, createdAt: new Date(Date.now() - 3 * 86_400_000).toISOString(), comments: [],
+    body: 'findMemoryStores pushes { project: dir, db: resolved }; my fixture got "2 distinct real project paths, 1 unique canonical DB path" and 2,774 rows counted twice for 7,306.' };
+  const item = { issue, kind: 'not-fixed', facts: { verified: [], notVerified: ['a fix that passes every check'] } };
+  const entry = { number: 500, whatWasWrong: 'That resolver walks up to the Git root, so line 1948 pushes { project: dir, db: resolved } and keeps the nested directory instead of resolved.projectRoot.', whatItNeeds: 'The fix I tried didn\'t pass verification, so it has not shipped. It needs to carry the resolved project root.' };
+  let N;
+  beforeAll(async () => { N = await import('../../scripts/issue-autofix-notes.mjs'); });
+  const check = (thanks, e = entry) => N.checkNote({ note: { thanks, perIssue: [e] }, login: 'Obi', items: [item], priorNotes: [], now: Date.now() }).reasons;
+  it('"nothing has shipped yet" and quoted code are truthful', () => {
+    expect(check('Your fixture made this easy to follow: getting "2 distinct real project paths, 1 unique canonical DB path" isolates the defect cleanly. I tried a fix and it did not get through verification, so nothing has shipped yet.')).not.toContain('overclaim:500');
+  });
+  it('a real overclaim on a not-fixed issue is still caught', () => {
+    expect(check('Your fixture with "2 distinct real project paths, 1 unique canonical DB path" was perfect, and this is fixed now in the latest release.')).toContain('overclaim:500');
+    expect(check('Your fixture with "2 distinct real project paths, 1 unique canonical DB path" was perfect.', { ...entry, whatItNeeds: 'Nothing; it shipped this morning.' })).toContain('overclaim:500');
+  });
+});
+
