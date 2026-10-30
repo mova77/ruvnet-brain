@@ -275,7 +275,9 @@ describe('the exec wrapper and the primary checkout', () => {
     for (const f of fs.readdirSync(dir).filter((n) => /^issue-autofix.*\.mjs$/.test(n) && !['issue-autofix-policy.mjs', 'issue-autofix-security.mjs'].includes(n))) {
       const src = strip(fs.readFileSync(path.join(dir, f), 'utf8'));
       expect(src, f).not.toMatch(/--force|force-with-lease|\+refs\/|['"]merge['"]|\/merge['"`\s)]|dangerously/);
-      if (!/-(agents|exec)\.mjs$/.test(f)) expect(src, f).not.toMatch(/child_process/);
+      // prompts.mjs only NAMES child_process, in the builder's instructions forbidding it
+      if (!/-(agents|exec|prompts)\.mjs$/.test(f)) expect(src, f).not.toMatch(/child_process/);
+      if (!/-(agents|exec)\.mjs$/.test(f)) expect(src, f).not.toMatch(/(?:from\s*|import\s*\(\s*|require\s*\(\s*)['"](?:node:)?child_process['"]/);
     }
   });
 });
