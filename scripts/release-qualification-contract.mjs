@@ -386,6 +386,11 @@ export const RELEASE_REQUIREMENTS = Object.freeze({
       "files": []
     },
     {
+      "id": "release-prepush-shift-left",
+      "reason": "The explicit release pre-push gate collects every failure with per-check timing, reads the newest corpus generation's public census over HTTP Range (refusing zip64, unknown compression and CRC mismatch), names each stale claim surface with its old and new number, refuses stray added artifacts with anchored patterns, selects text-anchored tests for changed source, and before dispatch requires the preflight's sealed generation to still be the newest",
+      "files": ["tests/unit/release-prepush.test.mjs", "tests/unit/generation-census.test.mjs"]
+    },
+    {
       "id": "canonical-progression-store",
       "reason": "Actual adopted canonical storage, exact readback, and concurrent session restoration retain consent and complete history",
       "files": [],
