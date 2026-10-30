@@ -79,6 +79,8 @@ governs:
   - scripts/deferral-replay.mjs
   - scripts/doc-currency.mjs
   - scripts/hook-qualify-core.mjs
+  - scripts/issue-autofix-policy.mjs
+  - scripts/issue-autofix-release.mjs
   - scripts/managed-terminal-input.mjs
   - scripts/model-managed-prompt.mjs
   - scripts/model-managed-workflow-service.mjs

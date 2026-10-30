@@ -1,4 +1,4 @@
-Updated: 2026-10-26 03:30:00 EDT | Version 1.5.2
+Updated: 2026-10-29 12:00:00 EDT | Version 1.6.0
 Created: 2026-07-07 09:22:01 EDT
 
 # Contributing to RuvNet Brain — the one rulebook
@@ -15,6 +15,7 @@ instructions. `npm run single-source:check` fails CI if a second, conflicting in
 | Change code or docs | Work on a branch; land it on a `release/X.Y.Z` branch. Nothing is pushed to `main` directly. | `release-candidate-preflight` green on that SHA |
 | Set the version | `npm run version:set -- X.Y.Z` (first commit of the release branch) | `npm run version:check` exits 0 |
 | Release code | Preflight → fast-forward `main` → dispatch `protected-release.yml mode=code` → the workflow's machine gates carry it across `Production – ruvnet-brain` (no human approval step) | Terminal receipt `install-verified` on Linux, macOS, Windows; npm `latest` = GitHub `releases/latest` = `main` |
+| Fix a person's issue unattended | `node scripts/issue-fix.mjs --mode autofix` (daily `com.ruvnet.issue-autofix`; runs only while the repository variable `ISSUE_AUTOFIX` is exactly `on`) — follows "Releasing code" below step for step and holds no publish operation (ADR-107) | Terminal `install-verified`, then one comment per fixed issue naming that version and one personal note per reporter; every night's fixes ship as one release |
 | Build the customer corpus | CI only: `corpus-seed.yml` → `scripts/corpus-reconcile.mjs` | Sealed candidate + receipt artifact |
 | Publish the corpus | `protected-release.yml mode=corpus` (nightly dispatcher), armed unless repository variable `CORPUS_NIGHTLY` is `off` (the owner's kill switch) **and** the newest code release is `install-verified` (resolved at run time, `scripts/approved-runtime.mjs --resolve`; never a committed file, never a fallback to an older release); the corpus is built at that release's source commit, and `main` being ahead of it does not matter; a night with no upstream change publishes nothing | `corpus-sha256-*` release promoted to `releases/latest` |
 | Update a user's machine | One coordinator and shared lock; the Brain schedule invokes it at 03:30 local time, and existing managed ownership remains explicit | `SOURCE.json` `releaseTag` equals the plugin version; latest `~/.cache/ruvnet-brain/refresh-runs/*.json` is PASS |
@@ -49,7 +50,7 @@ git push origin release/X.Y.Z                                # triggers release-
 
 1. Wait for `release-candidate-preflight` to pass on the exact SHA. Any source change repeats it.
 2. Open a PR `release/X.Y.Z → main` for review and required checks. **Never click Merge, Squash or
-   Rebase** — each creates a new SHA the publisher will refuse.
+   Rebase** — each creates a new SHA the publisher will refuse. An agent never calls `gh pr merge` or the merge API; the PR exists only to put the required `canonical-qa` check on the exact SHA, and step 3's fast-forward push lands it.
 3. Promote with a normal fast-forward: confirm `origin/main` is an ancestor, then
    `git push origin "$SHA:refs/heads/main"` and confirm the remote ref equals `$SHA`. Never force.
 4. Dispatch: `gh workflow run protected-release.yml -f mode=code -f candidate_sha=$SHA -f version=X.Y.Z`.
@@ -83,7 +84,7 @@ Publishing is allowed only when every one of these holds, each enforced in code,
   The corpus nightly refuses to run on a release that is not `install-verified`.
 
 What this gives up, stated once: anyone with write access who can dispatch on protected `main` (today the
-release agent and the owner's account) can publish to npm without a second person confirming it. The control is
+release agent, the owner's account, and the issue-autofix job, ADR-107) can publish to npm without a second person confirming it. The control is
 that only an already-preflighted head of `main` can be published, and `main` moves only by fast-forward through
 required checks that admins cannot bypass. Strengthening a gate is a code change to the workflow, never a person
 in the loop.
