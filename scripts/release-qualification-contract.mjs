@@ -345,6 +345,15 @@ export const RELEASE_REQUIREMENTS = Object.freeze({
       "reason": "Complete outbox tails replay and accepted pending journal events survive capacity pressure without silent deletion",
       "files": [
       ]
+    },
+    {
+      "id": "open-issue-fixes-4-7-22",
+      "reason": "Reporter-filed defects stay fixed: completion evidence never binds a masked or negated check and a masked check is an advisory, not a false 'no check ran' stop; the boot surface of a recovered Codex host is proven per changed path; Console fleet and lesson counts match by store identity and never show unknown as zero; one project-scope rule is shared by the lesson gate and the Console; a refused or unreadable memory restore is reported as such and an aborted Ruflo call leaves no child process",
+      "files": [],
+      "platformFiles": {
+        "linux": ["tests/unit/continuation-gate-codex-transcript.test.mjs", "tests/unit/codex-boot-surface-proof.test.mjs", "tests/unit/console-activity-fleet-dedupe.test.mjs", "tests/unit/console-activity-identity.test.mjs", "tests/unit/console-activity-lessons.test.mjs", "tests/unit/lesson-gate.test.mjs", "tests/unit/ruflo-memory-session.test.mjs"],
+        "macos": ["tests/unit/continuation-gate-codex-transcript.test.mjs", "tests/unit/codex-boot-surface-proof.test.mjs", "tests/unit/console-activity-fleet-dedupe.test.mjs", "tests/unit/console-activity-identity.test.mjs", "tests/unit/console-activity-lessons.test.mjs", "tests/unit/lesson-gate.test.mjs", "tests/unit/ruflo-memory-session.test.mjs"]
+      }
     }
   ],
   "integration": [
@@ -441,6 +450,15 @@ export const RELEASE_REQUIREMENTS = Object.freeze({
       "reason": "POSIX non-root permission refusal, capacity-pressure reporting and recovery preserve all accepted pending continuity events",
       "files": [
       ]
+    },
+    {
+      "id": "open-issue-fixes-4-7-22-integration",
+      "reason": "A named release over an existing install moves, skips truthfully or warns on a downgrade instead of reporting a false lookup failure; the Ruflo memory hooks honour the absolute deadline and abort, kill the whole child process group, and never report a refused or partly unreadable restore as restored",
+      "files": [],
+      "platformFiles": {
+        "linux": ["tests/integration/stale-install-trap.test.mjs", "tests/integration/ruflo-memory-hooks.test.mjs"],
+        "macos": ["tests/integration/stale-install-trap.test.mjs", "tests/integration/ruflo-memory-hooks.test.mjs"]
+      }
     }
   ]
 });

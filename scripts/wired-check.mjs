@@ -226,6 +226,8 @@ const STANDALONE = [
     + 'starts themselves (--url http://127.0.0.1:.../page.html, via Playwright) — needs a live '
     + 'rendered page, not a static diff, so it is a dev-loop tool like gen-console-images.mjs, not a '
     + 'CI step'],
+  ['recall-latency-probe', 'human-run measurement (#429): times prompt recall and SessionStart restore against a real '
+    + 'project store and exits 1 outside the budgets; it reads the owner\'s live store and loads the machine, so no scheduler runs it'],
   ['dev-plugin-link', 'developer convenience CLI — its own header: "Users never run it." Hot-links '
     + 'the cached plugin install to the working tree so hook edits apply without a CC restart'],
 
