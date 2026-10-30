@@ -65,7 +65,7 @@ export async function fixAll(rt, candidates, { governed }) {
       const a = e instanceof AutofixAbort ? e : new AutofixAbort('S4', 'agent-failed', e?.stack || String(e));
       const c = classifyFailure(a, { plan: rt.current.plan });
       if (c.stop) throw a;
-      rt.receipt.dropped.push({ number: n, stage: a.stage, code: a.code });
+      rt.receipt.dropped.push({ number: n, stage: a.stage, code: a.code, detail: String(a.detail || '').slice(0, 600) }); // private: receipt only
       rt.bump(n, { lastStage: a.stage, lastCode: a.code, lastOutcome: c.item?.kind || (c.hold ? 'security-hold' : 'aborted'),
         failCount: (readNs(rt.paths.state)[n]?.failCount || 0) + (c.breaker ? 1 : 0), ...(c.hold ? { securityHold: { at: iso(rt.now()), code: a.code } } : {}) });
       if (c.page) rt.page(`${c.page.title} #${n}`, `${a.stage}:${a.code} — ${a.detail}`.slice(0, 900), c.page.priority);

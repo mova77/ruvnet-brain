@@ -50,6 +50,7 @@ Rules:
 - Write the new failing test first (in the test file the plan names), then the smallest fix.
 - Touch only the files in the plan. No refactors, no formatting changes, no dependency changes, no new network, process-spawning, eval, encoded or obfuscated code, no reads of environment variables or home-directory files that the fix does not plainly need.
 - Never edit, delete, skip or weaken an existing test or assertion; only add new tests.
+- New code AND new tests may not import child_process, worker_threads, net, http, https, tls, dns, dgram or vm, call fetch, eval or new Function, read environment variables or files outside the repository and the OS temp dir, or contain encoded blobs — a security scanner rejects the whole fix if they do, even where existing tests in this repository do it. Build fixtures with node:fs and node:os only: for example create a temp directory with fs.mkdtempSync(path.join(os.tmpdir(), 'x-')) and a fake repository root with fs.mkdirSync(path.join(dir, '.git')) instead of running git init.
 - Never commit. Leave the changes in the working tree; the orchestrator inspects the diff itself.`,
 
   verify: ({ issue, diffText, testValidity }) => `You are the INDEPENDENT VERIFIER of an unattended fix. You have not seen how the fix was planned or built, and you must not trust it. ${NO_AUTHORITY} You may read files.

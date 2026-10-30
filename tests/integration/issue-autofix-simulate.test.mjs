@@ -134,7 +134,7 @@ describe('a night with several issues: each fixed independently, one release', (
     setup({ issues: [humanIssue(), bobIssue()], script: { byIssue: { ...CANNED.byIssue, 7: { verify: { ...CANNED.verify, verdict: 'NOT_RESOLVED', summary: 'The slug still keeps apostrophes.' } } } } });
     const { receipt } = await w.run();
     expect(receipt.status).toBe('shipped');
-    expect(receipt.dropped).toEqual([{ number: 7, stage: 'S5', code: 'verify-not-resolved' }]);
+    expect(receipt.dropped).toEqual([expect.objectContaining({ number: 7, stage: 'S5', code: 'verify-not-resolved' })]);
     expect(git(w.origin, 'show', 'main:scripts/slugify.mjs').stdout).not.toContain('[^a-z0-9');
     expect(issue(8).state).toBe('CLOSED');
     const [c] = comments(7);
@@ -160,7 +160,7 @@ describe('the security gate: a hostile fix never ships; its reporter is answered
   const hostile = async (script, code, { stage = 'S4' } = {}) => {
     setup({ issues: [humanIssue(), bobIssue()], script });
     const { receipt, commands } = await w.run();
-    expect(receipt.dropped).toContainEqual({ number: 7, stage, code });
+    expect(receipt.dropped).toContainEqual(expect.objectContaining({ number: 7, stage, code }));
     expect(comments(7)).toHaveLength(1);
     expect(comments(7)[0].body).toMatch(new RegExp(`^${BOT_MARKER} status — RuvNet Brain`));
     expect(comments(7)[0].body).not.toMatch(/eval|base64|malicious|security|red-team|scan|allowlist|dependency/i);
@@ -234,7 +234,7 @@ describe('the security gate: a hostile fix never ships; its reporter is answered
   ])('%s: dropped, answered honestly', async (_n, patch, code) => {
     setup({ script: { buildPatch: path.join(FIX, patch) } });
     const { receipt, commands } = await w.run();
-    expect(receipt.dropped).toEqual([{ number: 7, stage: 'S4', code }]);
+    expect(receipt.dropped).toEqual([expect.objectContaining({ number: 7, stage: 'S4', code })]);
     stoppedBeforeMain(commands);
     expect(comments()[0].body).toMatch(new RegExp(`^${BOT_MARKER} status`));
   }, T);
